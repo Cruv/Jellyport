@@ -1,0 +1,190 @@
+name: Publish Docker image
+
+on:
+  workflow_run:
+    workflows: [Checks]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize publication so a slower build cannot replace a newer release.
+concurrency:
+  group: jellyport-image-publication
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha: ${{ steps.verify.outputs.sha }}
+      image: ${{ steps.verify.outputs.image }}
+    steps:
+      - name: Require successful Checks for the exact current main commit
+        id: verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          if [[ "$SOURCE_SHA" != "$main_sha" ]]; then
+            echo '::error::Only the current main commit can publish an image.'
+            exit 1
+          fi
+          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$SOURCE_SHA" -f branch=main -f event=push -f status=success \
+            -f per_page=100 |
+            jq -e --arg sha "$SOURCE_SHA" --arg repo "$GITHUB_REPOSITORY" \
+              'any(.workflow_runs[]; .head_sha == $sha and .head_branch == "main" and
+                .head_repository.full_name == $repo and .event == "push" and
+                .status == "completed" and .conclusion == "success")' > /dev/null
+          printf 'sha=%s\n' "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          printf 'image=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            architecture: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            architecture: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Build the native image for a smoke test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: jellyport:smoke
+          cache-from: type=gha,scope=jellyport-${{ matrix.architecture }}
+          cache-to: type=gha,scope=jellyport-${{ matrix.architecture }},mode=max
+      - name: Start the image in demo mode
+        run: >-
+          docker run -d --name jellyport-smoke -p 127.0.0.1:8173:8000
+          -e JELLYPORT_DEMO=true -e JELLYPORT_ADMIN_PASSWORD=demo-jellyport jellyport:smoke
+      - name: Verify the running application
+        run: node scripts/smoke.mjs http://127.0.0.1:8173
+      - name: Show smoke-test logs on failure
+        if: failure()
+        run: docker logs jellyport-smoke
+      - name: Stop the smoke-test container
+        if: always()
+        run: docker stop jellyport-smoke
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the verified image by digest
+        id: image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ needs.verify.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          labels: |
+            org.opencontainers.image.title=Jellyport
+            org.opencontainers.image.description=Emby to Jellyfin migration and Discord account management
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ needs.verify.outputs.sha }}
+          provenance: true
+          sbom: true
+          cache-from: type=gha,scope=jellyport-${{ matrix.architecture }}
+      - name: Save the published digest
+        env:
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${IMAGE_DIGEST#sha256:}"
+      - name: Upload the digest for manifest assembly
+        uses: actions/upload-artifact@v7
+        with:
+          name: image-digest-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [verify, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download both verified image digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: image-digest-*
+          merge-multiple: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish latest and the full commit tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ needs.verify.outputs.sha }}
+          IMAGE_NAME: ${{ needs.verify.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          main_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          if [[ "$SOURCE_SHA" != "$main_sha" ]]; then
+            echo '::error::Main changed during the build; no release tags were published.'
+            exit 1
+          fi
+          digests=()
+          for digest_file in "$RUNNER_TEMP"/digests/*; do
+            digest=${digest_file##*/}
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+            digests+=("$IMAGE_NAME@sha256:$digest")
+          done
+          [[ ${#digests[@]} -eq 2 ]]
+          docker buildx imagetools create \
+            --tag "$IMAGE_NAME:latest" --tag "$IMAGE_NAME:sha-$SOURCE_SHA" \
+            "${digests[@]}"
+          docker buildx imagetools inspect "$IMAGE_NAME:sha-$SOURCE_SHA"

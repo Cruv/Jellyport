@@ -1,14 +1,18 @@
+---
 services:
   jellyport:
+    image: ghcr.io/cruv/jellyport:latest
     build: .
+    container_name: jellyport
     restart: unless-stopped
     stop_grace_period: 35s
     ports:
       - "127.0.0.1:8000:8000"
     environment:
-      JELLYPORT_ADMIN_PASSWORD: ${JELLYPORT_ADMIN_PASSWORD:?Set JELLYPORT_ADMIN_PASSWORD in .env}
-      JELLYPORT_SECURE_COOKIE: ${JELLYPORT_SECURE_COOKIE:-false}
-      JELLYPORT_DATA_DIR: /data
+      - JELLYPORT_ADMIN_PASSWORD=${JELLYPORT_ADMIN_PASSWORD:-}
+      - JELLYPORT_SECURE_COOKIE=${JELLYPORT_SECURE_COOKIE:-false}
+      - JELLYPORT_DATA_DIR=/data
+      - TZ=Etc/UTC
     volumes:
       - jellyport-data:/data
     security_opt:

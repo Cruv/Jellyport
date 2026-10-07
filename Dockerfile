@@ -8,6 +8,8 @@ COPY frontend ./frontend
 RUN npm run build
 
 FROM node:24-bookworm-slim AS runtime
+LABEL org.opencontainers.image.source="https://github.com/Cruv/Jellyport" \
+      org.opencontainers.image.description="Jellyport - Emby to Jellyfin account and watched status migration"
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --ignore-scripts && \

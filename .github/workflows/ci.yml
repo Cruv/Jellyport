@@ -26,10 +26,31 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+      - name: Validate Compose examples
+        run: |
+          for compose_file in compose.yaml examples/compose.portainer.yaml examples/compose.shared-network.yaml; do
+            docker compose -f "$compose_file" config --quiet
+          done
       - run: docker build -t jellyport:ci .
       - run: docker run -d --name jellyport-ci -p 127.0.0.1:8173:8000 -e JELLYPORT_DEMO=true -e JELLYPORT_ADMIN_PASSWORD=demo-jellyport jellyport:ci
       - run: node scripts/smoke.mjs http://127.0.0.1:8173
+      - name: Smoke test an unprivileged bind-mount deployment
+        run: |
+          mkdir -p "${RUNNER_TEMP}/jellyport-bind"
+          sudo chown 1000:1000 "${RUNNER_TEMP}/jellyport-bind"
+          sudo chmod 700 "${RUNNER_TEMP}/jellyport-bind"
+          docker run -d --name jellyport-bind-ci --user 1000:1000 \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            -p 127.0.0.1:8174:8000 \
+            -e TZ=Etc/UTC -e JELLYPORT_DEMO=true -e JELLYPORT_ADMIN_PASSWORD=demo-jellyport \
+            -v "${RUNNER_TEMP}/jellyport-bind:/data" jellyport:ci
+          node scripts/smoke.mjs http://127.0.0.1:8174
+          docker exec jellyport-bind-ci node -e "const assert=require('node:assert/strict'),fs=require('node:fs'); assert.equal(process.getuid(),1000); assert.equal(process.getgid(),1000); for(const name of ['secret.key','jellyport.db']){const s=fs.statSync('/data/'+name); assert.equal(s.uid,1000); assert.equal(s.gid,1000); assert.equal(s.mode&0o777,0o600);} console.log('Bind-mount ownership and secret file permissions passed.');"
       - if: failure()
-        run: docker logs jellyport-ci
+        run: |
+          docker logs jellyport-ci || true
+          docker logs jellyport-bind-ci || true
       - if: always()
-        run: docker stop jellyport-ci
+        run: |
+          docker stop jellyport-ci || true
+          docker stop jellyport-bind-ci || true

@@ -10,6 +10,51 @@ This is an initial implementation. Automated tests and the local demo cover the 
 
 ## Run with Docker Compose
 
+### Portainer or a prebuilt image
+
+The image is `ghcr.io/cruv/jellyport:latest`, published for Linux x86-64 and ARM64 after the main branch passes CI. Each publication also has a `sha-<full-commit-sha>` tag for pinning a deployment. GitHub packages start private; authenticated pulls are required while the package is private. In Portainer, add a **Custom** registry with URL `ghcr.io`, authentication enabled, your GitHub username, and a classic personal access token with `read:packages`. See [GitHub's registry authentication documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry) and [Portainer's custom registry setup](https://docs.portainer.io/admin/registries/add/custom).
+
+Paste [examples/compose.portainer.yaml](examples/compose.portainer.yaml) into Portainer's stack editor, or use this equivalent example:
+
+```yaml
+---
+services:
+  jellyport:
+    image: ghcr.io/cruv/jellyport:latest
+    container_name: jellyport
+    user: "1000:1000" # Host UID:GID.
+    environment:
+      - JELLYPORT_ADMIN_PASSWORD=${JELLYPORT_ADMIN_PASSWORD:-}
+      - JELLYPORT_DATA_DIR=/data
+      - JELLYPORT_SECURE_COOKIE=false # Set true for HTTPS.
+      - TZ=Etc/UTC # Optional.
+    volumes:
+      - "/path/to/jellyport:/data"
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    stop_grace_period: 35s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+```
+
+Replace the host path and prepare that dedicated directory on your Docker host before deployment:
+
+```sh
+sudo install -d -m 700 -o 1000 -g 1000 /path/to/jellyport
+openssl rand -base64 32
+```
+
+Set `JELLYPORT_ADMIN_PASSWORD` to the generated password in Portainer's stack environment variables, or in a local `.env` beside your Compose file. Never commit it. The app rejects an unset, short, or example password when it starts. `user: "1000:1000"` sets the real process UID and GID; change it and the directory owner together if your host uses different IDs. Jellyport does not use `PUID` or `PGID` environment variables.
+
+Open `http://YOUR_SERVER:8000`. For HTTPS through a reverse proxy, set `JELLYPORT_SECURE_COOKIE=true`. Use [examples/compose.shared-network.yaml](examples/compose.shared-network.yaml) when joining an existing media-server network from a separate stack; set `JELLYPORT_MEDIA_NETWORK` to the actual Docker network name. Jellyport connects through server APIs and only needs its own `/data` mount. It does not need access to media files or the Jellyfin configuration directory.
+
+For network details, updates, backups, and moving an existing named-volume deployment, see [Docker and Portainer deployment](docs/docker-deployment.md).
+
+### Build from source
+
 From a checkout of this repository:
 
 ```sh
@@ -93,7 +138,7 @@ Lifecycle actions disable accounts rather than deleting them. Passwords and watc
 
 ## Data and backups
 
-Compose stores application data in the `jellyport-data` named volume mounted at `/data`. It contains `jellyport.db`, SQLite journal files when present, and `secret.key`. Server secrets and retained passwords are encrypted; audit records, usernames, account links, and job summaries are stored as ordinary database records. The encryption key is stored beside the database, so protect the entire volume and its backups.
+The repository's default `compose.yaml` stores application data in the `jellyport-data` named volume mounted at `/data`. The Portainer examples instead use your chosen host bind directory. Both contain `jellyport.db`, SQLite journal files when present, and `secret.key`. Server secrets and retained passwords are encrypted; audit records, usernames, account links, and job summaries are stored as ordinary database records. The encryption key is stored beside the database, so protect the entire volume or directory and its backups.
 
 Stop the service before copying its data, and use a new destination directory for each backup:
 

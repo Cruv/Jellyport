@@ -1,0 +1,43 @@
+{
+  "name": "jellyport",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Self-hosted Emby to Jellyfin migration and Discord account management",
+  "engines": {
+    "node": "^22.13.0 || ^24.0.0"
+  },
+  "scripts": {
+    "dev": "tsx watch server/index.ts",
+    "dev:ui": "vite --host 127.0.0.1",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.frontend.json",
+    "test": "vitest run",
+    "format": "prettier --write server frontend tests-ts scripts *.ts *.json .github/**/*.yml",
+    "build": "npm run typecheck && tsc -p tsconfig.build.json && vite build",
+    "start": "node dist/server/index.js"
+  },
+  "dependencies": {
+    "@fastify/cookie": "11.1.2",
+    "@fastify/static": "10.1.5",
+    "discord.js": "14.27.0",
+    "dotenv": "18.0.6",
+    "fastify": "5.12.5",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "unicode-case-folding": "1.1.2"
+  },
+  "devDependencies": {
+    "@testing-library/react": "16.3.3",
+    "@testing-library/user-event": "14.6.7",
+    "@types/node": "26.6.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "jsdom": "30.1.2",
+    "prettier": "3.9.9",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2",
+    "vite": "8.3.3",
+    "vitest": "5.0.3"
+  }
+}

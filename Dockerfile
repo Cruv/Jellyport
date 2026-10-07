@@ -1,10 +1,22 @@
-FROM python:3.12-slim
+FROM node:24-bookworm-slim AS build
 WORKDIR /app
-COPY pyproject.toml ./
-COPY app ./app
-RUN pip install --no-cache-dir . && useradd --uid 10001 --create-home jellyport && mkdir /data && chown jellyport:jellyport /data
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY tsconfig*.json vite.config.ts ./
+COPY server ./server
+COPY frontend ./frontend
+RUN npm run build
+
+FROM node:24-bookworm-slim AS runtime
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --ignore-scripts && \
+    groupadd --system --gid 10001 jellyport && \
+    useradd --system --uid 10001 --gid 10001 --create-home jellyport && \
+    mkdir /data && chown jellyport:jellyport /data
+COPY --from=build /app/dist ./dist
 USER jellyport
-ENV JELLYPORT_DATA_DIR=/data PYTHONUNBUFFERED=1
+ENV NODE_ENV=production JELLYPORT_DATA_DIR=/data HOST=0.0.0.0 PORT=8000
 EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD node -e "fetch('http://127.0.0.1:8000/health',{signal:AbortSignal.timeout(3000)}).then(r=>{if(!r.ok)process.exitCode=1}).catch(()=>{process.exitCode=1})"
+CMD ["node", "dist/server/index.js"]

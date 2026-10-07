@@ -2,6 +2,8 @@
 
 Jellyport is a self-hosted web app for moving one or several users from Emby to Jellyfin, creating accounts from a Jellyfin template, and optionally delivering new credentials through Discord. It also provides an administrator review queue for MEE6 membership announcements and Discord membership role changes, with optional automatic provisioning and access removal.
 
+The app uses TypeScript throughout: React/Vite for the web interface, Fastify on Node.js for the API, discord.js for the optional bot, and SQLite for encrypted settings, account links, audit records, and queued jobs. Docker packages the built interface and API together.
+
 This is an initial implementation. Automated tests and the local demo cover the implemented workflows; compatibility has not yet been validated against your live Emby, Jellyfin, or Discord servers.
 
 ![Jellyport demo dashboard](docs/jellyport-preview.jpg)
@@ -24,7 +26,7 @@ Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and sign in. Compose binds t
 
 The container must be able to reach both media servers. A server URL containing `localhost` refers to the Jellyport container itself. Use reachable hostnames or addresses; reverse proxy base paths are supported.
 
-Serve Jellyport at the root of its own host/subdomain. Run one application worker/replica: the job lock and admin sessions are local to that process.
+Serve Jellyport at the root of its own host/subdomain. Run one application worker/replica: mutation coordination, the Discord Gateway connection, and admin sessions are local to that process. Account mutations are serialized, with the lock released between users in a bulk job so other account operations can run.
 
 ## Configure your servers
 
@@ -59,7 +61,7 @@ New destination accounts receive a generated 24-character password and the templ
 
 ## Create accounts and deliver passwords
 
-Use the account creation form for a new member. With a connected Discord bot, provide the member's numeric Discord user ID and their current Discord username. Jellyport uses the actual username (`member.name`), rather than a server nickname or display name.
+Use the account creation form for a new member. With a connected Discord bot, provide the member's numeric Discord user ID and their current Discord username. Jellyport uses the actual username (`member.user.username`), rather than a server nickname or display name.
 
 For the first Discord link, the account's username must match the member's current Discord username exactly. An Emby user with a different legacy username can still be migrated without selecting a Discord recipient. Verify and resolve that mismatch before linking; Jellyport does not guess ownership or rename accounts automatically.
 
@@ -103,22 +105,29 @@ docker compose start jellyport
 
 Restore the database and `secret.key` together while the service is stopped. Without the original key, saved secrets cannot be decrypted. Keep the volume when rebuilding or upgrading. The `.env` admin password is separate from the encrypted volume and should also be kept securely.
 
-Jobs interrupted by a restart are marked interrupted for review; they are not silently resumed. Rerunning a reviewed migration merges remaining watched flags without resetting ordinary existing accounts.
+New jobs persist their requests and an encrypted settings snapshot before execution. Jobs that have never started can resume after a restart. Running jobs are marked interrupted for review and are not silently replayed: a remote creation or policy change may already have succeeded. Rerunning a reviewed migration merges remaining watched flags without resetting ordinary existing accounts.
+
+### Upgrading from the Python version
+
+Keep the same Compose project name, `jellyport-data` volume, and `.env`. Back up the stopped service as described above, pull the updated repository, then run `docker compose up -d --build`. The Node application reads the original SQLite schema and Fernet-encrypted records using the existing `secret.key`; no Python runtime or export/import step is required. It adds the queued-job table on startup. Old queued/running jobs lack a durable execution record and are marked interrupted for review. Settings, credentials within their retention period, account links, and audit history remain available.
+
+Do not run both versions against the same volume. Keep your pre-upgrade backup if you need to roll back, and restore it while the service is stopped.
 
 ## Development and local demo
 
-Use Python 3.11 or newer:
+Use Node.js 24 (recommended) or Node.js 22.13 or newer in the 22.x series. Dependencies are pinned in `package-lock.json`:
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[test]'
-.venv/bin/python -m pytest
+npm ci
+npm run typecheck
+npm test
+npm run build
 ```
 
 For real local operation, set the admin password in `.env` and run:
 
 ```sh
-.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
+HOST=127.0.0.1 npm start
 ```
 
 The demo uses simulated in-memory servers, makes no Emby/Jellyfin/Discord API calls, and keeps settings read-only. Use a separate data directory:
@@ -128,10 +137,12 @@ JELLYPORT_DEMO=true \
 JELLYPORT_DATA_DIR=/tmp/jellyport-demo \
 JELLYPORT_ADMIN_PASSWORD=demo-jellyport \
 JELLYPORT_SECURE_COOKIE=false \
-.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --no-access-log
+HOST=127.0.0.1 npm start
 ```
 
 Sign in with `demo-jellyport`. Demo server fixtures reset when the process restarts.
+
+For development with hot reload, run `npm run dev` for the API and `npm run dev:ui` in a second terminal. Open Vite's local URL at [http://127.0.0.1:5173](http://127.0.0.1:5173); it proxies `/api` to the Node service at port 8000. Production uses the compiled `dist/server` and `dist/client` files. Source lives in `server/` and `frontend/src/`; Vitest covers backend, Discord, persistence compatibility, and React safeguards. CI checks Node 22 and 24, the production build, dependency vulnerabilities, and a Docker demo smoke test.
 
 ## API
 

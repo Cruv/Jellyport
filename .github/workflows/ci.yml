@@ -1,14 +1,35 @@
-name: Tests
+name: Checks
 on:
   push:
   pull_request:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: '3.12'
-      - run: pip install '.[test]'
-      - run: pytest
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: docker build -t jellyport:ci .
+      - run: docker run -d --name jellyport-ci -p 127.0.0.1:8173:8000 -e JELLYPORT_DEMO=true -e JELLYPORT_ADMIN_PASSWORD=demo-jellyport jellyport:ci
+      - run: node scripts/smoke.mjs http://127.0.0.1:8173
+      - if: failure()
+        run: docker logs jellyport-ci
+      - if: always()
+        run: docker stop jellyport-ci

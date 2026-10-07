@@ -23,7 +23,7 @@ Configure an optional membership role ID to require recipients to hold your MEE6
 /jellyport status job_id:YOUR_JOB_ID
 ```
 
-Create uses the recipient's current Discord username, `member.name`. Its optional `username` argument is only a confirmation and must match exactly. Migration's optional `emby_username` selects an exact Emby username; when omitted, it defaults to the member's current Discord username. The first identity link still requires the Emby and Discord usernames to match. Nicknames and display names are not identities.
+Create uses the recipient's current Discord username, `member.user.username`. Its optional `username` argument is only a confirmation and must match exactly. Migration's optional `emby_username` selects an exact Emby username; when omitted, it defaults to the member's current Discord username. The first identity link still requires the Emby and Discord usernames to match. Nicknames and display names are not identities.
 
 Replies are ephemeral job statuses visible to the administrator. There is no automatic status polling; check the job with `/jellyport status` or the web page. New credentials are sent by DM only to the selected member. Users need to allow DMs from server members. Failed delivery leaves the new password available through the web app's one-time reveal for up to 24 hours. Existing Jellyfin passwords are not reset or sent by an ordinary migration.
 

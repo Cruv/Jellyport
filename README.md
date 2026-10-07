@@ -12,7 +12,7 @@ This is an initial implementation. Automated tests and the local demo cover the 
 
 ### Portainer or a prebuilt image
 
-The image is `ghcr.io/cruv/jellyport:latest`, published for Linux x86-64 and ARM64 after the main branch passes CI. Each publication also has a `sha-<full-commit-sha>` tag for pinning a deployment. GitHub packages start private; authenticated pulls are required while the package is private. In Portainer, add a **Custom** registry with URL `ghcr.io`, authentication enabled, your GitHub username, and a classic personal access token with `read:packages`. See [GitHub's registry authentication documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry) and [Portainer's custom registry setup](https://docs.portainer.io/admin/registries/add/custom).
+The public image is `ghcr.io/cruv/jellyport:latest`, published for Linux x86-64 and ARM64 after the main branch passes CI. Portainer can pull it without GitHub credentials. Each publication also has a `sha-<full-commit-sha>` tag for selecting a commit; pin the image's manifest digest when you need an immutable deployment.
 
 Paste [examples/compose.portainer.yaml](examples/compose.portainer.yaml) into Portainer's stack editor, or use this equivalent example:
 

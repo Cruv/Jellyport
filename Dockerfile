@@ -1,4 +1,4 @@
-FROM node:24-bookworm-slim AS build
+FROM node:25-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -7,7 +7,7 @@ COPY server ./server
 COPY frontend ./frontend
 RUN npm run build
 
-FROM node:24-bookworm-slim AS runtime
+FROM node:25-bookworm-slim AS runtime
 LABEL org.opencontainers.image.source="https://github.com/Cruv/Jellyport" \
       org.opencontainers.image.description="Jellyport - Emby to Jellyfin account and watched status migration"
 WORKDIR /app

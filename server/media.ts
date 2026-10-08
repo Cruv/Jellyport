@@ -53,6 +53,8 @@ export interface MediaAPI {
   setPassword(id: string, password: string): Promise<void>;
   setPolicy(id: string, policy: JsonObject): Promise<void>;
   setConfiguration(id: string, configuration: JsonObject): Promise<void>;
+  displayPreferences?(userId: string): Promise<JsonObject>;
+  setDisplayPreferences?(userId: string, preferences: JsonObject): Promise<void>;
   markPlayed(userId: string, itemId: string, datePlayed?: string): Promise<void>;
   migrationItems?(userId?: string): Promise<MediaItem[]>;
   migrationCapabilities?(): Promise<MigrationCapabilities>;
@@ -769,6 +771,26 @@ export class MediaClient implements MediaAPI {
       `Users/${this.id(id)}/Configuration`,
       undefined,
       configuration,
+      false,
+    );
+  }
+  /** Jellyfin Web's account-wide, server-backed preferences use this fixed legacy client ID. */
+  async displayPreferences(userId: string): Promise<JsonObject> {
+    this.id(userId);
+    return this.object(
+      await this.request('GET', 'DisplayPreferences/usersettings', { userId, client: 'emby' }),
+    );
+  }
+  async setDisplayPreferences(userId: string, preferences: JsonObject): Promise<void> {
+    if (this.kind !== 'jellyfin')
+      throw new MediaError('Display preference updates are supported only on Jellyfin.');
+    this.id(userId);
+    if (!isObject(preferences)) throw new MediaError('Valid display preferences are required.');
+    await this.request(
+      'POST',
+      'DisplayPreferences/usersettings',
+      { userId, client: 'emby' },
+      preferences,
       false,
     );
   }

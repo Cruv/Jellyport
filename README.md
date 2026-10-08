@@ -1,6 +1,6 @@
 # Jellyport
 
-Jellyport is a self-hosted web app for moving one or several users from Emby to Jellyfin, creating accounts from a Jellyfin template, and optionally delivering new credentials through Discord. It also provides an administrator review queue for MEE6 membership announcements and Discord membership role changes, with optional automatic provisioning and access removal.
+Jellyport is a self-hosted web app for moving one or several users from Emby to Jellyfin, creating accounts with saved permission and preference roles, and optionally delivering new credentials through Discord. It also provides an administrator review queue for MEE6 membership announcements and Discord membership role changes, with optional automatic provisioning and access removal.
 
 The app uses TypeScript throughout: React/Vite for the web interface, Fastify on Node.js for the API, discord.js for the optional bot, and SQLite for encrypted settings, account links, audit records, and queued jobs. Docker packages the built interface and API together.
 
@@ -52,7 +52,7 @@ sudo install -d -m 700 -o 1000 -g 1000 /path/to/jellyport
 
 `user: "1000:1000"` sets the real process UID and GID; change it and the directory owner together if your host uses different IDs. Jellyport does not use `PUID` or `PGID` environment variables.
 
-Open `http://YOUR_LAN_IP:8000` or `http://localhost:8000` and complete the setup wizard with your Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password. Choose your existing template user and public Jellyfin URL. Subsequent sign-ins use your Jellyfin administrator account. Initial pairing requires both a private connection source and a local hostname or private IP address; complete it before exposing any reverse proxy. The first qualifying visitor can pair the installation.
+Open `http://YOUR_LAN_IP:8000` or `http://localhost:8000` and complete the setup wizard with your Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password. Set the public Jellyfin URL; selecting a legacy template user is optional. After setup, choose a saved default account role or a template before creating or migrating accounts. Subsequent sign-ins use your Jellyfin administrator account. Initial pairing requires both a private connection source and a local hostname or private IP address; complete it before exposing any reverse proxy. The first qualifying visitor can pair the installation.
 
 For HTTPS through a reverse proxy, set `JELLYPORT_SECURE_COOKIE=true` and add its hostname to `JELLYPORT_ALLOWED_HOSTS`, for example `jellyport.example.com` (comma-separated hostnames, without schemes or ports). Preserve the browser's Host header. IP literals, single-label local names, and `.local`, `.localhost`, or `.home.arpa` names work by default. A public hostname cannot perform initial pairing. Use [examples/compose.shared-network.yaml](examples/compose.shared-network.yaml) when joining an existing media-server network from a separate stack; set `JELLYPORT_MEDIA_NETWORK` to the actual Docker network name. Jellyport connects through server APIs and only needs its own `/data` mount. It does not need access to media files or the Jellyfin configuration directory.
 
@@ -79,7 +79,7 @@ Serve Jellyport at the root of its own host/subdomain. Run one application worke
 
 The first-run wizard links Jellyport to one Jellyfin server. Enter the server URL and an enabled administrator's username and password. Jellyport verifies those credentials with Jellyfin and creates a dedicated API key for background account operations. It encrypts the key in its data directory and does not save your Jellyfin password.
 
-Choose an existing, enabled Jellyfin template user that is not an administrator. New accounts receive its user policy and configuration, including library permissions. Set the public Jellyfin URL that users should receive in their credential message. After completing setup, configure the Emby source URL and API key in Settings.
+The wizard can finish without a template user. After setup, use **Account roles** to capture an enabled, non-administrator Jellyfin account's supported settings, then choose that saved role as the default in Settings. Alternatively, select a legacy template user in Settings to copy its policy and configuration during provisioning. A default account role takes precedence when both are configured. Set the public Jellyfin URL that users should receive in their credential message, and configure the Emby source URL and API key in Settings.
 
 After setup, sign in with the linked server's Jellyfin administrator username and password. Only enabled administrator accounts are accepted. Jellyport keeps each interactive Jellyfin token in server memory, checks the account's authorization on protected requests, and revokes that token on sign-out. The background API key is separate, so signing out does not interrupt queued work or the optional bot. Jellyfin sign-in requires the linked server to be reachable.
 
@@ -95,6 +95,30 @@ If the same media files have different mount paths on the two servers, configure
 
 API keys and the Discord bot token are encrypted in the application database. Leaving a saved editable secret's input blank preserves its current value.
 
+## Account roles and defaults
+
+Jellyport account roles are reusable settings presets, separate from Discord membership roles and administrator authorization. They can include three groups:
+
+| Group | Supported examples |
+| --- | --- |
+| Permissions | Library access, remote access, downloads, parental controls, and playback/transcoding permissions. Administrator access, disabled state, login providers, passwords, and authentication counters are excluded. |
+| Account preferences | Audio/subtitle languages, subtitle mode, autoplay, remembered track selections, library ordering/exclusions, and hiding played items from Latest Media. |
+| Home and display preferences | Supported Jellyfin Web home sections, library landing pages, episode-image choices, skip intervals, and display/sorting preferences. |
+
+To create or revise a role:
+
+1. Open **Account roles**, choose **Create a new role** or an existing saved role, and give it a name.
+2. Choose **Copy settings from** an enabled, non-administrator Jellyfin account. A legacy template account is also an eligible source. Click **Copy settings** and review the captured fields and import notes.
+3. Save the new role or replace the existing role. The saved snapshot is encrypted and scoped to the linked Jellyfin server. It is independent of the source account; later source-account changes do not alter the role, and the source account is no longer required after saving.
+4. To use it for future accounts, select it as the **Default account role** in Settings. New accounts receive its permissions and preferences, including supported home settings. The role's preferences take precedence over portable Emby preferences during a new-account migration.
+5. To update existing accounts, select up to 100 eligible users and click **Assign role**. Each account has one assigned Jellyport role. Assignment alone does not change Jellyfin. Select the setting groups, click **Review changes**, and then **Apply settings** to queue the update.
+
+Reimporting settings or saving an edited role never automatically updates existing accounts. You can apply only preferences while preserving permissions, or choose another combination. Applying settings preserves passwords, watch history, favorites, and playlists. Administrators, disabled accounts, and the selected legacy template are excluded from update targets. Existing-account migrations preserve their current settings; use the separate role update workflow when you intend to change them.
+
+Application status records the role revision successfully applied to each setting group. **Up to date** means all captured groups were applied successfully; it is not a live comparison with Jellyfin and does not detect later user changes or enforce settings continuously. Refresh roles after a job finishes to see the recorded status. Review Activity for failed or partial updates.
+
+Client support varies. Roles capture a bounded allowlist of server-backed preferences rather than arbitrary client data. TV/mobile apps may use their own home screens and playback settings; device-local themes, subtitle styling, and other local options cannot be configured universally. Unsupported or unavailable fields are reported during import. Users can subsequently change preferences allowed by their Jellyfin permissions.
+
 ## Migrate users
 
 Select 1–100 distinct Emby users, review the preview, and start the migration. Usernames match exactly by default. Use **User mappings** for simplified usernames, different existing Jellyfin usernames, or other identity exceptions; case-only conflicts are never guessed.
@@ -105,7 +129,7 @@ Matching uses provider IDs, series identity with season/episode numbers, and exa
 
 User-visible Emby playlists become **private copies owned by the destination user**, with matched entries in order. Existing Jellyfin playlists are preserved. Jellyfin 12 preserves repeated entries; 10.9–10.11 removes duplicates and the migration reports this. Creation sets privacy and all entries in one request. An encrypted import journal prevents blind replay after an uncertain response; later migrations never append to copies that their owners might have made public or shared.
 
-New destination accounts receive a generated 24-character password and the template's permissions. Portable playback preferences and a bounded profile image can also transfer to new accounts. Existing accounts keep their passwords, permissions, preferences, and profile images. Administrators, disabled accounts, and the template user are protected from migration.
+New destination accounts receive a generated 24-character password and the configured default role's permissions and preferences. Without a default role, the legacy template supplies policy/configuration and portable Emby playback preferences can transfer over its configuration. A bounded profile image can also transfer to new accounts. Existing accounts keep their passwords, permissions, preferences, and profile images. Administrators, disabled accounts, and any selected legacy template user are protected from migration.
 
 Jellyfin **10.9+** is required for detailed user data and explicit private playlists. Older versions receive a limited watched/favorite merge with warnings. Next Up and Continue Watching are rebuilt by Jellyfin from the migrated episode history, original dates, and resume positions; client cutoffs and unavailable media can affect their appearance. See [migration capabilities and limitations](docs/migration-capabilities.md) for everything supported, excluded, and reported.
 
@@ -132,7 +156,7 @@ New passwords are encrypted and retained for up to 24 hours. After the job finis
 
 Credential DMs contain the server URL, username, and plaintext password for the selected recipient. Command replies show only private job status. Users can change their password in Jellyfin after signing in.
 
-If a creation times out or stops before initialization finishes, inspect Jellyfin and the recorded job before retrying. The recovery workflow first inspects an exact target account; recovery can reset its password and apply the template only when Jellyport tracks it as an incomplete creation. It preserves watched history and refuses protected or unrelated accounts.
+If a creation times out or stops before initialization finishes, inspect Jellyfin and the recorded job before retrying. The recovery workflow first inspects an exact target account; recovery can reset its password and apply the configured provisioning defaults only when Jellyport tracks it as an incomplete creation. It preserves watched history and refuses protected or unrelated accounts.
 
 ## Optional Discord and membership automation
 
@@ -160,13 +184,13 @@ The most useful next steps for reducing administrator input are:
 2. **Role and channel pickers:** discover the server's roles and channels during setup instead of requiring their numeric IDs.
 3. **An exception dashboard:** bring unresolved identities, failed credential delivery, interrupted jobs, and membership-check failures into one actionable queue.
 4. **Scheduled migration catch-up:** repeat the merge for selected linked users until their move is complete, preserving newer Jellyfin activity.
-5. **Billing tiers and paid-through access:** map subscription tiers to permission templates and use verified billing status, renewal dates, and grace periods to manage access.
+5. **Billing tiers and paid-through access:** map subscription tiers to saved account roles and use verified billing status, renewal dates, and grace periods to manage access.
 
 These are future features. We have not found a documented public MEE6 billing API. Stripe integration needs verification of the connected account's API/webhook access and a reliable Discord identity link. [MEE6's Stripe guide](https://mee6bot.freshdesk.com/support/solutions/articles/101000472733-server-owner-how-to-see-information-about-subscribers-on-stripe) says Standard accounts can expose a subscriber's Discord ID in the initial Checkout Session request logs, which may only remain available for one year; Express account owners must contact MEE6. Seeing those details in the dashboard does not establish that Jellyport can retrieve them through an API.
 
 ## Data and backups
 
-The repository's default `compose.yaml` stores application data in the `jellyport-data` named volume mounted at `/data`. The Portainer examples instead use your chosen host bind directory. Both contain `jellyport.db`, SQLite journal files when present, and `secret.key`. Server secrets and retained passwords are encrypted; audit records, usernames, account links, and job summaries are stored as ordinary database records. The encryption key is stored beside the database, so protect the entire volume or directory and its backups.
+The repository's default `compose.yaml` stores application data in the `jellyport-data` named volume mounted at `/data`. The Portainer examples instead use your chosen host bind directory. Both contain `jellyport.db`, SQLite journal files when present, and `secret.key`. Server secrets, retained passwords, account roles, and role assignments are encrypted; audit records, usernames, account links, and job summaries are stored as ordinary database records. The encryption key is stored beside the database, so protect the entire volume or directory and its backups.
 
 Stop the service before copying its data, and use a new destination directory for each backup:
 
@@ -231,6 +255,10 @@ The browser uses authenticated session cookies. Mutating API requests require th
 | Read or update configuration | `GET` / `PUT /api/settings` |
 | Connect Jellyfin and complete first-run setup | `GET /api/setup`, `POST /api/setup/connect`, `POST /api/setup/complete` |
 | Refresh the managed background API key | `POST /api/auth/service-key` |
+| Read, save, or remove account roles | `GET` / `POST /api/account-roles`, `DELETE /api/account-roles/:id` |
+| Capture supported Jellyfin user settings | `POST /api/account-roles/import` |
+| Assign or unassign saved roles without remote writes | `POST /api/account-roles/assign`, `POST /api/account-roles/unassign` |
+| Queue selected role setting groups for assigned users | `POST /api/account-roles/apply` |
 | Test server connections | `POST /api/connections/test` |
 | List source and destination users | `GET /api/users` |
 | Search Discord server members | `GET /api/discord/members?query=USERNAME_OR_NICKNAME_PREFIX` |

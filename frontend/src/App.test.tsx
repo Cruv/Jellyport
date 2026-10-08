@@ -77,6 +77,7 @@ beforeEach(() => {
     },
     '/api/settings': settings,
     '/api/users': { emby: [], jellyfin: [] },
+    '/api/account-roles': { roles: [], assignments: [] },
   };
   vi.stubGlobal(
     'fetch',
@@ -107,6 +108,93 @@ async function openJob() {
   return screen.findByRole('dialog');
 }
 describe('React account safeguards', () => {
+  it('uses a saved default role for fresh account creation without a fallback template', async () => {
+    responses['/api/settings'] = { ...settings, template_user_id: '', default_role_id: 'role-1' };
+    responses['/api/accounts'] = job;
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Create account' }));
+    fireEvent.change(await screen.findByLabelText('Username'), { target: { value: 'alex' } });
+    const form = screen.getByLabelText('Username').closest('form')!;
+    const submit = within(form).getByRole('button', { name: 'Create account' });
+    expect((submit as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === '/api/accounts')).toBe(true),
+    );
+    expect(
+      JSON.parse(
+        String(requests.find((request) => request.path === '/api/accounts')!.options?.body),
+      ),
+    ).toEqual({ username: 'alex' });
+  });
+  it('loads roles into settings and saves the selected default independently of the template', async () => {
+    responses['/api/account-roles'] = {
+      roles: [
+        {
+          id: 'role-1',
+          name: 'Crew defaults',
+          revision: 'revision-1',
+          parameters: { policy: {}, configuration: {}, display: null },
+        },
+      ],
+      assignments: [],
+    };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await screen.findByRole('option', { name: 'Crew defaults' });
+    fireEvent.change(screen.getByLabelText('Default account role'), {
+      target: { value: 'role-1' },
+    });
+    fireEvent.change(screen.getByLabelText('Fallback template user'), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await screen.findByText('Settings saved. Your connections are ready to test.');
+    const saved = requests.find(
+      (request) => request.path === '/api/settings' && request.options?.method === 'PUT',
+    )!;
+    expect(JSON.parse(String(saved.options?.body))).toMatchObject({
+      default_role_id: 'role-1',
+      template_user_id: '',
+    });
+  });
+  it('opens account role management from the main navigation', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Account roles' }));
+    await screen.findByText('Set the experience once.');
+    await screen.findByText('Create an account role');
+    expect(requests.some((request) => request.path === '/api/account-roles')).toBe(true);
+  });
+  it('keeps the saved default selected when role names finish loading later', async () => {
+    responses['/api/settings'] = { ...settings, default_role_id: 'role-1' };
+    const baseFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    let resolveRoles!: (value: unknown) => void;
+    vi.mocked(globalThis.fetch).mockImplementation(async (...args) => {
+      if (args[0] === '/api/account-roles') {
+        return {
+          ok: true,
+          status: 200,
+          json: () =>
+            new Promise((resolve) => {
+              resolveRoles = resolve;
+            }),
+        } as Response;
+      }
+      return baseFetch(...args);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await screen.findByRole('option', { name: 'Saved default role' });
+    expect((screen.getByLabelText('Default account role') as HTMLSelectElement).value).toBe(
+      'role-1',
+    );
+    await waitFor(() => expect(resolveRoles).toBeTypeOf('function'));
+    await act(async () =>
+      resolveRoles({ roles: [{ id: 'role-1', name: 'Crew defaults' }], assignments: [] }),
+    );
+    await screen.findByRole('option', { name: 'Crew defaults' });
+    expect((screen.getByLabelText('Default account role') as HTMLSelectElement).value).toBe(
+      'role-1',
+    );
+  });
   it('reveals credentials only after explicit confirmation, renders text safely, and clears secrets on close', async () => {
     let dialog = await openJob();
     expect(within(dialog).getByText('<script>bad()</script>')).toBeTruthy();
@@ -172,7 +260,7 @@ describe('React account safeguards', () => {
     ).toBe(true);
     fireEvent.click(
       screen.getByLabelText(
-        'I inspected this Jellyfin account and approve a new password and template permissions.',
+        'I inspected this Jellyfin account and approve a new password and account defaults.',
       ),
     );
     expect(
@@ -251,7 +339,7 @@ describe('React account safeguards', () => {
     await screen.findByText('alex · Eligible for recovery');
     fireEvent.click(
       screen.getByLabelText(
-        'I inspected this Jellyfin account and approve a new password and template permissions.',
+        'I inspected this Jellyfin account and approve a new password and account defaults.',
       ),
     );
     fireEvent.click(await screen.findByRole('button', { name: 'Select @alex' }));
@@ -763,11 +851,13 @@ describe('Jellyfin administrator sign-in and setup', () => {
     responses['/api/session'] = pendingSession;
     responses['/api/setup'] = { ...connection, templates: [] };
     render(<App />);
-    await screen.findByText('Create a regular template user in Jellyfin, then refresh this list.');
+    await screen.findByText(
+      'No regular template users are available. You can finish setup and configure an account role later.',
+    );
     expect(screen.queryByLabelText('Jellyfin password')).toBeNull();
     expect(
       (screen.getByRole('button', { name: 'Finish setup' }) as HTMLButtonElement).disabled,
-    ).toBe(true);
+    ).toBe(false);
     responses['/api/setup'] = connection;
     fireEvent.click(screen.getByRole('button', { name: 'Refresh users' }));
     await screen.findByRole('option', { name: 'Member template' });

@@ -259,6 +259,7 @@ export function JobsTable({
     migrate: 'User migration',
     migration: 'User migration',
     create: 'Account creation',
+    role_update: 'Account role update',
     account: 'Account creation',
     recover: 'Account recovery',
     disable: 'Disable account',

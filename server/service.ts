@@ -31,6 +31,8 @@ import {
 import type { Store } from './store.js';
 import type { Settings } from './types.js';
 import type { DiscordMemberSearchResult } from './discord-members.js';
+import { AccountRoles, type AccountRole, type RoleAssignment } from './account-roles.js';
+import { mergeRoleSection, type RoleSection } from './role-parameters.js';
 
 export { ServiceError } from './errors.js';
 export interface JobRequest {
@@ -40,6 +42,12 @@ export interface JobRequest {
   recover_target_id?: string;
   mapping_id?: string;
   mapping_revision?: string;
+  role_id?: string;
+  role_revision?: string;
+  role_assignment_revision?: string;
+  target_user_id?: string;
+  role_sections?: RoleSection[];
+  default_role_revision?: string;
 }
 export interface JobStats {
   source_played: number;
@@ -63,6 +71,10 @@ export interface JobResult extends Partial<JobStats> {
   error?: string;
   source_username?: string;
   mapping_id?: string;
+  role_id?: string;
+  role_name?: string;
+  role_sections?: RoleSection[];
+  warnings?: string[];
   data?: MigrationDetails;
   unmatched_items?: Array<{ name: string; type: string; id: string }>;
   ambiguous_items?: Array<{ name: string; id: string; candidate_ids: string[] }>;
@@ -115,6 +127,9 @@ export interface BotAdapter {
 export interface ServiceOptions {
   clientFactory?: ClientFactory;
   demo?: boolean;
+}
+interface ProvisioningDefaults extends MediaUser {
+  accountRole?: AccountRole;
 }
 interface PreviewUser {
   source_user_id: string;
@@ -201,6 +216,7 @@ export class Service {
   private stopping = false;
   readonly demo: boolean;
   readonly mappings: UserMappings;
+  readonly roles: AccountRoles;
   constructor(
     readonly store: Store,
     options: ServiceOptions = {},
@@ -209,6 +225,7 @@ export class Service {
       options.clientFactory ?? ((url, key, kind) => new MediaClient(url, key, kind));
     this.demo = options.demo ?? false;
     this.mappings = new UserMappings(store);
+    this.roles = new AccountRoles(store, this.demo);
   }
   resolveDiscordMapping(discordId: string): UserMapping | null {
     return this.mappings.getForDiscord(discordId, this.store.settings());
@@ -294,9 +311,26 @@ export class Service {
     const [emby, jellyfin] = await Promise.all([check('emby'), check('jellyfin')]);
     return { emby, jellyfin, discord: this.bot?.status() ?? { enabled: false, connected: false } };
   }
-  private async template(client: MediaAPI, settings: Settings): Promise<MediaUser> {
+  private async template(client: MediaAPI, settings: Settings): Promise<ProvisioningDefaults> {
+    if (settings.default_role_id) {
+      const role = this.roles.get(settings.default_role_id, settings);
+      if (!role)
+        throw new ServiceError(
+          'The default account role is unavailable. Choose it again in Settings.',
+        );
+      await this.requireRoleServer(client, role);
+      return {
+        Id: '',
+        Name: role.name,
+        Policy: structuredClone(role.parameters.policy),
+        Configuration: structuredClone(role.parameters.configuration),
+        accountRole: role,
+      };
+    }
     if (!settings.template_user_id)
-      throw new ServiceError('Select your Jellyfin template user in Settings first.');
+      throw new ServiceError(
+        'Select a default account role or Jellyfin template user in Settings first.',
+      );
     const template = await client.user(settings.template_user_id);
     templatePolicy(template);
     return template;
@@ -471,7 +505,12 @@ export class Service {
               ? validateExistingMappingUsername(mapping.target_username)
               : validateUsername(mapping?.target_username ?? source.user.Name),
             target = this.mappedTarget(targets, mapping, username, settings);
-          if (target && (target.Id === template.Id || target.Policy?.IsAdministrator))
+          if (
+            target &&
+            (target.Id === template.Id ||
+              target.Id === settings.template_user_id ||
+              target.Policy?.IsAdministrator)
+          )
             throw new ServiceError(
               'A migration cannot target your template user or a Jellyfin administrator.',
             );
@@ -480,8 +519,8 @@ export class Service {
               'A disabled Jellyfin account cannot be a migration destination.',
             );
           let targetItems = await (jellyfin.migrationItems
-            ? jellyfin.migrationItems(target?.Id ?? template.Id)
-            : jellyfin.items(target?.Id ?? template.Id));
+            ? jellyfin.migrationItems(target?.Id || template.Id || undefined)
+            : jellyfin.items(target?.Id || template.Id || undefined));
           if (!target)
             targetItems = targetItems.map((item) => ({ ...item, UserData: { Played: false } }));
           const [plan, stats] = this.plan(
@@ -493,6 +532,11 @@ export class Service {
           const warnings = [
             ...source.warnings,
             ...source.playlists.flatMap((entry) => (entry.error ? [entry.error] : [])),
+            ...(!target && template.accountRole
+              ? [
+                  'This preview uses the server catalog. The new account’s role may limit library access; final matches are checked using that account.',
+                ]
+              : []),
           ];
           this.assertMapping(mapping, sourceId, settings);
           users.push({
@@ -588,7 +632,7 @@ export class Service {
       target_user_id: target?.Id ?? null,
       eligible,
       reason: eligible
-        ? 'Inspect this Jellyfin account. Recovery will reset its password and apply your template; watch history is preserved.'
+        ? 'Inspect this Jellyfin account. Recovery will reset its password and apply your account defaults; watch history is preserved.'
         : 'Recovery is available only for an incomplete Jellyport creation with an existing, unprotected Jellyfin account.',
     };
   }
@@ -679,6 +723,211 @@ export class Service {
     });
     return this.queue('migrate', requests);
   }
+  private async requireRoleServer(client: MediaAPI, role: AccountRole): Promise<void> {
+    const info = await client.systemInfo();
+    this.checkStopped();
+    if (info.Id !== role.server_id)
+      throw new ServiceError(
+        'The Jellyfin server identity changed. No role settings were applied.',
+      );
+  }
+  private assertDefaultRole(
+    template: ProvisioningDefaults,
+    request: JobRequest,
+    settings: Settings,
+  ): void {
+    const role = template.accountRole;
+    const current = this.store.settings();
+    if ((current.default_role_id || '') !== (settings.default_role_id || ''))
+      throw new ServiceError('The default account role changed. Review and start a new job.');
+    if (!role) {
+      if (request.default_role_revision)
+        throw new ServiceError('The default account role changed. Review a new job.');
+      return;
+    }
+    if (
+      current.default_role_id !== role.id ||
+      settings.default_role_id !== role.id ||
+      request.default_role_revision !== role.revision ||
+      this.roles.get(role.id, current)?.revision !== role.revision
+    )
+      throw new ServiceError('The default account role changed. Review and start a new job.');
+  }
+  private assertRoleUpdate(
+    request: JobRequest,
+    settings: Settings,
+  ): { role: AccountRole; assignment: RoleAssignment } {
+    this.checkStopped();
+    const current = this.store.settings();
+    if (current.jellyfin_url !== settings.jellyfin_url)
+      throw new ServiceError('The Jellyfin destination changed. Review this role update.');
+    const role = this.roles.get(request.role_id || '', settings);
+    const assignment = this.roles.getAssignment(request.target_user_id || '', settings);
+    if (
+      !role ||
+      role.revision !== request.role_revision ||
+      !assignment ||
+      assignment.role_id !== role.id ||
+      assignment.revision !== request.role_assignment_revision ||
+      assignment.username !== request.username
+    )
+      throw new ServiceError(
+        'The role or account assignment changed. Review a new update before applying.',
+      );
+    return { role, assignment };
+  }
+  private assertRoleTarget(
+    user: MediaUser,
+    expectedId: string,
+    expectedName: string,
+    settings: Settings,
+  ): void {
+    if (
+      user.Id !== expectedId ||
+      user.Name !== expectedName ||
+      user.Policy?.IsAdministrator !== false ||
+      user.Policy?.IsDisabled !== false ||
+      user.Id === settings.template_user_id ||
+      user.Id === this.store.settings().template_user_id
+    )
+      throw new ServiceError(
+        'The Jellyfin account changed or is protected. No further role settings were applied.',
+      );
+  }
+  async applyRole(
+    roleId: string,
+    roleRevision: string,
+    userIds: string[],
+    sections: RoleSection[],
+  ): Promise<Job> {
+    if (
+      !userIds.length ||
+      userIds.length > 100 ||
+      new Set(userIds).size !== userIds.length ||
+      userIds.some((id) => typeof id !== 'string' || !id || id.length > 128) ||
+      !sections.length ||
+      sections.length > 3 ||
+      new Set(sections).size !== sections.length ||
+      sections.some((section) => !['policy', 'configuration', 'display'].includes(section))
+    )
+      throw new ServiceError(
+        'Select 1–100 distinct assigned accounts and one or more settings groups.',
+      );
+    const settings = this.store.settings();
+    const role = this.roles.get(roleId, settings);
+    if (!role || role.revision !== roleRevision)
+      throw new ServiceError('This account role changed. Reload it before applying.');
+    if (sections.includes('display') && role.parameters.display === null)
+      throw new ServiceError('This role has no Home screen preferences.');
+    return this.withClient(settings, 'jellyfin', async (client) => {
+      await this.requireRoleServer(client, role);
+      if (
+        sections.includes('display') &&
+        (!client.displayPreferences || !client.setDisplayPreferences)
+      )
+        throw new ServiceError('This Jellyfin client cannot update Home screen preferences.');
+      const requests: JobRequest[] = [];
+      for (const userId of userIds) {
+        const assignment = this.roles.getAssignment(userId, settings);
+        if (!assignment || assignment.role_id !== role.id)
+          throw new ServiceError(
+            'Assign this role to every selected account before applying settings.',
+          );
+        const user = await client.user(userId);
+        this.assertRoleTarget(user, userId, assignment.username, settings);
+        const request: JobRequest = {
+          username: user.Name,
+          target_user_id: user.Id,
+          role_id: role.id,
+          role_revision: role.revision,
+          role_assignment_revision: assignment.revision,
+          role_sections: [...sections],
+        };
+        this.assertRoleUpdate(request, settings);
+        requests.push(request);
+      }
+      for (const request of requests) this.assertRoleUpdate(request, settings);
+      return this.queue('role_update', requests);
+    });
+  }
+  private async oneRoleUpdate(
+    job: Job,
+    request: JobRequest,
+    settings: Settings,
+    client: MediaAPI,
+  ): Promise<void> {
+    const result: JobResult = {
+      username: request.username || '',
+      status: 'running',
+      target_user_id: request.target_user_id,
+      role_id: request.role_id,
+      role_sections: [],
+    };
+    job.results.push(result);
+    this.save(job);
+    try {
+      const { role } = this.assertRoleUpdate(request, settings);
+      result.role_name = role.name;
+      if (
+        !request.role_sections?.length ||
+        request.role_sections.length > 3 ||
+        new Set(request.role_sections).size !== request.role_sections.length ||
+        request.role_sections.some(
+          (section) => !['policy', 'configuration', 'display'].includes(section),
+        )
+      )
+        throw new ServiceError('The queued role update is invalid. Review a new update.');
+      for (const section of request.role_sections) {
+        await this.requireRoleServer(client, role);
+        this.assertRoleUpdate(request, settings);
+        const user = await client.user(request.target_user_id!);
+        this.assertRoleUpdate(request, settings);
+        this.assertRoleTarget(user, request.target_user_id!, request.username!, settings);
+        if (section === 'display') {
+          if (
+            role.parameters.display === null ||
+            !client.displayPreferences ||
+            !client.setDisplayPreferences
+          )
+            throw new ServiceError(
+              'Home screen preferences are unavailable for this role or server.',
+            );
+          const current = await client.displayPreferences(user.Id);
+          const confirmed = await client.user(user.Id);
+          this.assertRoleUpdate(request, settings);
+          this.assertRoleTarget(confirmed, user.Id, user.Name, settings);
+          await client.setDisplayPreferences(
+            user.Id,
+            mergeRoleSection('display', current, role.parameters),
+          );
+        } else if (section === 'policy') {
+          await client.setPolicy(user.Id, mergeRoleSection(section, user.Policy!, role.parameters));
+        } else {
+          await client.setConfiguration(
+            user.Id,
+            mergeRoleSection(section, user.Configuration ?? {}, role.parameters),
+          );
+        }
+        // A completed remote write remains part of the result even if a local role
+        // edit prevents us from stamping the assignment as current afterwards.
+        result.role_sections!.push(section);
+        this.save(job);
+        const { assignment } = this.assertRoleUpdate(request, settings);
+        this.roles.markApplied(user.Id, role.id, role.revision, assignment.revision, settings, [
+          section,
+        ]);
+      }
+      result.status = 'completed';
+    } catch (error) {
+      if (error instanceof StoppedError) throw error;
+      result.status = 'failed';
+      result.error =
+        error instanceof MediaError || error instanceof ServiceError
+          ? error.message
+          : 'Role settings could not be fully applied. Review completed groups before retrying.';
+    }
+    this.save(job);
+  }
   private queue(kind: string, requests: JobRequest[]): Job {
     if (this.stopping) throw new ServiceError('The app is stopping. Retry after it restarts.');
     const timestamp = now();
@@ -692,6 +941,12 @@ export class Service {
       results: [],
     };
     const settings = this.store.settings();
+    if (kind !== 'role_update' && settings.default_role_id) {
+      const role = this.roles.get(settings.default_role_id, settings);
+      if (!role)
+        throw new ServiceError('The default account role is unavailable. Review Settings.');
+      requests = requests.map((request) => ({ ...request, default_role_revision: role.revision }));
+    }
     this.store.saveQueuedJob(job, requests, settings);
     this.schedule(job, requests, settings);
     return structuredClone(job);
@@ -714,13 +969,17 @@ export class Service {
   private async provision(
     jellyfin: MediaAPI,
     settings: Settings,
-    template: MediaUser,
+    template: ProvisioningDefaults,
     username: string,
     allowExisting: boolean,
     recoverTargetId?: string,
     mapping: UserMapping | null = null,
     guard: () => void = () => {},
   ): Promise<[MediaUser, boolean, string | null]> {
+    const roleGuard = async () => {
+      if (template.accountRole) await this.requireRoleServer(jellyfin, template.accountRole);
+      guard();
+    };
     let target = this.mappedTarget(
       await jellyfin.users(),
       mapping,
@@ -730,12 +989,23 @@ export class Service {
     );
     guard();
     const local = this.store.account(username);
-    if (target?.Id === template.Id)
+    if (target?.Id === template.Id || (target && target.Id === settings.template_user_id))
       throw new ServiceError('The template account cannot be a destination account.');
     if (target?.Policy?.IsAdministrator)
       throw new ServiceError('A Jellyfin administrator cannot be a destination account.');
     if (target?.Policy?.IsDisabled && !recoverTargetId)
       throw new ServiceError('A disabled Jellyfin account cannot be a migration destination.');
+    if (target && template.accountRole && (recoverTargetId || local?.status === 'provisioning')) {
+      await roleGuard();
+      const confirmed = await jellyfin.user(target.Id);
+      guard();
+      this.assertRoleTarget(confirmed, target.Id, username, settings);
+      const assignment = this.roles.getAssignment(target.Id, settings);
+      if (assignment && assignment.role_id !== template.accountRole.id)
+        throw new ServiceError(
+          'The account has a different role assignment. Review it before recovering account defaults.',
+        );
+    }
     let password: string | null = null;
     if (recoverTargetId) {
       if (
@@ -750,7 +1020,7 @@ export class Service {
         );
       password = generatePassword();
       this.store.saveAccount(username, target.Id, 'provisioning', password);
-      guard();
+      await roleGuard();
       await jellyfin.setPassword(target.Id, password);
     }
     if (target) {
@@ -758,7 +1028,7 @@ export class Service {
         /* Explicit inspected recovery already reset this tracked account. */
       } else if (local && local.remote_id === target.Id && local.status === 'provisioning') {
         password = this.store.accountPassword(local) ?? generatePassword();
-        guard();
+        await roleGuard();
         await jellyfin.setPassword(target.Id, password);
       } else if (allowExisting) return [target, false, null];
       else
@@ -772,7 +1042,7 @@ export class Service {
         );
       password = generatePassword();
       this.store.saveAccount(username, null, 'provisioning', password);
-      guard();
+      await roleGuard();
       try {
         target = await jellyfin.createUser(username, password);
       } catch (error) {
@@ -788,9 +1058,32 @@ export class Service {
       this.store.saveAccount(username, target.Id, 'provisioning', password);
     }
     guard();
-    await jellyfin.setPolicy(target.Id, templatePolicy(template));
-    guard();
-    await jellyfin.setConfiguration(target.Id, structuredClone(template.Configuration ?? {}));
+    if (template.accountRole) {
+      await roleGuard();
+      const live = await jellyfin.user(target.Id);
+      guard();
+      this.assertRoleTarget(live, target.Id, username, settings);
+      await jellyfin.setPolicy(
+        target.Id,
+        mergeRoleSection('policy', live.Policy ?? {}, template.accountRole.parameters),
+      );
+      await roleGuard();
+      const configured = await jellyfin.user(target.Id);
+      guard();
+      this.assertRoleTarget(configured, target.Id, username, settings);
+      await jellyfin.setConfiguration(
+        target.Id,
+        mergeRoleSection(
+          'configuration',
+          configured.Configuration ?? {},
+          template.accountRole.parameters,
+        ),
+      );
+    } else {
+      await jellyfin.setPolicy(target.Id, templatePolicy(template));
+      guard();
+      await jellyfin.setConfiguration(target.Id, structuredClone(template.Configuration ?? {}));
+    }
     return [target, true, password];
   }
   private async one(
@@ -798,7 +1091,7 @@ export class Service {
     request: JobRequest,
     settings: Settings,
     jellyfin: MediaAPI,
-    template: MediaUser,
+    template: ProvisioningDefaults,
   ): Promise<void> {
     let source: SourceSnapshot | null = null;
     let avatar: MediaUserImage | null = null;
@@ -807,6 +1100,7 @@ export class Service {
     let username: string;
     const guard = () => {
       this.checkStopped();
+      this.assertDefaultRole(template, request, settings);
       this.assertMapping(mapping, request.source_user_id, settings);
       this.assertDestinationMapping(mapping, destinationId, username, settings);
     };
@@ -917,6 +1211,7 @@ export class Service {
         liveTarget.Id !== target.Id ||
         liveTarget.Name !== username ||
         liveTarget.Id === template.Id ||
+        liveTarget.Id === settings.template_user_id ||
         liveTarget.Policy?.IsAdministrator ||
         liveTarget.Policy?.IsDisabled
       )
@@ -924,6 +1219,66 @@ export class Service {
           'The destination account changed or became protected. Review it before retrying.',
         );
       guard();
+      if (created && template.accountRole) {
+        const role = template.accountRole;
+        this.assertRoleTarget(liveTarget, target.Id, username, settings);
+        const previous = this.roles.getAssignment(target.Id, settings);
+        if (previous && previous.role_id !== role.id)
+          throw new ServiceError(
+            'The account role was changed during provisioning. Review the account before retrying.',
+          );
+        const [assignment] = this.roles.assign(role.id, role.revision, [liveTarget], settings);
+        const sections: RoleSection[] = ['policy', 'configuration'];
+        Object.assign(result, { role_id: role.id, role_name: role.name, role_sections: sections });
+        if (role.parameters.display !== null) {
+          await this.requireRoleServer(jellyfin, role);
+          guard();
+          let preferences: JsonObject | undefined;
+          try {
+            if (!jellyfin.displayPreferences || !jellyfin.setDisplayPreferences)
+              throw new ServiceError('Home preferences are unavailable.');
+            preferences = await jellyfin.displayPreferences(target.Id);
+          } catch (error) {
+            if (error instanceof StoppedError) throw error;
+            result.warnings = [
+              'The account was created, but its Home screen preferences could not be applied. Review the role update before retrying.',
+            ];
+          }
+          if (preferences) {
+            guard();
+            const confirmed = await jellyfin.user(target.Id);
+            guard();
+            this.assertRoleTarget(confirmed, target.Id, username, settings);
+            try {
+              await jellyfin.setDisplayPreferences!(
+                target.Id,
+                mergeRoleSection('display', preferences, role.parameters),
+              );
+              sections.push('display');
+              this.save(job);
+            } catch (error) {
+              if (error instanceof StoppedError) throw error;
+              result.warnings = [
+                'The account was created, but its Home screen preferences could not be applied. Review the role update before retrying.',
+              ];
+            }
+          }
+          // Protection and identity errors are fatal; optional Home API failures
+          // alone may leave an otherwise usable new account with a warning.
+          await this.requireRoleServer(jellyfin, role);
+          const confirmed = await jellyfin.user(target.Id);
+          this.assertRoleTarget(confirmed, target.Id, username, settings);
+        }
+        guard();
+        this.roles.markApplied(
+          target.Id,
+          role.id,
+          role.revision,
+          assignment!.revision,
+          settings,
+          sections,
+        );
+      }
       if (recipient) {
         const existing = this.store.linkForRemote(target.Id);
         if (existing && existing.discord_user_id !== recipient)
@@ -944,11 +1299,13 @@ export class Service {
       }
       if (source && result.data) {
         if (created) {
+          if (template.accountRole)
+            result.data.preferences = Object.keys(template.accountRole.parameters.configuration);
           const preferences = portableConfiguration(
             source.user.Configuration,
             template.Configuration,
           );
-          if (preferences.copied.length) {
+          if (!template.accountRole && preferences.copied.length) {
             guard();
             try {
               await jellyfin.setConfiguration(target.Id, preferences.configuration);
@@ -1040,7 +1397,8 @@ export class Service {
         result.ambiguous ||
         result.discord_delivery === 'failed' ||
         result.data?.failed_items ||
-        result.data?.warnings.length
+        result.data?.warnings.length ||
+        result.warnings?.length
           ? 'partial'
           : 'completed';
     } catch (error) {
@@ -1062,12 +1420,15 @@ export class Service {
     this.save(job);
     try {
       await this.withClient(settings, 'jellyfin', async (jellyfin) => {
-        const template = await this.template(jellyfin, settings);
+        const template =
+          job.kind === 'role_update' ? null : await this.template(jellyfin, settings);
         for (const request of requests) {
           await this.mutationMutex.run(async () => {
             this.checkStopped();
             try {
-              await this.one(job, request, settings, jellyfin, template);
+              if (job.kind === 'role_update')
+                await this.oneRoleUpdate(job, request, settings, jellyfin);
+              else await this.one(job, request, settings, jellyfin, template!);
             } catch (error) {
               if (error instanceof StoppedError) throw error;
               if (!(error instanceof MediaError || error instanceof ServiceError)) throw error;
@@ -1092,8 +1453,7 @@ export class Service {
     } catch (error) {
       if (error instanceof StoppedError || this.stopping) {
         job.status = 'interrupted';
-        job.error =
-          'App stopped during this job. Review results before resuming watch-state merging.';
+        job.error = 'App stopped during this job. Review results before starting another update.';
       } else {
         job.status = 'failed';
         job.error =

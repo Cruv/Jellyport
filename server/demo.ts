@@ -18,6 +18,21 @@ export class DemoServers {
   userData: Record<string, Record<string, MediaUserDataPatch>> = {};
   playlists: Record<string, Array<MediaPlaylist & { items: string[] }>> = {};
   images: Record<string, MediaUserImage> = {};
+  display: Record<string, JsonObject> = {
+    template: {
+      ShowBackdrop: true,
+      ShowSidebar: false,
+      CustomPrefs: {
+        homesection0: 'smalllibrarytiles',
+        homesection1: 'resume',
+        homesection2: 'nextup',
+        homesection3: 'latestmedia',
+        useEpisodeImagesInNextUpAndResume: 'true',
+        skipBackLength: '10000',
+        skipForwardLength: '30000',
+      },
+    },
+  };
   users: Record<MediaKind, MediaUser[]> = {
     emby: [
       { Id: 'e-alex', Name: 'alex', Policy: {} },
@@ -68,6 +83,7 @@ export class DemoClient implements MediaAPI {
   async close(): Promise<void> {}
   async systemInfo(): Promise<JsonObject> {
     return {
+      Id: `demo-${this.kind}`,
       ServerName: `Demo ${this.kind === 'emby' ? 'Emby' : 'Jellyfin'}`,
       Version: 'simulation',
     };
@@ -108,7 +124,7 @@ export class DemoClient implements MediaAPI {
     const user = {
       Id: randomUUID().replaceAll('-', ''),
       Name: name,
-      Policy: {},
+      Policy: { IsAdministrator: false, IsDisabled: false },
       Configuration: {},
     };
     this.servers.users[this.kind].push(user);
@@ -122,6 +138,16 @@ export class DemoClient implements MediaAPI {
   }
   async setConfiguration(id: string, configuration: JsonObject): Promise<void> {
     this.findUser(id).Configuration = structuredClone(configuration);
+  }
+  async displayPreferences(userId: string): Promise<JsonObject> {
+    this.findUser(userId);
+    return structuredClone(this.servers.display[userId] ?? { CustomPrefs: {} });
+  }
+  async setDisplayPreferences(userId: string, preferences: JsonObject): Promise<void> {
+    if (this.kind !== 'jellyfin')
+      throw new MediaError('Display preference updates are supported only on Jellyfin.');
+    this.findUser(userId);
+    this.servers.display[userId] = structuredClone(preferences);
   }
   async markPlayed(userId: string, itemId: string, datePlayed?: string): Promise<void> {
     (this.servers.played[userId] ??= new Set()).add(itemId);

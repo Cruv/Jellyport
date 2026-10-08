@@ -1,5 +1,12 @@
 export type Page =
-  'overview' | 'migrate' | 'mappings' | 'accounts' | 'subscriptions' | 'activity' | 'settings';
+  | 'overview'
+  | 'migrate'
+  | 'mappings'
+  | 'roles'
+  | 'accounts'
+  | 'subscriptions'
+  | 'activity'
+  | 'settings';
 export interface Session {
   authenticated: boolean;
   csrf_token: string;
@@ -44,6 +51,32 @@ export interface DiscordMember {
   nickname: string | null;
   membership_active: boolean | null;
 }
+export type RoleSection = 'policy' | 'configuration' | 'display';
+export interface RoleParameters {
+  policy: Record<string, unknown>;
+  configuration: Record<string, unknown>;
+  display: Record<string, unknown> | null;
+}
+export interface AccountRole {
+  id: string;
+  name: string;
+  revision: string;
+  server_url: string;
+  server_id: string;
+  parameters: RoleParameters;
+  updated_at: string;
+}
+export interface RoleAssignment {
+  user_id: string;
+  username: string;
+  role_id: string;
+  revision: string;
+  applied_revision: string | null;
+  applied_sections?: Partial<Record<RoleSection, string>>;
+  updated_at: string;
+  server_url?: string;
+  server_id?: string;
+}
 export interface Connection {
   connected?: boolean;
   configured?: boolean;
@@ -66,6 +99,10 @@ export interface JobResult {
   username?: string;
   source_username?: string;
   mapping_id?: string;
+  role_id?: string;
+  role_name?: string;
+  role_sections?: RoleSection[];
+  warnings?: string[];
   data?: MigrationDetails;
   status: string;
   created?: boolean;
@@ -170,6 +207,7 @@ export interface Settings {
   jellyfin_auth_managed: boolean;
   jellyfin_public_url: string;
   template_user_id: string;
+  default_role_id?: string;
   path_mappings: { source: string; target: string }[];
   discord_enabled: boolean;
   discord_bot_token_set: boolean;

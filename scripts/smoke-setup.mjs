@@ -25,6 +25,7 @@ assert(
   'Direct Jellyfin setup must not require a local bootstrap code.',
 );
 assert.equal((await fetch(new URL('/api/settings', base))).status, 401);
+assert.equal((await fetch(new URL('/api/account-roles', base))).status, 401);
 assert.equal((await fetch(new URL('/api/discord/members?query=alex', base))).status, 401);
 const setupWithoutCsrf = await fetch(new URL('/api/setup/connect', base), {
   method: 'POST',

@@ -32,11 +32,19 @@ Create a stack using the selected example and deploy it. For later image updates
 
 ## Complete first-run setup
 
-Open Jellyport using its private LAN IP, local hostname, or localhost, and enter the Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password in the setup wizard. Choose an existing enabled, non-administrator template user and set the public Jellyfin URL that your users should receive. After completing setup, add the Emby source URL and API key in Settings. Pairing requires both a private/loopback connection source and a local Host header. Complete setup before exposing a reverse proxy; the first qualifying visitor can link the server. A permitted public proxy hostname cannot perform first pairing, even when the proxy connects from a private address. For loopback-only deployments, use a local browser or SSH tunnel.
+Open Jellyport using its private LAN IP, local hostname, or localhost, and enter the Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password in the setup wizard. Set the public Jellyfin URL that your users should receive; selecting an existing enabled, non-administrator legacy template user is optional. The wizard can finish without one. After completing setup, add the Emby source URL and API key in Settings. Pairing requires both a private/loopback connection source and a local Host header. Complete setup before exposing a reverse proxy; the first qualifying visitor can link the server. A permitted public proxy hostname cannot perform first pairing, even when the proxy connects from a private address. For loopback-only deployments, use a local browser or SSH tunnel.
 
 Jellyport verifies the administrator with Jellyfin, creates its own API key for background operations, and encrypts the pairing and key in `/data`. It does not retain your Jellyfin password. Subsequent sign-ins use an enabled administrator account on the linked Jellyfin server. Jellyfin must be reachable for sign-in and authorization checks.
 
 When upgrading from shared-password sign-in, complete the wizard with your Jellyfin administrator account. The wizard keeps an existing saved Jellyfin server address fixed. Remove the obsolete `JELLYPORT_ADMIN_PASSWORD` variable from the service configuration and Portainer's stack variables; it is ignored. Preserve the existing data directory when upgrading. Installations already paired with Jellyfin continue using their normal Jellyfin sign-in.
+
+## Choose account defaults
+
+Before creating or migrating accounts, configure a default account role or an optional legacy template in Jellyport Settings. These are application settings; no additional Compose environment variables are required.
+
+Use **Account roles** to copy supported permissions, account preferences, and Jellyfin Web home/display settings from an enabled, non-administrator Jellyfin account into a new or existing saved role. Save the snapshot, then select it as the default in Settings. A saved role is encrypted and scoped to the paired Jellyfin server; the original source account is no longer required. Roles and assignments are retained in the existing `/data` directory on upgrade, so keep the database and matching `secret.key` together.
+
+The default role affects future accounts and takes precedence over a selected legacy template and portable Emby preferences. It does not automatically reconfigure existing accounts. Use the separate assign/review/apply workflow to update chosen groups for up to 100 existing users. Client-local TV/mobile preferences cannot be configured universally. See [account roles and defaults](../README.md#account-roles-and-defaults) for details.
 
 ## Web access and server URLs
 

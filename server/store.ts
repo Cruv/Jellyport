@@ -81,6 +81,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS job_queue (job_id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS migration_playlists (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS user_mappings (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS account_roles (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS account_role_assignments (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS credentials_expiry ON credentials(expires);
     `);
     const columns = this.db.prepare('PRAGMA table_info(links)').all();
@@ -99,7 +101,8 @@ export class Store {
       UNION ALL SELECT 1 FROM jobs UNION ALL SELECT 1 FROM accounts
       UNION ALL SELECT 1 FROM credentials UNION ALL SELECT 1 FROM links
       UNION ALL SELECT 1 FROM subscriptions UNION ALL SELECT 1 FROM job_queue
-      UNION ALL SELECT 1 FROM migration_playlists UNION ALL SELECT 1 FROM user_mappings LIMIT 1`,
+      UNION ALL SELECT 1 FROM migration_playlists UNION ALL SELECT 1 FROM user_mappings
+      UNION ALL SELECT 1 FROM account_roles UNION ALL SELECT 1 FROM account_role_assignments LIMIT 1`,
         )
         .get();
     if (options.demo && (auth || (hasData && !recognizedDemo))) {
@@ -166,6 +169,40 @@ export class Store {
     this.db
       .prepare('INSERT OR REPLACE INTO migration_playlists VALUES (?,?)')
       .run(id, this.encrypt(value));
+  }
+  accountRoleRecords<T>(): Array<{ id: string; value: T }> {
+    return this.db
+      .prepare('SELECT id,encrypted FROM account_roles')
+      .all()
+      .map((row) => ({
+        id: row.id as string,
+        value: this.decrypt<T>(row.encrypted as Uint8Array),
+      }));
+  }
+  saveAccountRoleRecord(id: string, value: unknown): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO account_roles (id,encrypted) VALUES (?,?)')
+      .run(id, this.encrypt(value));
+  }
+  deleteAccountRoleRecord(id: string): void {
+    this.db.prepare('DELETE FROM account_roles WHERE id=?').run(id);
+  }
+  accountRoleAssignmentRecords<T>(): Array<{ id: string; value: T }> {
+    return this.db
+      .prepare('SELECT id,encrypted FROM account_role_assignments')
+      .all()
+      .map((row) => ({
+        id: row.id as string,
+        value: this.decrypt<T>(row.encrypted as Uint8Array),
+      }));
+  }
+  saveAccountRoleAssignmentRecord(id: string, value: unknown): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO account_role_assignments (id,encrypted) VALUES (?,?)')
+      .run(id, this.encrypt(value));
+  }
+  deleteAccountRoleAssignmentRecord(id: string): void {
+    this.db.prepare('DELETE FROM account_role_assignments WHERE id=?').run(id);
   }
   authState(): AuthState | null {
     const row = this.db.prepare('SELECT encrypted FROM auth_state WHERE id=1').get();

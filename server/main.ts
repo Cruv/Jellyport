@@ -8,6 +8,7 @@ import cookie from '@fastify/cookie';
 import staticFiles from '@fastify/static';
 import { registerUserMappingRoutes } from './user-mappings.js';
 import { registerDiscordMemberRoutes } from './discord-members.js';
+import { registerAccountRoleRoutes } from './account-roles.js';
 import { randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
@@ -589,7 +590,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           additionalProperties: false,
           required: ['template_user_id', 'jellyfin_public_url'],
           properties: {
-            template_user_id: id,
+            template_user_id: { type: 'string', maxLength: 128 },
             jellyfin_public_url: { type: 'string', maxLength: 2048 },
           },
         },
@@ -616,9 +617,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         'jellyfin',
       );
       try {
-        const template = await client.user(request.body.template_user_id);
-        if (template.Policy?.IsAdministrator !== false || template.Policy?.IsDisabled !== false)
-          throw new ServiceError('Choose an enabled, non-administrator Jellyfin template user.');
+        if (request.body.template_user_id) {
+          const template = await client.user(request.body.template_user_id);
+          if (template.Policy?.IsAdministrator !== false || template.Policy?.IsDisabled !== false)
+            throw new ServiceError('Choose an enabled, non-administrator Jellyfin template user.');
+        }
       } finally {
         await client.close();
       }
@@ -710,6 +713,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       }
       const settings = { ...store.settings(), ...incoming };
       validateSettings(settings);
+      if (settings.default_role_id && !service.roles.get(settings.default_role_id, settings))
+        throw new ServiceError('Choose an account role saved for this Jellyfin server.');
       for (const key of ['emby_url', 'jellyfin_url', 'jellyfin_public_url'] as const)
         settings[key] = settings[key].replace(/\/+$/, '');
       store.saveSettings(settings);
@@ -873,6 +878,47 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   );
   registerUserMappingRoutes(app);
   registerDiscordMemberRoutes(app);
+  registerAccountRoleRoutes(app);
+  app.post<{
+    Body: {
+      role_id: string;
+      role_revision: string;
+      user_ids: string[];
+      sections: import('./role-parameters.js').RoleSection[];
+    };
+  }>(
+    '/api/account-roles/apply',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['role_id', 'role_revision', 'user_ids', 'sections'],
+          properties: {
+            role_id: id,
+            role_revision: id,
+            user_ids: { type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: id },
+            sections: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 3,
+              uniqueItems: true,
+              items: { type: 'string', enum: ['policy', 'configuration', 'display'] },
+            },
+          },
+        },
+      },
+    },
+    async (request) => {
+      if (demo) throw new ServiceError('Demo account roles are read-only.');
+      return service.applyRole(
+        request.body.role_id,
+        request.body.role_revision,
+        request.body.user_ids,
+        request.body.sections,
+      );
+    },
+  );
   const staticDir = resolve(options.staticDir ?? 'dist/client');
   if (existsSync(resolve(staticDir, 'index.html'))) {
     await app.register(staticFiles, { root: staticDir, index: false });

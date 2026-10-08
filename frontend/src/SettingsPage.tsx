@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { Callout, Heading, Icon } from './components';
 import {
   safeUrl,
@@ -7,6 +7,7 @@ import {
   type Notify,
   type Settings,
   type Users,
+  type AccountRole,
 } from './types';
 
 const toggleNames = [
@@ -194,6 +195,22 @@ export default function SettingsPage({
   const [mappings, setMappings] = useState(s.path_mappings || []);
   const [busy, setBusy] = useState('');
   const [tested, setTested] = useState<Partial<Connections> | null>(null);
+  const [roles, setRoles] = useState<AccountRole[]>([]);
+  const [rolesError, setRolesError] = useState('');
+  const [defaultRoleId, setDefaultRoleId] = useState(s.default_role_id || '');
+  useEffect(() => setDefaultRoleId(s.default_role_id || ''), [s.default_role_id]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void api<{ roles: AccountRole[] }>('/api/account-roles', { signal: controller.signal })
+      .then((value) => {
+        if (!controller.signal.aborted) setRoles(value.roles);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted)
+          setRolesError('Account roles could not be loaded. Refresh before changing the default.');
+      });
+    return () => controller.abort();
+  }, [api]);
   const jfUsers = users.jellyfin.filter(
     (user) => !user.Policy?.IsAdministrator && !user.Policy?.IsDisabled,
   );
@@ -345,13 +362,13 @@ export default function SettingsPage({
                   hint="Include this address in the user’s credential message."
                 />
                 <div className="field">
-                  <label htmlFor="setting-template_user_id">Template user</label>
+                  <label htmlFor="setting-template_user_id">Fallback template user</label>
                   <select
                     id="setting-template_user_id"
                     name="template_user_id"
                     defaultValue={s.template_user_id}
                   >
-                    <option value="">Choose a Jellyfin user…</option>
+                    <option value="">No fallback template</option>
                     {jfUsers.map((user) => (
                       <option key={user.Id} value={user.Id}>
                         {user.Name}
@@ -371,7 +388,33 @@ export default function SettingsPage({
                 </div>
               </div>
               <div className="support-note">
-                Use a regular account with the library access you want new members to have.
+                A default account role takes priority over the fallback template. Role settings are
+                saved in Jellyport and do not depend on the source account remaining available.
+              </div>
+              <div className="field">
+                <label htmlFor="setting-default_role_id">Default account role</label>
+                <select
+                  id="setting-default_role_id"
+                  name="default_role_id"
+                  value={defaultRoleId}
+                  onChange={(event) => setDefaultRoleId(event.target.value)}
+                >
+                  <option value="">Use fallback template</option>
+                  {roles.map((role) => (
+                    <option key={role.id} value={role.id}>
+                      {role.name}
+                    </option>
+                  ))}
+                  {s.default_role_id && !roles.some((role) => role.id === s.default_role_id) && (
+                    <option value={s.default_role_id}>Saved default role</option>
+                  )}
+                </select>
+                <small>
+                  Create and update presets on Account roles. The default applies only to new
+                  accounts and inspected incomplete-account recovery. Existing migrations keep
+                  current permissions and preferences.
+                </small>
+                {rolesError && <small role="alert">{rolesError}</small>}
               </div>
             </div>
           </Section>

@@ -2,7 +2,7 @@
 
 Jellyport migrates user records through the servers' authenticated APIs. Both servers must already contain the media. It does not copy media files or either server's database. Exact usernames are the default; an administrator-approved identity mapping can associate accounts with different names.
 
-The merge preserves existing Jellyfin activity. Watched and favorite flags are combined, play counts use the larger value, and valid last-played dates use the later date. Confident matching is required; missing and ambiguous media are reported instead of guessed. Existing Jellyfin passwords and permission policies remain intact. New accounts receive a generated password and the selected Jellyfin template's permissions.
+The merge preserves existing Jellyfin activity. Watched and favorite flags are combined, play counts use the larger value, and valid last-played dates use the later date. Confident matching is required; missing and ambiguous media are reported instead of guessed. Existing Jellyfin passwords, permission policies, and preferences remain intact. New accounts receive a generated password and the configured default account role, or the legacy Jellyfin template when no default role is selected.
 
 ## What can move
 
@@ -18,10 +18,20 @@ The merge preserves existing Jellyfin activity. Watched and favorite flags are c
 | Next Up / future seasons | Migrate individual episode watched flags and available dates. Jellyfin then selects the next unwatched episode, including episodes from a new season after they are scanned. There is no permanent cross-server "follow this show" record to import. See the explanation below. |
 | Playlists | Recreate user-visible playlists as private copies owned by the destination user. Match each member separately and retain supported order. Merge available playlist favorites/likes/ratings after confirming the copy. Missing members are reported. Existing unrelated Jellyfin playlists are preserved. Original public visibility, collaborators, description/artwork, and edit permissions are not copied. |
 | Repeated playlist entries | Jellyfin 12 supports repeated entries. Jellyfin 10.9–10.11 removes duplicates during playlist insertion; migration must report that limitation rather than claiming an exact copy. |
-| Portable playback preferences | For newly created accounts, copy an explicit allowlist of shared audio/subtitle language, subtitle mode, autoplay, remembered track selection, missing-episode display, and hide-played preferences over the template configuration. Keep the template's permission policy and server-specific configuration. Existing users keep their Jellyfin preferences. |
+| Portable playback preferences | For newly created accounts using a legacy template, copy an explicit allowlist of shared audio/subtitle language, subtitle mode, autoplay, remembered track selection, missing-episode display, and hide-played preferences over the template configuration. A configured default account role takes precedence: its preferences are preserved instead of overwritten by Emby preferences. Existing users keep their Jellyfin preferences. |
 | Profile image | For newly created accounts, transfer a bounded PNG/JPEG profile image from the configured Emby server's user-image endpoint. Request a small image, validate its signature, and preserve existing Jellyfin profiles. No image URL from upstream metadata is fetched. |
 
 The portable item-data write contract is `POST /UserItems/{itemId}/UserData?userId={userId}`. Jellyfin persists `Played`, `PlaybackPositionTicks`, `PlayCount`, `LastPlayedDate`, `IsFavorite`, `Likes`, and `Rating` when supplied. Although its update DTO also declares `PlayedPercentage`, `UnplayedItemCount`, `Key`, and `ItemId`, these are not independent values that Jellyport should import: percentages and aggregate counts are derived, while keys and IDs belong to the destination server. These behaviors were checked against Jellyfin's [item controller](https://github.com/jellyfin/jellyfin/blob/v12.2/Jellyfin.Api/Controllers/ItemsController.cs), [update DTO](https://github.com/jellyfin/jellyfin/blob/v12.2/MediaBrowser.Model/Dto/UpdateUserItemDataDto.cs), and [user-data manager](https://github.com/jellyfin/jellyfin/blob/v10.11.10/Emby.Server.Implementations/Library/UserDataManager.cs).
+
+## Jellyfin onboarding roles
+
+Account roles supply destination defaults independently of Emby migration. Import supported settings from an enabled, non-administrator Jellyfin account into a new or existing role. The encrypted snapshot is bound to the linked Jellyfin server and no longer depends on the source account after saving. The wizard can finish without a legacy template; choose a default role or template before creating or migrating accounts.
+
+Roles separate permissions, account configuration, and supported Jellyfin Web home/display preferences. Home settings include supported home sections, library landing pages, episode images, and skip intervals. These are destination Jellyfin settings captured from a Jellyfin user, not an import of Emby's arbitrary display-preference dictionary. Independent TV/mobile clients and device-local options can behave differently. Unknown fields and unsupported values are excluded and reported.
+
+The default role applies only to newly provisioned accounts and takes precedence over portable Emby playback preferences. Existing destination accounts retain their settings during migration. To change them, assign a role explicitly, choose the setting groups, and review/apply an update for up to 100 eligible accounts. Each account has one Jellyport role; saving a role or assigning it alone causes no remote settings change. Passwords and personal media history remain intact during a role update.
+
+Role application status records successful application of a saved revision, including partial setting-group results. It does not monitor live configuration drift or prevent users from subsequently changing permitted preferences. See [the role workflow](../README.md#account-roles-and-defaults) for creating defaults and updating existing accounts.
 
 ## Shows awaiting a future season
 
@@ -48,10 +58,10 @@ Reads are bounded to 500 source playlists and 100,000 total entries per user. A 
 | Data | Reason / achievable alternative |
 | --- | --- |
 | Passwords, PINs, login tokens, sessions, device authentication, Emby Connect links | Authentication systems are different. Generate new Jellyfin passwords; never import these secrets. |
-| Emby permission policies and library-access IDs | Use the Jellyfin template. Emby IDs and privilege flags must not override destination access controls. |
+| Emby permission policies and library-access IDs | Use a server-scoped Jellyfin account role or the optional legacy Jellyfin template. Emby IDs and privilege flags must not override destination access controls. |
 | Every historical playback event, watch duration, device, IP, plugin statistics | Core item data exposes a count and latest date, not the full event ledger. Playback-reporting, Trakt, or other plugin data requires a separate explicitly supported integration. |
 | Hidden-from-resume state | Emby has a hide endpoint, but its published readable user-data DTO does not expose a portable hide field, and the checked Jellyfin update DTO has no matching write field. Do not erase legitimate resume positions to approximate hiding. |
-| Client themes, home layouts, sorting, device-local settings | Display preferences are scoped by client and item IDs, with no general export of all clients. Blindly copying custom preference dictionaries can retain invalid IDs or change security-sensitive behavior. Users can recreate these settings in Jellyfin. |
+| Emby client themes, home layouts, sorting, device-local settings | Display preferences are scoped by client and item IDs, with no general export of all clients. Blindly copying Emby custom preference dictionaries can retain invalid IDs or change security-sensitive behavior. A Jellyfin account role can supply supported destination Web home/display defaults; it cannot migrate every Emby client or device-local setting. |
 | Server-specific ordered views, excluded library IDs, local-password switches, profile PINs, cast receiver IDs | These are deliberately excluded from the portable configuration allowlist. |
 | Emby intro-skip mode, rewind seconds, unsupported subtitle modes | The checked Jellyfin user-configuration model has no exact shared field or enum value. Client/plugin capabilities differ. |
 | Smart playlist rules, external URLs, unsupported media, deleted or unavailable items | Copy only confidently matched destination library members. Dynamic rules and remote sources need a separate compatible feature; report unavailable members. |
@@ -65,6 +75,8 @@ Profile-image uploads use the authenticated user-image route and a base64 body, 
 
 Preview before a bulk migration. Review unmatched and ambiguous media, unsupported capabilities, missing dates, and playlist differences. Newer or uncertain destination resume positions are retained automatically. Test one representative account against the actual Emby/Jellyfin versions first: API and client behavior can differ even when a request succeeds.
 
+For a new account using a saved role, preview matching uses the server catalog because no live template account is required. The role's library restrictions can reduce the final matched set. The execution phase reads media through the newly created account's actual access and reports unavailable matches; the preview warns about this difference.
+
 Jellyport refreshes each destination item's user data immediately before merging. The upstream API has no conditional update transaction, so concurrent playback during the brief read/write interval can still race with a migration. Run a user's migration while they are not actively watching for the most reliable result. Jobs explicitly report partial results and preserve ordinary existing account credentials and permissions.
 
-Research checked primary API documentation and tagged Jellyfin source on **2026-10-08**, including 10.8.13, 10.9.0, 10.10.7, 10.11.10, and 12.2. The migration behavior above is implemented in Jellyport 0.4.0 and checked with local API fixtures; it has not been run against your production users or servers.
+Research checked primary API documentation and tagged Jellyfin source on **2026-10-08**, including 10.8.13, 10.9.0, 10.10.7, 10.11.10, and 12.2. Detailed migration was introduced in Jellyport 0.4.0; saved onboarding roles and selective updates were added in 0.6.0. Behavior is checked with local API fixtures and has not been run against your production users or servers.

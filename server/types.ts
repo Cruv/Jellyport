@@ -9,6 +9,7 @@ export interface Settings {
   jellyfin_api_key: string;
   jellyfin_public_url: string;
   template_user_id: string;
+  default_role_id?: string;
   path_mappings: PathMapping[];
   discord_enabled: boolean;
   discord_bot_token: string;
@@ -31,6 +32,7 @@ export const DEFAULT_SETTINGS: Settings = {
   jellyfin_api_key: '',
   jellyfin_public_url: '',
   template_user_id: '',
+  default_role_id: '',
   path_mappings: [],
   discord_enabled: false,
   discord_bot_token: '',

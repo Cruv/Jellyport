@@ -79,6 +79,74 @@ describe('media API boundary', () => {
     expect(new URL(request).search).toBe('');
     expect(request).toContain('alice%2F%3Fapi_key%3Dstolen%23x');
   });
+  it('reads and writes account display preferences only through the fixed web namespace', async () => {
+    const seen: Array<{
+      method: string;
+      pathname: string;
+      query: Record<string, string>;
+      body: unknown;
+    }> = [];
+    const client = new MediaClient('http://jellyfin.test/base', 'private-key', 'jellyfin', {
+      transport: async (address, init) => {
+        const url = new URL(address);
+        seen.push({
+          method: init.method!,
+          pathname: url.pathname,
+          query: Object.fromEntries(url.searchParams),
+          body: init.body ? JSON.parse(String(init.body)) : null,
+        });
+        expect(address).not.toContain('private-key');
+        return init.method === 'GET'
+          ? json({ CustomPrefs: { homesection0: 'resume' } })
+          : new Response(null, { status: 204 });
+      },
+    });
+    const id = 'user/?client=other#fragment';
+    const preferences = await client.displayPreferences(id);
+    expect(preferences).toEqual({ CustomPrefs: { homesection0: 'resume' } });
+    await client.setDisplayPreferences(id, preferences);
+    expect(seen).toEqual([
+      {
+        method: 'GET',
+        pathname: '/base/DisplayPreferences/usersettings',
+        query: { userId: id, client: 'emby' },
+        body: null,
+      },
+      {
+        method: 'POST',
+        pathname: '/base/DisplayPreferences/usersettings',
+        query: { userId: id, client: 'emby' },
+        body: preferences,
+      },
+    ]);
+    await client.close();
+  });
+  it('rejects invalid display responses and all Emby display writes before contacting the server', async () => {
+    const transport = vi.fn(async () => json([]));
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
+    await expect(client.displayPreferences('user')).rejects.toThrow('invalid API response');
+    await expect(client.displayPreferences('')).rejects.toThrow('valid media server identifier');
+    await expect(
+      client.setDisplayPreferences('user', [] as unknown as Record<string, unknown>),
+    ).rejects.toThrow('Valid display preferences');
+    expect(transport).toHaveBeenCalledTimes(1);
+    const emby = new MediaClient('http://emby.test', 'key', 'emby', { transport });
+    await expect(emby.setDisplayPreferences('user', {})).rejects.toThrow('only on Jellyfin');
+    expect(transport).toHaveBeenCalledTimes(1);
+    await client.close();
+    await emby.close();
+  });
+  it('does not retry uncertain display preference mutations', async () => {
+    const transport = vi.fn(async () => {
+      throw new Error('private-key upstream response');
+    });
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
+    await expect(client.setDisplayPreferences('user', { CustomPrefs: {} })).rejects.toThrow(
+      'operation may have been applied',
+    );
+    expect(transport).toHaveBeenCalledTimes(1);
+    await client.close();
+  });
   it('bounds read retries and never retries mutations', async () => {
     const counts: Record<string, number> = { GET: 0, POST: 0 },
       sleeps: number[] = [];

@@ -46,6 +46,22 @@ assert.equal(
   'Encoded API routes must require authentication.',
 );
 assert.equal((await fetch(new URL('/api/user-mappings', base))).status, 401);
+assert.equal((await fetch(new URL('/api/account-roles', base))).status, 401);
+assert.equal(
+  (
+    await fetch(new URL('/api/account-roles/apply', base), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        role_id: 'unauthorized',
+        role_revision: 'unauthorized',
+        user_ids: ['unauthorized'],
+        sections: ['policy'],
+      }),
+    })
+  ).status,
+  401,
+);
 assert.equal((await fetch(new URL('/api/discord/members?query=alex', base))).status, 401);
 assert.equal(
   (
@@ -69,6 +85,7 @@ assert(settings.jellyfin_api_key_set);
 const users = await request('/api/users');
 assert.equal(users.emby.length, 3);
 assert.deepEqual(await request('/api/user-mappings'), { mappings: [] });
+assert.deepEqual(await request('/api/account-roles'), { roles: [], assignments: [] });
 const preview = await request('/api/migrations/preview', 'POST', {
   source_user_ids: users.emby.map((user) => user.Id),
 });

@@ -280,10 +280,9 @@ export default function AuthScreen({
                 id="setup-template"
                 name="template_user_id"
                 defaultValue={connection.defaults.template_user_id}
-                required
                 disabled={!!busy}
               >
-                <option value="">Choose a Jellyfin user…</option>
+                <option value="">Configure an account role after setup</option>
                 {templates.map((user) => (
                   <option key={user.Id} value={user.Id}>
                     {user.Name}
@@ -291,12 +290,13 @@ export default function AuthScreen({
                 ))}
               </select>
               <small>
-                Choose an enabled regular account with the library access you want new members to
-                have.
+                Optionally choose an enabled regular account as a fallback template. You can instead
+                finish setup, create a saved account role, and select it as the default in Settings.
               </small>
               {!templates.length && (
                 <small className="setup-warning">
-                  Create a regular template user in Jellyfin, then refresh this list.
+                  No regular template users are available. You can finish setup and configure an
+                  account role later.
                 </small>
               )}
               <button
@@ -322,11 +322,7 @@ export default function AuthScreen({
               />
               <small>The address to include when sending account credentials to your users.</small>
             </div>
-            <button
-              className="btn btn-primary"
-              type="submit"
-              disabled={!!busy || !templates.length}
-            >
+            <button className="btn btn-primary" type="submit" disabled={!!busy}>
               {busy === 'complete' ? <span className="spinner" /> : <Icon name="check" />}
               {busy === 'complete' ? 'Finishing setup…' : 'Finish setup'}
             </button>

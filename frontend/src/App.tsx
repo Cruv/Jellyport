@@ -14,6 +14,7 @@ import SettingsPage from './SettingsPage';
 import AuthScreen from './AuthScreen';
 import UserMappingsPage from './UserMappingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
+import AccountRolesPage from './AccountRolesPage';
 import {
   AccountsPage,
   ActivityPage,
@@ -46,6 +47,7 @@ const pages: Record<Page, { title: string; icon: string }> = {
   overview: { title: 'Overview', icon: 'grid' },
   migrate: { title: 'Migrate users', icon: 'migrate' },
   mappings: { title: 'User mappings', icon: 'link' },
+  roles: { title: 'Account roles', icon: 'shield' },
   accounts: { title: 'Create account', icon: 'userPlus' },
   subscriptions: { title: 'Subscriptions', icon: 'inbox' },
   activity: { title: 'Activity', icon: 'activity' },
@@ -242,6 +244,15 @@ export default function App() {
               (current) =>
                 new Set([...current].filter((id) => value.emby.some((user) => user.Id === id))),
             );
+          }
+        } else if (target === 'roles') {
+          const [listed, configuration] = await Promise.all([
+            api<Users>('/api/users'),
+            api<Settings>('/api/settings'),
+          ]);
+          if (version === loadVersion.current) {
+            setUsers(listed);
+            setSettings(configuration);
           }
         } else if (target === 'mappings') {
           const [value, listed, configuration] = await Promise.all([
@@ -553,6 +564,17 @@ export default function App() {
         api={api}
         notify={notify}
         refresh={() => load('mappings')}
+      />
+    );
+  else if (page === 'roles')
+    content = (
+      <AccountRolesPage
+        users={users}
+        api={api}
+        notify={notify}
+        created={created}
+        templateUserId={settings?.template_user_id}
+        defaultRoleId={settings?.default_role_id}
       />
     );
   else if (page === 'accounts' && overview && settings)
@@ -963,6 +985,21 @@ function DialogContent({
                 Emby: {result.source_username} → Jellyfin: {result.username}
               </p>
             )}
+            {result.role_name && (
+              <p className="subtle text-small">
+                Account role: {result.role_name} · Applied groups:{' '}
+                {result.role_sections
+                  ?.map(
+                    (section) =>
+                      ({
+                        policy: 'permissions',
+                        configuration: 'account preferences',
+                        display: 'Home preferences',
+                      })[section],
+                  )
+                  .join(', ') || 'none'}
+              </p>
+            )}
             <div className="job-meta">
               {result.created && (
                 <span>
@@ -1009,6 +1046,11 @@ function DialogContent({
                 {warning}
               </div>
             ))}
+            {result.warnings?.map((warning, index) => (
+              <div className="error-block" key={`role-${index}`}>
+                {warning}
+              </div>
+            ))}
             {result.discord_delivery && (
               <p>
                 <Icon name="discord" /> Discord delivery:{' '}
@@ -1035,7 +1077,7 @@ function DialogContent({
         {!job.results?.length && !activeJob(job) && !job.error && (
           <p className="muted text-small mt-18">This operation has no per-user results.</p>
         )}
-        {!activeJob(job) && (
+        {!activeJob(job) && job.kind !== 'role_update' && (
           <div className="support-note">
             New account passwords can be revealed once. Existing account passwords are preserved. If
             Discord delivery failed, reveal and copy the new credentials for manual delivery.

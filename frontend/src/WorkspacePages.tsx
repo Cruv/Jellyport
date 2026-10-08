@@ -410,7 +410,7 @@ export function MigratePage({
             <ul>
               <li>The same username</li>
               <li>Played status for matched movies and episodes</li>
-              <li>Permissions from your template user for new accounts</li>
+              <li>Saved account defaults for new accounts</li>
               <li>A generated password for each new account</li>
             </ul>
           </div>
@@ -446,7 +446,9 @@ export function AccountsPage({
   const [approved, setApproved] = useState(false);
   const [recoveryRecipient, setRecoveryRecipient] = useState('');
   const recoveryVersion = useRef(0);
-  const ready = overview.connections.jellyfin.connected && settings.template_user_id;
+  const ready =
+    overview.connections.jellyfin.connected &&
+    (settings.default_role_id || settings.template_user_id);
   async function create(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -527,11 +529,11 @@ export function AccountsPage({
     <>
       <Heading
         title="Welcome someone new."
-        description="Create a Jellyfin account with your template’s permissions and a secure generated password."
+        description="Create a Jellyfin account with your saved defaults and a secure generated password."
       />
       {!ready && (
         <Callout icon="warning" warning title="Finish your Jellyfin setup first.">
-          Connect Jellyfin and choose your template user in{' '}
+          Connect Jellyfin and choose a default account role or fallback template in{' '}
           <button className="text-button" onClick={() => navigate('settings')}>
             Settings
           </button>
@@ -612,8 +614,8 @@ export function AccountsPage({
               {[
                 {
                   icon: 'shield',
-                  title: 'Your template permissions',
-                  text: 'New accounts inherit library access and account permissions from your selected Jellyfin template.',
+                  title: 'Your account defaults',
+                  text: 'New accounts receive your default role’s saved settings, or your fallback Jellyfin template when no default role is selected.',
                 },
                 {
                   icon: 'discord',
@@ -724,8 +726,8 @@ export function AccountsPage({
                       onChange={(event) => setApproved(event.target.checked)}
                     />
                     <span>
-                      I inspected this Jellyfin account and approve a new password and template
-                      permissions.
+                      I inspected this Jellyfin account and approve a new password and account
+                      defaults.
                     </span>
                   </label>
                   <div className="form-actions">

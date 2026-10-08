@@ -332,4 +332,90 @@ describe('Discord membership account allowances', () => {
     expect(created).not.toHaveBeenCalled();
     expect(notify).not.toHaveBeenCalled();
   });
+  it('saves complimentary access for a non-paying member without creating or modifying media accounts', async () => {
+    const requests: { path: string; options?: ApiOptions }[] = [];
+    const api = vi.fn(async (path: string, options?: ApiOptions) => {
+      requests.push({ path, options });
+      if (path === '/api/memberships') return { memberships: [] };
+      if (path === '/api/user-mappings') return { mappings: [] };
+      if (path.startsWith('/api/discord/members?'))
+        return { members: [{ ...member, membership_active: false }], truncated: false };
+      if (path === '/api/memberships/access')
+        return {
+          ...membership,
+          access_mode: 'complimentary',
+          account_limit: 2,
+          tier_id: 'complimentary',
+        };
+      throw new Error(`Unexpected request ${path}`);
+    }) as Api;
+    const { notify, created } = page([], api);
+    await screen.findByText('Give each member their account allowance.');
+    fireEvent.change(screen.getByLabelText('Access policy'), {
+      target: { value: 'complimentary' },
+    });
+    fireEvent.change(screen.getByLabelText('Discord member'), { target: { value: 'Jim' } });
+    fireEvent.click(await screen.findByRole('button', { name: 'Select @Jim' }));
+    expect(screen.getByLabelText('Access policy')).toHaveProperty('value', 'complimentary');
+    fireEvent.change(screen.getByLabelText('Complimentary account allowance'), {
+      target: { value: '2' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save access policy' }));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith(
+        'Access policy saved. Media accounts have not been changed.',
+      ),
+    );
+    expect(mutations(requests)).toEqual([
+      {
+        path: '/api/memberships/access',
+        options: expect.objectContaining({
+          method: 'POST',
+          body: { discord_user_id: ownerId, access_mode: 'complimentary', account_limit: 2 },
+        }),
+      },
+    ]);
+    expect(created).not.toHaveBeenCalled();
+  });
+
+  it('saves a reviewed complimentary policy before queuing accounts using the newly saved revision', async () => {
+    const requests: { path: string; options?: ApiOptions }[] = [];
+    const api = vi.fn(async (path: string, options?: ApiOptions) => {
+      requests.push({ path, options });
+      if (path === '/api/memberships') return { memberships: [membership] };
+      if (path === '/api/user-mappings') return { mappings: [] };
+      if (path === '/api/memberships/access')
+        return {
+          ...membership,
+          access_mode: 'complimentary',
+          account_limit: 1,
+          tier_id: 'complimentary',
+          revision: 'free-revision',
+        };
+      if (path === '/api/memberships/provision') return job;
+      throw new Error(`Unexpected request ${path}`);
+    }) as Api;
+    const { created } = page([], api);
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
+    fireEvent.change(screen.getByLabelText('Access policy'), {
+      target: { value: 'complimentary' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
+    expect(mutations(requests)).toHaveLength(0);
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Queue membership update' }),
+    );
+    await waitFor(() => expect(created).toHaveBeenCalledWith(job));
+    expect(mutations(requests).map((entry) => entry.path)).toEqual([
+      '/api/memberships/access',
+      '/api/memberships/provision',
+    ]);
+    expect(mutations(requests)[1].options?.body).toEqual({
+      discord_user_id: ownerId,
+      tier_id: 'complimentary',
+      expected_account_limit: 1,
+      expected_usernames: ['Jim'],
+      expected_revision: 'free-revision',
+    });
+  });
 });

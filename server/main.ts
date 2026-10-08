@@ -15,7 +15,8 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Store } from './store.js';
 import { Service } from './service.js';
-import { BotManager } from './bot.js';
+import { BotManager, BotError } from './bot.js';
+import { UserOrganization } from './user-organization.js';
 import { DemoServers } from './demo.js';
 import { ServiceError, MediaError } from './errors.js';
 import { DEMO_SETTINGS } from './types.js';
@@ -363,7 +364,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   app.setErrorHandler<FastifyError>((error, _request, reply) => {
     if (error instanceof JellyfinAuthError)
       return reply.code(error.statusCode).send({ detail: error.message });
-    if (error instanceof ServiceError) return reply.code(400).send({ detail: error.message });
+    if (error instanceof ServiceError || error instanceof BotError)
+      return reply.code(400).send({ detail: error.message });
     if (error instanceof MediaError) return reply.code(502).send({ detail: error.message });
     if (error.validation)
       return reply
@@ -680,7 +682,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     }
     result.jellyfin_auth_managed = !demo && store.authState()?.kind === 'configured';
     result.bot_invite_url = settings.discord_application_id
-      ? `https://discord.com/oauth2/authorize?${new URLSearchParams({ client_id: settings.discord_application_id, scope: 'bot applications.commands', permissions: '68608', guild_id: settings.discord_guild_id, disable_guild_select: 'true' })}`
+      ? `https://discord.com/oauth2/authorize?${new URLSearchParams({ client_id: settings.discord_application_id, scope: 'bot applications.commands', permissions: settings.discord_emby_role_id || settings.discord_jellyfin_role_id ? '268504064' : '68608', guild_id: settings.discord_guild_id, disable_guild_select: 'true' })}`
+      : '';
+    result.bot_organization_invite_url = settings.discord_application_id
+      ? `https://discord.com/oauth2/authorize?${new URLSearchParams({ client_id: settings.discord_application_id, scope: 'bot applications.commands', permissions: '268504064', guild_id: settings.discord_guild_id, disable_guild_select: 'true' })}`
       : '';
     return result;
   }
@@ -869,6 +874,69 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   });
   app.get('/api/subscriptions', async () => ({ events: store.subscriptions() }));
   app.get('/api/memberships', async () => ({ memberships: service.listMemberships() }));
+  const organization = new UserOrganization(service);
+  app.get('/api/user-directory', async () => organization.directory());
+  app.get('/api/discord/tag-roles', async () => organization.listTagRoles());
+  app.post('/api/discord/tags/preview', async () => organization.preview());
+  app.post<{ Body: { token: string } }>(
+    '/api/discord/tags/apply',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['token'],
+          properties: { token: { type: 'string', format: 'uuid' } },
+        },
+      },
+    },
+    async (request) => organization.apply(request.body.token),
+  );
+  app.post<{
+    Body: { discord_user_id: string; jellyfin_user_id: string; membership_slot?: number };
+  }>(
+    '/api/accounts/link',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['discord_user_id', 'jellyfin_user_id'],
+          properties: {
+            discord_user_id: { type: 'string', pattern: '^[0-9]{5,22}$' },
+            jellyfin_user_id: id,
+            membership_slot: { type: 'integer', minimum: 1, maximum: 3 },
+          },
+        },
+      },
+    },
+    async (request) =>
+      service.linkExistingAccount(
+        request.body.discord_user_id,
+        request.body.jellyfin_user_id,
+        request.body.membership_slot,
+      ),
+  );
+  app.post<{ Body: Parameters<Service['setMembershipAccess']>[0] }>(
+    '/api/memberships/access',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['discord_user_id', 'access_mode'],
+          properties: {
+            discord_user_id: { type: 'string', pattern: '^[0-9]{5,22}$' },
+            access_mode: { type: 'string', enum: ['subscription', 'complimentary'] },
+            account_limit: { type: 'integer', minimum: 1, maximum: 3 },
+            tier_id: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' },
+            expected_revision: id,
+          },
+        },
+      },
+    },
+    async (request) => service.setMembershipAccess(request.body),
+  );
   app.post<{
     Body: {
       discord_user_id: string;
@@ -994,7 +1062,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           removeSession(sid);
           await revoke(value);
         }
-      if (!demo && store.authState()?.kind === 'configured') await service.reconcileMemberships();
+      if (!demo && store.authState()?.kind === 'configured') {
+        await service.reconcileMemberships();
+        await organization.reconcile();
+      }
     })()
       .catch(() => {})
       .finally(() => {

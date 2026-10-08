@@ -26,8 +26,14 @@ class FakeBot implements BotAdapter {
   async recipientIdentity(id: string) {
     return { id, username: this.username };
   }
-  async sendCredentials(...args: string[]) {
-    this.delivered.push(args);
+  async sendCredentials(
+    id: string,
+    username: string,
+    password: string,
+    url: string,
+    _requireMembership = true,
+  ) {
+    this.delivered.push([id, username, password, url]);
   }
   async membershipActive(_id: string) {
     return this.active;

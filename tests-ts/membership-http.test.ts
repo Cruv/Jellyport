@@ -125,6 +125,131 @@ afterEach(async () => {
 });
 
 describe('administrator membership HTTP endpoints', () => {
+  it('rejects unsafe organization configuration and requests Manage Roles only when tags are configured', async () => {
+    const { app, headers } = await fixture();
+    const before = app.jellyport.store.settings();
+    for (const payload of [
+      { discord_emby_role_id: '123456', discord_jellyfin_role_id: '123456' },
+      { discord_emby_role_id: '123456', discord_member_role_id: '123456' },
+      { discord_emby_role_id: '123456', discord_admin_role_id: '123456' },
+      { discord_emby_role_id: '123456', discord_guild_id: '123456' },
+      { discord_emby_role_id: 'bad-role' },
+      { discord_auto_role_sync: true },
+      {
+        membership_tiers: [
+          { id: 'complimentary', name: 'Reserved', plan_name: 'Reserved Plan', account_limit: 1 },
+        ],
+      },
+    ]) {
+      const response = await app.inject({ method: 'PUT', url: '/api/settings', headers, payload });
+      expect(response.statusCode).toBe(400);
+      expect(app.jellyport.store.settings()).toEqual(before);
+    }
+    const base = await app.inject({
+      method: 'PUT',
+      url: '/api/settings',
+      headers,
+      payload: { discord_application_id: '999999999' },
+    });
+    expect(base.statusCode).toBe(200);
+    expect(new URL(base.json().bot_invite_url).searchParams.get('permissions')).toBe('68608');
+    const tagged = await app.inject({
+      method: 'PUT',
+      url: '/api/settings',
+      headers,
+      payload: { discord_emby_role_id: '444444444', discord_jellyfin_role_id: '555555555' },
+    });
+    expect(tagged.statusCode).toBe(200);
+    expect(new URL(tagged.json().bot_invite_url).searchParams.get('permissions')).toBe('268504064');
+  });
+
+  it('protects organization and complimentary endpoints with administrator authentication and CSRF', async () => {
+    const { app, headers } = await fixture();
+    for (const url of ['/api/user-directory', '/api/discord/tag-roles']) {
+      const response = await app.inject(url);
+      expect(response.statusCode).toBe(401);
+      expect(response.headers['cache-control']).toBe('no-store');
+    }
+    const requests = [
+      {
+        url: '/api/memberships/access',
+        payload: { discord_user_id: owner, access_mode: 'complimentary' },
+      },
+      { url: '/api/accounts/link', payload: { discord_user_id: owner, jellyfin_user_id: 'alice' } },
+      { url: '/api/discord/tags/preview', payload: {} },
+      {
+        url: '/api/discord/tags/apply',
+        payload: { token: '12345678-1234-4123-8123-123456789abc' },
+      },
+    ];
+    for (const request of requests) {
+      expect((await app.inject({ method: 'POST', ...request })).statusCode).toBe(401);
+      for (const invalid of [
+        { cookie: headers.cookie },
+        { ...headers, origin: 'https://untrusted.example' },
+      ]) {
+        const response = await app.inject({ method: 'POST', ...request, headers: invalid });
+        expect(response.statusCode).toBe(403);
+        expect(response.headers['cache-control']).toBe('no-store');
+      }
+    }
+    expect(app.jellyport.store.links()).toEqual([]);
+    expect(app.jellyport.service.listMemberships()).toEqual([]);
+  });
+
+  it('saves complimentary policy without provisioning, and projects safe user directory fields', async () => {
+    const { app, headers, servers } = await fixture();
+    const create = vi.spyOn(servers, 'factory');
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/memberships/access',
+      headers,
+      payload: { discord_user_id: owner, access_mode: 'complimentary', account_limit: 2 },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ access_mode: 'complimentary', account_limit: 2 });
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(app.jellyport.store.jobs()).toEqual([]);
+    expect(app.jellyport.store.links()).toEqual([]);
+    expect(create).not.toHaveBeenCalled();
+    servers.users.jellyfin[0]!.Configuration = { SecretProfileSetting: 'private-profile-token' };
+    const directory = await app.inject({ url: '/api/user-directory', headers });
+    expect(directory.statusCode).toBe(200);
+    expect(directory.headers['cache-control']).toBe('no-store');
+    expect(directory.json().users).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          discord_user_id: owner,
+          access_mode: 'complimentary',
+          emby: [],
+          jellyfin: [],
+        }),
+      ]),
+    );
+    for (const secret of [
+      'private-profile-token',
+      'private-managed-api-key',
+      'private-interactive-session-token',
+    ])
+      expect(directory.body).not.toContain(secret);
+    for (const row of directory.json().users) {
+      expect(Object.keys(row).sort()).toEqual(
+        [
+          'id',
+          'emby',
+          'jellyfin',
+          'discord_user_id',
+          'discord_username',
+          'access_mode',
+          'account_limit',
+          'protected',
+        ].sort(),
+      );
+      for (const account of [...row.emby, ...row.jellyfin])
+        expect(Object.keys(account).sort()).toEqual(['id', 'name', 'disabled'].sort());
+    }
+  });
+
   it('requires administrator authentication and CSRF before exposing or provisioning members', async () => {
     const { app, headers } = await fixture();
     const list = vi.spyOn(app.jellyport.service, 'listMemberships');
@@ -224,6 +349,7 @@ describe('administrator membership HTTP endpoints', () => {
         'discord_user_id',
         'base_username',
         'tier_id',
+        'access_mode',
         'account_limit',
         'active',
         'server_url',

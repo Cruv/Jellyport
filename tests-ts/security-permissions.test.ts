@@ -24,8 +24,14 @@ class MemberFixture implements BotAdapter {
   async validateRecipient(id: string) {
     await this.recipientIdentity(id);
   }
-  async sendCredentials(...args: string[]) {
-    this.deliveries.push(args);
+  async sendCredentials(
+    id: string,
+    username: string,
+    password: string,
+    url: string,
+    _requireMembership = true,
+  ) {
+    this.deliveries.push([id, username, password, url]);
   }
   async membershipActive(id: string) {
     return this.members.get(id)?.active ?? false;

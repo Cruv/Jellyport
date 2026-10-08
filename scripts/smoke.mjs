@@ -48,6 +48,8 @@ assert.equal(
 assert.equal((await fetch(new URL('/api/user-mappings', base))).status, 401);
 assert.equal((await fetch(new URL('/api/account-roles', base))).status, 401);
 assert.equal((await fetch(new URL('/api/memberships', base))).status, 401);
+assert.equal((await fetch(new URL('/api/user-directory', base))).status, 401);
+assert.equal((await fetch(new URL('/api/discord/tag-roles', base))).status, 401);
 assert.equal(
   (
     await fetch(new URL('/api/memberships/provision', base), {
@@ -93,6 +95,25 @@ csrf = session.csrf_token;
 const settings = await request('/api/settings');
 assert(!Object.hasOwn(settings, 'jellyfin_api_key'));
 assert(settings.jellyfin_api_key_set);
+assert.equal(settings.discord_auto_role_sync, false);
+assert.equal(settings.discord_emby_only_role, true);
+const directory = await request('/api/user-directory');
+assert(directory.users.some((user) => user.access_mode === 'standalone'));
+assert(directory.users.every((user) => user.discord_user_id === null));
+assert(!JSON.stringify(directory).includes('Configuration'));
+for (const [path, body] of [
+  ['/api/memberships/access', { discord_user_id: '123456789', access_mode: 'complimentary' }],
+  ['/api/accounts/link', { discord_user_id: '123456789', jellyfin_user_id: 'j-river' }],
+  ['/api/discord/tags/preview', {}],
+]) {
+  const response = await fetch(new URL(path, base), {
+    method: 'POST',
+    headers: { Cookie: cookie, 'X-CSRF-Token': csrf, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(response.status, 400, 'Demo organization mutations must remain read-only.');
+}
 const users = await request('/api/users');
 assert.equal(users.emby.length, 3);
 assert.deepEqual(await request('/api/user-mappings'), { mappings: [] });
@@ -131,5 +152,5 @@ assert.equal(
   401,
 );
 console.log(
-  'Container smoke passed: React assets, authentication/CSRF, bulk migration, preserved existing accounts, and one-time credentials.',
+  'Container smoke passed: React assets, authentication/CSRF, safe user directory, read-only demo organization, bulk migration, preserved existing accounts, and one-time credentials.',
 );

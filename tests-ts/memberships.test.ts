@@ -134,6 +134,7 @@ describe('encrypted scoped memberships', () => {
     const { memberships } = fixture();
     const initial = memberships.save(input(), settings);
     expect(initial.active).toBe(true);
+    expect(initial.access_mode).toBe('subscription');
     expect(memberships.get('123456789', settings)).toEqual(initial);
     expect(memberships.save(input(), settings, initial.revision)).toEqual(initial);
     const upgraded = memberships.save(
@@ -153,6 +154,60 @@ describe('encrypted scoped memberships', () => {
     );
     expect(renamed.revision).not.toBe(inactive.revision);
     expect(renamed.active).toBe(false);
+  });
+  it('persists complimentary access and revises changes between access modes', () => {
+    const { memberships } = fixture();
+    const initial = memberships.save(input(), settings);
+    const complimentary = memberships.save(
+      { ...initial, access_mode: 'complimentary', tier_id: 'complimentary' },
+      settings,
+      initial.revision,
+    );
+    expect(complimentary.access_mode).toBe('complimentary');
+    expect(complimentary.revision).not.toBe(initial.revision);
+    expect(memberships.get(initial.discord_user_id, settings)).toEqual(complimentary);
+    expect(memberships.save({ ...complimentary }, settings, complimentary.revision)).toEqual(
+      complimentary,
+    );
+    const subscription = memberships.save(
+      { ...complimentary, access_mode: 'subscription' },
+      settings,
+      complimentary.revision,
+    );
+    expect(subscription.access_mode).toBe('subscription');
+    expect(subscription.revision).not.toBe(complimentary.revision);
+    expect(() => memberships.save(complimentary, settings, complimentary.revision)).toThrow(
+      'changed',
+    );
+  });
+  it('normalizes legacy records to subscription access without invalidating their revision', () => {
+    const { memberships, store } = fixture();
+    const saved = memberships.save(input(), settings);
+    const { id } = store.membershipRecords()[0]!;
+    const { access_mode: _accessMode, ...legacy } = saved;
+    store.saveMembershipRecord(id, legacy);
+    expect(memberships.get(saved.discord_user_id, settings)).toEqual(saved);
+    expect(memberships.list(settings)).toEqual([saved]);
+    expect(memberships.save(input(), settings, saved.revision)).toEqual(saved);
+  });
+  it('revises a change to the access mode even when every other field is unchanged', () => {
+    const { memberships } = fixture();
+    const saved = memberships.save(input(), settings);
+    const complimentary = memberships.save(
+      { ...saved, access_mode: 'complimentary' },
+      settings,
+      saved.revision,
+    );
+    expect(complimentary.revision).not.toBe(saved.revision);
+    expect(complimentary).toEqual({
+      ...saved,
+      access_mode: 'complimentary',
+      revision: complimentary.revision,
+    });
+    // An omitted mode is the legacy subscription default, never an implicit exemption.
+    expect(memberships.save(input(), settings, complimentary.revision).access_mode).toBe(
+      'subscription',
+    );
   });
   it('scopes records to normalized server URL and configured authentication server identity', () => {
     const { memberships, store } = fixture();
@@ -241,7 +296,10 @@ describe('encrypted scoped memberships', () => {
   });
   it('encrypts identity and entitlement details in the database and WAL and emits only approved fields', () => {
     const { directory, memberships, store } = fixture();
-    const saved = memberships.save(input({ base_username: 'Private.membership.alias' }), settings);
+    const saved = memberships.save(
+      input({ base_username: 'Private.membership.alias', access_mode: 'complimentary' }),
+      settings,
+    );
     for (const name of ['jellyport.db', 'jellyport.db-wal']) {
       const bytes = readFileSync(join(directory, name));
       for (const secret of [
@@ -249,6 +307,7 @@ describe('encrypted scoped memberships', () => {
         'Private.membership.alias',
         settings.jellyfin_url,
         'brigantine',
+        'complimentary',
       ])
         expect(bytes.includes(Buffer.from(secret))).toBe(false);
     }
@@ -269,6 +328,10 @@ describe('encrypted scoped memberships', () => {
     { account_limit: 1.5 },
     { active: 'true' },
     { inactive_reason: 'unsupported' },
+    { access_mode: 'free' },
+    { access_mode: null },
+    { access_mode: true },
+    { access_mode: '' },
     { base_username: 'x'.repeat(63), account_limit: 2 },
     { tier_id: '../tier' },
   ])('rejects invalid membership inputs %#', (fields) => {
@@ -280,6 +343,14 @@ describe('encrypted scoped memberships', () => {
     const { memberships, store } = fixture();
     const saved = memberships.save(input(), settings);
     store.saveMembershipRecord('invalid-record-id', saved);
+    expect(() => memberships.list(settings)).toThrow('identity');
+  });
+  it('fails closed on a malformed access mode in a saved record', () => {
+    const { memberships, store } = fixture();
+    const saved = memberships.save(input(), settings);
+    const { id } = store.membershipRecords()[0]!;
+    store.saveMembershipRecord(id, { ...saved, access_mode: 'unexpected' });
+    expect(() => memberships.get(saved.discord_user_id, settings)).toThrow('identity');
     expect(() => memberships.list(settings)).toThrow('identity');
   });
   it('authenticates a directly resolved record against its scoped identifier and observes later changes', () => {

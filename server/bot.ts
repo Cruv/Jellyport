@@ -14,6 +14,7 @@ import {
   type GuildMember,
   type Message,
   type PartialGuildMember,
+  type Role,
 } from 'discord.js';
 import type { Settings as AppSettings } from './types.js';
 import type { Job, SubscriptionInput } from './service.js';
@@ -23,6 +24,7 @@ import { DEFAULT_MEMBERSHIP_TIERS } from './memberships.js';
 import type { DiscordMemberSearchResult, DiscordMemberSummary } from './discord-members.js';
 
 export class BotError extends Error {}
+class MissingMember extends BotError {}
 
 /** The bot only calls these service operations; Discord never owns account state. */
 export interface BotService {
@@ -32,6 +34,7 @@ export interface BotService {
   embyUsers(): Promise<MediaUser[]>;
   resolveDiscordMapping?(discordId: string): UserMapping | null;
   resolveDiscordMappings?(discordId: string): UserMapping[];
+  recipientRequiresSubscription?(discordId: string): boolean;
   getJob(id: string): Job | null | undefined;
   recordSubscription(event: SubscriptionInput & { guild_id?: string }): Promise<unknown>;
   reconcileMemberships?(): Promise<unknown>;
@@ -41,6 +44,12 @@ type Settings = Partial<AppSettings>;
 type Identity = { id: string; username: string };
 type Authorization = { administrator: boolean; roleIds: Iterable<unknown>; adminRoleId?: unknown };
 type Eligibility = { bot: boolean; roleIds: Iterable<unknown>; memberRoleId?: unknown };
+
+export interface DiscordTagRole {
+  id: string;
+  name: string;
+  manageable: boolean;
+}
 
 export function snowflake(value: unknown): string | null {
   // Discord IDs cannot pass through JS numbers once they exceed the safe integer range.
@@ -329,7 +338,12 @@ export class BotManager {
         this.error = 'Configure a Discord bot token and valid server ID.';
         return;
       }
-      for (const field of ['discord_admin_role_id', 'discord_member_role_id'] as const) {
+      for (const field of [
+        'discord_admin_role_id',
+        'discord_member_role_id',
+        'discord_emby_role_id',
+        'discord_jellyfin_role_id',
+      ] as const) {
         if (settings[field] != null && settings[field] !== '' && !snowflake(settings[field])) {
           this.error = 'Configure valid Discord role IDs.';
           return;
@@ -544,7 +558,9 @@ export class BotManager {
     } catch (error) {
       if (error instanceof Stopped) throw error;
       if (isMissingMember(error))
-        throw new BotError('The recipient is no longer a member of the configured Discord server.');
+        throw new MissingMember(
+          'The recipient is no longer a member of the configured Discord server.',
+        );
       throw new BotError(
         'Discord membership could not be verified. Check bot access and the configured server.',
       );
@@ -571,6 +587,154 @@ export class BotManager {
   }
   async validateRecipient(userId: string, requireMembership = true): Promise<void> {
     await this.recipientIdentity(userId, requireMembership);
+  }
+
+  /** Fetch role permissions and our own role hierarchy immediately before use. */
+  private async tagRoleContext() {
+    const guild = this.guild();
+    const client = this.client;
+    const settings = this.settings;
+    const botId = snowflake(client?.user?.id);
+    if (!botId) throw new BotError('The Discord bot identity is unavailable. Reconnect the bot.');
+    try {
+      const roles = await this.wait(guild.roles.fetch(), 20_000);
+      const bot = await this.fetchMember(botId);
+      this.checkActive();
+      if (client !== this.client || settings !== this.settings) throw new Stopped();
+      return {
+        guild,
+        client,
+        settings,
+        roles,
+        bot,
+        canManageRoles: bot.permissions.has(PermissionFlagsBits.ManageRoles),
+      };
+    } catch (error) {
+      if (error instanceof Stopped || error instanceof BotError) throw error;
+      throw new BotError('Discord roles could not be verified. Check bot access and try again.');
+    }
+  }
+
+  private manageableTagRole(
+    role: Role,
+    context: Awaited<ReturnType<BotManager['tagRoleContext']>>,
+  ): boolean {
+    const { guild, bot, settings, canManageRoles } = context;
+    return (
+      canManageRoles &&
+      role.guild.id === guild.id &&
+      role.id !== guild.id &&
+      role.id !== snowflake(settings.discord_admin_role_id) &&
+      role.id !== snowflake(settings.discord_member_role_id) &&
+      !role.managed &&
+      role.permissions.bitfield === 0n &&
+      !!bot.roles.highest &&
+      role.comparePositionTo(bot.roles.highest) < 0
+    );
+  }
+
+  async listTagRoles(): Promise<{ roles: DiscordTagRole[]; can_manage_roles: boolean }> {
+    const context = await this.tagRoleContext();
+    return {
+      roles: [...context.roles.values()]
+        .filter((role) => snowflake(role.id) && typeof role.name === 'string')
+        .map((role) => ({
+          id: role.id,
+          name: role.name,
+          manageable: this.manageableTagRole(role, context),
+        }))
+        .sort(
+          (left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
+        ),
+      can_manage_roles: context.canManageRoles,
+    };
+  }
+
+  async memberTagState(
+    userId: string,
+  ): Promise<{ id: string; username: string; roles: string[] } | null> {
+    let member: GuildMember;
+    try {
+      member = await this.fetchMember(userId);
+    } catch (error) {
+      // Only a confirmed missing-member REST response is safe to skip. An outage
+      // or permission error must still stop a review instead of implying absence.
+      if (error instanceof MissingMember) return null;
+      throw error;
+    }
+    if (
+      !recipientEligible(member.guild.id, this.settings.discord_guild_id, {
+        bot: member.user.bot,
+        roleIds: member.roles.cache.keys(),
+      })
+    )
+      throw new BotError('Organizational roles can only be applied to human server members.');
+    return { id: member.id, username: member.user.username, roles: [...member.roles.cache.keys()] };
+  }
+
+  async updateTagRoles(userId: string, add: string[], remove: string[]): Promise<void> {
+    if (
+      !Array.isArray(add) ||
+      !Array.isArray(remove) ||
+      add.length > 2 ||
+      remove.length > 2 ||
+      [...add, ...remove].some((id) => typeof id !== 'string' || snowflake(id) !== id) ||
+      new Set([...add, ...remove]).size !== add.length + remove.length
+    )
+      throw new BotError('Select distinct configured organizational roles.');
+    const context = await this.tagRoleContext();
+    const configured = [
+      context.settings.discord_emby_role_id,
+      context.settings.discord_jellyfin_role_id,
+    ].filter((id): id is string => typeof id === 'string' && id !== '');
+    if (
+      !configured.length ||
+      new Set(configured).size !== configured.length ||
+      [...add, ...remove].some((id) => !configured.includes(id))
+    )
+      throw new BotError(
+        'Only the distinct Emby and Jellyfin organizational roles can be updated.',
+      );
+    // Validate every configured role before writing, including removals. An unsafe role
+    // configuration must never repurpose a subscription or administrator role.
+    for (const id of configured) {
+      const role = context.roles.get(id);
+      if (!role || !this.manageableTagRole(role, context))
+        throw new BotError(
+          'Organizational roles must have no server permissions, be below the bot’s highest role, and differ from admin and subscription roles. The bot needs Manage Roles permission.',
+        );
+    }
+    const member = await this.fetchMember(userId);
+    if (
+      !recipientEligible(member.guild.id, context.guild.id, {
+        bot: member.user.bot,
+        roleIds: member.roles.cache.keys(),
+      })
+    )
+      throw new BotError('Organizational roles can only be applied to human server members.');
+    try {
+      // Use Discord's individual role endpoints, never a replacement member role list.
+      // This leaves subscription, family, and every other unrelated role untouched.
+      for (const id of add) {
+        this.checkActive();
+        if (this.client !== context.client || this.settings !== context.settings)
+          throw new Stopped();
+        if (!member.roles.cache.has(id))
+          await this.wait(member.roles.add(id, 'Jellyport media account organization'), 20_000);
+      }
+      for (const id of remove) {
+        this.checkActive();
+        if (this.client !== context.client || this.settings !== context.settings)
+          throw new Stopped();
+        if (member.roles.cache.has(id))
+          await this.wait(member.roles.remove(id, 'Jellyport media account organization'), 20_000);
+      }
+    } catch (error) {
+      if (error instanceof Stopped) throw error;
+      throw new BotError(
+        'Discord organizational roles could not be updated. Preview again before retrying.',
+      );
+    }
   }
 
   async searchMembers(query: string): Promise<DiscordMemberSearchResult> {
@@ -727,13 +891,14 @@ export class BotManager {
     username: string,
     password: string,
     serverUrl: string,
+    requireMembership = true,
   ): Promise<void> {
     const member = await this.fetchMember(userId);
     if (
       !recipientEligible(member.guild.id, this.settings.discord_guild_id, {
         bot: member.user.bot,
         roleIds: member.roles.cache.keys(),
-        memberRoleId: this.settings.discord_member_role_id,
+        memberRoleId: requireMembership ? this.settings.discord_member_role_id : undefined,
       })
     )
       throw new BotError(
@@ -767,8 +932,9 @@ export class BotManager {
     username: string,
     password: string,
     serverUrl: string,
+    requireMembership = true,
   ): Promise<void> {
-    return this.sendCredentials(userId, username, password, serverUrl);
+    return this.sendCredentials(userId, username, password, serverUrl, requireMembership);
   }
 
   private async prepare(interaction: ChatInputCommandInteraction): Promise<void> {
@@ -821,7 +987,10 @@ export class BotManager {
     let message: string;
     try {
       await this.prepare(interaction);
-      const identity = await this.recipientIdentity(user.id);
+      const identity = await this.recipientIdentity(
+        user.id,
+        this.service.recipientRequiresSubscription?.(user.id) ?? true,
+      );
       const mapping = !this.service.provisionMembership
         ? this.service.resolveDiscordMapping?.(identity.id)
         : null;
@@ -859,7 +1028,10 @@ export class BotManager {
     let message: string;
     try {
       await this.prepare(interaction);
-      const identity = await this.recipientIdentity(user.id);
+      const identity = await this.recipientIdentity(
+        user.id,
+        this.service.recipientRequiresSubscription?.(user.id) ?? true,
+      );
       const proposedMappings = this.service.resolveDiscordMappings
         ? this.service.resolveDiscordMappings(identity.id)
         : [this.service.resolveDiscordMapping?.(identity.id)].filter(

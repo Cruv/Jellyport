@@ -16,6 +16,7 @@ import UserMappingsPage from './UserMappingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import AccountRolesPage from './AccountRolesPage';
 import MembershipsPage from './MembershipsPage';
+import UserDirectoryPage from './UserDirectoryPage';
 import {
   AccountsPage,
   ActivityPage,
@@ -46,6 +47,7 @@ import {
 
 const pages: Record<Page, { title: string; icon: string }> = {
   overview: { title: 'Overview', icon: 'grid' },
+  users: { title: 'Users', icon: 'users' },
   migrate: { title: 'Migrate users', icon: 'migrate' },
   mappings: { title: 'User mappings', icon: 'link' },
   roles: { title: 'Account roles', icon: 'shield' },
@@ -267,7 +269,7 @@ export default function App() {
             setUsers(listed);
             setSettings(configuration);
           }
-        } else if (target === 'memberships') {
+        } else if (target === 'memberships' || target === 'users') {
           const value = await api<Settings>('/api/settings');
           if (version === loadVersion.current) setSettings(value);
         } else if (target === 'accounts') {
@@ -581,6 +583,10 @@ export default function App() {
         templateUserId={settings?.template_user_id}
         defaultRoleId={settings?.default_role_id}
       />
+    );
+  else if (page === 'users' && settings)
+    content = (
+      <UserDirectoryPage settings={settings} api={api} notify={notify} navigate={navigate} />
     );
   else if (page === 'memberships' && settings)
     content = <MembershipsPage settings={settings} api={api} notify={notify} created={created} />;

@@ -15,15 +15,19 @@ export const DEFAULT_MEMBERSHIP_TIERS: MembershipTier[] = [
   { id: 'brigantine', name: 'Brigantine', plan_name: 'Brigantine Crewman Plan', account_limit: 2 },
   { id: 'galleon', name: 'Galleon', plan_name: 'Galleon Crewman Plan', account_limit: 3 },
 ];
+export type MembershipAccessMode = 'subscription' | 'complimentary';
 export interface MembershipInput {
   discord_user_id: string;
   base_username: string;
   tier_id: string;
   account_limit: number;
+  /** Omitted legacy inputs retain subscription-managed behavior. */
+  access_mode?: MembershipAccessMode;
   active?: boolean;
   inactive_reason?: 'cancel' | 'expire';
 }
 export interface Membership extends MembershipInput {
+  access_mode: MembershipAccessMode;
   server_url: string;
   server_id?: string;
   revision: string;
@@ -107,6 +111,8 @@ function validateInput(value: MembershipInput): void {
     typeof value.discord_user_id !== 'string' ||
     !/^[0-9]{5,22}$/.test(value.discord_user_id) ||
     !tierId(value.tier_id) ||
+    (value.access_mode !== undefined &&
+      !['subscription', 'complimentary'].includes(value.access_mode)) ||
     (value.active !== undefined && typeof value.active !== 'boolean') ||
     (value.inactive_reason !== undefined && !['cancel', 'expire'].includes(value.inactive_reason))
   )
@@ -152,6 +158,7 @@ export class Memberships {
       base_username: value.base_username,
       tier_id: value.tier_id,
       account_limit: value.account_limit,
+      access_mode: value.access_mode ?? 'subscription',
       active: value.active ?? true,
       ...(value.active === false && value.inactive_reason
         ? { inactive_reason: value.inactive_reason }
@@ -213,6 +220,7 @@ export class Memberships {
         existing.base_username === input.base_username &&
         existing.tier_id === input.tier_id &&
         existing.account_limit === input.account_limit &&
+        existing.access_mode === (input.access_mode ?? 'subscription') &&
         existing.active === (input.active ?? true) &&
         existing.inactive_reason === (input.active === false ? input.inactive_reason : undefined)
       ) {
@@ -224,6 +232,7 @@ export class Memberships {
         base_username: input.base_username,
         tier_id: input.tier_id,
         account_limit: input.account_limit,
+        access_mode: input.access_mode ?? 'subscription',
         active: input.active ?? true,
         ...(input.active === false && input.inactive_reason
           ? { inactive_reason: input.inactive_reason }

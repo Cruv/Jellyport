@@ -446,11 +446,23 @@ export function AccountsPage({
   const [approved, setApproved] = useState(false);
   const [recoveryRecipient, setRecoveryRecipient] = useState('');
   const recoveryVersion = useRef(0);
+  const mounted = useRef(true);
+  const busyRef = useRef(false);
+  const controllers = useRef(new Set<AbortController>());
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      recoveryVersion.current++;
+      controllers.current.forEach((controller) => controller.abort());
+    };
+  }, []);
   const ready =
     overview.connections.jellyfin.connected &&
     (settings.default_role_id || settings.template_user_id);
   async function create(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (busyRef.current) return;
     const form = event.currentTarget;
     const values = new FormData(form);
     const username = String(values.get('username') || '').trim();
@@ -458,6 +470,9 @@ export function AccountsPage({
       (form.elements.namedItem('username') as HTMLInputElement).focus();
       return;
     }
+    busyRef.current = true;
+    const controller = new AbortController();
+    controllers.current.add(controller);
     setBusy('create');
     try {
       const job = await api<Job>('/api/accounts', {
@@ -468,21 +483,30 @@ export function AccountsPage({
             String(values.get('discord_user_id') || values.get('discord_manual_id') || '').trim() ||
             undefined,
         },
+        signal: controller.signal,
       });
+      if (!mounted.current || controller.signal.aborted) return;
       form.reset();
       setAccountUsername('');
       setAccountMember(null);
       created(job);
       notify('Account creation started.');
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Account could not be created.', true);
+      if (mounted.current && !controller.signal.aborted)
+        notify(error instanceof Error ? error.message : 'Account could not be created.', true);
     } finally {
-      setBusy('');
+      controllers.current.delete(controller);
+      busyRef.current = false;
+      if (mounted.current) setBusy('');
     }
   }
   async function inspect(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (busyRef.current) return;
     const values = new FormData(event.currentTarget);
+    const controller = new AbortController();
+    controllers.current.add(controller);
+    busyRef.current = true;
     const version = ++recoveryVersion.current;
     setRecovery(null);
     setApproved(false);
@@ -490,21 +514,28 @@ export function AccountsPage({
     try {
       const result = await api<Recovery>(
         `/api/accounts/recovery?username=${encodeURIComponent(String(values.get('username') || '').trim())}`,
+        { signal: controller.signal },
       );
-      if (version === recoveryVersion.current) {
+      if (mounted.current && !controller.signal.aborted && version === recoveryVersion.current) {
         setRecovery(result);
         setRecoveryRecipient(
           String(values.get('discord_user_id') || values.get('discord_manual_id') || '').trim(),
         );
       }
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Account inspection failed.', true);
+      if (mounted.current && !controller.signal.aborted)
+        notify(error instanceof Error ? error.message : 'Account inspection failed.', true);
     } finally {
-      setBusy('');
+      controllers.current.delete(controller);
+      busyRef.current = false;
+      if (mounted.current) setBusy('');
     }
   }
   async function recover() {
-    if (!approved || !recovery?.eligible || !recovery.target_user_id) return;
+    if (busyRef.current || !approved || !recovery?.eligible || !recovery.target_user_id) return;
+    const controller = new AbortController();
+    controllers.current.add(controller);
+    busyRef.current = true;
     setBusy('recover');
     try {
       const job = await api<Job>('/api/accounts/recover', {
@@ -514,15 +545,20 @@ export function AccountsPage({
           target_user_id: recovery.target_user_id,
           discord_user_id: recoveryRecipient || undefined,
         },
+        signal: controller.signal,
       });
+      if (!mounted.current || controller.signal.aborted) return;
       setRecovery(null);
       setApproved(false);
       created(job);
       notify('Account recovery started.');
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Account recovery failed.', true);
+      if (mounted.current && !controller.signal.aborted)
+        notify(error instanceof Error ? error.message : 'Account recovery failed.', true);
     } finally {
-      setBusy('');
+      controllers.current.delete(controller);
+      busyRef.current = false;
+      if (mounted.current) setBusy('');
     }
   }
   return (
@@ -545,7 +581,7 @@ export function AccountsPage({
           <div className="panel-header">
             <div>
               <h2>Create a fresh account</h2>
-              <p>For new members without an Emby account.</p>
+              <p>For new members, family, and children without an Emby account.</p>
             </div>
             <span className="server-icon jellyfin">
               <Icon name="userPlus" />
@@ -579,6 +615,7 @@ export function AccountsPage({
                 suggestedQuery={accountUsername}
                 disabled={!!busy}
                 label="Discord member (optional)"
+                allowInactive
                 id="account-discord"
                 inputName="discord_user_id"
               />
@@ -586,6 +623,11 @@ export function AccountsPage({
                 {overview.connections.discord.connected
                   ? 'Jellyport will privately message this member with their credentials.'
                   : 'Connect your Discord bot in Settings to enable private account delivery.'}
+              </p>
+              <p className="subtle text-small">
+                Leave Discord blank for an independent, admin-managed account with no subscription
+                requirement. For non-paying Discord members, save complimentary access in
+                Memberships first.
               </p>
               <ManualDiscordId id="account-manual-discord" disabled={!!busy || !!accountMember} />
               <Callout

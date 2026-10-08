@@ -18,6 +18,10 @@ export interface Settings {
   discord_guild_id: string;
   discord_admin_role_id: string;
   discord_member_role_id: string;
+  discord_emby_role_id?: string;
+  discord_jellyfin_role_id?: string;
+  discord_auto_role_sync?: boolean;
+  discord_emby_only_role?: boolean;
   discord_application_id: string;
   discord_subscription_channel_id: string;
   discord_subscription_bot_id: string;
@@ -42,6 +46,10 @@ export const DEFAULT_SETTINGS: Settings = {
   discord_guild_id: '',
   discord_admin_role_id: '',
   discord_member_role_id: '',
+  discord_emby_role_id: '',
+  discord_jellyfin_role_id: '',
+  discord_auto_role_sync: false,
+  discord_emby_only_role: true,
   discord_application_id: '',
   discord_subscription_channel_id: '',
   discord_subscription_bot_id: '',

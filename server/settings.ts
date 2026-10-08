@@ -43,6 +43,8 @@ export function validateSettings(input: unknown): asserts input is Settings {
     'discord_guild_id',
     'discord_admin_role_id',
     'discord_member_role_id',
+    'discord_emby_role_id',
+    'discord_jellyfin_role_id',
     'discord_application_id',
     'discord_subscription_channel_id',
     'discord_subscription_bot_id',
@@ -50,12 +52,34 @@ export function validateSettings(input: unknown): asserts input is Settings {
     if (settings[key] && !snowflake.test(settings[key] as string))
       throw new ServiceError(`${key} must be a Discord numeric ID.`);
   }
+  const tagRoles = [settings.discord_emby_role_id, settings.discord_jellyfin_role_id].filter(
+    Boolean,
+  );
+  if (
+    new Set(tagRoles).size !== tagRoles.length ||
+    tagRoles.some((role) =>
+      [
+        settings.discord_guild_id,
+        settings.discord_admin_role_id,
+        settings.discord_member_role_id,
+      ].includes(role),
+    )
+  )
+    throw new ServiceError(
+      'Organization roles must be distinct from each other, the subscriber role, and the administrator role.',
+    );
+  if (settings.discord_auto_role_sync && (!settings.discord_enabled || tagRoles.length !== 2))
+    throw new ServiceError('Automatic organization requires Discord and both organization roles.');
   const mappings = settings.path_mappings;
-  validateMembershipTiers(
+  const tiers = validateMembershipTiers(
     settings.membership_tiers === undefined
       ? DEFAULT_SETTINGS.membership_tiers
       : settings.membership_tiers,
   );
+  if (tiers.some((tier) => tier.id.toLowerCase() === 'complimentary'))
+    throw new ServiceError(
+      'The complimentary tier ID is reserved for administrator-managed access.',
+    );
   if (!Array.isArray(mappings) || mappings.length > 20)
     throw new ServiceError('Provide at most 20 path mappings.');
   for (const item of mappings) {

@@ -1,6 +1,6 @@
 # Jellyport
 
-Jellyport is a self-hosted web app for moving one or several users from Emby to Jellyfin, creating accounts with saved permission and preference roles, and optionally delivering new credentials through Discord. One Discord membership can own up to three Jellyfin accounts. It also provides an administrator review queue for MEE6 membership announcements and Discord membership role changes, with optional automatic provisioning and access removal.
+Jellyport is a self-hosted web app for moving one or several users from Emby to Jellyfin, creating accounts with saved permission and preference roles, and optionally delivering new credentials through Discord. One Discord owner can have up to three Jellyfin accounts through a paid subscription or complimentary access. Independent accounts do not require Discord or a subscription. It also provides an administrator review queue for MEE6 membership announcements and Discord membership role changes, with optional automatic provisioning and access removal.
 
 The app uses TypeScript throughout: React/Vite for the web interface, Fastify on Node.js for the API, discord.js for the optional bot, and SQLite for encrypted settings, account links, audit records, and queued jobs. Docker packages the built interface and API together.
 
@@ -148,13 +148,31 @@ Mappings are encrypted and scoped to the configured servers. Each source and des
 
 ## Create accounts and deliver passwords
 
-Use the account creation form for a new member. With a connected Discord bot, search for and select the member; their actual Discord username and ID fill in automatically. The same member picker is available in migration previews and incomplete-account recovery. Numeric IDs remain available under Advanced details when needed. Jellyport uses the actual username (`member.user.username`), rather than a server nickname or display name.
+Use the account creation form for a new member, family member, or child. Leave Discord blank for an independent, administrator-managed account with no subscription requirement; its generated password is available through the one-time reveal after creation. For a non-paying Discord member, save complimentary access under **Memberships** before creating or linking their account. With a connected Discord bot, search for and select the member; their actual Discord username and ID fill in automatically. The same member picker is available in migration previews and incomplete-account recovery. Numeric IDs remain available under Advanced details when needed. Jellyport uses the actual username (`member.user.username`), rather than a server nickname or display name.
 
 Member search matches username and server-nickname prefixes. Results show the actual `@username`, display name, and server nickname so you can select the correct person. It does not guess ownership from a similar name or search by display name. Searches start when you interact with the picker; opening a bulk preview does not query Discord for every user. Member search does not require an extra privileged Gateway intent.
 
-For the first Discord link, a primary account's username must match the member's current Discord username exactly unless an administrator has saved a mapping with that verified Discord ID. Additional accounts use the owner's numbered account slots, or their approved mappings. For mapped existing Emby members, use migration or the membership provisioning workflow so their approved destination names and history are used. Jellyport does not guess ownership from similar names or rename accounts automatically.
+For a newly created first Discord link, a primary account's username must match the member's current Discord username exactly unless an administrator has saved a mapping with that verified Discord ID. An administrator can also select an existing Jellyfin account by its ID under **Users → Link Discord owner**, including an account with a different name. This explicit association preserves its password, policy, preferences, and personal data; it does not perform a migration or re-enable the account. Additional accounts use the owner's numbered account slots, or their approved mappings. For mapped existing Emby members, use migration or the membership provisioning workflow so their approved destination names and history are used. Jellyport does not guess ownership from similar names or rename accounts automatically.
 
 When a recipient is selected, account provisioning stores the Discord user ID and Jellyfin account ID as a durable link. Membership actions use this link even if the member later changes their Discord username.
+
+### Paid, complimentary, and independent access
+
+**Memberships** has two access policies. Subscription-managed members follow your reviewed or automatic MEE6/Discord membership events. Complimentary members have an administrator-controlled allowance of 1–3 accounts. Subscription cancellations, expiry, missing subscriber roles, and leaving Discord never revoke complimentary media access. The recipient must still be a current human member of the configured Discord server for bot commands or credential delivery; leaving Discord does not disable their media accounts.
+
+**Save access policy** records the selected policy and allowance without creating, disabling, enabling, or changing a media account. Use it to protect an existing Emby-only family member before any migration or account linking. **Review membership update** shows account names and access changes; confirming queues creation, migration, or restoration of entitled slots and disables extras outside the reviewed allowance. Complimentary access is saved before that queue request, so the billing exemption remains even if provisioning needs attention.
+
+Independent accounts have no Discord owner and remain administrator managed. Create them with Discord blank, or migrate their Emby data without selecting a Discord recipient. Each account keeps its own history and password. There is no requirement to invent a Discord identity for children or family members.
+
+### Organize users and Discord roles
+
+The **Users** directory searches media and Discord usernames and filters by server presence and access policy. Same-name accounts may appear together for display; this pairing does not establish ownership. Only explicit account links and approved user mappings can authorize Discord tagging or membership actions. For an existing Jellyfin-only account, choose **Link Discord owner**, select the actual account and Discord member, then confirm its slot. Save a complimentary policy first for a non-paying owner. For an Emby-only account or a migration with different names, use **User mappings** to approve the source, destination name, Discord owner, and slot.
+
+Discord organization is optional and starts with manual review. Under **Users → Discord organization roles**, select existing roles from the bot's server; individual role IDs do not need to be entered. Roles must have no server permissions and be below the bot's highest role. Use dedicated tag roles that are not referenced by channel permission overwrites; Jellyport checks guild-level role permissions, not channel overwrites. The bot needs Manage Roles in addition to its normal channel permissions. If it lacks this permission, **Users → Update bot permissions** opens the server-generated invite with Manage Roles requested, allowing you to update the installation before selecting roles. After organization roles are configured, the generated invite URL includes Manage Roles for inviting or updating the bot.
+
+By default, the Emby role marks owners with only Emby accounts and the Jellyfin role marks owners with a Jellyfin account, including owners who still have both. Turn off **Reserve the Emby role for owners who have only Emby accounts** to assign both roles to owners with accounts on both servers. Tags reflect account existence, including disabled accounts; they do not establish billing eligibility or grant media access. Other Discord roles, including subscriber roles, are preserved.
+
+Save the organization settings and use **Preview role changes** before applying. A preview expires after five minutes, can be applied once, and is rejected if its configuration or reviewed account associations have changed. Optional automatic synchronization checks every five minutes. Unlinked accounts and members confirmed to have left Discord are skipped; saved media ownership and access are retained. Missing media API credentials, unavailable servers, or failed Discord checks stop synchronization instead of treating unavailable account data as an empty server and removing roles.
 
 ### One membership with several accounts
 
@@ -168,7 +186,7 @@ Use **Memberships** to select a Discord member and review their account allowanc
 
 Each slot is a separate Jellyfin account with its own password and personal data, owned by the same verified Discord ID. New credentials are sent privately to that Discord member. New accounts receive the configured default account role or legacy template. Existing linked accounts keep their passwords, history, favorites, playlists, and preferences.
 
-An upgrade fills the missing entitled slots, migrating exact matching Emby accounts or approved slot mappings before creating fresh accounts. Existing unrelated Jellyfin usernames are not claimed automatically. A downgrade disables slots outside the new allowance and keeps their data. Upgrading later restores those same accounts if Jellyport disabled them. Applying a cancellation or expiry event disables every linked slot; no account is deleted. Accounts disabled independently by an administrator require review instead of automatic re-enabling.
+An upgrade fills the missing entitled slots, migrating exact matching Emby accounts or approved slot mappings before creating fresh accounts. Existing unrelated Jellyfin usernames are not claimed automatically. A downgrade disables slots outside the new allowance and keeps their data. Upgrading later restores those same accounts if Jellyport disabled them. For subscription-managed members, applying a cancellation or expiry event disables every linked slot; no account is deleted. Complimentary members are exempt from these billing actions. Accounts disabled independently by an administrator require review instead of automatic re-enabling.
 
 Tier names, exact trusted MEE6 plan names, and account limits are configurable in Settings. Each tier supports 1–3 accounts. Subscription plan names are matched exactly apart from capitalization and surrounding whitespace; unknown plans remain for review. A role-only event has no billing tier, so it preserves a saved tier or uses an initial one-account tier for a new member. If no one-account tier is configured, select a tier explicitly. Membership tiers control account counts; Jellyport account roles remain independent permission and preference presets.
 
@@ -195,18 +213,18 @@ Follow [Discord setup](docs/discord-setup.md) to configure the bot, command perm
 
 Recognized events appear in the subscription review queue. Apply or ignore them as an administrator. An unresolved username remains for review and cannot automatically change an account; use a verified manual account action instead.
 
-Automatic provisioning and automatic disabling are separate switches, both off by default. Provisioning fills every account slot included in the resolved tier, using exact matching Emby accounts or approved slot mappings when available and creating fresh accounts otherwise. Automatic tier downgrades require both switches; with only automatic provisioning enabled, downgrades remain for review. Manually approving a tier update applies its access changes regardless of those switches. An existing Jellyfin account without a Discord link requires an admin-approved migration before subscription automation can claim it. A member with multiple saved Emby mappings must specify `emby_username` when using `/jellyport migrate`.
+Automatic provisioning and automatic disabling are separate switches, both off by default. Provisioning fills every account slot included in the resolved tier, using exact matching Emby accounts or approved slot mappings when available and creating fresh accounts otherwise. Automatic tier downgrades require both switches; with only automatic provisioning enabled, downgrades remain for review. Manually approving a tier update applies its access changes regardless of those switches. An existing Jellyfin account without a Discord link requires an explicit **Users → Link Discord owner** association or an admin-approved migration before subscription automation can manage it. A member with multiple saved Emby mappings must specify `emby_username` when using `/jellyport migrate`.
 
-Cancellation announcements default to review because cancellation can happen before paid access expires. Role removal or departure is treated as expiry; linked memberships are checked on startup/reconnect and every five minutes when role events are enabled. With automatic provisioning also enabled, reconciliation scans current active-role members for unlinked subscribers, including members who joined during downtime. Enabling this combination can provision all currently eligible unlinked members. Immediate disabling on cancellation is an explicit additional option. An applied cancellation remains a hold until a fresh subscription or role-add event, or a manual membership update; routine reconciliation cannot undo it. Jellyport has no direct MEE6 billing API integration or paid-through date tracking.
+Cancellation announcements default to review because cancellation can happen before paid access expires. For subscription-managed members, role removal or departure is treated as expiry; linked memberships are checked on startup/reconnect and every five minutes when role events are enabled. With automatic provisioning also enabled, reconciliation scans current active-role members for unlinked subscribers, including members who joined during downtime. Enabling this combination can provision all currently eligible unlinked members. Immediate disabling on cancellation is an explicit additional option. An applied cancellation remains a hold until a fresh subscription or role-add event, or a manual membership update; routine reconciliation cannot undo it. Jellyport has no direct MEE6 billing API integration or paid-through date tracking.
 
-Lifecycle actions disable accounts rather than deleting them. Passwords and watched history are preserved. Returning members can regain access to accounts that Jellyport disabled; accounts disabled independently by an administrator are not automatically re-enabled.
+Subscription lifecycle actions apply only to subscription-managed members and disable accounts rather than deleting them. Complimentary and independent accounts are exempt. Passwords and watched history are preserved. Returning members can regain access to accounts that Jellyport disabled; accounts disabled independently by an administrator are not automatically re-enabled.
 
 ### Planned automation improvements
 
 The most useful next steps for reducing administrator input are:
 
 1. **Bulk mapping suggestions with approval:** suggest matching Emby, Jellyfin, and Discord accounts together, then approve clear matches in one review while retaining explicit handling for exceptions.
-2. **Role and channel pickers:** discover the server's roles and channels during setup instead of requiring their numeric IDs.
+2. **More role and channel pickers:** extend the existing organization-role selectors to subscription/admin roles and announcement channels during setup.
 3. **An exception dashboard:** bring unresolved identities, failed credential delivery, interrupted jobs, and membership-check failures into one actionable queue.
 4. **Scheduled migration catch-up:** repeat the merge for selected linked users until their move is complete, preserving newer Jellyfin activity.
 5. **Paid-through access and tier-specific settings:** extend account-count tiers with saved account-role selection, verified billing status, renewal dates, and grace periods.
@@ -286,10 +304,15 @@ The browser uses authenticated session cookies. Mutating API requests require th
 | Queue selected role setting groups for assigned users | `POST /api/account-roles/apply` |
 | Test server connections | `POST /api/connections/test` |
 | List source and destination users | `GET /api/users` |
+| Read the combined user directory | `GET /api/user-directory` |
+| Explicitly link an existing Jellyfin account to a Discord owner | `POST /api/accounts/link` |
 | Search Discord server members | `GET /api/discord/members?query=USERNAME_OR_NICKNAME_PREFIX` |
 | Preview or queue migrations | `POST /api/migrations/preview`, `POST /api/migrations` |
 | Create a new account | `POST /api/accounts` |
 | Read managed memberships or provision a member's account allowance | `GET /api/memberships`, `POST /api/memberships/provision` |
+| Save a paid or complimentary access policy without media account changes | `POST /api/memberships/access` |
+| Discover safe Discord organization roles | `GET /api/discord/tag-roles` |
+| Preview or apply Discord organization role changes | `POST /api/discord/tags/preview`, `POST /api/discord/tags/apply` |
 | Inspect or recover an incomplete creation | `GET /api/accounts/recovery`, `POST /api/accounts/recover` |
 | List or inspect jobs | `GET /api/jobs`, `GET /api/jobs/{job_id}` |
 | Consume retained credentials | `POST /api/jobs/{job_id}/credentials` |

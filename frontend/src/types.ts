@@ -1,5 +1,6 @@
 export type Page =
   | 'overview'
+  | 'users'
   | 'migrate'
   | 'mappings'
   | 'roles'
@@ -73,6 +74,7 @@ export interface MembershipLink {
   pending_disabled: number | null;
 }
 export interface Membership {
+  access_mode?: 'subscription' | 'complimentary';
   discord_user_id: string;
   base_username: string;
   tier_id: string;
@@ -252,11 +254,16 @@ export interface Settings {
   discord_subscription_bot_id: string;
   discord_message_events: boolean;
   discord_role_events: boolean;
+  discord_emby_role_id?: string;
+  discord_jellyfin_role_id?: string;
+  discord_auto_role_sync?: boolean;
+  discord_emby_only_role?: boolean;
   auto_provision: boolean;
   auto_disable: boolean;
   disable_on_cancel: boolean;
   membership_tiers?: MembershipTier[];
   bot_invite_url: string;
+  bot_organization_invite_url?: string;
 }
 export interface ApiOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
@@ -287,3 +294,31 @@ export const safeUrl = (value?: string) => {
     return '';
   }
 };
+
+export interface DirectoryAccount {
+  id: string;
+  name: string;
+  disabled: boolean;
+}
+export interface DirectoryUser {
+  id: string;
+  emby: DirectoryAccount[];
+  jellyfin: DirectoryAccount[];
+  discord_user_id: string | null;
+  discord_username: string | null;
+  access_mode: 'subscription' | 'complimentary' | 'standalone' | 'unlinked';
+  account_limit: number | null;
+  protected: boolean;
+}
+export interface DiscordTagRole {
+  id: string;
+  name: string;
+  manageable: boolean;
+}
+export interface DiscordTagPreview {
+  token: string;
+  changes: Array<{ discord_user_id: string; username: string; add: string[]; remove: string[] }>;
+  unchanged: number;
+  unlinked: number;
+  unavailable?: number;
+}

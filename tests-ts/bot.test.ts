@@ -156,6 +156,220 @@ async function fixture(extra: Partial<Settings> = {}) {
   return { service, admin, recipient, guild, client, manager, settings, factory };
 }
 
+function tagRole(
+  id: string,
+  name: string,
+  options: { position?: number; managed?: boolean; permissions?: bigint } = {},
+) {
+  const position = options.position ?? 2;
+  return {
+    id,
+    name,
+    guild: { id: '123' },
+    position,
+    managed: options.managed ?? false,
+    permissions: { bitfield: options.permissions ?? 0n },
+    comparePositionTo: vi.fn((other: { position: number }) => position - other.position),
+  };
+}
+
+async function roleFixture(extra: Partial<Settings> = {}) {
+  const base = await fixture({
+    discord_emby_role_id: '66',
+    discord_jellyfin_role_id: '77',
+    ...extra,
+  });
+  const roles = new Collection([
+    ['123', tagRole('123', '@everyone', { position: 0 })],
+    ['66', tagRole('66', 'Emby only')],
+    ['77', tagRole('77', 'Jellyfin')],
+    ['55', tagRole('55', 'Subscriber')],
+    ['99', tagRole('99', 'Administrator')],
+    ['10', tagRole('10', 'Bot', { position: 10, managed: true })],
+  ]);
+  const bot = member('10', 'jellyport_bot', { bot: true });
+  Object.assign(bot.roles, { highest: roles.get('10') });
+  bot.permissions.has.mockImplementation(() => true);
+  Object.assign(base.client, { user: { id: '10' } });
+  const roleManager = { fetch: vi.fn(async () => roles) };
+  Object.assign(base.guild, { roles: roleManager });
+  const target = member('22', 'family', { roles: ['66', '55', '44'] });
+  const targetRoles = {
+    add: vi.fn(async (_id: string, _reason: string) => target),
+    remove: vi.fn(async (_id: string, _reason: string) => target),
+    set: vi.fn(async () => target),
+  };
+  Object.assign(target.roles, targetRoles);
+  base.guild.members.fetch.mockImplementation(async (options) => {
+    if (options.user === '10') return bot;
+    if (options.user === '11') return base.admin;
+    return target;
+  });
+  return { ...base, roles, roleManager, bot, target, targetRoles };
+}
+
+describe('Discord organizational roles', () => {
+  it('lists current roles and marks only harmless roles below the bot as manageable', async () => {
+    const { manager, roles, roleManager, guild } = await roleFixture();
+    roles.set(
+      '88',
+      tagRole('88', 'Privileged', { permissions: PermissionFlagsBits.Administrator }),
+    );
+    roles.set('89', tagRole('89', 'High', { position: 11 }));
+    const result = await manager.listTagRoles();
+    expect(result.can_manage_roles).toBe(true);
+    expect(
+      result.roles
+        .filter((role) => role.manageable)
+        .map((role) => role.id)
+        .sort(),
+    ).toEqual(['66', '77']);
+    expect(
+      result.roles.every((role) => Object.keys(role).sort().join(',') === 'id,manageable,name'),
+    ).toBe(true);
+    expect(roleManager.fetch).toHaveBeenCalledOnce();
+    expect(guild.members.fetch).toHaveBeenCalledWith({ user: '10', force: true, cache: false });
+  });
+
+  it('reports missing Manage Roles permission without presenting roles as manageable', async () => {
+    const { manager, bot, targetRoles } = await roleFixture();
+    bot.permissions.has.mockReturnValue(false);
+    expect(await manager.listTagRoles()).toMatchObject({ can_manage_roles: false });
+    expect((await manager.listTagRoles()).roles.some((role) => role.manageable)).toBe(false);
+    await expect(manager.updateTagRoles('22', ['77'], ['66'])).rejects.toThrow('Manage Roles');
+    expect(targetRoles.add).not.toHaveBeenCalled();
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+  });
+
+  it('reads non-paying members and changes individual tags without replacing unrelated roles', async () => {
+    const { manager, target, targetRoles } = await roleFixture();
+    target.roles.cache.delete('55');
+    expect(await manager.memberTagState('22')).toEqual({
+      id: '22',
+      username: 'family',
+      roles: ['66', '44'],
+    });
+    await manager.updateTagRoles('22', ['77'], ['66']);
+    expect(targetRoles.add).toHaveBeenCalledExactlyOnceWith(
+      '77',
+      'Jellyport media account organization',
+    );
+    expect(targetRoles.remove).toHaveBeenCalledExactlyOnceWith(
+      '66',
+      'Jellyport media account organization',
+    );
+    expect(targetRoles.set).not.toHaveBeenCalled();
+    expect(target.roles.cache.has('44')).toBe(true);
+  });
+
+  it('skips confirmed departed members while preserving transport and permission failures', async () => {
+    const { manager, guild, targetRoles } = await roleFixture();
+    guild.members.fetch.mockRejectedValue({ code: 10007, status: 404 });
+    expect(await manager.memberTagState('22')).toBeNull();
+    guild.members.fetch.mockRejectedValue(new Error('PRIVATE-TOKEN transport outage'));
+    await expect(manager.memberTagState('22')).rejects.toThrow('membership could not be verified');
+    guild.members.fetch.mockRejectedValue({ code: 50013, status: 403 });
+    await expect(manager.memberTagState('22')).rejects.toThrow('membership could not be verified');
+    expect(targetRoles.add).not.toHaveBeenCalled();
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    'admin',
+    'subscriber',
+    'everyone',
+    'managed',
+    'privileged',
+    'higher',
+    'equal',
+    'missing',
+    'duplicate',
+  ])('rejects unsafe %s role configuration before making any writes', async (unsafe) => {
+    const extra: Partial<Settings> = {};
+    if (unsafe === 'admin') extra.discord_emby_role_id = '99';
+    if (unsafe === 'subscriber') extra.discord_emby_role_id = '55';
+    if (unsafe === 'everyone') extra.discord_emby_role_id = '123';
+    if (unsafe === 'duplicate') extra.discord_emby_role_id = '77';
+    const { manager, roles, targetRoles } = await roleFixture(extra);
+    if (unsafe === 'managed') roles.set('66', tagRole('66', 'Managed', { managed: true }));
+    if (unsafe === 'privileged')
+      roles.set('66', tagRole('66', 'Can send', { permissions: PermissionFlagsBits.SendMessages }));
+    if (unsafe === 'higher') roles.set('66', tagRole('66', 'Higher', { position: 11 }));
+    if (unsafe === 'equal') roles.set('66', tagRole('66', 'Equal', { position: 10 }));
+    if (unsafe === 'missing') roles.delete('66');
+    await expect(manager.updateTagRoles('22', ['77'], [])).rejects.toThrow(BotError);
+    expect(targetRoles.add).not.toHaveBeenCalled();
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [['55'], []],
+    [[], ['99']],
+    [['77', '77'], []],
+    [['77'], ['77']],
+    [['77', '66', '44'], []],
+    [['077'], []],
+    [['invalid'], []],
+  ])('rejects arbitrary or ambiguous role updates (%j %j)', async (add, remove) => {
+    const { manager, targetRoles } = await roleFixture();
+    await expect(manager.updateTagRoles('22', add, remove)).rejects.toThrow(BotError);
+    expect(targetRoles.add).not.toHaveBeenCalled();
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+  });
+
+  it('skips already satisfied changes and never writes tags for bots or other guilds', async () => {
+    const { manager, guild, bot, target, targetRoles } = await roleFixture();
+    await manager.updateTagRoles('22', ['66'], ['77']);
+    expect(targetRoles.add).not.toHaveBeenCalled();
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+    target.user.bot = true;
+    await expect(manager.memberTagState('22')).rejects.toThrow('human server members');
+    await expect(manager.updateTagRoles('22', ['77'], ['66'])).rejects.toThrow(
+      'human server members',
+    );
+    guild.members.fetch.mockImplementation(async (options) =>
+      options.user === '10' ? bot : member('22', 'outside', { guildId: '456' }),
+    );
+    await expect(manager.updateTagRoles('22', ['77'], ['66'])).rejects.toThrow(
+      'human server members',
+    );
+    expect(targetRoles.add).not.toHaveBeenCalled();
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+  });
+
+  it('redacts role API errors and stops before a later removal after an add failure', async () => {
+    const { manager, roleManager, targetRoles } = await roleFixture();
+    targetRoles.add.mockRejectedValue(new Error('SECRET-TOKEN'));
+    await expect(manager.updateTagRoles('22', ['77'], ['66'])).rejects.toThrow('Preview again');
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+    roleManager.fetch.mockRejectedValue(new Error('SECRET-TOKEN'));
+    await expect(manager.listTagRoles()).rejects.toThrow('roles could not be verified');
+    await manager
+      .listTagRoles()
+      .catch((error) => expect(String(error)).not.toContain('SECRET-TOKEN'));
+  });
+
+  it('aborts a stale role update when the bot connection changes during its verification', async () => {
+    const { manager, guild, settings, bot, target, targetRoles } = await roleFixture();
+    let finish!: (value: ReturnType<typeof member>) => void;
+    guild.members.fetch.mockImplementation(async (options) => {
+      if (options.user === '10') return bot;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    });
+    const pending = manager.updateTagRoles('22', ['77'], ['66']);
+    const assertion = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+    await manager.restart(settings);
+    await assertion;
+    finish(target);
+    await Promise.resolve();
+    expect(targetRoles.add).not.toHaveBeenCalled();
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+  });
+});
+
 describe('Discord authorization and identity', () => {
   it.each([
     ['123', '123', true, [], undefined, true],
@@ -745,6 +959,63 @@ describe('Bot lifecycle and commands', () => {
 });
 
 describe('Private credential delivery and membership', () => {
+  it('delivers complimentary credentials without a paid role while requiring a human guild member', async () => {
+    const { manager, guild } = await fixture();
+    const family = member('22', 'family', { roles: [] });
+    guild.members.fetch.mockResolvedValue(family);
+    await manager.sendCredentials(
+      '22',
+      'family',
+      'PRIVATE',
+      'https://jellyfin.example.test',
+      false,
+    );
+    expect(family.send).toHaveBeenCalledOnce();
+    await expect(
+      manager.sendCredentials('22', 'family', 'PRIVATE', 'https://jellyfin.example.test'),
+    ).rejects.toThrow('membership role');
+    const robot = member('22', 'robot', { roles: [], bot: true });
+    guild.members.fetch.mockResolvedValue(robot);
+    await expect(
+      manager.sendCredentials('22', 'family', 'PRIVATE', 'https://jellyfin.example.test', false),
+    ).rejects.toThrow('human server member');
+    expect(robot.send).not.toHaveBeenCalled();
+    const outsider = member('22', 'outside', { roles: [], guildId: '456' });
+    guild.members.fetch.mockResolvedValue(outsider);
+    await expect(
+      manager.sendCredentials('22', 'family', 'PRIVATE', 'https://jellyfin.example.test', false),
+    ).rejects.toThrow('human server member');
+    expect(outsider.send).not.toHaveBeenCalled();
+    guild.members.fetch.mockRejectedValue({ code: 10007, status: 404 });
+    await expect(
+      manager.sendCredentials('22', 'family', 'PRIVATE', 'https://jellyfin.example.test', false),
+    ).rejects.toThrow('no longer a member');
+  });
+
+  it.each(['create', 'migrate'])(
+    'uses the current service access policy for complimentary %s commands',
+    async (command) => {
+      const { manager, service, guild, admin } = await fixture();
+      const recipientRequiresSubscription = vi.fn(() => false);
+      Object.assign(service, { recipientRequiresSubscription });
+      guild.members.fetch.mockImplementation(async (options) =>
+        options.user === '11' ? admin : member('22', 'jlogan35', { roles: [] }),
+      );
+      if (command === 'create')
+        await manager.handleCreate(asInteraction(interaction()), { id: '22' });
+      else await manager.handleMigrate(asInteraction(interaction()), { id: '22' });
+      expect(recipientRequiresSubscription).toHaveBeenCalledWith('22');
+      if (command === 'create') expect(service.createAccount).toHaveBeenCalledOnce();
+      else expect(service.migrateUsers).toHaveBeenCalledOnce();
+      recipientRequiresSubscription.mockReturnValue(true);
+      if (command === 'create')
+        await manager.handleCreate(asInteraction(interaction()), { id: '22' });
+      else await manager.handleMigrate(asInteraction(interaction()), { id: '22' });
+      if (command === 'create') expect(service.createAccount).toHaveBeenCalledOnce();
+      else expect(service.migrateUsers).toHaveBeenCalledOnce();
+    },
+  );
+
   it('fetches membership again at delivery and rejects removed roles', async () => {
     const { manager, guild, recipient } = await fixture();
     await manager.validateRecipient('22');

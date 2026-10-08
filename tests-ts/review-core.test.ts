@@ -18,7 +18,13 @@ class MembershipBot implements BotAdapter {
     if (this.departed) throw new Error('Member departed');
     return { id, username: 'river' };
   }
-  async sendCredentials(..._args: string[]) {}
+  async sendCredentials(
+    _id: string,
+    _username: string,
+    _password: string,
+    _url: string,
+    _requireMembership = true,
+  ) {}
   async membershipActive(_id: string) {
     return this.active;
   }

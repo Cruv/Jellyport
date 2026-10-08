@@ -17,6 +17,7 @@ interface MembershipReview {
   member: DiscordMember;
   existing?: Membership;
   tier: MembershipTier;
+  accessMode: 'subscription' | 'complimentary';
   usernames: string[];
 }
 const message = (reason: unknown) =>
@@ -38,6 +39,8 @@ export default function MembershipsPage({
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [mappings, setMappings] = useState<UserMapping[]>([]);
   const [member, setMember] = useState<DiscordMember | null>(null);
+  const [accessMode, setAccessMode] = useState<'subscription' | 'complimentary'>('subscription');
+  const [complimentaryLimit, setComplimentaryLimit] = useState(1);
   const [tierId, setTierId] = useState(tiers[0]?.id || '');
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
@@ -88,7 +91,15 @@ export default function MembershipsPage({
   }, [reload]);
 
   const existing = memberships.find((item) => item.discord_user_id === member?.id);
-  const tier = tiers.find((item) => item.id === tierId);
+  const tier =
+    accessMode === 'complimentary'
+      ? {
+          id: 'complimentary',
+          name: 'Complimentary',
+          plan_name: '',
+          account_limit: complimentaryLimit,
+        }
+      : tiers.find((item) => item.id === tierId);
   const mappedSlots = mappings.filter((mapping) => mapping.discord_user_id === member?.id);
   const baseUsername =
     existing?.base_username ||
@@ -109,12 +120,16 @@ export default function MembershipsPage({
     setError('');
     const saved = memberships.find((item) => item.discord_user_id === value?.id);
     setTierId(saved?.tier_id || tiers[0]?.id || '');
+    if (saved) {
+      setAccessMode(saved.access_mode || 'subscription');
+      setComplimentaryLimit(saved.access_mode === 'complimentary' ? saved.account_limit : 1);
+    }
   }
   function showReview(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!member || !tier || !loaded || loading || busyRef.current) return;
     setError('');
-    setReview({ member, existing, tier: { ...tier }, usernames });
+    setReview({ member, existing, tier: { ...tier }, accessMode, usernames });
   }
   async function provision() {
     if (!review || busyRef.current) return;
@@ -124,6 +139,34 @@ export default function MembershipsPage({
     const controller = new AbortController();
     controllers.current.add(controller);
     try {
+      let current = review.existing;
+      if (
+        review.accessMode === 'complimentary' ||
+        (current?.access_mode === 'complimentary' && review.accessMode === 'subscription')
+      ) {
+        current = await api<Membership>('/api/memberships/access', {
+          method: 'POST',
+          body: {
+            discord_user_id: review.member.id,
+            access_mode: review.accessMode,
+            ...(review.accessMode === 'complimentary'
+              ? { account_limit: review.tier.account_limit }
+              : { tier_id: review.tier.id }),
+            ...(current?.revision ? { expected_revision: current.revision } : {}),
+          },
+          signal: controller.signal,
+        });
+        if (!mounted.current || controller.signal.aborted) return;
+        // Keep a failed provision retry bound to the policy that was just saved.
+        setMemberships((items) => [
+          ...items.filter((item) => item.discord_user_id !== review.member.id),
+          { ...current!, links: current!.links || review.existing?.links || [] },
+        ]);
+        setReview({
+          ...review,
+          existing: { ...current, links: current.links || review.existing?.links || [] },
+        });
+      }
       const job = await api<Job>('/api/memberships/provision', {
         method: 'POST',
         body: {
@@ -131,7 +174,7 @@ export default function MembershipsPage({
           tier_id: review.tier.id,
           expected_account_limit: review.tier.account_limit,
           expected_usernames: review.usernames,
-          ...(review.existing?.revision ? { expected_revision: review.existing.revision } : {}),
+          ...(current?.revision ? { expected_revision: current.revision } : {}),
         },
         signal: controller.signal,
       });
@@ -149,11 +192,43 @@ export default function MembershipsPage({
     }
   }
 
+  async function saveAccess() {
+    if (!member || !tier || !loaded || busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    setError('');
+    const controller = new AbortController();
+    controllers.current.add(controller);
+    try {
+      await api<Membership>('/api/memberships/access', {
+        method: 'POST',
+        body: {
+          discord_user_id: member.id,
+          access_mode: accessMode,
+          ...(accessMode === 'complimentary'
+            ? { account_limit: tier.account_limit }
+            : { tier_id: tier.id }),
+          ...(existing?.revision ? { expected_revision: existing.revision } : {}),
+        },
+        signal: controller.signal,
+      });
+      if (!mounted.current || controller.signal.aborted) return;
+      notify('Access policy saved. Media accounts have not been changed.');
+      await reload();
+    } catch (reason) {
+      if (mounted.current && !controller.signal.aborted) setError(message(reason));
+    } finally {
+      controllers.current.delete(controller);
+      busyRef.current = false;
+      if (mounted.current) setBusy(false);
+    }
+  }
+
   return (
     <>
       <Heading
         title="One membership, every entitled account."
-        description="Manage multiple Jellyfin accounts for the same Discord owner."
+        description="Manage paid and complimentary accounts for each Discord owner."
         actions={
           <button className="btn" onClick={() => void reload()} disabled={busy || loading}>
             <Icon name="refresh" /> Refresh
@@ -163,7 +238,8 @@ export default function MembershipsPage({
       <Callout icon="shield" title="Account access is reviewed before changing.">
         New accounts receive the default account role and their own generated password, delivered
         privately to the Discord owner. Downgrades disable extra accounts and preserve their data.
-        Upgrades can restore those same accounts when Jellyport disabled them.
+        Upgrades can restore those same accounts when Jellyport disabled them. Complimentary access
+        is managed by you and is exempt from subscription cancellation and renewal automation.
       </Callout>
       {error && !review && (
         <div className="error-block" role="alert">
@@ -183,36 +259,77 @@ export default function MembershipsPage({
           </div>
           <div className="panel-body">
             <form className="form-stack" onSubmit={showReview}>
+              <div className="field">
+                <label htmlFor="membership-access-mode">Access policy</label>
+                <select
+                  id="membership-access-mode"
+                  value={accessMode}
+                  disabled={busy || loading}
+                  onChange={(event) =>
+                    setAccessMode(event.target.value as 'subscription' | 'complimentary')
+                  }
+                >
+                  <option value="subscription">Subscription managed</option>
+                  <option value="complimentary">Complimentary · admin managed</option>
+                </select>
+                <small>
+                  Use complimentary access for family and other non-paying Discord members. Users
+                  without Discord can have independent accounts from Create account.
+                </small>
+              </div>
               <DiscordMemberPicker
                 api={api}
                 value={member}
                 onChange={selectMember}
                 disabled={busy || loading}
+                allowInactive={accessMode === 'complimentary'}
               />
-              <div className="field">
-                <label htmlFor="membership-tier">Membership tier</label>
-                <select
-                  id="membership-tier"
-                  value={tierId}
-                  onChange={(event) => setTierId(event.target.value)}
-                  disabled={busy || loading}
-                  required
-                >
-                  {!tiers.some((item) => item.id === tierId) && (
-                    <option value="">Select a configured tier</option>
-                  )}
-                  {tiers.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.name} · {item.account_limit}{' '}
-                      {item.account_limit === 1 ? 'account' : 'accounts'}
-                    </option>
-                  ))}
-                </select>
-                <small>
-                  Tier names, trusted subscription plan names, and account limits can be changed in
-                  Settings.
-                </small>
-              </div>
+              {accessMode === 'subscription' ? (
+                <div className="field">
+                  <label htmlFor="membership-tier">Membership tier</label>
+                  <select
+                    id="membership-tier"
+                    value={tierId}
+                    onChange={(event) => setTierId(event.target.value)}
+                    disabled={busy || loading}
+                    required
+                  >
+                    {!tiers.some((item) => item.id === tierId) && (
+                      <option value="">Select a configured tier</option>
+                    )}
+                    {tiers.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name} · {item.account_limit}{' '}
+                        {item.account_limit === 1 ? 'account' : 'accounts'}
+                      </option>
+                    ))}
+                  </select>
+                  <small>
+                    Tier names, trusted subscription plan names, and account limits can be changed
+                    in Settings.
+                  </small>
+                </div>
+              ) : (
+                <div className="field">
+                  <label htmlFor="complimentary-allowance">Complimentary account allowance</label>
+                  <select
+                    id="complimentary-allowance"
+                    value={complimentaryLimit}
+                    disabled={busy || loading}
+                    onChange={(event) => setComplimentaryLimit(Number(event.target.value))}
+                  >
+                    {[1, 2, 3].map((count) => (
+                      <option key={count} value={count}>
+                        {count} {count === 1 ? 'account' : 'accounts'}
+                      </option>
+                    ))}
+                  </select>
+                  <small>
+                    Billing events do not disable these accounts. Save this policy to protect
+                    existing accounts without creating or changing any accounts.
+                  </small>
+                </div>
+              )}
               {member && tier && (
                 <div className="support-note">
                   <strong>
@@ -226,6 +343,14 @@ export default function MembershipsPage({
                 </div>
               )}
               <div className="form-actions">
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={!member || !tier || !loaded || loading || busy}
+                  onClick={() => void saveAccess()}
+                >
+                  Save access policy
+                </button>
                 <button
                   className="btn btn-primary"
                   type="submit"
@@ -265,11 +390,15 @@ export default function MembershipsPage({
                         <small>Discord ID: {item.discord_user_id}</small>
                       </td>
                       <td>
-                        {tiers.find((entry) => entry.id === item.tier_id)?.name || item.tier_id}
+                        {item.access_mode === 'complimentary'
+                          ? 'Complimentary'
+                          : tiers.find((entry) => entry.id === item.tier_id)?.name || item.tier_id}
                         <small>
-                          {item.active === false
-                            ? 'Inactive membership'
-                            : `${item.account_limit} entitled ${item.account_limit === 1 ? 'account' : 'accounts'}`}
+                          {item.access_mode === 'complimentary'
+                            ? 'Admin managed · billing exempt'
+                            : item.active === false
+                              ? 'Inactive membership'
+                              : `${item.account_limit} entitled ${item.account_limit === 1 ? 'account' : 'accounts'}`}
                         </small>
                       </td>
                       <td>
@@ -391,8 +520,9 @@ export default function MembershipsPage({
             outside Jellyport require your review.
           </p>
           <p>
-            Expired memberships disable all linked account slots when the expiration event is
-            applied.
+            {review.accessMode === 'complimentary'
+              ? 'This saves complimentary access before queuing the update. Subscription cancellations, missing subscriber roles, and expiry events do not disable these accounts.'
+              : 'Expired memberships disable all linked account slots when the expiration event is applied.'}
           </p>
           {error && (
             <div className="error-block mt-18" role="alert">

@@ -125,6 +125,55 @@ afterEach(async () => {
 });
 
 describe('administrator membership HTTP endpoints', () => {
+  it('shows private alert status only to admins and rejects a stale recipient stop review', async () => {
+    const { app, headers } = await fixture();
+    const { store, service } = app.jellyport;
+    const settings = {
+      ...store.settings(),
+      discord_enabled: true,
+      discord_guild_id: '123456789',
+      discord_bot_token: 'synthetic-bot-token',
+    };
+    store.saveSettings(settings);
+    service.adminAlerts.enable(
+      { guild_id: settings.discord_guild_id, user_id: '222222222', username: 'captain' },
+      settings,
+    );
+    const reviewed = await app.inject({ url: '/api/discord/admin-alerts', headers });
+    expect(reviewed.statusCode).toBe(200);
+    expect(reviewed.headers['cache-control']).toBe('no-store');
+    expect(reviewed.json()).toMatchObject({ enabled: true, recipient_username: 'captain' });
+    expect(reviewed.body).not.toContain('synthetic-bot-token');
+    expect(reviewed.body).not.toContain('private-managed-api-key');
+    for (const url of ['/api/discord/admin-alerts', '/api/discord/%61dmin-alerts']) {
+      const denied = await app.inject(url);
+      expect(denied.statusCode).toBe(401);
+      expect(denied.body).not.toContain('captain');
+    }
+    service.adminAlerts.enable(
+      { guild_id: settings.discord_guild_id, user_id: '333333333', username: 'other_admin' },
+      settings,
+    );
+    const stale = await app.inject({
+      method: 'POST',
+      url: '/api/discord/admin-alerts/disable',
+      headers,
+      payload: { expected_revision: reviewed.json().revision },
+    });
+    expect(stale.statusCode).toBe(400);
+    expect(service.adminAlerts.status(settings).enabled).toBe(true);
+    const current = service.adminAlerts.status(settings);
+    const stopped = await app.inject({
+      method: 'POST',
+      url: '/api/discord/admin-alerts/disable',
+      headers,
+      payload: { expected_revision: current.revision },
+    });
+    expect(stopped.statusCode).toBe(200);
+    expect(stopped.json().enabled).toBe(false);
+    expect(store.jobs()).toEqual([]);
+  });
+
   it('keeps unlinked accounts enabled for review and saves manual per-account family notes without Discord', async () => {
     const { app, headers, servers } = await fixture();
     app.jellyport.service.bot = null;
@@ -254,12 +303,20 @@ describe('administrator membership HTTP endpoints', () => {
 
   it('protects organization and complimentary endpoints with administrator authentication and CSRF', async () => {
     const { app, headers } = await fixture();
-    for (const url of ['/api/user-directory', '/api/discord/tag-roles']) {
+    for (const url of [
+      '/api/user-directory',
+      '/api/discord/tag-roles',
+      '/api/discord/admin-alerts',
+    ]) {
       const response = await app.inject(url);
       expect(response.statusCode).toBe(401);
       expect(response.headers['cache-control']).toBe('no-store');
     }
     const requests = [
+      {
+        url: '/api/discord/admin-alerts/disable',
+        payload: { expected_revision: 'synthetic-reviewed-recipient' },
+      },
       {
         url: '/api/account-profiles',
         payload: {

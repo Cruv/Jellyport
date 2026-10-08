@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { SecretCipher } from './crypto.js';
 import { nameKey } from './identity.js';
@@ -46,6 +46,24 @@ export interface PlaylistImport {
   content_hash?: string;
 }
 
+export interface AdminAlertSource {
+  kind: 'job' | 'subscription';
+  id: string;
+  status: string;
+}
+/** Hashed keys keep source IDs and recipient generations out of receipt indexes. */
+export function adminAlertReceiptId(generation: string, source: AdminAlertSource): string {
+  return createHash('sha256')
+    .update(JSON.stringify([generation, source.kind, source.id, source.status]))
+    .digest('hex');
+}
+const ADMIN_ALERT_SOURCES = `
+  SELECT 'job' AS kind,id,json_extract(payload,'$.status') AS status FROM jobs
+  WHERE json_extract(payload,'$.status') IN ('completed','partial','failed','interrupted','cancelled')
+  UNION ALL
+  SELECT 'subscription' AS kind,id,json_extract(payload,'$.status') AS status FROM subscriptions
+  WHERE json_extract(payload,'$.status') IN ('pending','failed')`;
+
 /** Compatible with existing Python SQLite volumes, including encrypted Fernet records. */
 export class Store {
   readonly db: DatabaseSync;
@@ -68,6 +86,16 @@ export class Store {
     chmodSync(keyfile, 0o600);
     this.cipher = new SecretCipher(readFileSync(keyfile, 'utf8'));
     this.db = new DatabaseSync(database);
+    this.db.function(
+      'jellyport_admin_alert_receipt',
+      { deterministic: true },
+      (generation, kind, id, status) =>
+        adminAlertReceiptId(String(generation), {
+          kind: kind === 'job' ? 'job' : 'subscription',
+          id: String(id),
+          status: String(status),
+        }),
+    );
     chmodSync(database, 0o600);
     this.db.exec(`
       PRAGMA journal_mode=WAL;
@@ -86,6 +114,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS account_role_assignments (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS memberships (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS account_profiles (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS admin_alert_config (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS admin_alert_receipts (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS credentials_expiry ON credentials(expires);
     `);
     const columns = this.db.prepare('PRAGMA table_info(links)').all();
@@ -115,7 +145,8 @@ export class Store {
       UNION ALL SELECT 1 FROM subscriptions UNION ALL SELECT 1 FROM job_queue
       UNION ALL SELECT 1 FROM migration_playlists UNION ALL SELECT 1 FROM user_mappings
       UNION ALL SELECT 1 FROM account_roles UNION ALL SELECT 1 FROM account_role_assignments
-      UNION ALL SELECT 1 FROM memberships UNION ALL SELECT 1 FROM account_profiles LIMIT 1`,
+      UNION ALL SELECT 1 FROM memberships UNION ALL SELECT 1 FROM account_profiles
+      UNION ALL SELECT 1 FROM admin_alert_config UNION ALL SELECT 1 FROM admin_alert_receipts LIMIT 1`,
         )
         .get();
     if (options.demo && (auth || (hasData && !recognizedDemo))) {
@@ -173,6 +204,53 @@ export class Store {
   }
   saveSettings(settings: Settings): void {
     this.db.prepare('INSERT OR REPLACE INTO settings VALUES (1,?)').run(this.encrypt(settings));
+  }
+  adminAlertConfig<T>(): T | null {
+    const row = this.db.prepare('SELECT encrypted FROM admin_alert_config WHERE id=1').get();
+    return row ? this.decrypt<T>(row.encrypted as Uint8Array) : null;
+  }
+  saveAdminAlertConfig(value: unknown): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO admin_alert_config (id,encrypted) VALUES (1,?)')
+      .run(this.encrypt(value));
+  }
+  clearAdminAlerts(): void {
+    this.db.exec('DELETE FROM admin_alert_config; DELETE FROM admin_alert_receipts');
+  }
+  saveAdminAlertReceipt(id: string, value: unknown): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO admin_alert_receipts (id,encrypted) VALUES (?,?)')
+      .run(id, this.encrypt(value));
+  }
+  baselineAdminAlerts(generation: string): void {
+    // Iterate a narrow projection so a large migration history is never loaded into memory.
+    for (const source of this.db.prepare(ADMIN_ALERT_SOURCES).iterate()) {
+      const record = source as unknown as AdminAlertSource;
+      this.saveAdminAlertReceipt(adminAlertReceiptId(generation, record), { baseline: true });
+    }
+  }
+  pendingAdminAlertSources(generation: string, limit = 100): AdminAlertSource[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+      throw new Error('Invalid private notification batch limit.');
+    return this.db
+      .prepare(
+        `SELECT source.kind,source.id,source.status FROM (${ADMIN_ALERT_SOURCES}) AS source
+        LEFT JOIN admin_alert_receipts AS receipt
+        ON receipt.id=jellyport_admin_alert_receipt(?,source.kind,source.id,source.status)
+        WHERE receipt.id IS NULL ORDER BY source.kind,source.id LIMIT ?`,
+      )
+      .all(generation, limit) as unknown as AdminAlertSource[];
+  }
+  pendingAdminAlertCount(generation: string): number {
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM (${ADMIN_ALERT_SOURCES}) AS source
+        LEFT JOIN admin_alert_receipts AS receipt
+        ON receipt.id=jellyport_admin_alert_receipt(?,source.kind,source.id,source.status)
+        WHERE receipt.id IS NULL`,
+      )
+      .get(generation);
+    return Number(row!.count);
   }
   playlistImport(id: string): PlaylistImport | null {
     const row = this.db.prepare('SELECT encrypted FROM migration_playlists WHERE id=?').get(id);

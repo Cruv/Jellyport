@@ -44,6 +44,7 @@ import {
 } from './memberships.js';
 import type { Link } from './store.js';
 import { AccountProfiles, type AccountProfileInput } from './account-profiles.js';
+import { AdminAlerts } from './admin-alerts.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 
 export { ServiceError } from './errors.js';
@@ -249,6 +250,7 @@ export class Service {
   readonly roles: AccountRoles;
   readonly memberships: Memberships;
   readonly profiles: AccountProfiles;
+  readonly adminAlerts: AdminAlerts;
   private readonly membershipMutex = new Mutex();
   constructor(
     readonly store: Store,
@@ -261,6 +263,7 @@ export class Service {
     this.roles = new AccountRoles(store, this.demo);
     this.memberships = new Memberships(store);
     this.profiles = new AccountProfiles(store);
+    this.adminAlerts = new AdminAlerts(store);
   }
   resolveDiscordMapping(discordId: string): UserMapping | null {
     return this.mappings.getForDiscord(discordId, this.store.settings());

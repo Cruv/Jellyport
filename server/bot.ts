@@ -22,6 +22,7 @@ import type { MediaUser } from './media.js';
 import type { UserMapping } from './user-mappings.js';
 import { DEFAULT_MEMBERSHIP_TIERS } from './memberships.js';
 import type { DiscordMemberSearchResult, DiscordMemberSummary } from './discord-members.js';
+import type { AdminAlerts } from './admin-alerts.js';
 
 export class BotError extends Error {}
 class MissingMember extends BotError {}
@@ -38,6 +39,7 @@ export interface BotService {
   getJob(id: string): Job | null | undefined;
   recordSubscription(event: SubscriptionInput & { guild_id?: string }): Promise<unknown>;
   reconcileMemberships?(): Promise<unknown>;
+  adminAlerts?: AdminAlerts;
 }
 
 type Settings = Partial<AppSettings>;
@@ -268,6 +270,23 @@ export function botCommand(settings: Settings = {}) {
         .addStringOption((option) =>
           option.setName('job_id').setDescription('Jellyport job ID').setRequired(true),
         ),
+    )
+    .addSubcommand((command) =>
+      command
+        .setName('alerts')
+        .setDescription('Manage private Jellyport admin notifications for yourself')
+        .addStringOption((option) =>
+          option
+            .setName('action')
+            .setDescription('Enable, disable, test, or check private admin notifications')
+            .setRequired(true)
+            .addChoices(
+              { name: 'Enable for me', value: 'enable' },
+              { name: 'Disable for me', value: 'disable' },
+              { name: 'Send me a test', value: 'test' },
+              { name: 'Check status', value: 'status' },
+            ),
+        ),
     );
 }
 
@@ -309,6 +328,8 @@ export class BotManager {
   private changing: Promise<void> = Promise.resolve();
   private reconciling = false;
   private registered = false;
+  private adminAlertTimer: ReturnType<typeof setInterval> | null = null;
+  private adminAlertTask: Promise<void> | null = null;
   private readonly clientFactory: (options: ClientOptions) => Client;
 
   constructor(
@@ -324,6 +345,9 @@ export class BotManager {
       enabled: !!this.settings.discord_enabled,
       connected: !!this.client?.isReady(),
       error: this.error,
+      ...(this.service.adminAlerts
+        ? { admin_alerts: this.service.adminAlerts.status(this.settings as AppSettings) }
+        : {}),
     };
   }
 
@@ -384,6 +408,8 @@ export class BotManager {
   }
 
   private async stopUnlocked(): Promise<void> {
+    if (this.adminAlertTimer) clearInterval(this.adminAlertTimer);
+    this.adminAlertTimer = null;
     const client = this.client;
     this.client = null;
     this.lifecycle?.abort();
@@ -391,6 +417,8 @@ export class BotManager {
     for (const controller of this.callbacks.values()) controller.abort();
     // Finish callbacks already inside service operations before the caller closes SQLite.
     await Promise.allSettled([...this.callbacks.keys()]);
+    await this.adminAlertTask;
+    this.adminAlertTask = null;
     if (client) {
       client.removeAllListeners();
       try {
@@ -453,6 +481,8 @@ export class BotManager {
           );
         if (command === 'status')
           await this.handleStatus(interaction, interaction.options.getString('job_id', true));
+        if (command === 'alerts')
+          await this.handleAdminAlerts(interaction, interaction.options.getString('action', true));
       });
     });
     client.on(Events.Error, () => {
@@ -502,6 +532,7 @@ export class BotManager {
   async handleReady(client: Client): Promise<void> {
     if (this.client !== client) return;
     this.error = null;
+    this.startAdminAlerts(client);
     try {
       if (!this.registered) {
         await this.wait(this.guild().commands.set([botCommand(this.settings).toJSON()]), 20_000);
@@ -526,6 +557,33 @@ export class BotManager {
         this.error =
           'Membership reconciliation or command registration could not complete. Check the Jellyport web page.';
     }
+  }
+
+  private startAdminAlerts(client: Client): void {
+    if (!this.service.adminAlerts || this.adminAlertTimer || this.client !== client) return;
+    const settings = this.settings;
+    const tick = () => {
+      if (this.adminAlertTask || this.client !== client || this.settings !== settings) return;
+      const task = this.dispatchEvent(client, async () => {
+        await this.service.adminAlerts!.flush(
+          settings as AppSettings,
+          async (id, content, current) => {
+            await this.sendAdminPrivate(
+              id,
+              content,
+              () => current() && this.client === client && this.settings === settings,
+            );
+          },
+        );
+      });
+      this.adminAlertTask = task;
+      void task.finally(() => {
+        if (this.adminAlertTask === task) this.adminAlertTask = null;
+      });
+    };
+    this.adminAlertTimer = setInterval(tick, 30_000);
+    this.adminAlertTimer.unref();
+    tick();
   }
 
   private guild(): Guild {
@@ -937,7 +995,105 @@ export class BotManager {
     return this.sendCredentials(userId, username, password, serverUrl, requireMembership);
   }
 
-  private async prepare(interaction: ChatInputCommandInteraction): Promise<void> {
+  private async adminIdentity(userId: string): Promise<GuildMember> {
+    const id = snowflake(userId);
+    const guild = this.guild();
+    const client = this.client;
+    const settings = this.settings;
+    const current = () => {
+      this.checkActive();
+      if (this.client !== client || this.settings !== settings || this.guild().id !== guild.id)
+        throw new Stopped();
+    };
+    let member: GuildMember;
+    let administrator = false;
+    let adminRoleId: string | null = null;
+    try {
+      // GuildMember.permissions uses the gateway role cache. Fetch the owner and
+      // full role definitions before authorizing so a retained role cannot keep
+      // stale Administrator permission after that permission has been revoked.
+      const freshGuild = await this.wait(guild.fetch(), 20_000);
+      current();
+      if (freshGuild.id !== guild.id) throw new Stopped();
+      const ownerId = snowflake(freshGuild.ownerId);
+      const roles = await this.wait(freshGuild.roles.fetch(undefined, { cache: false }), 20_000);
+      current();
+      member = await this.fetchMember(userId);
+      current();
+      const roleIds = new Set([guild.id, ...member.roles.cache.keys()]);
+      administrator =
+        ownerId === id ||
+        [...roleIds].some((roleId) => {
+          const role = roles.get(roleId);
+          return (
+            role?.guild.id === guild.id &&
+            typeof role.permissions.bitfield === 'bigint' &&
+            (role.permissions.bitfield & PermissionFlagsBits.Administrator) !== 0n
+          );
+        });
+      const configuredRole = snowflake(settings.discord_admin_role_id);
+      if (configuredRole && roles.get(configuredRole)?.guild.id === guild.id)
+        adminRoleId = configuredRole;
+    } catch (error) {
+      if (error instanceof Stopped || error instanceof BotError) throw error;
+      throw new BotError(
+        'Discord administrator access could not be verified. Check bot access and try again.',
+      );
+    }
+    if (
+      !id ||
+      member.id !== id ||
+      member.user.id !== id ||
+      member.partial ||
+      member.user.bot ||
+      !commandAuthorized(member.guild.id, settings.discord_guild_id, {
+        administrator,
+        roleIds: member.roles.cache.keys(),
+        adminRoleId,
+      })
+    )
+      throw new BotError(
+        'This command requires server Administrator permission or the configured admin role.',
+      );
+    return member;
+  }
+
+  private async sendAdminPrivate(
+    userId: string,
+    content: string,
+    current: () => boolean = () => true,
+  ): Promise<Identity> {
+    const client = this.client;
+    const settings = this.settings;
+    this.checkActive();
+    if (!current()) throw new Stopped();
+    const member = await this.adminIdentity(userId);
+    this.checkActive();
+    // Recipient configuration may change while Discord verifies this member. No
+    // cached role snapshot or stale alert generation can authorize the send.
+    if (this.client !== client || this.settings !== settings || !current()) throw new Stopped();
+    this.guild();
+    try {
+      await this.wait(
+        member.send({
+          content,
+          allowedMentions: { parse: [], repliedUser: false },
+          flags: MessageFlags.SuppressEmbeds,
+        }),
+        20_000,
+      );
+    } catch (error) {
+      if (error instanceof Stopped) throw error;
+      throw new BotError(
+        'The private admin message could not be delivered. Allow direct messages from this server and try again. Nothing was posted in a server channel.',
+      );
+    }
+    this.checkActive();
+    if (this.client !== client || this.settings !== settings || !current()) throw new Stopped();
+    return { id: member.id, username: member.user.username };
+  }
+
+  private async prepare(interaction: ChatInputCommandInteraction): Promise<Identity> {
     this.checkActive();
     await this.wait(interaction.deferReply({ flags: MessageFlags.Ephemeral }), 20_000);
     this.checkActive();
@@ -947,18 +1103,8 @@ export class BotManager {
     ) {
       throw new BotError('This command is restricted to the configured Discord server.');
     }
-    const member = await this.fetchMember(interaction.user.id);
-    if (
-      member.user.bot ||
-      !commandAuthorized(member.guild.id, this.settings.discord_guild_id, {
-        administrator: member.permissions.has(PermissionFlagsBits.Administrator),
-        roleIds: member.roles.cache.keys(),
-        adminRoleId: this.settings.discord_admin_role_id,
-      })
-    )
-      throw new BotError(
-        'This command requires server Administrator permission or the configured admin role.',
-      );
+    const member = await this.adminIdentity(interaction.user.id);
+    return { id: member.id, username: member.user.username };
   }
 
   private async reply(interaction: ChatInputCommandInteraction, content: string): Promise<void> {
@@ -1090,6 +1236,78 @@ export class BotManager {
         error instanceof BotError
           ? error.message
           : 'Job status could not be read. Check the Jellyport web page.';
+    }
+    await this.reply(interaction, message);
+  }
+
+  async handleAdminAlerts(interaction: ChatInputCommandInteraction, action: string): Promise<void> {
+    let message: string;
+    try {
+      const identity = await this.prepare(interaction);
+      const alerts = this.service.adminAlerts;
+      if (!alerts)
+        throw new BotError(
+          'Private admin notifications are unavailable. Check the Jellyport web page.',
+        );
+      const settings = this.settings;
+      const client = this.client;
+      const current = () => this.client === client && this.settings === settings;
+      if (action === 'enable' || action === 'test') {
+        await this.sendAdminPrivate(
+          identity.id,
+          'Jellyport private admin notification test. Only you receive this direct message. Admin alerts contain brief status summaries; account credentials and private owner notes are never included.',
+          current,
+        );
+        if (action === 'enable') {
+          // Verify authority again after the test DM, before persisting any recipient.
+          const verified = await this.adminIdentity(identity.id);
+          this.checkActive();
+          if (!current()) throw new Stopped();
+          alerts.enable(
+            {
+              guild_id: String(settings.discord_guild_id),
+              user_id: verified.id,
+              username: verified.user.username,
+            },
+            settings as AppSettings,
+          );
+          message =
+            'Private admin notifications are enabled for you. Future notices will be sent by direct message; command replies are visible only to you.';
+        } else {
+          message =
+            'A private test message was sent to you. The selected notification recipient was not changed.';
+        }
+      } else if (action === 'disable') {
+        const status = alerts.status(settings as AppSettings);
+        if (status.recipient_id && status.recipient_id !== identity.id)
+          throw new BotError(
+            'You can only disable your own private admin notifications. Use the Jellyport web page to review the selected recipient.',
+          );
+        alerts.disable(identity.id);
+        message = 'Your private admin notifications are disabled.';
+      } else if (action === 'status') {
+        const status = alerts.status(settings as AppSettings);
+        message = status.enabled
+          ? status.recipient_id === identity.id
+            ? 'Private admin notifications are enabled for you. Notices are sent only by direct message.'
+            : 'Private admin notifications are enabled for another verified administrator. Use Enable for me to select yourself.'
+          : 'Private admin notifications are disabled. Use Enable for me to receive them by direct message.';
+        if (status.last_error)
+          message +=
+            ' The last private delivery failed. Check the Jellyport web page or send yourself a test.';
+      } else {
+        throw new BotError(
+          'Choose enable, disable, test, or status for private admin notifications.',
+        );
+      }
+    } catch (error) {
+      if (error instanceof Stopped) throw error;
+      // Storage, Discord, and notification state exceptions can contain private
+      // identifiers or upstream details. Only our fixed bot errors are displayed.
+      message =
+        error instanceof BotError
+          ? error.message
+          : 'Private admin notification settings could not be changed. Check the Jellyport web page.';
     }
     await this.reply(interaction, message);
   }

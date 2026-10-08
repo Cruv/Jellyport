@@ -51,7 +51,7 @@ function member(
       cache: new Collection((options.roles ?? ['55']).map((role) => [role, { id: role }] as const)),
     },
     permissions: { has: vi.fn(() => options.admin ?? false) },
-    send: vi.fn(async () => ({})),
+    send: vi.fn(async (_options: unknown) => ({})),
   };
 }
 
@@ -121,7 +121,22 @@ async function fixture(extra: Partial<Settings> = {}) {
   const recipient = member();
   const guild = {
     id: '123',
+    ownerId: '777',
     available: true,
+    roles: {
+      fetch: vi.fn(
+        async () =>
+          new Collection([
+            ['123', tagRole('123', '@everyone', { position: 0 })],
+            ['99', tagRole('99', 'Jellyport admin')],
+            [
+              '98',
+              tagRole('98', 'Server admin', { permissions: PermissionFlagsBits.Administrator }),
+            ],
+            ['55', tagRole('55', 'Subscriber')],
+          ]),
+      ),
+    },
     members: {
       fetch: vi.fn(async (options: { user: string; force: boolean; cache: boolean }) =>
         options.user === '11' ? admin : recipient,
@@ -131,6 +146,7 @@ async function fixture(extra: Partial<Settings> = {}) {
     },
     commands: { set: vi.fn(async (_commands: unknown) => new Collection()) },
   };
+  Object.assign(guild, { fetch: vi.fn(async () => guild) });
   const client = Object.assign(new EventEmitter(), {
     ready: true,
     isReady: vi.fn(() => client.ready),
@@ -534,7 +550,12 @@ describe('Bot lifecycle and commands', () => {
     const command = botCommand().toJSON();
     expect(command.dm_permission).toBe(false);
     expect(command.default_member_permissions).toBe(String(PermissionFlagsBits.Administrator));
-    expect(command.options?.map((option) => option.name)).toEqual(['create', 'migrate', 'status']);
+    expect(command.options?.map((option) => option.name)).toEqual([
+      'create',
+      'migrate',
+      'status',
+      'alerts',
+    ]);
   });
 
   it.each([
@@ -1468,5 +1489,476 @@ describe('Discord member discovery', () => {
     finish(new Collection([['22', member()]]));
     await Promise.resolve();
     expect(guild.members.search).toHaveBeenCalledTimes(1);
+  });
+});
+
+async function alertFixture() {
+  const base = await fixture();
+  let selected: { guild_id: string; user_id: string; username: string } | null = null;
+  let generation = 0;
+  const alerts = {
+    status: vi.fn((_settings: unknown) => ({
+      enabled: !!selected,
+      recipient_id: selected?.user_id ?? null,
+      recipient_username: selected?.username ?? null,
+      last_sent_at: null,
+      last_error: null as string | null,
+      pending_count: selected ? 1 : 0,
+    })),
+    enable: vi.fn((recipient: NonNullable<typeof selected>, _settings: unknown) => {
+      selected = recipient;
+      generation++;
+    }),
+    disable: vi.fn((_id?: string) => {
+      selected = null;
+      generation++;
+    }),
+    flush: vi.fn(
+      async (
+        _settings: unknown,
+        send: (id: string, content: string, current: () => boolean) => Promise<void>,
+      ) => {
+        if (!selected) return;
+        const recipient = selected;
+        const currentGeneration = generation;
+        await send(
+          recipient.user_id,
+          'Jellyport: a job requires review. Open the admin web page.',
+          () => generation === currentGeneration && selected === recipient,
+        );
+      },
+    ),
+  };
+  Object.assign(base.service, { adminAlerts: alerts });
+  return { ...base, alerts };
+}
+
+describe('Private admin notifications', () => {
+  it('registers fixed private notification actions without a recipient option', () => {
+    const command = botCommand()
+      .toJSON()
+      .options?.find((option) => option.name === 'alerts');
+    expect(command).toMatchObject({
+      name: 'alerts',
+      options: [
+        {
+          name: 'action',
+          required: true,
+          choices: [
+            { name: 'Enable for me', value: 'enable' },
+            { name: 'Disable for me', value: 'disable' },
+            { name: 'Send me a test', value: 'test' },
+            { name: 'Check status', value: 'status' },
+          ],
+        },
+      ],
+    });
+  });
+
+  it('tests the invoking admin privately before saving that freshly verified identity', async () => {
+    const { manager, admin, recipient, alerts, settings } = await alertFixture();
+    admin.user.username = 'current_admin_username';
+    const request = interaction();
+    await manager.handleAdminAlerts(asInteraction(request), 'enable');
+    expect(admin.send).toHaveBeenCalledExactlyOnceWith({
+      content: expect.stringContaining('private admin notification test'),
+      allowedMentions: { parse: [], repliedUser: false },
+      flags: MessageFlags.SuppressEmbeds,
+    });
+    expect(recipient.send).not.toHaveBeenCalled();
+    expect(alerts.enable).toHaveBeenCalledExactlyOnceWith(
+      {
+        guild_id: '123',
+        user_id: '11',
+        username: 'current_admin_username',
+      },
+      settings,
+    );
+    expect(admin.send.mock.invocationCallOrder[0]).toBeLessThan(
+      alerts.enable.mock.invocationCallOrder[0]!,
+    );
+    expect(request.deferReply).toHaveBeenCalledExactlyOnceWith({ flags: MessageFlags.Ephemeral });
+    expect(request.followUp).toHaveBeenCalledExactlyOnceWith({
+      content: expect.stringContaining('enabled for you'),
+      allowedMentions: { parse: [], repliedUser: false },
+      flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds,
+    });
+    expect(manager.status().admin_alerts).toMatchObject({ enabled: true, recipient_id: '11' });
+  });
+
+  it('a test only DMs the invoking admin and never changes the selected recipient', async () => {
+    const { manager, admin, recipient, alerts, settings } = await alertFixture();
+    alerts.enable({ guild_id: '123', user_id: '33', username: 'other_admin' }, settings);
+    const request = interaction();
+    await manager.handleAdminAlerts(asInteraction(request), 'test');
+    expect(admin.send).toHaveBeenCalledOnce();
+    expect(recipient.send).not.toHaveBeenCalled();
+    expect(alerts.enable).toHaveBeenCalledOnce();
+    expect(manager.status().admin_alerts?.recipient_id).toBe('33');
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('not changed'),
+    });
+  });
+
+  it('does not opt in after a failed DM and never posts a channel fallback or upstream details', async () => {
+    const { manager, admin, recipient, alerts } = await alertFixture();
+    admin.send.mockRejectedValue(new Error('DISCORD TOKEN AND USER SECRET'));
+    const request = interaction();
+    await manager.handleAdminAlerts(asInteraction(request), 'enable');
+    expect(alerts.enable).not.toHaveBeenCalled();
+    expect(recipient.send).not.toHaveBeenCalled();
+    expect(request.reply).not.toHaveBeenCalled();
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('Allow direct messages'),
+    });
+    expect(JSON.stringify(request.followUp.mock.calls)).not.toContain('SECRET');
+  });
+
+  it('rechecks admin authorization after the test DM before persisting opt-in', async () => {
+    const { manager, admin, guild, alerts } = await alertFixture();
+    admin.send.mockImplementation(async () => {
+      guild.members.fetch.mockResolvedValue(member('11', 'former_admin', { roles: [] }));
+      return {};
+    });
+    const request = interaction();
+    await manager.handleAdminAlerts(asInteraction(request), 'enable');
+    expect(admin.send).toHaveBeenCalledOnce();
+    expect(alerts.enable).not.toHaveBeenCalled();
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('requires'),
+    });
+  });
+
+  it.each(['enable', 'disable', 'test', 'status'])(
+    'rejects %s from a non-admin with only an ephemeral reply',
+    async (action) => {
+      const { manager, guild, admin, alerts } = await alertFixture();
+      guild.members.fetch.mockResolvedValue(member('11', 'outsider', { roles: [] }));
+      const request = interaction();
+      await manager.handleAdminAlerts(asInteraction(request), action);
+      expect(alerts.enable).not.toHaveBeenCalled();
+      expect(alerts.disable).not.toHaveBeenCalled();
+      expect(admin.send).not.toHaveBeenCalled();
+      expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+        content: expect.stringContaining('requires'),
+        flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds,
+      });
+    },
+  );
+
+  it.each([null, '456'])(
+    'rejects notification actions outside the configured guild %s',
+    async (guildId) => {
+      const { manager, guild, alerts, admin } = await alertFixture();
+      const request = interaction(guildId);
+      await manager.handleAdminAlerts(asInteraction(request), 'enable');
+      expect(guild.members.fetch).not.toHaveBeenCalled();
+      expect(alerts.enable).not.toHaveBeenCalled();
+      expect(admin.send).not.toHaveBeenCalled();
+      expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+        content: expect.stringContaining('configured Discord server'),
+      });
+    },
+  );
+
+  it('an admin cannot disable another admin’s selected notifications through a slash command', async () => {
+    const { manager, alerts, settings } = await alertFixture();
+    alerts.enable({ guild_id: '123', user_id: '33', username: 'other_admin' }, settings);
+    const request = interaction();
+    await manager.handleAdminAlerts(asInteraction(request), 'disable');
+    expect(alerts.disable).not.toHaveBeenCalled();
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('only disable your own'),
+    });
+    expect(manager.status().admin_alerts?.recipient_id).toBe('33');
+  });
+
+  it('the selected admin can disable their notifications without another DM', async () => {
+    const { manager, alerts, settings, admin } = await alertFixture();
+    alerts.enable({ guild_id: '123', user_id: '11', username: 'server_admin' }, settings);
+    const request = interaction();
+    await manager.handleAdminAlerts(asInteraction(request), 'disable');
+    expect(alerts.disable).toHaveBeenCalledExactlyOnceWith('11');
+    expect(admin.send).not.toHaveBeenCalled();
+    expect(manager.status().admin_alerts?.enabled).toBe(false);
+  });
+
+  it('status replies use fixed text rather than stored names or private delivery errors', async () => {
+    const { manager, alerts, settings } = await alertFixture();
+    alerts.enable({ guild_id: '123', user_id: '33', username: '@everyone SECRET' }, settings);
+    alerts.status.mockReturnValue({
+      enabled: true,
+      recipient_id: '33',
+      recipient_username: '@everyone SECRET',
+      last_sent_at: null,
+      last_error: 'TOKEN SECRET',
+      pending_count: 1,
+    });
+    const request = interaction();
+    await manager.handleAdminAlerts(asInteraction(request), 'status');
+    expect(JSON.stringify(request.followUp.mock.calls)).not.toContain('SECRET');
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('another verified administrator'),
+    });
+  });
+
+  it('the worker only DMs the selected freshly authorized human admin', async () => {
+    const { manager, alerts, settings, client, admin, recipient, guild } = await alertFixture();
+    alerts.enable({ guild_id: '123', user_id: '11', username: 'server_admin' }, settings);
+    await manager.handleReady(client as unknown as Client);
+    await vi.waitFor(() => expect(admin.send).toHaveBeenCalledOnce());
+    expect(guild.members.fetch).toHaveBeenCalledExactlyOnceWith({
+      user: '11',
+      force: true,
+      cache: false,
+    });
+    expect(recipient.send).not.toHaveBeenCalled();
+    expect(admin.send.mock.calls[0]![0]).toMatchObject({
+      allowedMentions: { parse: [], repliedUser: false },
+      flags: MessageFlags.SuppressEmbeds,
+    });
+  });
+
+  it('never substitutes another administrator for the explicitly selected recipient', async () => {
+    const { manager, alerts, settings, client, admin, recipient, guild } = await alertFixture();
+    const selected = member('33', 'selected_admin', { admin: true, roles: ['98'] });
+    guild.members.fetch.mockImplementation(async (options) =>
+      options.user === '33' ? selected : admin,
+    );
+    alerts.enable({ guild_id: '123', user_id: '33', username: 'selected_admin' }, settings);
+    await manager.handleReady(client as unknown as Client);
+    await vi.waitFor(() => expect(selected.send).toHaveBeenCalledOnce());
+    expect(admin.send).not.toHaveBeenCalled();
+    expect(recipient.send).not.toHaveBeenCalled();
+  });
+
+  it('denies a selected admin whose retained role lost Administrator despite cached permission', async () => {
+    const { manager, alerts, settings, client, admin, guild } = await alertFixture();
+    admin.roles.cache.clear();
+    admin.roles.cache.set('98', { id: '98' });
+    admin.permissions.has.mockReturnValue(true);
+    // Discord's current role keeps the same ID, but the Administrator bit is gone.
+    guild.roles.fetch.mockResolvedValue(
+      new Collection([
+        ['123', tagRole('123', '@everyone', { position: 0 })],
+        ['98', tagRole('98', 'Former server admin', { permissions: 0n })],
+      ]),
+    );
+    alerts.enable({ guild_id: '123', user_id: '11', username: 'server_admin' }, settings);
+    await manager.handleReady(client as unknown as Client);
+    await vi.waitFor(() =>
+      expect(manager.status().error).toBe('A Discord event could not be processed.'),
+    );
+    expect(guild.roles.fetch).toHaveBeenCalledOnce();
+    expect(guild.roles.fetch).toHaveBeenCalledWith(undefined, { cache: false });
+    expect(admin.permissions.has).not.toHaveBeenCalled();
+    expect(admin.send).not.toHaveBeenCalled();
+  });
+
+  it('accepts the freshly fetched server owner even without an administrator role', async () => {
+    const { manager, guild, admin } = await alertFixture();
+    admin.roles.cache.clear();
+    Object.assign(guild, { fetch: vi.fn(async () => ({ ...guild, ownerId: '11' })) });
+    await manager.handleAdminAlerts(asInteraction(interaction()), 'test');
+    expect(admin.send).toHaveBeenCalledOnce();
+    expect(admin.permissions.has).not.toHaveBeenCalled();
+  });
+
+  it('does not trust a cached owner ID after server ownership transfers', async () => {
+    const { manager, guild, admin } = await alertFixture();
+    admin.roles.cache.clear();
+    admin.permissions.has.mockReturnValue(true);
+    guild.ownerId = '11';
+    Object.assign(guild, { fetch: vi.fn(async () => ({ ...guild, ownerId: '777' })) });
+    const request = interaction();
+    await manager.handleAdminAlerts(asInteraction(request), 'test');
+    expect(admin.send).not.toHaveBeenCalled();
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('requires'),
+    });
+  });
+
+  it('rejects a configured admin role deleted from the freshly fetched role list', async () => {
+    const { manager, guild, admin } = await alertFixture();
+    guild.roles.fetch.mockResolvedValue(
+      new Collection([['123', tagRole('123', '@everyone', { position: 0 })]]),
+    );
+    const request = interaction();
+    await manager.handleAdminAlerts(asInteraction(request), 'enable');
+    expect(admin.send).not.toHaveBeenCalled();
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('requires'),
+    });
+  });
+
+  it('fails closed with a fixed private reply if fresh administrator roles cannot be read', async () => {
+    const { manager, guild, admin } = await alertFixture();
+    guild.roles.fetch.mockRejectedValue(new Error('TOKEN AND USER SECRET'));
+    const request = interaction();
+    await manager.handleAdminAlerts(asInteraction(request), 'test');
+    expect(admin.send).not.toHaveBeenCalled();
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('could not be verified'),
+      flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds,
+    });
+    expect(JSON.stringify(request.followUp.mock.calls)).not.toContain('SECRET');
+  });
+
+  it('aborts stale role verification when the bot stops before a private send', async () => {
+    const { manager, alerts, settings, client, admin, guild } = await alertFixture();
+    alerts.enable({ guild_id: '123', user_id: '11', username: 'server_admin' }, settings);
+    let finish!: (value: Awaited<ReturnType<typeof guild.roles.fetch>>) => void;
+    guild.roles.fetch.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await manager.handleReady(client as unknown as Client);
+    await vi.waitFor(() => expect(guild.roles.fetch).toHaveBeenCalledOnce());
+    await manager.stop();
+    finish(new Collection([['99', tagRole('99', 'Jellyport admin')]]));
+    await Promise.resolve();
+    expect(guild.members.fetch).not.toHaveBeenCalled();
+    expect(admin.send).not.toHaveBeenCalled();
+  });
+
+  it('dispatches notification commands with private replies through the registered event handler', async () => {
+    const { manager, client, alerts } = await alertFixture();
+    const request = Object.assign(interaction(), {
+      commandName: 'jellyport',
+      isChatInputCommand: () => true,
+      options: { getSubcommand: () => 'alerts', getString: () => 'status' },
+    });
+    client.emit(Events.InteractionCreate, request);
+    await vi.waitFor(() => expect(request.followUp).toHaveBeenCalledOnce());
+    expect(alerts.enable).not.toHaveBeenCalled();
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('disabled'),
+      flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds,
+    });
+    await manager.stop();
+  });
+
+  it.each([
+    member('11', 'former_admin', { roles: [] }),
+    member('11', 'robot', { roles: ['99'], bot: true }),
+    member('22', 'wrong_identity', { roles: ['99'] }),
+    member('11', 'wrong_server', { roles: ['99'], guildId: '456' }),
+  ])(
+    'refuses notification delivery after recipient authorization or identity changes',
+    async (invalid) => {
+      const { manager, alerts, settings, client, admin, guild } = await alertFixture();
+      alerts.enable({ guild_id: '123', user_id: '11', username: 'server_admin' }, settings);
+      guild.members.fetch.mockResolvedValue(invalid);
+      await manager.handleReady(client as unknown as Client);
+      await vi.waitFor(() => expect(alerts.flush).toHaveBeenCalledOnce());
+      await vi.waitFor(() =>
+        expect(manager.status().error).toBe('A Discord event could not be processed.'),
+      );
+      expect(admin.send).not.toHaveBeenCalled();
+      expect(invalid.send).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rechecks the selected recipient generation after awaiting Discord membership', async () => {
+    const { manager, alerts, settings, client, admin, guild } = await alertFixture();
+    alerts.enable({ guild_id: '123', user_id: '11', username: 'server_admin' }, settings);
+    let finish!: (value: typeof admin) => void;
+    guild.members.fetch.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await manager.handleReady(client as unknown as Client);
+    await vi.waitFor(() => expect(guild.members.fetch).toHaveBeenCalledOnce());
+    alerts.enable({ guild_id: '123', user_id: '33', username: 'other_admin' }, settings);
+    finish(admin);
+    await manager.stop();
+    expect(admin.send).not.toHaveBeenCalled();
+  });
+
+  it('stopping aborts pending notification authorization and leaves no late send', async () => {
+    const { manager, alerts, settings, client, admin, guild } = await alertFixture();
+    alerts.enable({ guild_id: '123', user_id: '11', username: 'server_admin' }, settings);
+    let finish!: (value: typeof admin) => void;
+    guild.members.fetch.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await manager.handleReady(client as unknown as Client);
+    await vi.waitFor(() => expect(guild.members.fetch).toHaveBeenCalledOnce());
+    await manager.stop();
+    finish(admin);
+    await Promise.resolve();
+    expect(admin.send).not.toHaveBeenCalled();
+  });
+
+  it('restart with a different guild aborts the old notification before any private send', async () => {
+    const { manager, alerts, settings, client, admin, guild } = await alertFixture();
+    alerts.enable({ guild_id: '123', user_id: '11', username: 'server_admin' }, settings);
+    let finish!: (value: typeof admin) => void;
+    guild.members.fetch.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await manager.handleReady(client as unknown as Client);
+    await vi.waitFor(() => expect(guild.members.fetch).toHaveBeenCalledOnce());
+    await manager.restart({ ...settings, discord_guild_id: '456' });
+    finish(admin);
+    await Promise.resolve();
+    expect(admin.send).not.toHaveBeenCalled();
+  });
+
+  it('notification flushes do not overlap and their worker timer stops with the bot', async () => {
+    const { manager, alerts, client } = await alertFixture();
+    vi.useFakeTimers();
+    let finish!: () => void;
+    alerts.flush.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await manager.handleReady(client as unknown as Client);
+    expect(alerts.flush).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(alerts.flush).toHaveBeenCalledOnce();
+    finish();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(alerts.flush).toHaveBeenCalledTimes(2);
+    finish();
+    await vi.advanceTimersByTimeAsync(0);
+    await manager.stop();
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(alerts.flush).toHaveBeenCalledTimes(2);
+  });
+
+  it('shutdown joins an alert flush already working on persistent state', async () => {
+    const { manager, alerts, client } = await alertFixture();
+    let finish!: () => void;
+    alerts.flush.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await manager.handleReady(client as unknown as Client);
+    await vi.waitFor(() => expect(alerts.flush).toHaveBeenCalledOnce());
+    let stopped = false;
+    const stop = manager.stop().then(() => {
+      stopped = true;
+    });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    finish();
+    await stop;
+    expect(stopped).toBe(true);
   });
 });

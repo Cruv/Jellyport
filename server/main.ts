@@ -690,6 +690,28 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     return result;
   }
   app.get('/api/settings', async () => publicSettings());
+  app.get('/api/discord/admin-alerts', async () => ({
+    ...service.adminAlerts.status(store.settings()),
+    connected: bot.status().connected,
+  }));
+  app.post<{ Body: { expected_revision: string } }>(
+    '/api/discord/admin-alerts/disable',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['expected_revision'],
+          properties: { expected_revision: { type: 'string', minLength: 1, maxLength: 128 } },
+        },
+      },
+    },
+    async (request) => {
+      if (demo) throw new ServiceError('Demo admin alerts are read-only.');
+      service.adminAlerts.disable(undefined, request.body.expected_revision);
+      return service.adminAlerts.status(store.settings());
+    },
+  );
   app.put<{ Body: Record<string, unknown> }>(
     '/api/settings',
     { schema: { body: { type: 'object' } } },

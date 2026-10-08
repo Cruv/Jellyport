@@ -97,6 +97,10 @@ assert(!Object.hasOwn(settings, 'jellyfin_api_key'));
 assert(settings.jellyfin_api_key_set);
 assert.equal(settings.discord_auto_role_sync, false);
 assert.equal(settings.discord_emby_only_role, false);
+const adminAlerts = await request('/api/discord/admin-alerts');
+assert.equal(adminAlerts.enabled, false);
+assert.equal(adminAlerts.recipient_id, null);
+assert.equal(adminAlerts.pending_count, 0);
 const directory = await request('/api/user-directory');
 assert(directory.users.some((user) => user.access_mode === 'standalone'));
 assert(directory.users.every((user) => user.discord_user_id === null));
@@ -107,6 +111,7 @@ for (const [path, body] of [
   ['/api/memberships/access', { discord_user_id: '123456789', access_mode: 'complimentary' }],
   ['/api/accounts/link', { discord_user_id: '123456789', jellyfin_user_id: 'j-river' }],
   ['/api/discord/tags/preview', {}],
+  ['/api/discord/admin-alerts/disable', { expected_revision: 'synthetic-review' }],
   [
     '/api/account-profiles',
     {

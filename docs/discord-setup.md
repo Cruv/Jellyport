@@ -40,7 +40,24 @@ One verified Discord member can own three separate account slots. Choose slot 1,
 
 An advanced manual ID fallback remains available when you already know the member's ID. User mappings also allow a manual username label; a label alone is not a verified identity. Searching starts on interaction with the picker, so a bulk migration preview does not perform a Discord lookup for every user on opening. The slash command's `user:@member` selector also supplies the ID without manual entry.
 
-Replies are ephemeral job statuses visible to the administrator. There is no automatic status polling; check the job with `/jellyport status` or the web page. New credentials are sent by DM only to the selected member. Users need to allow DMs from server members. Failed delivery leaves the new password available through the web app's one-time reveal for up to 24 hours. Existing Jellyfin passwords are not reset or sent by an ordinary migration.
+Command replies are ephemeral: only the administrator who invoked the command can see them, including when the command runs in a shared channel. Check a job with `/jellyport status` or the web page, or opt into the private alerts below. New credentials are sent by DM only to the selected member. Users need to allow DMs from server members. Failed delivery leaves the new password available through the web app's one-time reveal for up to 24 hours. Existing Jellyfin passwords are not reset or sent by an ordinary migration.
+
+### Private administrator alerts
+
+Background alerts are optional and off until an administrator explicitly enables them:
+
+```text
+/jellyport alerts action:enable
+/jellyport alerts action:status
+/jellyport alerts action:test
+/jellyport alerts action:disable
+```
+
+Run **enable** in the configured server using your own Discord account. Jellyport checks your current administrator permission or configured admin role, captures your user ID automatically, and sends a test DM before saving you as the recipient. No manual user ID is required. There is one selected recipient; another authorized administrator can replace that selection only after their own test DM succeeds. **disable** stops alerts for the selected administrator. Any Jellyport web administrator can also use **Settings → Discord → Private admin alerts → Stop admin DMs** after reviewing the current recipient.
+
+Alerts summarize completed, partial, failed, interrupted, or cancelled jobs and pending or failed subscription events. Enabling starts with future changes; existing job history and review items are not sent as a backlog. Unlinked accounts in **Users → Needs review** and organization-role synchronization errors remain web-app reviews. Alerts do not include affected users' names, passwords, private owner notes, internal server URLs, or raw error details. Open Jellyport to review the affected records and take action. These administrator alerts are separate from credential DMs to account owners and never send you copies of their passwords.
+
+Command confirmations remain ephemeral. Background alerts arrive in the selected administrator's DM conversation with the bot because [Discord interaction follow-ups expire after 15 minutes](https://docs.discord.com/developers/interactions/receiving-and-responding#followup-messages). They are private from other server members, but Discord handles them and [text messages are not end-to-end encrypted](https://discord.com/blog/every-voice-and-video-call-on-discord-is-now-end-to-end-encrypted). If delivery fails, Jellyport does not fall back to a server channel. **Settings → Discord → Private admin alerts** shows the selected recipient, pending alerts, last delivery, and delivery error. Use **Refresh status**, fix DM permissions, and use **test** to check delivery; a test does not change the recipient or retry timing. Pending alerts retry after one minute, then every five minutes. The selected administrator can run **enable** again after a successful test to reset that delay without losing pending alerts. Unresolved account or subscription records still need review in the web app.
 
 ## Choose event sources and intents
 
@@ -113,7 +130,7 @@ Use **Users → Manage account access** to enable or disable one reviewed accoun
 
 Use **Users → Discord organization roles** to tag confirmed owners according to their media accounts. This is separate from subscriber roles and does not enable, disable, or grant media access. Role tags count existing accounts, including disabled ones, so they organize your users rather than report active subscriptions.
 
-1. Create dedicated informational roles in Discord with no server permissions, such as `Emby` and `Jellyfin`. Do not use them in channel permission overwrites. Jellyport checks guild-level role permissions but does not query channel overwrites, which can independently affect Discord channel access.
+1. Create dedicated informational roles in Discord once, with no server permissions, such as `Emby` and `Jellyfin`. Jellyport lists existing roles and does not create missing ones automatically. Do not use them in channel permission overwrites. Jellyport checks guild-level role permissions but does not query channel overwrites, which can independently affect Discord channel access.
 2. Give Jellyport's bot Manage Roles and place its highest role above both organization roles. If Manage Roles is missing, use **Users → Update bot permissions** to open the generated invite requesting this permission before selecting roles. The app lists existing roles and marks unsafe or unmanageable choices unavailable. It refuses managed roles, subscriber/admin roles, and roles with server permissions. Discord's [role hierarchy rules](https://docs.discord.com/developers/topics/permissions#permission-hierarchy) apply to bot-managed roles.
 3. Select the roles from Jellyport's dropdowns and save. When organization roles are configured, the generated invite requests Manage Roles in addition to its normal permissions; use the updated invite or update the bot's guild permissions.
 4. Preview the proposed additions and removals, then apply them. No member IDs or individual role IDs need to be entered for these steps.

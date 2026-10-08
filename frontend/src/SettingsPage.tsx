@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { Callout, Heading, Icon } from './components';
+import AdminAlertsPanel from './AdminAlertsPanel';
 import {
   safeUrl,
   defaultMembershipTiers,
@@ -611,6 +612,7 @@ export default function SettingsPage({
                   <p>Check the result of an account or migration operation.</p>
                 </div>
               </div>
+              <AdminAlertsPanel api={api} notify={notify} demo={demo} />
             </div>
           </Section>
           <Section

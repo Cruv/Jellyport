@@ -23,7 +23,6 @@ export default function AuthScreen({
   const busyRef = useRef(false);
   const requestVersion = useRef(0);
   const setup = !!session?.setup_required;
-  const legacy = session?.setup_protection === 'legacy_password';
   const templates = (connection?.templates || []).filter(
     (user) => !user.Policy?.IsAdministrator && !user.Policy?.IsDisabled,
   );
@@ -95,7 +94,6 @@ export default function AuthScreen({
     const data = new FormData(form);
     const body = setup
       ? {
-          setup_code: String(data.get('setup_code') || ''),
           jellyfin_url: String(data.get('jellyfin_url') || '').trim(),
           username: String(data.get('username') || '').trim(),
           password: String(data.get('password') || ''),
@@ -105,10 +103,8 @@ export default function AuthScreen({
           password: String(data.get('password') || ''),
         };
     // Remove secrets from the visible form even when the server rejects the request.
-    for (const name of ['password', 'setup_code']) {
-      const field = form.elements.namedItem(name);
-      if (field instanceof HTMLInputElement) field.value = '';
-    }
+    const passwordField = form.elements.namedItem('password');
+    if (passwordField instanceof HTMLInputElement) passwordField.value = '';
     busyRef.current = true;
     setBusy(setup ? 'connect' : 'login');
     setError('');
@@ -346,39 +342,26 @@ export default function AuthScreen({
         ) : (
           <form key="credentials" className="form-stack" onSubmit={submit}>
             {setup && (
-              <>
-                <div className="field">
-                  <label htmlFor="setup-code">
-                    {legacy ? 'Current Jellyport password' : 'One-time setup code'}
-                  </label>
-                  <input
-                    id="setup-code"
-                    name="setup_code"
-                    type="password"
-                    autoComplete="off"
-                    required
-                    autoFocus
-                    disabled={!!busy}
-                  />
-                  <small>
-                    {legacy
-                      ? 'Use your existing Jellyport password to authorize this upgrade once.'
-                      : 'Copy the setup code from the Jellyport container logs in Portainer.'}
-                  </small>
-                </div>
-                <div className="field">
-                  <label htmlFor="setup-server-url">Jellyfin server URL</label>
-                  <input
-                    id="setup-server-url"
-                    name="jellyfin_url"
-                    type="url"
-                    placeholder="http://jellyfin:8096"
-                    required
-                    disabled={!!busy}
-                  />
-                  <small>Use a URL reachable from the Jellyport container.</small>
-                </div>
-              </>
+              <div className="field">
+                <label htmlFor="setup-server-url">Jellyfin server URL</label>
+                <input
+                  key={session.setup_server_url || 'new-server'}
+                  id="setup-server-url"
+                  name="jellyfin_url"
+                  type="url"
+                  defaultValue={session.setup_server_url || ''}
+                  readOnly={!!session.setup_server_url}
+                  placeholder="http://jellyfin:8096"
+                  required
+                  autoFocus={!session.setup_server_url}
+                  disabled={!!busy}
+                />
+                <small>
+                  {session.setup_server_url
+                    ? 'Sign in to the Jellyfin server already connected to this workspace.'
+                    : 'Use a URL reachable from the Jellyport container.'}
+                </small>
+              </div>
             )}
             <div className="field">
               <label htmlFor="jellyfin-username">Jellyfin username</label>
@@ -389,7 +372,7 @@ export default function AuthScreen({
                 autoComplete="username"
                 defaultValue={session?.demo ? 'admin' : ''}
                 required
-                autoFocus={!setup}
+                autoFocus={!setup || !!session.setup_server_url}
                 disabled={!!busy}
               />
               <small>Use a Jellyfin administrator account with a password.</small>

@@ -26,7 +26,7 @@ async function setup(demo = true) {
     deleteApiKey: async () => {},
   };
   const app = await createApp({
-    adminPassword: 'testing-password-long',
+    demoPassword: 'testing-password-long',
     dataDir: directory,
     demo,
     authClient,
@@ -198,7 +198,7 @@ it('rate limits repeated incorrect logins and rotates the successful session', a
 it('sets security headers and secure session attributes', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-api-'));
   const app = await createApp({
-    adminPassword: 'testing-password-long',
+    demoPassword: 'testing-password-long',
     dataDir: directory,
     demo: true,
     secureCookie: true,
@@ -278,17 +278,16 @@ it('validates account and migration request shapes without coercion', async () =
     ).statusCode,
   ).toBe(422);
 });
-it('rejects unsafe one-time upgrade passwords without touching a development data directory', async () => {
-  for (const adminPassword of ['short', 'replace-with-a-long-random-password']) {
-    const directory = mkdtempSync(join(tmpdir(), 'jellyport-api-'));
-    try {
-      await expect(createApp({ adminPassword, dataDir: directory })).rejects.toThrow(
-        'strong password',
-      );
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
-  }
+it('starts production setup without a local administrator password or bootstrap code', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'jellyport-api-'));
+  const app = await createApp({ demo: false, dataDir: directory });
+  resources.push({ app, directory });
+  const response = await app.inject('/api/session');
+  expect(response.statusCode).toBe(200);
+  expect(response.json()).toMatchObject({ authenticated: false, setup_required: true });
+  expect(response.json()).not.toHaveProperty('setup_protection');
+  expect(response.json()).not.toHaveProperty('setup_code');
+  expect(app.jellyport.store.authState()).not.toHaveProperty('setupCode');
 });
 
 it('protects encoded API route aliases with the same authentication and CSRF checks', async () => {

@@ -20,7 +20,7 @@ sudo install -d -m 700 -o 1000 -g 1000 /path/to/jellyport
 
 Use the actual host path in the Compose volume entry. On a NAS shell already running as root, omit `sudo`. The `user: "1000:1000"` entry sets the container process's UID and GID directly; change it and the directory ownership together if your host uses different IDs. Jellyport does not interpret `PUID` or `PGID` environment variables. Docker documents the [Compose user setting](https://docs.docker.com/reference/compose-file/services/#user) and [bind mounts](https://docs.docker.com/engine/storage/bind-mounts/).
 
-A fresh installation does not need `JELLYPORT_ADMIN_PASSWORD`. Jellyport generates a persistent, one-time setup code and prints it in the container logs. Use `TZ=Etc/UTC` or another valid timezone in the container environment; no localtime mount is required.
+Jellyport uses your Jellyfin administrator account for setup and sign-in. Use `TZ=Etc/UTC` or another valid timezone in the container environment; no localtime mount is required.
 
 ## Configure image access in Portainer
 
@@ -32,17 +32,11 @@ Create a stack using the selected example and deploy it. For later image updates
 
 ## Complete first-run setup
 
-In Portainer, open the Jellyport container's **Logs** and find `Jellyport setup code:`. With command-line Compose, run:
+Open Jellyport and enter the Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password in the setup wizard. Choose an existing enabled, non-administrator template user and set the public Jellyfin URL that your users should receive. After completing setup, add the Emby source URL and API key in Settings. Keep the first-run page accessible only on your trusted network until pairing is complete; the first administrator to finish the wizard links the server.
 
-```sh
-docker compose logs jellyport
-```
+Jellyport verifies the administrator with Jellyfin, creates its own API key for background operations, and encrypts the pairing and key in `/data`. It does not retain your Jellyfin password. Subsequent sign-ins use an enabled administrator account on the linked Jellyfin server. Jellyfin must be reachable for sign-in and authorization checks.
 
-Open Jellyport and enter that code in the setup wizard, along with the Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password. Choose an existing enabled, non-administrator template user and set the public Jellyfin URL that your users should receive. After completing setup, add the Emby source URL and API key in Settings.
-
-Jellyport verifies the administrator with Jellyfin, creates its own API key for background operations, and encrypts the pairing and key in `/data`. It consumes the setup code and does not retain your Jellyfin password. Subsequent sign-ins use an enabled administrator account on the linked Jellyfin server. Jellyfin must be reachable for sign-in and authorization checks.
-
-When upgrading an existing container that still receives `JELLYPORT_ADMIN_PASSWORD`, enter that previous password as the one-time setup code instead. Once setup is complete, remove the environment variable from the service configuration and Portainer's stack variables. It no longer grants access to Jellyport. Preserve the existing data directory when upgrading.
+When upgrading from shared-password sign-in, complete the wizard with your Jellyfin administrator account. The wizard keeps an existing saved Jellyfin server address fixed. Remove the obsolete `JELLYPORT_ADMIN_PASSWORD` variable from the service configuration and Portainer's stack variables; it is ignored. Preserve the existing data directory when upgrading. Installations already paired with Jellyfin continue using their normal Jellyfin sign-in.
 
 ## Web access and server URLs
 
@@ -71,8 +65,6 @@ Keep the existing stack's top-level network definition. Do not replace it with `
 
 ## Troubleshooting startup
 
-An unset `JELLYPORT_ADMIN_PASSWORD` is expected on a fresh installation. The repository Compose file retains `JELLYPORT_ADMIN_PASSWORD=${JELLYPORT_ADMIN_PASSWORD:-}` only to pass through an existing installation's optional one-time setup password. An empty value uses the generated setup code instead.
-
 If the setup page reports an unreachable server, confirm that the Jellyfin URL is reachable from the container and includes the correct port and any reverse-proxy base path. Jellyfin sign-in requires an enabled administrator account. The Jellyfin service key is managed separately; if it is revoked, sign in as a Jellyfin administrator and refresh the key from Settings. Refresh creates a new key and keeps the previous one available for already queued jobs; remove obsolete Jellyport keys in Jellyfin's dashboard after those jobs finish.
 
 For a permission-denied startup message, check that the mounted directory and its existing database, journal files, and `secret.key` are owned by the configured container user and group. The bind-mount examples use `1000:1000`; the default named-volume deployment uses `10001:10001`.
@@ -81,17 +73,19 @@ Bind-mount source paths refer to the Docker host. A directory reached through a 
 
 ## Reset Jellyfin pairing
 
-For local recovery or to update your Jellyfin server's address, stop Jellyport and run the reset command against the same data mount and image. Recovery verifies the original Jellyfin server's identity. To link a different Jellyfin server, start a fresh Jellyport installation with a new data directory; existing account links and jobs belong to the original server.
+For local recovery, stop Jellyport and run the reset command against the same data mount and image. Recovery retains the linked Jellyfin server's address and verifies its identity. To link a different Jellyfin server, start a fresh Jellyport installation with a new data directory; existing account links and jobs belong to the original server.
 
 With the repository Compose file:
 
 ```sh
 docker compose stop jellyport
-docker compose run --rm --no-deps -e JELLYPORT_ADMIN_PASSWORD= jellyport node dist/server/reset-auth.js
+docker compose run --rm --no-deps jellyport node dist/server/reset-auth.js
 docker compose up -d jellyport
 ```
 
-The command prints a new `Jellyport setup code:`. Use it to complete setup again. Remove any old `JELLYPORT_ADMIN_PASSWORD` from the service environment before restarting, so setup uses the generated code.
+The command confirms that authentication was reset. Open Jellyport and complete the wizard again using your Jellyfin administrator account.
+
+If the same Jellyfin server has moved to a new address, add `--server-url http://NEW_JELLYFIN_ADDRESS:8096` after `reset-auth.js` in the reset command. This changes the address used by the wizard while still requiring the original Jellyfin server's identity. Without this option, recovery keeps the previous address fixed.
 
 For a Portainer bind-mount deployment, stop the container in Portainer, then run the equivalent command on the Docker host with its actual data directory and configured UID/GID:
 
@@ -102,7 +96,7 @@ docker run --rm --user 1000:1000 \
   ghcr.io/cruv/jellyport:latest node dist/server/reset-auth.js
 ```
 
-Use the same image version as the stopped container. Remove the old password environment variable if present, then start Jellyport in Portainer and use the new code. Reset preserves server settings, account links, jobs, history, and `secret.key`; it requires setup again against the same Jellyfin server. Keep the app stopped throughout the reset, and never delete the database or encryption key to recover a login.
+Use the same image version as the stopped container, then start Jellyport in Portainer and complete setup with your Jellyfin administrator account. Reset preserves server settings, account links, jobs, history, and `secret.key`; it requires setup again against the same Jellyfin server. Keep the app stopped throughout the reset, and never delete the database or encryption key to recover a login.
 
 ## Existing installations and backups
 

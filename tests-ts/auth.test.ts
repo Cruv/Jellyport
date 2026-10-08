@@ -6,6 +6,7 @@ import { createApp, type JellyportApp } from '../server/main.js';
 import { DemoServers } from '../server/demo.js';
 import { JellyfinAuthError, type JellyfinAuthentication } from '../server/jellyfin-auth.js';
 import type { ClientFactory } from '../server/media.js';
+import { Store } from '../server/store.js';
 
 const SERVER_URL = 'http://jellyfin:8096';
 const SERVER_ID = 'jellyfin-server-id';
@@ -73,9 +74,11 @@ function fakeAuthentication() {
 
 async function fixture(
   options: {
-    adminPassword?: string;
     directory?: string;
     authentication?: ReturnType<typeof fakeAuthentication>;
+    existingServerUrl?: string;
+    legacyPendingCode?: string;
+    legacyPreviousServerId?: string;
   } = {},
 ) {
   const directory = options.directory ?? mkdtempSync(join(tmpdir(), 'jellyport-jellyfin-auth-'));
@@ -87,24 +90,40 @@ async function fixture(
     return servers.factory(...args);
   };
   const authentication = options.authentication ?? fakeAuthentication();
-  let setupCode = '';
+  if (options.existingServerUrl || options.legacyPendingCode) {
+    const previous = new Store(directory);
+    try {
+      if (options.existingServerUrl)
+        previous.saveSettings({ ...previous.settings(), jellyfin_url: options.existingServerUrl });
+      if (options.legacyPendingCode)
+        previous.db.prepare('INSERT OR REPLACE INTO auth_state VALUES (1,?)').run(
+          previous.encrypt({
+            kind: 'pending',
+            generation: 'existing-generation',
+            setupCode: options.legacyPendingCode,
+            ...(options.legacyPreviousServerId
+              ? { previousServerId: options.legacyPreviousServerId }
+              : {}),
+          }),
+        );
+    } finally {
+      previous.close();
+    }
+  }
   const app = await createApp({
     demo: false,
     dataDir: directory,
-    adminPassword: options.adminPassword ?? '',
     authClient: authentication.auth,
     clientFactory,
-    onSetupCode: (code) => {
-      setupCode = code;
-    },
   });
   apps.add(app);
-  return { app, directory, servers, mediaCalls, setupCode, ...authentication };
+  return { app, directory, servers, mediaCalls, ...authentication };
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const app of apps) await app.close();
   apps.clear();
   for (const directory of directories) rmSync(directory, { recursive: true, force: true });
@@ -144,14 +163,13 @@ async function anonymous(app: JellyportApp): Promise<Browser> {
   expect(response.statusCode).toBe(200);
   return browser(response);
 }
-async function connect(value: Fixture, current?: Browser, setupCode = value.setupCode) {
+async function connect(value: Fixture, current?: Browser) {
   const initial = current ?? (await anonymous(value.app));
   const response = await value.app.inject({
     method: 'POST',
     url: '/api/setup/connect',
     headers: headers(initial),
     payload: {
-      setup_code: setupCode,
       jellyfin_url: `${SERVER_URL}/`,
       username: 'administrator',
       password: JELLYFIN_PASSWORD,
@@ -170,7 +188,7 @@ async function complete(value: Fixture, current: Browser) {
 }
 async function configured(options: Parameters<typeof fixture>[0] = {}) {
   const value = await fixture(options);
-  const connected = await connect(value, undefined, options?.adminPassword ?? value.setupCode);
+  const connected = await connect(value);
   const response = await complete(value, connected.current);
   expect(response.statusCode).toBe(200);
   return { ...value, current: browser(response), setupBrowser: connected.current };
@@ -188,10 +206,9 @@ async function signIn(value: Fixture, username = 'administrator') {
 }
 
 describe('first-time Jellyfin administrator setup', () => {
-  it('requires the local setup code before contacting a server or exposing settings', async () => {
+  it('offers direct Jellyfin setup without a local password or code while protecting private settings', async () => {
     const value = await fixture();
     const initial = await anonymous(value.app);
-    expect(value.setupCode.length).toBeGreaterThanOrEqual(24);
     const view = (
       await value.app.inject({ url: '/api/session', headers: headers(initial) })
     ).json();
@@ -199,9 +216,10 @@ describe('first-time Jellyfin administrator setup', () => {
       authenticated: false,
       setup_required: true,
       setup_connected: false,
-      setup_protection: 'setup_code',
     });
-    expect(JSON.stringify(view)).not.toContain(value.setupCode);
+    expect(view).not.toHaveProperty('setup_protection');
+    expect(view).not.toHaveProperty('setup_code');
+    expect(value.app.jellyport.store.authState()).not.toHaveProperty('setupCode');
     expect((await value.app.inject('/api/settings')).statusCode).toBe(401);
     expect(
       (await value.app.inject({ url: '/api/setup', headers: headers(initial) })).statusCode,
@@ -211,13 +229,13 @@ describe('first-time Jellyfin administrator setup', () => {
       url: '/api/setup/connect',
       headers: headers(initial),
       payload: {
-        setup_code: 'wrong-local-code',
+        setup_code: 'obsolete-local-code',
         jellyfin_url: 'https://untrusted.test',
         username: 'administrator',
         password: JELLYFIN_PASSWORD,
       },
     });
-    expect(response.statusCode).toBe(401);
+    expect(response.statusCode).toBe(422);
     expect(value.auth.authenticate).not.toHaveBeenCalled();
     expect(value.mediaCalls).toEqual([]);
     expect(value.auth.createApiKey).not.toHaveBeenCalled();
@@ -291,7 +309,7 @@ describe('first-time Jellyfin administrator setup', () => {
       SERVER_ID,
       'administrator-id',
     );
-    for (const secret of [JELLYFIN_PASSWORD, value.setupCode, value.behavior.tokens[0]!])
+    for (const secret of [JELLYFIN_PASSWORD, value.behavior.tokens[0]!])
       expect(result.response.body + resumed.body).not.toContain(secret);
     expect((await complete(value, result.initial)).statusCode).toBe(403);
   });
@@ -306,7 +324,6 @@ describe('first-time Jellyfin administrator setup', () => {
         url: '/api/setup/connect',
         headers: headers(initial),
         payload: {
-          setup_code: value.setupCode,
           jellyfin_url: SERVER_URL,
           username,
           password: JELLYFIN_PASSWORD,
@@ -394,7 +411,6 @@ describe('first-time Jellyfin administrator setup', () => {
     );
     for (const secret of [
       JELLYFIN_PASSWORD,
-      value.setupCode,
       SERVER_URL,
       value.behavior.tokens[0]!,
       value.behavior.keys[0]!,
@@ -449,46 +465,105 @@ describe('first-time Jellyfin administrator setup', () => {
     expect(value.app.jellyport.store.settings().jellyfin_api_key).not.toBe(deleted);
   });
 
-  it('uses the existing flat password only to protect the one-time upgrade wizard', async () => {
-    const legacyPassword = 'previous-Jellyport-password!42';
-    const value = await fixture({ adminPassword: legacyPassword });
-    expect(value.setupCode).toBe('');
+  it.each(['short', 'replace-with-a-long-random-password', 'previous-Jellyport-password!42'])(
+    'ignores the obsolete admin environment password and accepts Jellyfin credentials directly: %s',
+    async (legacyPassword) => {
+      vi.stubEnv('JELLYPORT_ADMIN_PASSWORD', legacyPassword);
+      const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const value = await fixture();
+      const initial = await anonymous(value.app);
+      const view = (
+        await value.app.inject({ url: '/api/session', headers: headers(initial) })
+      ).json();
+      expect(view.setup_required).toBe(true);
+      expect(view).not.toHaveProperty('setup_protection');
+      const connected = await connect(value, initial);
+      const response = await complete(value, connected.current);
+      expect(response.statusCode).toBe(200);
+      const loggedOut = await value.app.inject({
+        method: 'POST',
+        url: '/api/logout',
+        headers: headers(browser(response)),
+      });
+      const current = browser(loggedOut);
+      expect(
+        (
+          await value.app.inject({
+            method: 'POST',
+            url: '/api/login',
+            headers: headers(current),
+            payload: { username: 'administrator', password: legacyPassword },
+          })
+        ).statusCode,
+      ).toBe(401);
+      expect(
+        (
+          await value.app.inject({
+            method: 'POST',
+            url: '/api/login',
+            headers: headers(current),
+            payload: { username: 'administrator', password: JELLYFIN_PASSWORD },
+          })
+        ).statusCode,
+      ).toBe(200);
+      const output = log.mock.calls.flat().join(' ');
+      expect(output).not.toContain(legacyPassword);
+      expect(output.toLowerCase()).not.toContain('setup code');
+    },
+  );
+
+  it('pins an existing installation to its saved Jellyfin URL before any remote authentication', async () => {
+    const value = await fixture({ existingServerUrl: `${SERVER_URL}/` });
     const initial = await anonymous(value.app);
     expect(
       (await value.app.inject({ url: '/api/session', headers: headers(initial) })).json()
-        .setup_protection,
-    ).toBe('legacy_password');
-    const connected = await connect(value, initial, legacyPassword);
-    const response = await complete(value, connected.current);
-    expect(response.statusCode).toBe(200);
-    const signedIn = browser(response);
-    const loggedOut = await value.app.inject({
+        .setup_server_url,
+    ).toBe(SERVER_URL);
+    const response = await value.app.inject({
       method: 'POST',
-      url: '/api/logout',
-      headers: headers(signedIn),
+      url: '/api/setup/connect',
+      headers: headers(initial),
+      payload: {
+        jellyfin_url: 'https://different-server.test',
+        username: 'administrator',
+        password: JELLYFIN_PASSWORD,
+      },
     });
-    const current = browser(loggedOut);
-    expect(
-      (
-        await value.app.inject({
-          method: 'POST',
-          url: '/api/login',
-          headers: headers(current),
-          payload: { username: 'administrator', password: legacyPassword },
-        })
-      ).statusCode,
-    ).toBe(401);
-    expect(
-      (
-        await value.app.inject({
-          method: 'POST',
-          url: '/api/login',
-          headers: headers(current),
-          payload: { username: 'administrator', password: JELLYFIN_PASSWORD },
-        })
-      ).statusCode,
-    ).toBe(200);
+    expect([400, 403]).toContain(response.statusCode);
+    expect(value.auth.authenticate).not.toHaveBeenCalled();
+    expect(value.mediaCalls).toEqual([]);
+    expect((await complete(value, (await connect(value, initial)).current)).statusCode).toBe(200);
   });
+
+  it.each([undefined, SERVER_ID])(
+    'migrates old pending bootstrap state without retaining or requiring its setup code; existing pin: %s',
+    async (previousServerId) => {
+      const legacyCode = 'obsolete-persisted-setup-code';
+      const value = await fixture({
+        existingServerUrl: SERVER_URL,
+        legacyPendingCode: legacyCode,
+        legacyPreviousServerId: previousServerId,
+      });
+      expect(value.app.jellyport.store.authState()).toMatchObject({
+        kind: 'pending',
+        generation: 'existing-generation',
+        serverUrl: SERVER_URL,
+      });
+      expect(value.app.jellyport.store.authState()).not.toHaveProperty('setupCode');
+      expect(value.app.jellyport.store.authState()).toMatchObject(
+        previousServerId ? { previousServerId } : {},
+      );
+      const result = await connect(value);
+      expect(value.auth.authenticate).toHaveBeenLastCalledWith(
+        SERVER_URL,
+        'administrator',
+        JELLYFIN_PASSWORD,
+        previousServerId,
+      );
+      expect(result.response.body).not.toContain(legacyCode);
+      expect((await complete(value, result.current)).statusCode).toBe(200);
+    },
+  );
 
   it('rejects a setup completion that returns after the connected session was logged out and revokes its new key', async () => {
     const value = await fixture();
@@ -531,7 +606,6 @@ describe('first-time Jellyfin administrator setup', () => {
       url: '/api/setup/connect',
       headers: headers(initial),
       payload: {
-        setup_code: value.setupCode,
         jellyfin_url: SERVER_URL,
         username: 'administrator',
         password: JELLYFIN_PASSWORD,
@@ -776,12 +850,12 @@ describe('configured Jellyfin administrator sessions', () => {
     await value.app.close();
     apps.delete(value.app);
     expect(existsSync(join(value.directory, 'jellyport.db'))).toBe(true);
+    vi.stubEnv('JELLYPORT_ADMIN_PASSWORD', 'short');
     const restarted = await fixture({
       directory: value.directory,
       authentication: { auth: value.auth, behavior: value.behavior },
-      adminPassword: 'short',
     });
-    expect(restarted.setupCode).toBe('');
+    expect(restarted.app.jellyport.store.authState()).not.toHaveProperty('setupCode');
     expect(restarted.app.jellyport.store.authState()).toEqual(previousState);
     expect(restarted.app.jellyport.store.settings().jellyfin_api_key).toBe(previousKey);
     expect(
@@ -799,13 +873,28 @@ describe('configured Jellyfin administrator sessions', () => {
     expect(value.auth.createApiKey).toHaveBeenCalledOnce();
   });
 
-  it('keeps the original server fingerprint during local authentication recovery', async () => {
+  it('keeps the original server URL and fingerprint during local authentication recovery', async () => {
     const value = await configured();
     const previousKey = value.app.jellyport.store.settings().jellyfin_api_key;
     const reset = value.app.jellyport.store.resetAuth();
-    expect(reset.previousServerId).toBe(SERVER_ID);
+    expect(reset).toMatchObject({ previousServerId: SERVER_ID, serverUrl: SERVER_URL });
+    expect(reset).not.toHaveProperty('setupCode');
     expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(previousKey);
     const initial = await anonymous(value.app);
+    const previousCalls = value.auth.authenticate.mock.calls.length;
+    const wrongServer = await value.app.inject({
+      method: 'POST',
+      url: '/api/setup/connect',
+      headers: headers(initial),
+      payload: {
+        jellyfin_url: 'https://different-server.test',
+        username: 'administrator',
+        password: JELLYFIN_PASSWORD,
+      },
+    });
+    expect([400, 403]).toContain(wrongServer.statusCode);
+    expect(value.auth.authenticate).toHaveBeenCalledTimes(previousCalls);
+    expect(value.app.jellyport.store.authState()).toEqual(reset);
     value.auth.authenticate.mockImplementationOnce(
       async (_url, _username, _password, expectedServerId) => {
         expect(expectedServerId).toBe(SERVER_ID);
@@ -815,20 +904,14 @@ describe('configured Jellyfin administrator sessions', () => {
         );
       },
     );
-    const wrongServer = await value.app.inject({
+    const changedServer = await value.app.inject({
       method: 'POST',
       url: '/api/setup/connect',
       headers: headers(initial),
-      payload: {
-        setup_code: reset.setupCode,
-        jellyfin_url: 'https://different-server.test',
-        username: 'administrator',
-        password: JELLYFIN_PASSWORD,
-      },
+      payload: { jellyfin_url: SERVER_URL, username: 'administrator', password: JELLYFIN_PASSWORD },
     });
-    expect(wrongServer.statusCode).toBe(502);
-    expect(value.app.jellyport.store.authState()).toEqual(reset);
-    const connected = await connect(value, initial, reset.setupCode);
+    expect(changedServer.statusCode).toBe(502);
+    const connected = await connect(value, initial);
     expect(value.auth.authenticate).toHaveBeenLastCalledWith(
       SERVER_URL,
       'administrator',
@@ -840,6 +923,42 @@ describe('configured Jellyfin administrator sessions', () => {
       kind: 'configured',
       serverId: SERVER_ID,
     });
+  });
+
+  it('allows a local server-address recovery while retaining the original Jellyfin fingerprint', async () => {
+    const value = await configured();
+    const relocatedUrl = 'http://relocated-jellyfin:8096';
+    const reset = value.app.jellyport.store.resetAuth(relocatedUrl);
+    expect(reset).toMatchObject({ serverUrl: relocatedUrl, previousServerId: SERVER_ID });
+    const initial = await anonymous(value.app);
+    expect(
+      (await value.app.inject({ url: '/api/session', headers: headers(initial) })).json()
+        .setup_server_url,
+    ).toBe(relocatedUrl);
+    const connection = await value.app.inject({
+      method: 'POST',
+      url: '/api/setup/connect',
+      headers: headers(initial),
+      payload: {
+        jellyfin_url: relocatedUrl,
+        username: 'administrator',
+        password: JELLYFIN_PASSWORD,
+      },
+    });
+    expect(connection.statusCode).toBe(200);
+    expect(value.auth.authenticate).toHaveBeenLastCalledWith(
+      relocatedUrl,
+      'administrator',
+      JELLYFIN_PASSWORD,
+      SERVER_ID,
+    );
+    expect((await complete(value, browser(connection, true))).statusCode).toBe(200);
+    expect(value.app.jellyport.store.authState()).toMatchObject({
+      kind: 'configured',
+      serverUrl: relocatedUrl,
+      serverId: SERVER_ID,
+    });
+    expect(value.app.jellyport.store.settings().jellyfin_url).toBe(relocatedUrl);
   });
 
   it('does not reveal credentials when remote authorization finishes after local logout', async () => {

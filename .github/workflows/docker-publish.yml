@@ -96,7 +96,7 @@ jobs:
       - name: Start the image in demo mode
         run: >-
           docker run -d --name jellyport-smoke -p 127.0.0.1:8173:8000
-          -e JELLYPORT_DEMO=true -e JELLYPORT_ADMIN_PASSWORD=demo-jellyport jellyport:smoke
+          -e JELLYPORT_DEMO=true jellyport:smoke
       - name: Verify the running application
         run: node scripts/smoke.mjs http://127.0.0.1:8173
       - name: Show smoke-test logs on failure

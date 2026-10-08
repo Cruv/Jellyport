@@ -5,7 +5,7 @@ export interface Session {
   demo: boolean;
   setup_required: boolean;
   setup_connected: boolean;
-  setup_protection: 'setup_code' | 'legacy_password';
+  setup_server_url?: string;
   user?: { id: string; name: string };
 }
 export interface SetupConnection {

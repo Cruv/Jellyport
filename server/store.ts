@@ -34,7 +34,7 @@ export interface QueuedJob {
   settings: Settings;
 }
 export type AuthState =
-  | { kind: 'pending'; generation: string; setupCode: string; previousServerId?: string }
+  | { kind: 'pending'; generation: string; serverUrl?: string; previousServerId?: string }
   | { kind: 'configured'; serverUrl: string; serverId: string; apiKeyName: string };
 
 /** Compatible with existing Python SQLite volumes, including encrypted Fernet records. */
@@ -136,19 +136,32 @@ export class Store {
   ensureAuthState(): AuthState {
     return this.transaction(() => {
       const existing = this.authState();
-      if (existing) return existing;
+      if (existing?.kind === 'configured') return existing;
+      if (existing?.kind === 'pending') {
+        // Migrate unfinished wizards by dropping obsolete local bootstrap secrets.
+        const serverUrl = existing.serverUrl || this.settings().jellyfin_url;
+        const state: AuthState = {
+          kind: 'pending',
+          generation: existing.generation,
+          ...(serverUrl ? { serverUrl } : {}),
+          ...(existing.previousServerId ? { previousServerId: existing.previousServerId } : {}),
+        };
+        this.db.prepare('UPDATE auth_state SET encrypted=? WHERE id=1').run(this.encrypt(state));
+        return state;
+      }
       return this.resetAuth();
     });
   }
   /** Local operator recovery; run with Jellyport stopped. Existing media data is preserved. */
-  resetAuth(): Extract<AuthState, { kind: 'pending' }> {
+  resetAuth(newServerUrl?: string): Extract<AuthState, { kind: 'pending' }> {
     const previous = this.authState();
     const previousServerId =
       previous?.kind === 'configured' ? previous.serverId : previous?.previousServerId;
+    const serverUrl = newServerUrl ?? previous?.serverUrl ?? this.settings().jellyfin_url;
     const state = {
       kind: 'pending' as const,
       generation: randomBytes(24).toString('base64url'),
-      setupCode: randomBytes(24).toString('base64url'),
+      ...(serverUrl ? { serverUrl } : {}),
       ...(previousServerId ? { previousServerId } : {}),
     };
     this.db.prepare('INSERT OR REPLACE INTO auth_state VALUES (1,?)').run(this.encrypt(state));

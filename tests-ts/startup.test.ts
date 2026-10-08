@@ -32,18 +32,31 @@ async function runStartup(environment: Record<string, string>) {
   }
 }
 
-it('reports an invalid admin password without printing its value or data path', async () => {
+it('ignores an obsolete invalid admin environment password and never logs it or a setup code', async () => {
   const secret = 'short!234';
-  const dataDir = join(tmpdir(), 'private-jellyport-startup-path');
-  const { code, output } = await runStartup({
-    JELLYPORT_ADMIN_PASSWORD: secret,
-    JELLYPORT_DATA_DIR: dataDir,
-  });
-  expect(code).toBe(1);
-  expect(output).toContain('JELLYPORT_ADMIN_PASSWORD');
-  expect(output).toContain('12–512 characters');
-  expect(output).not.toContain(secret);
-  expect(output).not.toContain(dataDir);
+  const occupied = createServer();
+  await new Promise<void>((resolve) => occupied.listen(0, '127.0.0.1', resolve));
+  const address = occupied.address();
+  if (!address || typeof address === 'string') throw new Error('Test port unavailable.');
+  const directory = mkdtempSync(join(tmpdir(), 'jellyport-obsolete-env-'));
+  try {
+    const { code, output } = await runStartup({
+      HOST: '127.0.0.1',
+      PORT: String(address.port),
+      JELLYPORT_ADMIN_PASSWORD: secret,
+      JELLYPORT_DATA_DIR: directory,
+    });
+    expect(code).toBe(1);
+    expect(output).toContain('configured HTTP port is already in use');
+    expect(output).not.toContain('JELLYPORT_ADMIN_PASSWORD');
+    expect(output).not.toContain('12–512 characters');
+    expect(output.toLowerCase()).not.toContain('setup code');
+    expect(output).not.toContain(secret);
+    expect(output).not.toContain(directory);
+  } finally {
+    await new Promise<void>((resolve) => occupied.close(() => resolve()));
+    rmSync(directory, { force: true, recursive: true });
+  }
 });
 
 it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(

@@ -1,9 +1,5 @@
 const safeErrors = new Map([
   [
-    'Set JELLYPORT_ADMIN_PASSWORD to a strong password of 12–512 characters before starting Jellyport.',
-    'Remove JELLYPORT_ADMIN_PASSWORD to use the generated setup code, or set this optional one-time upgrade password to 12–512 characters and replace the example value.',
-  ],
-  [
     'The Jellyport database has no encryption key. Restore secret.key from the same backup.',
     'The existing database is missing its encryption key. Restore secret.key and the database from the same backup; do not generate a replacement key.',
   ],

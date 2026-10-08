@@ -120,14 +120,9 @@ it('runs production HTTP clients through a Jellyfin 10.11 wizard, managed servic
   });
   const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/jellyfin`;
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-auth-http-'));
-  let setupCode = '';
   const app = await createApp({
     demo: false,
-    adminPassword: '',
     dataDir: directory,
-    onSetupCode: (code) => {
-      setupCode = code;
-    },
   });
   resources.push({ app, server, directory });
   const getBrowser = (response: Awaited<ReturnType<JellyportApp['inject']>>, nested = false) => ({
@@ -139,7 +134,7 @@ it('runs production HTTP clients through a Jellyfin 10.11 wizard, managed servic
     method: 'POST',
     url: '/api/setup/connect',
     headers: anonymous,
-    payload: { setup_code: setupCode, jellyfin_url: baseUrl, username: 'Administrator', password },
+    payload: { jellyfin_url: baseUrl, username: 'Administrator', password },
   });
   expect(connected.statusCode).toBe(200);
   expect(connected.json().templates).toEqual([{ Id: 'template-id', Name: 'Member template' }]);

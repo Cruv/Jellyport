@@ -10,7 +10,6 @@ const session: Session = {
   demo: false,
   setup_required: false,
   setup_connected: false,
-  setup_protection: 'setup_code',
   user: { id: 'admin-id', name: 'jellyfin-admin' },
 };
 const job: Job = {
@@ -372,27 +371,36 @@ describe('Jellyfin administrator sign-in and setup', () => {
     expect(requests.some((request) => request.path === '/api/overview')).toBe(false);
   });
 
-  it('connects Jellyfin with the setup code, filters unsafe templates, and uses the rotated CSRF token to finish', async () => {
+  it('connects directly with Jellyfin administrator credentials, filters unsafe templates, and uses the rotated CSRF token to finish', async () => {
     responses['/api/session'] = setupSession;
     responses['/api/setup/connect'] = connection;
     responses['/api/setup/complete'] = session;
     render(<App />);
     await screen.findByText('Connect your Jellyfin server');
-    const code = screen.getByLabelText('One-time setup code') as HTMLInputElement;
     const password = screen.getByLabelText('Jellyfin password') as HTMLInputElement;
-    fireEvent.change(code, { target: { value: 'one-time-code' } });
+    expect([...password.form!.querySelectorAll('input')].map((field) => field.name)).toEqual([
+      'jellyfin_url',
+      'username',
+      'password',
+    ]);
+    expect((screen.getByLabelText('Jellyfin server URL') as HTMLInputElement).readOnly).toBe(false);
     fireEvent.change(screen.getByLabelText('Jellyfin server URL'), {
       target: { value: 'http://jellyfin:8096' },
     });
     fireEvent.change(screen.getByLabelText('Jellyfin username'), { target: { value: 'admin' } });
     fireEvent.change(password, { target: { value: 'server-admin-password' } });
     fireEvent.click(screen.getByRole('button', { name: 'Connect Jellyfin' }));
-    expect(code.value).toBe('');
     expect(password.value).toBe('');
     await screen.findByText('Choose account permissions');
     expect(screen.queryByRole('option', { name: 'Admin user' })).toBeNull();
     expect(screen.queryByRole('option', { name: 'Disabled user' })).toBeNull();
     expect(screen.getByRole('option', { name: 'Member template' })).toBeTruthy();
+    const connect = requests.find((request) => request.path === '/api/setup/connect')!;
+    expect(JSON.parse(String(connect.options?.body))).toEqual({
+      jellyfin_url: 'http://jellyfin:8096',
+      username: 'admin',
+      password: 'server-admin-password',
+    });
     expect(requests.some((request) => request.path === '/api/overview')).toBe(false);
     fireEvent.click(screen.getByRole('button', { name: 'Finish setup' }));
     await screen.findByText('Everyone’s next chapter.');
@@ -409,16 +417,13 @@ describe('Jellyfin administrator sign-in and setup', () => {
   });
 
   it('keeps the setup wizard available after rejected Jellyfin credentials', async () => {
-    responses['/api/session'] = { ...setupSession, setup_protection: 'legacy_password' };
+    responses['/api/session'] = setupSession;
     responses['/api/setup/connect'] = {
       detail: 'Jellyfin did not accept that username and password.',
     };
     statuses['/api/setup/connect'] = 401;
     render(<App />);
     await screen.findByText('Connect your Jellyfin server');
-    fireEvent.change(screen.getByLabelText('Current Jellyport password'), {
-      target: { value: 'old-jellyport-password' },
-    });
     fireEvent.change(screen.getByLabelText('Jellyfin server URL'), {
       target: { value: 'http://jellyfin:8096' },
     });
@@ -429,11 +434,32 @@ describe('Jellyfin administrator sign-in and setup', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Connect Jellyfin' }));
     await screen.findByText('Jellyfin did not accept that username and password.');
     expect(screen.getByText('Connect your Jellyfin server')).toBeTruthy();
-    expect((screen.getByLabelText('Current Jellyport password') as HTMLInputElement).value).toBe(
-      '',
-    );
     expect((screen.getByLabelText('Jellyfin password') as HTMLInputElement).value).toBe('');
     expect(screen.queryByRole('button', { name: 'Sign in' })).toBeNull();
+  });
+  it('prefills and locks the connected server during guided setup for an existing workspace', async () => {
+    const storedUrl = 'http://existing-jellyfin:8096';
+    responses['/api/session'] = { ...setupSession, setup_server_url: storedUrl };
+    responses['/api/setup/connect'] = { ...connection, server: { url: storedUrl } };
+    render(<App />);
+    const server = (await screen.findByLabelText('Jellyfin server URL')) as HTMLInputElement;
+    expect(server.value).toBe(storedUrl);
+    expect(server.readOnly).toBe(true);
+    expect(
+      screen.getByText('Sign in to the Jellyfin server already connected to this workspace.'),
+    ).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Jellyfin username'), { target: { value: 'admin' } });
+    fireEvent.change(screen.getByLabelText('Jellyfin password'), {
+      target: { value: 'existing-admin-password' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Connect Jellyfin' }));
+    await screen.findByText('Choose account permissions');
+    const connect = requests.find((request) => request.path === '/api/setup/connect')!;
+    expect(JSON.parse(String(connect.options?.body))).toEqual({
+      jellyfin_url: storedUrl,
+      username: 'admin',
+      password: 'existing-admin-password',
+    });
   });
 
   it('resumes connected setup after a reload and refreshes template users without collecting credentials again', async () => {
@@ -483,16 +509,12 @@ describe('Jellyfin administrator sign-in and setup', () => {
     await screen.findByText('Choose account permissions');
     fireEvent.click(screen.getByRole('button', { name: 'Reconnect Jellyfin' }));
     await screen.findByText('Connect your Jellyfin server');
-    expect((screen.getByLabelText('One-time setup code') as HTMLInputElement).value).toBe('');
     expect((screen.getByLabelText('Jellyfin password') as HTMLInputElement).value).toBe('');
     const logout = requests.find((request) => request.path === '/api/logout')!;
     expect(logout.options?.method).toBe('POST');
     expect((logout.options?.headers as Record<string, string>)['X-CSRF-Token']).toBe(
       'pending-csrf',
     );
-    fireEvent.change(screen.getByLabelText('One-time setup code'), {
-      target: { value: 'one-time-code' },
-    });
     fireEvent.change(screen.getByLabelText('Jellyfin server URL'), {
       target: { value: 'http://jellyfin:8096' },
     });
@@ -516,7 +538,7 @@ describe('Jellyfin administrator sign-in and setup', () => {
     await screen.findByText('Choose account permissions');
     responses['/api/session'] = { ...setupSession, csrf_token: 'fresh-csrf' };
     fireEvent.click(screen.getByRole('button', { name: 'Finish setup' }));
-    await screen.findByLabelText('One-time setup code');
+    await screen.findByLabelText('Jellyfin server URL');
     expect(screen.queryByRole('button', { name: 'Finish setup' })).toBeNull();
     expect(screen.getByText('Connect your Jellyfin server')).toBeTruthy();
     expect((screen.getByLabelText('Jellyfin password') as HTMLInputElement).value).toBe('');
@@ -545,9 +567,6 @@ describe('Jellyfin administrator sign-in and setup', () => {
     render(<App />);
     await screen.findByText('Connect your Jellyfin server');
     responses['/api/session'] = { ...setupSession, csrf_token: 'renewed-setup-csrf' };
-    fireEvent.change(screen.getByLabelText('One-time setup code'), {
-      target: { value: 'one-time-code' },
-    });
     fireEvent.change(screen.getByLabelText('Jellyfin server URL'), {
       target: { value: 'http://jellyfin:8096' },
     });

@@ -32,9 +32,9 @@ jobs:
             docker compose -f "$compose_file" config --quiet
           done
       - run: docker build -t jellyport:ci .
-      - run: docker run -d --name jellyport-ci -p 127.0.0.1:8173:8000 -e JELLYPORT_DEMO=true -e JELLYPORT_ADMIN_PASSWORD=demo-jellyport jellyport:ci
+      - run: docker run -d --name jellyport-ci -p 127.0.0.1:8173:8000 -e JELLYPORT_DEMO=true jellyport:ci
       - run: node scripts/smoke.mjs http://127.0.0.1:8173
-      - name: Smoke test protected first-run setup without an admin password
+      - name: Smoke test guided first-run setup
         run: |
           docker run -d --name jellyport-fresh-ci -p 127.0.0.1:8175:8000 jellyport:ci
           node scripts/smoke-setup.mjs http://127.0.0.1:8175
@@ -46,7 +46,7 @@ jobs:
           docker run -d --name jellyport-bind-ci --user 1000:1000 \
             --cap-drop ALL --security-opt no-new-privileges:true \
             -p 127.0.0.1:8174:8000 \
-            -e TZ=Etc/UTC -e JELLYPORT_DEMO=true -e JELLYPORT_ADMIN_PASSWORD=demo-jellyport \
+            -e TZ=Etc/UTC -e JELLYPORT_DEMO=true \
             -v "${RUNNER_TEMP}/jellyport-bind:/data" jellyport:ci
           node scripts/smoke.mjs http://127.0.0.1:8174
           docker exec jellyport-bind-ci node -e "const assert=require('node:assert/strict'),fs=require('node:fs'); assert.equal(process.getuid(),1000); assert.equal(process.getgid(),1000); for(const name of ['secret.key','jellyport.db']){const s=fs.statSync('/data/'+name); assert.equal(s.uid,1000); assert.equal(s.gid,1000); assert.equal(s.mode&0o777,0o600);} console.log('Bind-mount ownership and secret file permissions passed.');"

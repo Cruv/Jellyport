@@ -49,14 +49,13 @@ interface MigrationRequest {
   discord_recipients?: Record<string, string>;
 }
 export interface CreateAppOptions {
-  adminPassword?: string;
+  demoPassword?: string;
   dataDir?: string;
   demo?: boolean;
   secureCookie?: boolean;
   clientFactory?: ClientFactory;
   staticDir?: string;
   authClient?: JellyfinAuthentication;
-  onSetupCode?: (code: string) => void;
 }
 export type JellyportApp = FastifyInstance & {
   jellyport: { store: Store; service: Service; bot: BotManager };
@@ -95,34 +94,13 @@ const migrationSchema = {
 
 export async function createApp(options: CreateAppOptions = {}): Promise<JellyportApp> {
   const demo = options.demo ?? process.env.JELLYPORT_DEMO === 'true';
-  const legacyPassword = options.adminPassword ?? process.env.JELLYPORT_ADMIN_PASSWORD ?? '';
-  const demoPassword = legacyPassword || 'demo-jellyport';
+  const demoPassword = options.demoPassword ?? 'demo-jellyport';
   const secureCookie = options.secureCookie ?? process.env.JELLYPORT_SECURE_COOKIE === 'true';
   const store = new Store(options.dataDir ?? process.env.JELLYPORT_DATA_DIR ?? './data');
   const authClient = options.authClient ?? new JellyfinAuthClient();
-  const initialAuth = demo ? null : store.ensureAuthState();
-  const setupPassword = initialAuth?.kind === 'pending' ? legacyPassword : '';
-  if (
-    setupPassword &&
-    (setupPassword.length < 12 ||
-      setupPassword.length > 512 ||
-      setupPassword.startsWith('replace-with'))
-  ) {
-    store.close();
-    throw new Error(
-      'Set JELLYPORT_ADMIN_PASSWORD to a strong password of 12–512 characters before starting Jellyport.',
-    );
-  }
+  if (!demo) store.ensureAuthState();
   const salt = randomBytes(16);
-  const passwordHash = (await hashPassword(
-    demo ? demoPassword : setupPassword,
-    salt,
-    64,
-  )) as Buffer;
-  if (initialAuth?.kind === 'pending' && !setupPassword) {
-    if (options.onSetupCode) options.onSetupCode(initialAuth.setupCode);
-    else console.log(`Jellyport setup code: ${initialAuth.setupCode}`);
-  }
+  const passwordHash = demo ? ((await hashPassword(demoPassword, salt, 64)) as Buffer) : null;
   let clientFactory = options.clientFactory;
   if (demo) {
     const servers = new DemoServers();
@@ -186,7 +164,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         !!value.connection &&
         state?.kind === 'pending' &&
         value.connection.generation === state.generation,
-      setup_protection: setupPassword ? 'legacy_password' : 'setup_code',
+      ...(state?.kind === 'pending' && state.serverUrl
+        ? { setup_server_url: normalizeJellyfinUrl(state.serverUrl) }
+        : {}),
       ...(value.authenticated
         ? {
             user: {
@@ -366,7 +346,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       let identity: JellyfinIdentity | undefined;
       if (demo) {
         const supplied = (await hashPassword(request.body.password, salt, 64)) as Buffer;
-        if (request.body.username !== 'admin' || !timingSafeEqual(passwordHash, supplied))
+        if (request.body.username !== 'admin' || !timingSafeEqual(passwordHash!, supplied))
           throw new JellyfinAuthError('Incorrect demo username or password.', 401);
       } else {
         const state = store.authState();
@@ -445,7 +425,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   }
   app.get('/api/setup', async (request) => setupView(request));
   app.post<{
-    Body: { setup_code: string; jellyfin_url: string; username: string; password: string };
+    Body: { jellyfin_url: string; username: string; password: string };
   }>(
     '/api/setup/connect',
     {
@@ -453,10 +433,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         body: {
           type: 'object',
           additionalProperties: false,
-          required: ['setup_code', 'jellyfin_url', 'username', 'password'],
+          required: ['jellyfin_url', 'username', 'password'],
           properties: {
             ...credentialsSchema,
-            setup_code: { type: 'string', minLength: 1, maxLength: 512 },
             jellyfin_url: { type: 'string', minLength: 1, maxLength: 2048 },
           },
         },
@@ -469,15 +448,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       const state = store.authState();
       if (demo || state?.kind !== 'pending')
         throw new JellyfinAuthError('Jellyport is already configured.', 403);
-      const validCode = setupPassword
-        ? timingSafeEqual(
-            passwordHash,
-            (await hashPassword(request.body.setup_code, salt, 64)) as Buffer,
-          )
-        : equal(request.body.setup_code, state.setupCode);
-      if (!validCode)
-        throw new JellyfinAuthError('Incorrect setup code or current Jellyport password.', 401);
       const serverUrl = normalizeJellyfinUrl(request.body.jellyfin_url);
+      if (state.serverUrl && serverUrl !== normalizeJellyfinUrl(state.serverUrl))
+        throw new JellyfinAuthError(
+          'Complete setup using the Jellyfin server already linked to this installation.',
+          403,
+        );
       const identity = await authClient.authenticate(
         serverUrl,
         request.body.username,

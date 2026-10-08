@@ -78,6 +78,8 @@ describe('user directory and informational Discord organization', () => {
       discord_bot_token: 'PRIVATE-DISCORD-TOKEN',
       discord_emby_role_id: embyRole,
       discord_jellyfin_role_id: jellyfinRole,
+      // These removal/stale-review fixtures explicitly exercise the optional exclusive mode.
+      discord_emby_only_role: true,
       template_user_id: 'template',
     });
     mediaWrites = [];
@@ -333,6 +335,39 @@ describe('user directory and informational Discord organization', () => {
     expect(mediaWrites).toEqual([]);
     expect(bot.sendCredentials).not.toHaveBeenCalled();
   });
+
+  it.each(['emby', 'jellyfin', 'both'] as const)(
+    'uses a tag for every confirmed server account by default: %s',
+    async (presence) => {
+      expect(DEFAULT_SETTINGS.discord_emby_only_role).toBe(false);
+      updateSettings({ discord_emby_only_role: DEFAULT_SETTINGS.discord_emby_only_role });
+      if (presence === 'both') linked();
+      else {
+        membership();
+        if (presence === 'emby') mapping('e-alex', null);
+        else store.saveLink(owner, 'river', 'j-river');
+      }
+      const preview = await organization.preview();
+      expect(preview.changes).toEqual([
+        {
+          discord_user_id: owner,
+          username: 'river',
+          add:
+            presence === 'both'
+              ? [embyRole, jellyfinRole]
+              : [presence === 'emby' ? embyRole : jellyfinRole],
+          remove: [],
+        },
+      ]);
+      await organization.apply(preview.token);
+      expect(bot.members.get(owner)!.roles).toEqual([
+        'unrelated',
+        'subscriber',
+        ...preview.changes[0]!.add,
+      ]);
+      expect(mediaWrites).toEqual([]);
+    },
+  );
 
   it('tags disabled accounts as existing accounts and supports keeping both server tags', async () => {
     linked();

@@ -49,7 +49,7 @@ export const DEFAULT_SETTINGS: Settings = {
   discord_emby_role_id: '',
   discord_jellyfin_role_id: '',
   discord_auto_role_sync: false,
-  discord_emby_only_role: true,
+  discord_emby_only_role: false,
   discord_application_id: '',
   discord_subscription_channel_id: '',
   discord_subscription_bot_id: '',

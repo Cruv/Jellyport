@@ -185,6 +185,15 @@ describe('User directory and Discord organization', () => {
     });
   });
 
+  it('defaults to tagging every server when no exclusive preference is saved', async () => {
+    page(undefined, { ...settings, discord_emby_only_role: undefined });
+    fireEvent.click(screen.getByRole('button', { name: 'Configure roles' }));
+    expect(await screen.findByLabelText('Emby account role')).toBeTruthy();
+    expect(
+      screen.getByLabelText('Reserve the Emby role for owners who have only Emby accounts'),
+    ).toHaveProperty('checked', false);
+  });
+
   it('requires saving edited role settings before preview and sends only organization settings', async () => {
     const { requests } = page();
     fireEvent.click(screen.getByRole('button', { name: 'Configure roles' }));

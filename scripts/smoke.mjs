@@ -96,7 +96,7 @@ const settings = await request('/api/settings');
 assert(!Object.hasOwn(settings, 'jellyfin_api_key'));
 assert(settings.jellyfin_api_key_set);
 assert.equal(settings.discord_auto_role_sync, false);
-assert.equal(settings.discord_emby_only_role, true);
+assert.equal(settings.discord_emby_only_role, false);
 const directory = await request('/api/user-directory');
 assert(directory.users.some((user) => user.access_mode === 'standalone'));
 assert(directory.users.every((user) => user.discord_user_id === null));

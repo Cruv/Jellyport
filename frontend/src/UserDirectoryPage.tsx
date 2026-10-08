@@ -66,12 +66,12 @@ export default function UserDirectoryPage({
   const [embyRole, setEmbyRole] = useState(settings.discord_emby_role_id || '');
   const [jellyfinRole, setJellyfinRole] = useState(settings.discord_jellyfin_role_id || '');
   const [autoSync, setAutoSync] = useState(!!settings.discord_auto_role_sync);
-  const [embyOnly, setEmbyOnly] = useState(settings.discord_emby_only_role !== false);
+  const [embyOnly, setEmbyOnly] = useState(settings.discord_emby_only_role === true);
   const [savedRoles, setSavedRoles] = useState({
     embyRole: settings.discord_emby_role_id || '',
     jellyfinRole: settings.discord_jellyfin_role_id || '',
     autoSync: !!settings.discord_auto_role_sync,
-    embyOnly: settings.discord_emby_only_role !== false,
+    embyOnly: settings.discord_emby_only_role === true,
   });
   const [preview, setPreview] = useState<DiscordTagPreview | null>(null);
   const organizationInvite = safeUrl(settings.bot_organization_invite_url);

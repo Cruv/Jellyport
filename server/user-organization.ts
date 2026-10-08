@@ -214,7 +214,7 @@ export class UserOrganization {
               ? [settings.discord_jellyfin_role_id]
               : []),
             ...(hasEmby &&
-            (settings.discord_emby_only_role === false || !hasJellyfin) &&
+            (settings.discord_emby_only_role !== true || !hasJellyfin) &&
             settings.discord_emby_role_id
               ? [settings.discord_emby_role_id]
               : []),

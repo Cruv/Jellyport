@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { createApp, type JellyportApp } from './main.js';
+import { startupFailureDetail } from './startup.js';
 
 let app: JellyportApp | undefined;
 try {
@@ -21,10 +22,8 @@ try {
   const port = Number(process.env.PORT ?? 8000);
   await app.listen({ host: process.env.HOST ?? '0.0.0.0', port });
   console.log(`Jellyport listening on port ${port}.`);
-} catch {
+} catch (error) {
   if (app) await app.close().catch(() => {});
-  console.error(
-    'Jellyport could not start. Check the admin password, data volume and configuration.',
-  );
+  console.error(`Jellyport could not start. ${startupFailureDetail(error)}`);
   process.exitCode = 1;
 }

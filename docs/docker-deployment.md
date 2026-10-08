@@ -67,6 +67,14 @@ services:
 
 Keep the existing stack's top-level network definition. Do not replace it with `external: true` merely to add Jellyport to the same stack; the external-network example is for a separate stack joining a network created elsewhere.
 
+## Troubleshooting startup
+
+`JELLYPORT_ADMIN_PASSWORD=${JELLYPORT_ADMIN_PASSWORD:-}` is valid Compose interpolation. The empty default lets maintenance commands work without a configured password; the application refuses to start if the resulting password is missing or invalid. Set the variable in the same Portainer stack as Jellyport, then update the stack so the container receives it.
+
+For a permission-denied startup message, check that the mounted directory and its existing database, journal files, and `secret.key` are owned by the configured container user and group. The bind-mount examples use `1000:1000`; the default named-volume deployment uses `10001:10001`.
+
+Bind-mount source paths refer to the Docker host. A directory reached through a mounted NAS share on a laptop can have a different path and displayed owner from that same directory on the server. Check the server-side path and permissions. If moving Jellyport into another stack, verify that its volume entry still points to the intended data directory.
+
 ## Existing installations and backups
 
 The repository Compose file continues to mount the `jellyport-data` named volume and use UID/GID `10001:10001`. Preserve its Compose project name, volume, and administrator password when updating it from source:

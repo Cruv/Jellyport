@@ -1,4 +1,5 @@
-export type Page = 'overview' | 'migrate' | 'accounts' | 'subscriptions' | 'activity' | 'settings';
+export type Page =
+  'overview' | 'migrate' | 'mappings' | 'accounts' | 'subscriptions' | 'activity' | 'settings';
 export interface Session {
   authenticated: boolean;
   csrf_token: string;
@@ -24,6 +25,18 @@ export interface Users {
   jellyfin: MediaUser[];
   errors?: Record<string, string>;
 }
+export interface UserMapping {
+  id: string;
+  source_user_id: string;
+  source_username: string;
+  target_user_id: string | null;
+  target_username: string;
+  discord_user_id: string | null;
+  discord_username: string | null;
+  revision: string;
+  source_server_url?: string;
+  target_server_url?: string;
+}
 export interface Connection {
   connected?: boolean;
   configured?: boolean;
@@ -44,6 +57,9 @@ export interface ItemIssue {
 }
 export interface JobResult {
   username?: string;
+  source_username?: string;
+  mapping_id?: string;
+  data?: MigrationDetails;
   status: string;
   created?: boolean;
   matched?: number;
@@ -56,6 +72,24 @@ export interface JobResult {
   discord_delivery?: string | { status?: string };
   delivery_error?: string;
   error?: string;
+}
+export interface MigrationDetails {
+  items_updated: number;
+  favorites: number;
+  resume_positions: number;
+  play_counts: number;
+  last_played_dates: number;
+  ratings: number;
+  preferences: string[];
+  avatar: boolean;
+  playlists_created: number;
+  playlists_existing: number;
+  playlist_items_added: number;
+  playlist_items_skipped: number;
+  playlist_duplicates_skipped: number;
+  failed_items: number;
+  history_dates_missing: number;
+  warnings: string[];
 }
 export interface Job {
   id: string;
@@ -75,6 +109,12 @@ export interface Overview {
 export interface PreviewUser {
   source_user_id: string;
   username: string;
+  source_username?: string;
+  mapping_id?: string | null;
+  mapping_revision?: string | null;
+  discord_user_id?: string | null;
+  discord_username?: string | null;
+  warnings?: string[];
   target_exists: boolean;
   stats: {
     source_played?: number;
@@ -82,6 +122,10 @@ export interface PreviewUser {
     unmatched?: number;
     ambiguous?: number;
     already_played?: number;
+    source_items?: number;
+    source_favorites?: number;
+    source_resume?: number;
+    source_playlists?: number;
   };
   unmatched?: ItemIssue[];
   ambiguous?: ItemIssue[];
@@ -136,7 +180,7 @@ export interface Settings {
   bot_invite_url: string;
 }
 export interface ApiOptions {
-  method?: 'GET' | 'POST' | 'PUT';
+  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   body?: unknown;
   signal?: AbortSignal;
 }

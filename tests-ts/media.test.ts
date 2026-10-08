@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MediaClient, type FetchTransport } from '../server/media.js';
+import { MediaClient, type FetchTransport, type MediaUserDataPatch } from '../server/media.js';
 import { MediaError } from '../server/errors.js';
 
 const json = (data: unknown, status = 200) =>
@@ -367,5 +367,423 @@ describe('media API boundary', () => {
     });
     await expect(client.users()).resolves.toEqual([]);
     await client.close();
+  });
+
+  it('reads broad user data and requests Emby history fields explicitly', async () => {
+    const seen: URL[] = [];
+    const client = new MediaClient('http://emby.test', 'key', 'emby', {
+      transport: async (address) => {
+        const url = new URL(address);
+        seen.push(url);
+        expect(url.pathname).toBe('/Users/alice/Items');
+        expect(url.searchParams.get('Fields')).toBe(
+          'ProviderIds,Path,UserDataPlayCount,UserDataLastPlayedDate',
+        );
+        expect(url.searchParams.get('EnableUserData')).toBe('true');
+        return json({
+          Items: [
+            { Id: 'series', Type: 'Series', ProviderIds: { Tvdb: '42' } },
+            { Id: 'season', Type: 'Season', SeriesId: 'series' },
+            { Id: 'episode', Type: 'Episode', SeriesId: 'series' },
+            { Id: 'song', Type: 'Audio', UserData: { PlayCount: 4, IsFavorite: true } },
+          ],
+          TotalRecordCount: 4,
+        });
+      },
+    });
+    const items = await client.migrationItems('alice');
+    expect(items.map((item) => item.Id)).toEqual(['series', 'season', 'episode', 'song']);
+    expect(items[1]?.SeriesProviderIds).toEqual({ Tvdb: '42' });
+    expect(items[2]?.SeriesProviderIds).toEqual({ Tvdb: '42' });
+    expect(items[3]?.UserData?.PlayCount).toBe(4);
+    expect(seen).toHaveLength(1);
+    const types = seen[0]!.searchParams.get('IncludeItemTypes')!.split(',');
+    expect(types).toEqual(
+      expect.arrayContaining([
+        'Series',
+        'Season',
+        'Book',
+        'AudioBook',
+        'MusicArtist',
+        'PhotoAlbum',
+        'BoxSet',
+      ]),
+    );
+    await client.close();
+  });
+
+  it.each([
+    ['10.8.13', false, false],
+    ['10.9.0', true, false],
+    ['10.11.10', true, false],
+    ['12.0', true, true],
+    ['12.2.0', true, true],
+    ['12.2.0-rc.1', false, false],
+    ['unknown', false, false],
+    [undefined, false, false],
+  ])(
+    'checks writable capabilities for Jellyfin version %s',
+    async (version, supported, duplicates) => {
+      const transport = vi.fn(async () => json({ Version: version }));
+      const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
+      const capabilities = await client.migrationCapabilities();
+      expect(capabilities.userData).toBe(supported);
+      expect(capabilities.privatePlaylists).toBe(supported);
+      expect(capabilities.playlistDuplicates).toBe(duplicates);
+      await client.migrationCapabilities();
+      expect(transport).toHaveBeenCalledOnce();
+      await client.close();
+    },
+  );
+
+  it('whitelists detailed user-data reads and partial writes without carrying item identifiers', async () => {
+    const writes: unknown[] = [];
+    const patch = {
+      Played: true,
+      IsFavorite: true,
+      Likes: false,
+      PlaybackPositionTicks: 12_000_000,
+      PlayCount: 8,
+      LastPlayedDate: '2026-01-02T03:04:05Z',
+      Rating: 7.5,
+      Key: 'source-key',
+      ItemId: 'source-item',
+      PlayedPercentage: 98,
+      UnplayedItemCount: 22,
+      api_key: 'source-secret',
+    };
+    const expected = {
+      Played: true,
+      IsFavorite: true,
+      Likes: false,
+      PlaybackPositionTicks: 12_000_000,
+      PlayCount: 8,
+      LastPlayedDate: '2026-01-02T03:04:05.000Z',
+      Rating: 7.5,
+    };
+    const client = new MediaClient('http://jellyfin.test/base', 'private-key', 'jellyfin', {
+      transport: async (address, init) => {
+        const url = new URL(address);
+        if (url.pathname.endsWith('/System/Info')) return json({ Version: '12.2' });
+        expect(url.pathname).toBe('/base/UserItems/target-item/UserData');
+        expect(url.searchParams.get('userId')).toBe('target-user');
+        expect(address).not.toContain('private-key');
+        if (init.method === 'POST') {
+          writes.push(JSON.parse(String(init.body)));
+          return new Response(null, { status: 204 });
+        }
+        return json(patch);
+      },
+    });
+    expect(await client.userData('target-user', 'target-item')).toEqual(expected);
+    await client.updateUserData('target-user', 'target-item', patch);
+    await client.updateUserData('target-user', 'target-item', { IsFavorite: true });
+    expect(writes).toEqual([expected, { IsFavorite: true }]);
+    await client.close();
+  });
+
+  it.each([
+    { Played: 'true' },
+    { IsFavorite: 1 },
+    { Likes: 'yes' },
+    { PlaybackPositionTicks: -1 },
+    { PlaybackPositionTicks: Number.MAX_SAFE_INTEGER + 1 },
+    { PlayCount: 1.5 },
+    { PlayCount: 2_147_483_648 },
+    { LastPlayedDate: 'invalid-date' },
+    { LastPlayedDate: '+010000-01-01T00:00:00Z' },
+    { Rating: Infinity },
+    { Rating: 11 },
+    { ItemId: 'source', Key: 'source-key' },
+  ])('rejects invalid user-data mutations before making any request: %j', async (patch) => {
+    const transport = vi.fn(async () => json({ Version: '12.2' }));
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
+    await expect(
+      client.updateUserData('target-user', 'target-item', patch as MediaUserDataPatch),
+    ).rejects.toBeInstanceOf(MediaError);
+    expect(transport).not.toHaveBeenCalled();
+    await client.close();
+  });
+
+  it('preserves legacy favorite and historical played-date endpoint contracts', async () => {
+    const seen: URL[] = [];
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', {
+      transport: async (address, init) => {
+        expect(init.method).toBe('POST');
+        seen.push(new URL(address));
+        return new Response(null, { status: 204 });
+      },
+    });
+    await client.markPlayed('alice', 'movie', '2026-01-02T03:04:05.123Z');
+    await client.markFavorite('alice', 'movie');
+    expect(seen[0]!.pathname).toBe('/Users/alice/PlayedItems/movie');
+    expect(seen[0]!.searchParams.get('DatePlayed')).toBe('20260102030405');
+    expect(seen[1]!.pathname).toBe('/Users/alice/FavoriteItems/movie');
+    expect(seen[1]!.search).toBe('');
+    await client.close();
+  });
+
+  it('reads only the selected user playlists and preserves duplicate occurrences in their order', async () => {
+    const client = new MediaClient('http://emby.test', 'key', 'emby', {
+      transport: async (address) => {
+        const url = new URL(address);
+        if (url.pathname === '/Users/alice/Items') {
+          expect(url.searchParams.get('IncludeItemTypes')).toBe('Playlist');
+          return json({
+            Items: [{ Id: 'playlist', Name: 'A mix', Type: 'Playlist' }],
+            TotalRecordCount: 1,
+          });
+        }
+        expect(url.pathname).toBe('/Playlists/playlist/Items');
+        expect(url.searchParams.get('userId')).toBe('alice');
+        expect(url.searchParams.get('SortBy')).toBeNull();
+        const entries = [
+          { Id: 'song-b', PlaylistItemId: 'song-b' },
+          { Id: 'song-a', PlaylistItemId: 'song-a' },
+          { Id: 'song-b', PlaylistItemId: 'song-b' },
+          { Id: 'song-b', PlaylistItemId: 'song-b' },
+          { Id: 'song-b', PlaylistItemId: 'song-b' },
+        ];
+        const start = Number(url.searchParams.get('StartIndex'));
+        return json({ Items: entries.slice(start, start + 2), TotalRecordCount: entries.length });
+      },
+    });
+    client.pageSize = 2;
+    expect(await client.playlists('alice')).toMatchObject([{ Id: 'playlist', Name: 'A mix' }]);
+    expect((await client.playlistItems('playlist', 'alice')).map((item) => item.Id)).toEqual([
+      'song-b',
+      'song-a',
+      'song-b',
+      'song-b',
+      'song-b',
+    ]);
+    await client.close();
+  });
+
+  it('creates empty private owner-bound playlists and appends ordered bounded batches', async () => {
+    const seen: { url: URL; method?: string; body: unknown }[] = [];
+    const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
+      transport: async (address, init) => {
+        const url = new URL(address);
+        if (url.pathname === '/System/Info') return json({ Version: '12.2' });
+        expect(address).not.toContain('private-key');
+        seen.push({
+          url,
+          method: init.method,
+          body: init.body ? JSON.parse(String(init.body)) : undefined,
+        });
+        return url.pathname === '/Playlists'
+          ? json({ Id: 'new-playlist' })
+          : new Response(null, { status: 204 });
+      },
+    });
+    expect(await client.createPlaylist('target-user', 'An imported mix', 'Audio')).toEqual({
+      Id: 'new-playlist',
+      Name: 'An imported mix',
+      Type: 'Playlist',
+      MediaType: 'Audio',
+    });
+    await client.addPlaylistItems('new-playlist', 'target-user', ['song-b', 'song-a', 'song-b']);
+    expect(seen[0]!.body).toEqual({
+      Name: 'An imported mix',
+      UserId: 'target-user',
+      Ids: [],
+      Users: [],
+      IsPublic: false,
+      MediaType: 'Audio',
+    });
+    expect(seen[1]!.url.pathname).toBe('/Playlists/new-playlist/Items');
+    expect(seen[1]!.url.searchParams.get('userId')).toBe('target-user');
+    expect(seen[1]!.url.searchParams.get('ids')).toBe('song-b,song-a,song-b');
+    await expect(
+      client.addPlaylistItems('new-playlist', 'target-user', ['one,other']),
+    ).rejects.toThrow('valid playlist item identifiers');
+    await expect(
+      client.addPlaylistItems('new-playlist', 'target-user', Array(101).fill('id')),
+    ).rejects.toThrow('valid playlist item identifiers');
+    expect(seen).toHaveLength(2);
+    await client.close();
+  });
+
+  it.each(['10.8.13', 'unknown'])(
+    'refuses potentially public playlist creation on version %s',
+    async (version) => {
+      const transport = vi.fn(async () => json({ Version: version }));
+      const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
+      await expect(client.createPlaylist('alice', 'Private')).rejects.toThrow('10.9 or newer');
+      await expect(client.updateUserData('alice', 'movie', { Played: true })).rejects.toThrow(
+        '10.9 or newer',
+      );
+      await expect(client.addPlaylistItems('playlist', 'alice', ['one'])).rejects.toThrow(
+        '10.9 or newer',
+      );
+      expect(transport).toHaveBeenCalledOnce();
+      await client.close();
+    },
+  );
+
+  it('creates the full private playlist atomically with a bounded ordered ID list', async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
+      transport: async (address, init) => {
+        if (new URL(address).pathname === '/System/Info') return json({ Version: '12.2' });
+        expect(new URL(address).pathname).toBe('/Playlists');
+        bodies.push(JSON.parse(String(init.body)));
+        return json({ Id: 'target-list' });
+      },
+    });
+    await client.createPlaylist('target-user', 'Private atomic import', 'Audio', [
+      'song-b',
+      'song-a',
+      'song-b',
+    ]);
+    expect(bodies[0]).toEqual({
+      Name: 'Private atomic import',
+      UserId: 'target-user',
+      Ids: ['song-b', 'song-a', 'song-b'],
+      Users: [],
+      IsPublic: false,
+      MediaType: 'Audio',
+    });
+    await client.createPlaylist(
+      'target-user',
+      'Maximum entries',
+      'Audio',
+      Array(100_000).fill('target-id'),
+    );
+    expect((bodies[1]!.Ids as string[]).length).toBe(100_000);
+    await expect(
+      client.createPlaylist('target-user', 'Too many', 'Audio', Array(100_001).fill('target-id')),
+    ).rejects.toThrow('100,000');
+    await expect(
+      client.createPlaylist(
+        'target-user',
+        'Too large',
+        'Audio',
+        Array(40_000).fill('x'.repeat(128)),
+      ),
+    ).rejects.toThrow('supported size');
+    await expect(
+      client.createPlaylist('target-user', 'Invalid', 'Audio', ['one,other']),
+    ).rejects.toThrow('valid item identifiers');
+    expect(bodies).toHaveLength(2);
+    await client.close();
+  });
+
+  it('never retries uncertain playlist creation or append mutations', async () => {
+    const posts: string[] = [];
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', {
+      transport: async (address, init) => {
+        const url = new URL(address);
+        if (init.method === 'GET') return json({ Version: '12.2' });
+        posts.push(url.pathname);
+        return new Response('private-upstream-data', { status: 503 });
+      },
+    });
+    await expect(client.createPlaylist('alice', 'Private')).rejects.toThrow('HTTP 503');
+    await expect(client.addPlaylistItems('playlist', 'alice', ['one'])).rejects.toThrow('HTTP 503');
+    expect(posts).toEqual(['/Playlists', '/Playlists/playlist/Items']);
+    await client.close();
+  });
+
+  it('bounds and validates raster avatars and posts upstream base64 without JSON encoding', async () => {
+    const png = Buffer.alloc(24);
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(png);
+    png.writeUInt32BE(13, 8);
+    png.write('IHDR', 12);
+    png.writeUInt32BE(64, 16);
+    png.writeUInt32BE(64, 20);
+    const client = new MediaClient('http://emby.test', 'source-key', 'emby', {
+      transport: async (address, init) => {
+        const url = new URL(address);
+        expect(url.pathname).toBe('/Users/alice/Images/Primary');
+        expect(url.searchParams.get('Format')).toBe('Png');
+        expect(url.searchParams.get('MaxWidth')).toBe('256');
+        expect(url.searchParams.get('MaxHeight')).toBe('256');
+        expect(init.headers).toMatchObject({ Accept: 'image/png, image/jpeg' });
+        return new Response(png, { headers: { 'Content-Type': 'image/png' } });
+      },
+    });
+    const avatar = await client.userImage('alice');
+    expect(avatar?.contentType).toBe('image/png');
+    expect(avatar?.data).toEqual(new Uint8Array(png));
+    const target = new MediaClient('http://jellyfin.test', 'target-key', 'jellyfin', {
+      transport: async (address, init) => {
+        expect(new URL(address).pathname).toBe('/Users/new-user/Images/Primary');
+        expect(init.method).toBe('POST');
+        expect(init.headers).toMatchObject({ 'Content-Type': 'image/png' });
+        expect(init.body).toBe(png.toString('base64'));
+        return new Response(null, { status: 204 });
+      },
+    });
+    await target.setUserImage('new-user', avatar!);
+    await client.close();
+    await target.close();
+  });
+
+  it('treats absent avatars as optional and refuses non-raster or oversized images', async () => {
+    const absent = new MediaClient('http://emby.test', 'key', 'emby', {
+      transport: async () => new Response(null, { status: 404 }),
+    });
+    expect(await absent.userImage('alice')).toBeNull();
+    await absent.close();
+    for (const [body, type, length] of [
+      ['<svg><script>private-data</script></svg>', 'image/svg+xml', undefined],
+      ['private-data', 'image/png', undefined],
+      ['', 'image/png', String(1024 * 1024 + 1)],
+    ]) {
+      const client = new MediaClient('http://emby.test', 'key', 'emby', {
+        transport: async () =>
+          new Response(body, {
+            headers: { 'Content-Type': type!, ...(length ? { 'Content-Length': length } : {}) },
+          }),
+      });
+      await expect(client.userImage('alice')).rejects.toBeInstanceOf(MediaError);
+      await client.close();
+    }
+    const png = Buffer.alloc(24);
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(png);
+    png.writeUInt32BE(13, 8);
+    png.write('IHDR', 12);
+    png.writeUInt32BE(100_000, 16);
+    png.writeUInt32BE(100_000, 20);
+    const transport = vi.fn(async () => new Response(null, { status: 204 }));
+    const target = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
+    await expect(
+      target.setUserImage('alice', { contentType: 'image/png', data: png }),
+    ).rejects.toBeInstanceOf(MediaError);
+    expect(transport).not.toHaveBeenCalled();
+    await target.close();
+  });
+
+  it('accepts small JPEG avatars while bounding chunked image responses and redirects', async () => {
+    const jpeg = Buffer.from('ffd8ffe000044142ffc0000b080001000101011100ffd9', 'hex');
+    const client = new MediaClient('http://emby.test', 'private-key', 'emby', {
+      transport: async () => new Response(jpeg, { headers: { 'Content-Type': 'image/jpeg' } }),
+    });
+    expect(await client.userImage('alice')).toEqual({
+      contentType: 'image/jpeg',
+      data: new Uint8Array(jpeg),
+    });
+    await client.close();
+
+    const oversized = new MediaClient('http://emby.test', 'private-key', 'emby', {
+      transport: async () =>
+        new Response(new Uint8Array(1024 * 1024 + 1), { headers: { 'Content-Type': 'image/png' } }),
+    });
+    await expect(oversized.userImage('alice')).rejects.toThrow('exceeds the supported size');
+    await oversized.close();
+
+    const transport = vi.fn(async (_address, init) => {
+      expect(init.redirect).toBe('manual');
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://other.invalid/private-image' },
+      });
+    });
+    const redirected = new MediaClient('http://emby.test', 'private-key', 'emby', { transport });
+    await expect(redirected.userImage('alice')).rejects.toMatchObject({ statusCode: 302 });
+    expect(transport).toHaveBeenCalledOnce();
+    await redirected.close();
   });
 });

@@ -18,6 +18,7 @@ import {
 import type { Settings as AppSettings } from './types.js';
 import type { Job, SubscriptionInput } from './service.js';
 import type { MediaUser } from './media.js';
+import type { UserMapping } from './user-mappings.js';
 
 export class BotError extends Error {}
 
@@ -26,6 +27,7 @@ export interface BotService {
   createAccount(username: string, discordId?: string): Promise<Job>;
   migrateUsers(ids: string[], recipients?: Record<string, string>): Promise<Job>;
   embyUsers(): Promise<MediaUser[]>;
+  resolveDiscordMapping?(discordId: string): UserMapping | null;
   getJob(id: string): Job | null | undefined;
   recordSubscription(event: SubscriptionInput & { guild_id?: string }): Promise<unknown>;
   reconcileMemberships?(): Promise<unknown>;
@@ -729,6 +731,11 @@ export class BotManager {
     try {
       await this.prepare(interaction);
       const identity = await this.recipientIdentity(user.id);
+      const mapping = this.service.resolveDiscordMapping?.(identity.id);
+      if (mapping?.discord_user_id === identity.id)
+        throw new BotError(
+          'This member has a verified Emby migration mapping. Use /jellyport migrate to preserve their data and use the approved Jellyfin destination.',
+        );
       if (username != null && username !== identity.username)
         throw new BotError(
           "New account usernames must match the recipient's current Discord username.",
@@ -756,14 +763,26 @@ export class BotManager {
     try {
       await this.prepare(interaction);
       const identity = await this.recipientIdentity(user.id);
+      const proposedMapping = this.service.resolveDiscordMapping?.(identity.id);
+      // A saved display label is not an identity. Only an exact verified Discord ID may
+      // select a source whose name differs from the live member's username.
+      const mapping = proposedMapping?.discord_user_id === identity.id ? proposedMapping : null;
       const users = await this.service.embyUsers();
       this.checkActive();
-      const matches = users.filter((item) => item.Name === (embyUsername ?? identity.username));
+      const matches = users.filter((item) =>
+        mapping && embyUsername == null
+          ? item.Id === mapping.source_user_id
+          : item.Name === (embyUsername ?? identity.username),
+      );
       if (matches.length !== 1 || !matches[0]!.Id)
         throw new BotError(
           'No unique Emby user matches that exact username. Check the Emby user list in the web page.',
         );
       const id = String(matches[0]!.Id);
+      if (mapping && id !== mapping.source_user_id)
+        throw new BotError(
+          "That Emby account differs from this member's verified mapping. Review User mappings in the web page before migrating.",
+        );
       const job = await this.service.migrateUsers([id], { [id]: identity.id });
       this.checkActive();
       message = jobStatusMessage(job) + ' Use /jellyport status to check progress.';

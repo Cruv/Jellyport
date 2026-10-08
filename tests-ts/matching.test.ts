@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { matchItems } from '../server/matching.js';
+import { matchItems, MIGRATABLE_ITEM_TYPES } from '../server/matching.js';
 import type { MediaItem } from '../server/media.js';
 
 const item = (Id: string, fields: Partial<MediaItem> = {}): MediaItem => ({
@@ -146,9 +146,264 @@ describe('conservative media matching', () => {
       matchItems([source], [item('t', { ProviderIds: { Extension: '1', Imdb: true } })]).unmatched,
     ).toEqual([source]);
   });
+  it('rejects rounded numeric provider IDs while retaining exact string identities', () => {
+    const unsafe = item('unsafe', { ProviderIds: { Tmdb: Number.MAX_SAFE_INTEGER + 1 } });
+    expect(matchItems([unsafe], [item('t', { ...unsafe, Id: 't' })]).unmatched).toEqual([unsafe]);
+    const exact = item('exact', { ProviderIds: { Tmdb: '9007199254740992' } });
+    expect(matchItems([exact], [item('t', { ...exact, Id: 't' })]).matches).toHaveLength(1);
+  });
   it('does not accept inherited JavaScript object properties as provider names', () => {
     const source = item('s', { ProviderIds: JSON.parse('{"constructor":"123","__proto__":"42"}') });
     const target = item('t', { ProviderIds: JSON.parse('{"constructor":"123","__proto__":"42"}') });
     expect(matchItems([source], [target]).unmatched).toEqual([source]);
+  });
+  it('matches series independently from episodes so series favorites can migrate', () => {
+    const source = item('s', { Type: 'Series', ProviderIds: { Tvdb: '100' } });
+    const target = item('t', { ...source, Id: 't', Name: 'Renamed show' });
+    const episode = item('episode', { ...source, Id: 'episode', Type: 'Episode' });
+    expect(matchItems([source], [target, episode]).matches).toEqual([
+      { source, target, method: 'provider_id' },
+    ]);
+  });
+  it('matches numbered seasons using a series identity including season zero', () => {
+    const source = item('s', {
+      Type: 'Season',
+      SeriesProviderIds: { Tvdb: '100' },
+      IndexNumber: 0,
+    });
+    const target = item('t', {
+      Type: 'Season',
+      SeriesProviderIds: { TheTvdb: '100' },
+      IndexNumber: '0',
+    });
+    expect(
+      matchItems(
+        [source],
+        [
+          target,
+          item('other-season', { ...target, Id: 'other-season', IndexNumber: 1 }),
+          item('other-show', { ...target, Id: 'other-show', SeriesProviderIds: { Tvdb: '200' } }),
+          item('episode', { ...target, Id: 'episode', Type: 'Episode', ParentIndexNumber: 0 }),
+        ],
+      ).matches,
+    ).toEqual([{ source, target, method: 'series_season' }]);
+  });
+  it('does not guess seasons from an own provider ID without complete series numbering', () => {
+    for (const IndexNumber of [undefined, true, -1, '1.2']) {
+      const source = item('s', {
+        Type: 'Season',
+        ProviderIds: { Tvdb: '100' },
+        SeriesProviderIds: { Tvdb: '100' },
+        IndexNumber,
+      });
+      expect(matchItems([source], [item('t', { ...source, Id: 't' })]).unmatched).toEqual([source]);
+    }
+  });
+  it('keeps conflicting season numbers and series IDs ambiguous even on the same path', () => {
+    const source = item('s', {
+      Type: 'Season',
+      SeriesProviderIds: { Tvdb: '100' },
+      IndexNumber: 1,
+      Path: '/media/show/season',
+    });
+    for (const fields of [{ IndexNumber: 2 }, { SeriesProviderIds: { Tvdb: '200' } }]) {
+      const target = item('t', { ...source, ...fields, Id: 't' });
+      expect(matchItems([source], [target]).ambiguous).toEqual([{ source, candidates: [target] }]);
+    }
+  });
+  it('matches recordings and release tracks without confusing their distinct MusicBrainz IDs', () => {
+    for (const ProviderIds of [
+      { MusicBrainzRecording: 'recording-id' },
+      { MusicBrainzTrack: 'track-id' },
+    ]) {
+      const source = item('s', { Type: 'Audio', ProviderIds });
+      const target = item('t', { ...source, Id: 't', Name: 'Renamed track' });
+      expect(matchItems([source], [target]).matches).toEqual([
+        { source, target, method: 'provider_id' },
+      ]);
+    }
+    const source = item('s', { Type: 'Audio', ProviderIds: { MusicBrainzRecording: 'shared-id' } });
+    const target = item('t', { Type: 'Audio', ProviderIds: { MusicBrainzTrack: 'shared-id' } });
+    expect(matchItems([source], [target]).unmatched).toEqual([source]);
+  });
+  it('accepts release-track aliases but never identifies a song from album or artist metadata', () => {
+    const source = item('s', {
+      Type: 'Audio',
+      ProviderIds: { MusicBrainzReleaseTrack: 'track-id' },
+    });
+    const target = item('t', { Type: 'Audio', ProviderIds: { musicbrainztrack: 'TRACK-ID' } });
+    expect(matchItems([source], [target]).matches[0]?.method).toBe('provider_id');
+    for (const provider of [
+      'MusicBrainzAlbum',
+      'MusicBrainzRelease',
+      'MusicBrainzReleaseGroup',
+      'MusicBrainzArtist',
+      'MusicBrainzAlbumArtist',
+      'AudioDbAlbum',
+      'AudioDbArtist',
+    ]) {
+      const audio = item('audio', {
+        Type: 'Audio',
+        ProviderIds: { [provider]: 'shared-album-id' },
+        Name: 'Song',
+        IndexNumber: 1,
+        ParentIndexNumber: 1,
+      });
+      expect(matchItems([audio], [item('t', { ...audio, Id: 't' })]).unmatched).toEqual([audio]);
+    }
+  });
+  it('matches album release aliases and release groups only within albums', () => {
+    const source = item('s', {
+      Type: 'MusicAlbum',
+      ProviderIds: { MusicBrainzRelease: 'release-id' },
+    });
+    const target = item('t', {
+      Type: 'MusicAlbum',
+      ProviderIds: { MusicBrainzAlbum: 'release-id' },
+    });
+    expect(matchItems([source], [target]).matches[0]?.method).toBe('provider_id');
+    const releaseGroup = item('group', {
+      Type: 'MusicAlbum',
+      ProviderIds: { MusicBrainzReleaseGroup: 'group-id' },
+    });
+    expect(
+      matchItems([releaseGroup], [item('t', { ...releaseGroup, Id: 't' })]).matches,
+    ).toHaveLength(1);
+    expect(
+      matchItems([source], [item('t', { ...target, Id: 't', Type: 'Audio' })]).matches,
+    ).toEqual([]);
+    expect(
+      matchItems(
+        [source],
+        [
+          item('t', {
+            Type: 'MusicAlbum',
+            ProviderIds: { MusicBrainzReleaseGroup: 'release-id' },
+          }),
+        ],
+      ).matches,
+    ).toEqual([]);
+  });
+  it('does not let album or recording identity override contradictory release IDs', () => {
+    const source = item('s', {
+      Type: 'MusicAlbum',
+      ProviderIds: { MusicBrainzReleaseGroup: 'group', MusicBrainzAlbum: 'a' },
+    });
+    const target = item('t', {
+      Type: 'MusicAlbum',
+      ProviderIds: { MusicBrainzReleaseGroup: 'group', MusicBrainzAlbum: 'b' },
+    });
+    expect(matchItems([source], [target]).ambiguous).toEqual([{ source, candidates: [target] }]);
+    const audio = item('audio', {
+      Type: 'Audio',
+      ProviderIds: { MusicBrainzRecording: 'recording', MusicBrainzTrack: 'a' },
+    });
+    const other = item('other', {
+      Type: 'Audio',
+      ProviderIds: { MusicBrainzRecording: 'recording', MusicBrainzTrack: 'b' },
+    });
+    expect(matchItems([audio], [other]).ambiguous).toEqual([
+      { source: audio, candidates: [other] },
+    ]);
+  });
+  it('matches artist and AudioDB identities without using an artist ID for an album', () => {
+    const source = item('s', {
+      Type: 'MusicArtist',
+      ProviderIds: { MusicBrainzAlbumArtist: 'artist' },
+    });
+    const target = item('t', { Type: 'MusicArtist', ProviderIds: { MusicBrainzArtist: 'artist' } });
+    expect(matchItems([source], [target]).matches[0]?.method).toBe('provider_id');
+    for (const [Type, provider] of [
+      ['MusicAlbum', 'AudioDbAlbum'],
+      ['MusicArtist', 'AudioDbArtist'],
+    ]) {
+      const source = item('s', { Type, ProviderIds: { [provider!]: '10' } });
+      expect(matchItems([source], [item('t', { ...source, Id: 't' })]).matches).toHaveLength(1);
+    }
+    const album = item('album', {
+      Type: 'MusicAlbum',
+      ProviderIds: { MusicBrainzArtist: 'artist' },
+    });
+    expect(matchItems([album], [item('t', { ...album, Id: 't' })]).unmatched).toEqual([album]);
+  });
+  it('matches collection IDs only for BoxSet items', () => {
+    const source = item('s', { Type: 'BoxSet', ProviderIds: { TmdbCollection: '100' } });
+    const target = item('t', { ...source, Id: 't' });
+    expect(matchItems([source], [target]).matches).toEqual([
+      { source, target, method: 'provider_id' },
+    ]);
+    const movie = item('movie', { ProviderIds: source.ProviderIds });
+    expect(matchItems([movie], [item('t', { ...movie, Id: 't' })]).matches).toEqual([]);
+  });
+  it('matches book metadata while keeping case-sensitive Google Books IDs distinct', () => {
+    for (const ProviderIds of [{ ISBN: '978-1-4028-9462-6' }, { ComicVine: '123' }]) {
+      const source = item('s', { Type: 'Book', ProviderIds });
+      const target = item('t', { ...source, Id: 't' });
+      expect(matchItems([source], [target]).matches).toHaveLength(1);
+    }
+    const book = item('book', { Type: 'Book', ProviderIds: { ISBN: '978-1-4028-9462-6' } });
+    expect(
+      matchItems(
+        [book],
+        [
+          item('t', {
+            Type: 'Book',
+            ProviderIds: { ISBN13: '9781402894626' },
+          }),
+        ],
+      ).matches,
+    ).toHaveLength(1);
+    const source = item('s', { Type: 'Book', ProviderIds: { GoogleBooks: 'AbC123' } });
+    expect(
+      matchItems(
+        [source],
+        [
+          item('t', {
+            Type: 'Book',
+            ProviderIds: { GoogleBooks: 'abc123' },
+          }),
+        ],
+      ).unmatched,
+    ).toEqual([source]);
+    expect(matchItems([source], [item('t', { ...source, Id: 't' })]).matches).toHaveLength(1);
+  });
+  it('uses exact mapped paths for every supported type without cross-type matching', () => {
+    for (const Type of MIGRATABLE_ITEM_TYPES) {
+      const source = item('s', { Type, Path: '/emby/item' });
+      const target = item('t', { Type, Path: '/jellyfin/item' });
+      const otherType = Type === 'Photo' ? 'Movie' : 'Photo';
+      const other = item('other', { Type: otherType, Path: target.Path });
+      expect(
+        matchItems([source], [target, other], [{ source: '/emby', target: '/jellyfin' }]).matches,
+      ).toEqual([{ source, target, method: 'path' }]);
+      expect(
+        matchItems([source], [other], [{ source: '/emby', target: '/jellyfin' }]).unmatched,
+      ).toEqual([source]);
+    }
+  });
+  it('leaves playlists and unsupported item types to their separate migration strategy', () => {
+    const playlist = item('s', { Type: 'Playlist', Path: '/shared/playlist' });
+    const folder = item('folder', { Type: 'Folder', Path: '/shared/folder' });
+    expect(
+      matchItems(
+        [playlist, folder],
+        [item('t', { ...playlist, Id: 't' }), item('t2', { ...folder, Id: 't2' })],
+      ).unmatched,
+    ).toEqual([playlist, folder]);
+  });
+  it('keeps contradictory provider aliases ambiguous instead of overwriting either value', () => {
+    for (const Type of ['Movie', 'Series', 'MusicAlbum']) {
+      const aliases =
+        Type === 'MusicAlbum'
+          ? { MusicBrainzAlbum: 'a', MusicBrainzRelease: 'b' }
+          : { Tmdb: '1', TheMovieDB: '2' };
+      const provider = Type === 'MusicAlbum' ? { MusicBrainzAlbum: 'a' } : { Tmdb: '1' };
+      const source = item('s', { Type, ProviderIds: aliases, Path: '/same' });
+      const target = item('t', { Type, ProviderIds: provider, Path: '/same' });
+      expect(matchItems([source], [target]).ambiguous).toEqual([{ source, candidates: [target] }]);
+      expect(matchItems([target], [source]).ambiguous).toEqual([
+        { source: target, candidates: [source] },
+      ]);
+    }
   });
 });

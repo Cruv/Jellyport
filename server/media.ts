@@ -3,6 +3,22 @@ import { MediaError } from './errors.js';
 
 export type MediaKind = 'emby' | 'jellyfin';
 export type JsonObject = Record<string, unknown>;
+/** Writable, non-derived fields accepted by Jellyfin's item user-data endpoint. */
+export interface MediaUserDataPatch extends JsonObject {
+  Played?: boolean;
+  IsFavorite?: boolean;
+  Likes?: boolean;
+  PlaybackPositionTicks?: number;
+  PlayCount?: number;
+  LastPlayedDate?: string;
+  Rating?: number;
+}
+export interface MigrationCapabilities {
+  userData: boolean;
+  privatePlaylists: boolean;
+  playlistDuplicates: boolean;
+  version?: string;
+}
 export interface MediaItem extends JsonObject {
   Id: string;
   Name?: string;
@@ -12,6 +28,14 @@ export interface MediaItem extends JsonObject {
   SeriesId?: string;
   Path?: string;
   UserData?: { Played?: boolean; [key: string]: unknown };
+}
+export interface MediaPlaylist extends MediaItem {
+  Name: string;
+  MediaType?: string;
+}
+export interface MediaUserImage {
+  contentType: 'image/png' | 'image/jpeg';
+  data: Uint8Array;
 }
 export interface MediaUser extends JsonObject {
   Id: string;
@@ -29,7 +53,23 @@ export interface MediaAPI {
   setPassword(id: string, password: string): Promise<void>;
   setPolicy(id: string, policy: JsonObject): Promise<void>;
   setConfiguration(id: string, configuration: JsonObject): Promise<void>;
-  markPlayed(userId: string, itemId: string): Promise<void>;
+  markPlayed(userId: string, itemId: string, datePlayed?: string): Promise<void>;
+  migrationItems?(userId?: string): Promise<MediaItem[]>;
+  migrationCapabilities?(): Promise<MigrationCapabilities>;
+  updateUserData?(userId: string, itemId: string, patch: MediaUserDataPatch): Promise<void>;
+  userData?(userId: string, itemId: string): Promise<MediaUserDataPatch>;
+  markFavorite?(userId: string, itemId: string): Promise<void>;
+  playlists?(userId: string): Promise<MediaPlaylist[]>;
+  playlistItems?(playlistId: string, userId: string): Promise<MediaItem[]>;
+  createPlaylist?(
+    userId: string,
+    name: string,
+    mediaType?: string,
+    ids?: string[],
+  ): Promise<MediaPlaylist>;
+  addPlaylistItems?(playlistId: string, userId: string, ids: string[]): Promise<void>;
+  userImage?(userId: string): Promise<MediaUserImage | null>;
+  setUserImage?(userId: string, image: MediaUserImage): Promise<void>;
 }
 export type ClientFactory = (url: string, apiKey: string, kind?: MediaKind) => MediaAPI;
 export type FetchTransport = (url: string, init: RequestInit) => Promise<Response>;
@@ -42,6 +82,113 @@ export interface MediaClientOptions {
 }
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 1024 * 1024;
+const MIGRATION_ITEM_TYPES =
+  'Movie,Episode,Series,Season,Audio,MusicAlbum,MusicArtist,MusicVideo,Video,Book,AudioBook,Photo,PhotoAlbum,BoxSet,Trailer';
+const PLAYLIST_MEDIA_TYPES = new Set(['Audio', 'Video', 'Photo', 'Book']);
+
+function versionAtLeast(version: string | undefined, major: number, minor = 0): boolean {
+  // Unknown and prerelease versions fail closed for privacy-sensitive writes.
+  const match = version?.match(/^(\d+)\.(\d+)(?:\.(\d+))?(?:\.\d+)?$/);
+  return (
+    !!match &&
+    (Number(match[1]) > major || (Number(match[1]) === major && Number(match[2]) >= minor))
+  );
+}
+
+function dateValue(value: unknown): string {
+  if (typeof value !== 'string' || value.length > 64 || !Number.isFinite(Date.parse(value)))
+    throw new MediaError('A valid playback date is required.');
+  const normalized = new Date(value).toISOString();
+  if (!/^\d{4}-/.test(normalized) || normalized.startsWith('0000-'))
+    throw new MediaError('A valid playback date is required.');
+  return normalized;
+}
+
+function writableUserData(value: unknown, requireFields = false): MediaUserDataPatch {
+  if (!isObject(value)) throw new MediaError('A valid user-data object is required.');
+  const body: MediaUserDataPatch = {};
+  for (const field of ['Played', 'IsFavorite', 'Likes'] as const) {
+    const candidate = value[field];
+    if (candidate === undefined || candidate === null) continue;
+    if (typeof candidate !== 'boolean') throw new MediaError('Invalid user-data boolean value.');
+    body[field] = candidate;
+  }
+  for (const field of ['PlaybackPositionTicks', 'PlayCount'] as const) {
+    const candidate = value[field];
+    if (candidate === undefined || candidate === null) continue;
+    if (
+      typeof candidate !== 'number' ||
+      !Number.isSafeInteger(candidate) ||
+      candidate < 0 ||
+      (field === 'PlayCount' && candidate > 2_147_483_647)
+    )
+      throw new MediaError('Invalid user-data playback value.');
+    body[field] = candidate;
+  }
+  if (value.LastPlayedDate !== undefined && value.LastPlayedDate !== null)
+    body.LastPlayedDate = dateValue(value.LastPlayedDate);
+  if (value.Rating !== undefined && value.Rating !== null) {
+    if (
+      typeof value.Rating !== 'number' ||
+      !Number.isFinite(value.Rating) ||
+      value.Rating < 0 ||
+      value.Rating > 10
+    )
+      throw new MediaError('Invalid user-data rating value.');
+    body.Rating = value.Rating;
+  }
+  if (requireFields && !Object.keys(body).length)
+    throw new MediaError('A writable user-data field is required.');
+  return body;
+}
+
+/** Accept small raster avatars only; PNG/JPEG dimensions also bound decompression work. */
+function validateImage(image: MediaUserImage): MediaUserImage {
+  const invalid = () => new MediaError('The profile image is not a supported small PNG or JPEG.');
+  if (!image || !(image.data instanceof Uint8Array) || image.data.length > MAX_IMAGE_BYTES)
+    throw invalid();
+  const data = Buffer.from(image.data.buffer, image.data.byteOffset, image.data.byteLength);
+  let width = 0;
+  let height = 0;
+  if (image.contentType === 'image/png') {
+    if (
+      data.length < 24 ||
+      !data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) ||
+      data.readUInt32BE(8) !== 13 ||
+      data.toString('ascii', 12, 16) !== 'IHDR'
+    )
+      throw invalid();
+    width = data.readUInt32BE(16);
+    height = data.readUInt32BE(20);
+  } else if (image.contentType === 'image/jpeg') {
+    if (data.length < 4 || data[0] !== 0xff || data[1] !== 0xd8) throw invalid();
+    let offset = 2;
+    while (offset < data.length) {
+      if (data[offset++] !== 0xff) throw invalid();
+      while (data[offset] === 0xff) offset++;
+      const marker = data[offset++];
+      if (marker === undefined || marker === 0xd9 || marker === 0xda) break;
+      if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+      if (offset + 2 > data.length) throw invalid();
+      const length = data.readUInt16BE(offset);
+      if (length < 2 || offset + length > data.length) throw invalid();
+      if (
+        [0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(
+          marker,
+        )
+      ) {
+        if (length < 8) throw invalid();
+        height = data.readUInt16BE(offset + 3);
+        width = data.readUInt16BE(offset + 5);
+        break;
+      }
+      offset += length;
+    }
+  } else throw invalid();
+  if (!width || !height || width > 256 || height > 256) throw invalid();
+  return image;
+}
 
 /** Bounds custom transports and streams even when they ignore the fetch signal. */
 async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -74,6 +221,7 @@ export class MediaClient implements MediaAPI {
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
   private readonly controller = new AbortController();
+  private capabilities?: Promise<MigrationCapabilities>;
 
   constructor(
     url: string,
@@ -138,7 +286,8 @@ export class MediaClient implements MediaAPI {
     path: string,
     params?: Record<string, string | number>,
     body?: unknown,
-    decode = true,
+    decode: boolean | 'image' = true,
+    bodyContentType?: MediaUserImage['contentType'],
   ): Promise<unknown> {
     const attempts = method === 'GET' ? 3 : 1;
     const url = new URL(this.baseUrl + path.replace(/^\/+/, ''));
@@ -163,11 +312,15 @@ export class MediaClient implements MediaAPI {
                   Authorization: `MediaBrowser Client="Jellyport", Device="Jellyport", DeviceId="jellyport-service", Version="0.3.0", Token="${this.apiKey.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
                 }
               : { 'X-Emby-Token': this.apiKey }),
-            Accept: 'application/json',
+            Accept: decode === 'image' ? 'image/png, image/jpeg' : 'application/json',
             'User-Agent': 'Jellyport/0.3',
-            ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+            ...(body !== undefined
+              ? { 'Content-Type': bodyContentType ?? 'application/json' }
+              : {}),
           },
-          ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+          ...(body !== undefined
+            ? { body: bodyContentType ? String(body) : JSON.stringify(body) }
+            : {}),
           signal,
         });
         // A transport that resolves after the deadline must not leave an unread body open.
@@ -188,18 +341,23 @@ export class MediaClient implements MediaAPI {
           );
           continue;
         }
+        if (decode === 'image' && response.status === 404) return null;
         if (!response.ok)
           throw new MediaError(
             `${this.label} rejected the request (HTTP ${response.status}).`,
             response.status,
           );
         if (!decode || response.status === 204) return null;
+        const maxBytes =
+          decode === 'image'
+            ? Math.min(this.maxResponseBytes, MAX_IMAGE_BYTES)
+            : this.maxResponseBytes;
         const declaredLength = Number(response.headers.get('Content-Length'));
-        if (Number.isFinite(declaredLength) && declaredLength > this.maxResponseBytes)
+        if (Number.isFinite(declaredLength) && declaredLength > maxBytes)
           throw new MediaError(`${this.label} API response exceeds the supported size.`);
         if (!response.body) throw new MediaError(`${this.label} returned an invalid API response.`);
         reader = response.body.getReader();
-        let buffer = Buffer.allocUnsafe(Math.min(64 * 1024, this.maxResponseBytes));
+        let buffer = Buffer.allocUnsafe(Math.min(64 * 1024, maxBytes));
         let bytes = 0;
         while (true) {
           // Immediate stream chunks must not starve the deadline's timer callback.
@@ -210,17 +368,39 @@ export class MediaClient implements MediaAPI {
           const chunk = await abortable(reader.read(), signal);
           if (chunk.done) break;
           const nextSize = bytes + chunk.value.byteLength;
-          if (nextSize > this.maxResponseBytes)
+          if (nextSize > maxBytes)
             throw new MediaError(`${this.label} API response exceeds the supported size.`);
           if (nextSize > buffer.length) {
             const expanded = Buffer.allocUnsafe(
-              Math.min(this.maxResponseBytes, Math.max(nextSize, buffer.length * 2)),
+              Math.min(maxBytes, Math.max(nextSize, buffer.length * 2)),
             );
             buffer.copy(expanded, 0, 0, bytes);
             buffer = expanded;
           }
           buffer.set(chunk.value, bytes);
           bytes = nextSize;
+        }
+        if (decode === 'image') {
+          if (Date.now() >= deadline) {
+            timeout.abort();
+            throw signal.reason;
+          }
+          const contentType = response.headers
+            .get('Content-Type')
+            ?.split(';')[0]
+            ?.trim()
+            .toLowerCase();
+          if (contentType !== 'image/png' && contentType !== 'image/jpeg')
+            throw new MediaError('The profile image is not a supported small PNG or JPEG.');
+          const image = validateImage({
+            contentType,
+            data: new Uint8Array(buffer.subarray(0, bytes)),
+          });
+          if (Date.now() >= deadline) {
+            timeout.abort();
+            throw signal.reason;
+          }
+          return image;
         }
         let result: unknown;
         try {
@@ -288,7 +468,11 @@ export class MediaClient implements MediaAPI {
     return this.validUser(await this.request('GET', `Users/${this.id(id)}`));
   }
 
-  private async itemsByType(userId: string | undefined, itemTypes: string): Promise<MediaItem[]> {
+  private async itemsByType(
+    userId: string | undefined,
+    itemTypes: string,
+    expanded = false,
+  ): Promise<MediaItem[]> {
     const path = userId !== undefined ? `Users/${this.id(userId)}/Items` : 'Items';
     const items: MediaItem[] = [];
     const seenIds = new Set<string>();
@@ -298,7 +482,10 @@ export class MediaClient implements MediaAPI {
         await this.request('GET', path, {
           IncludeItemTypes: itemTypes,
           Recursive: 'true',
-          Fields: 'ProviderIds,Path',
+          Fields:
+            expanded && this.kind === 'emby'
+              ? 'ProviderIds,Path,UserDataPlayCount,UserDataLastPlayedDate'
+              : 'ProviderIds,Path',
           EnableUserData: userId !== undefined ? 'true' : 'false',
           EnableImages: 'false',
           SortBy: 'SortName',
@@ -357,6 +544,202 @@ export class MediaClient implements MediaAPI {
     }
     return items;
   }
+
+  /** Reads per-user state beyond movies/episodes without requesting image or media streams. */
+  async migrationItems(userId?: string): Promise<MediaItem[]> {
+    const items = await this.itemsByType(userId, MIGRATION_ITEM_TYPES, true);
+    const providers = new Map(
+      items
+        .filter((item) => item.Type === 'Series' && isObject(item.ProviderIds))
+        .map((item) => [item.Id, item.ProviderIds!]),
+    );
+    for (const item of items) {
+      const values = item.SeriesId ? providers.get(item.SeriesId) : undefined;
+      if (values && !item.SeriesProviderIds) item.SeriesProviderIds = structuredClone(values);
+    }
+    return items;
+  }
+
+  async migrationCapabilities(): Promise<MigrationCapabilities> {
+    if (!this.capabilities) {
+      this.capabilities = this.systemInfo().then((info) => {
+        const version = typeof info.Version === 'string' ? info.Version : undefined;
+        const supported = this.kind === 'jellyfin' && versionAtLeast(version, 10, 9);
+        return {
+          userData: supported,
+          privatePlaylists: supported,
+          playlistDuplicates: supported && versionAtLeast(version, 12),
+          ...(version ? { version } : {}),
+        };
+      });
+      // A temporary read failure must not permanently disable retries for this client.
+      void this.capabilities.catch(() => {
+        this.capabilities = undefined;
+      });
+    }
+    return this.capabilities;
+  }
+
+  async updateUserData(userId: string, itemId: string, patch: MediaUserDataPatch): Promise<void> {
+    const body = writableUserData(patch, true);
+    this.id(userId);
+    const id = this.id(itemId);
+    if (!(await this.migrationCapabilities()).userData)
+      throw new MediaError('Detailed user-data migration requires Jellyfin 10.9 or newer.');
+    await this.request('POST', `UserItems/${id}/UserData`, { userId }, body, false);
+  }
+
+  async userData(userId: string, itemId: string): Promise<MediaUserDataPatch> {
+    this.id(userId);
+    if (!(await this.migrationCapabilities()).userData)
+      throw new MediaError('Detailed user-data migration requires Jellyfin 10.9 or newer.');
+    return writableUserData(
+      await this.request('GET', `UserItems/${this.id(itemId)}/UserData`, { userId }),
+    );
+  }
+
+  async playlists(userId: string): Promise<MediaPlaylist[]> {
+    const items = await this.itemsByType(userId, 'Playlist');
+    if (items.some((item) => typeof item.Name !== 'string' || !item.Name.trim()))
+      throw new MediaError(`${this.label} returned playlists without names.`);
+    return items as MediaPlaylist[];
+  }
+
+  /** Playlist entry IDs are occurrence IDs; ordinary media IDs must never be deduplicated here. */
+  async playlistItems(playlistId: string, userId: string): Promise<MediaItem[]> {
+    this.id(userId);
+    const path = `Playlists/${this.id(playlistId)}/Items`;
+    const items: MediaItem[] = [];
+    const seenPages = new Set<string>();
+    let start = 0;
+    while (true) {
+      const data = this.object(
+        await this.request('GET', path, {
+          userId,
+          Fields: 'ProviderIds,Path',
+          EnableUserData: 'true',
+          EnableImages: 'false',
+          StartIndex: start,
+          Limit: this.pageSize,
+        }),
+      );
+      if (
+        !Array.isArray(data.Items) ||
+        data.Items.some((item) => !isObject(item) || typeof item.Id !== 'string' || !item.Id)
+      )
+        throw new MediaError(`${this.label} returned an invalid playlist page.`);
+      const page = data.Items as MediaItem[];
+      if (!page.length) break;
+      // Jellyfin's PlaylistItemId can equal the media ID, including repeated occurrences.
+      // Keep every entry and bound pagination using the server's total count instead.
+      const total = data.TotalRecordCount;
+      const hasTotal = typeof total === 'number' && Number.isSafeInteger(total) && total >= 0;
+      if (hasTotal && total > 100_000)
+        throw new MediaError(`${this.label} playlist exceeds the supported migration size.`);
+      if (!hasTotal) {
+        const signature = JSON.stringify(page.map((item) => item.Id));
+        if (seenPages.has(signature))
+          throw new MediaError(`${this.label} repeated a playlist page; refresh and retry.`);
+        seenPages.add(signature);
+      }
+      items.push(...page);
+      start += page.length;
+      if (start > 100_000)
+        throw new MediaError(`${this.label} playlist exceeds the supported migration size.`);
+      if ((hasTotal && start >= total) || (!hasTotal && page.length < this.pageSize)) break;
+    }
+    return items;
+  }
+
+  async createPlaylist(
+    userId: string,
+    name: string,
+    mediaType?: string,
+    ids: string[] = [],
+  ): Promise<MediaPlaylist> {
+    this.id(userId);
+    if (typeof name !== 'string' || !name.trim() || name.length > 512)
+      throw new MediaError('A playlist name of at most 512 characters is required.');
+    if (mediaType !== undefined && !PLAYLIST_MEDIA_TYPES.has(mediaType))
+      throw new MediaError('Unsupported playlist media type.');
+    if (
+      !Array.isArray(ids) ||
+      ids.length > 100_000 ||
+      ids.some((id) => typeof id !== 'string' || !id || id.length > 128 || /[,\r\n\u0000]/.test(id))
+    )
+      throw new MediaError('Create playlists with at most 100,000 valid item identifiers.');
+    const body = {
+      Name: name,
+      UserId: userId,
+      Ids: ids,
+      Users: [],
+      IsPublic: false,
+      ...(mediaType ? { MediaType: mediaType } : {}),
+    };
+    if (Buffer.byteLength(JSON.stringify(body), 'utf8') > 4 * 1024 * 1024)
+      throw new MediaError('The private playlist creation request exceeds the supported size.');
+    if (!(await this.migrationCapabilities()).privatePlaylists)
+      throw new MediaError('Private playlist migration requires Jellyfin 10.9 or newer.');
+    const result = this.object(await this.request('POST', 'Playlists', undefined, body));
+    if (typeof result.Id !== 'string' || !result.Id)
+      throw new MediaError(
+        'Jellyfin returned an invalid playlist creation response. Check before retrying.',
+      );
+    return {
+      Id: result.Id,
+      Name: name,
+      Type: 'Playlist',
+      ...(mediaType ? { MediaType: mediaType } : {}),
+    };
+  }
+
+  async addPlaylistItems(playlistId: string, userId: string, ids: string[]): Promise<void> {
+    this.id(userId);
+    const id = this.id(playlistId);
+    if (
+      !Array.isArray(ids) ||
+      !ids.length ||
+      ids.length > 100 ||
+      ids.some(
+        (item) =>
+          typeof item !== 'string' || !item || item.length > 128 || /[,\r\n\u0000]/.test(item),
+      )
+    )
+      throw new MediaError('Add between 1 and 100 valid playlist item identifiers at a time.');
+    if (!(await this.migrationCapabilities()).privatePlaylists)
+      throw new MediaError('Private playlist migration requires Jellyfin 10.9 or newer.');
+    await this.request(
+      'POST',
+      `Playlists/${id}/Items`,
+      { userId, ids: ids.join(',') },
+      undefined,
+      false,
+    );
+  }
+
+  async userImage(userId: string): Promise<MediaUserImage | null> {
+    return (await this.request(
+      'GET',
+      `Users/${this.id(userId)}/Images/Primary`,
+      { Format: 'Png', MaxWidth: 256, MaxHeight: 256 },
+      undefined,
+      'image',
+    )) as MediaUserImage | null;
+  }
+
+  async setUserImage(userId: string, image: MediaUserImage): Promise<void> {
+    if (this.kind !== 'jellyfin')
+      throw new MediaError('Profile image migration is supported only on Jellyfin.');
+    const valid = validateImage(image);
+    await this.request(
+      'POST',
+      `Users/${this.id(userId)}/Images/Primary`,
+      undefined,
+      Buffer.from(valid.data).toString('base64'),
+      false,
+      valid.contentType,
+    );
+  }
   async createUser(name: string, password: string): Promise<MediaUser> {
     if (this.kind !== 'jellyfin')
       throw new MediaError('Account creation is supported only on Jellyfin.');
@@ -389,10 +772,20 @@ export class MediaClient implements MediaAPI {
       false,
     );
   }
-  async markPlayed(userId: string, itemId: string): Promise<void> {
+  async markPlayed(userId: string, itemId: string, datePlayed?: string): Promise<void> {
+    const date = datePlayed === undefined ? undefined : dateValue(datePlayed);
     await this.request(
       'POST',
       `Users/${this.id(userId)}/PlayedItems/${this.id(itemId)}`,
+      date ? { DatePlayed: date.replace(/[-:TZ.]/g, '').slice(0, 14) } : undefined,
+      undefined,
+      false,
+    );
+  }
+  async markFavorite(userId: string, itemId: string): Promise<void> {
+    await this.request(
+      'POST',
+      `Users/${this.id(userId)}/FavoriteItems/${this.id(itemId)}`,
       undefined,
       undefined,
       false,

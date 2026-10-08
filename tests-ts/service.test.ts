@@ -70,6 +70,10 @@ describe('account migration and subscription safety', () => {
       unmatched: 1,
       ambiguous: 0,
       already_played: 0,
+      source_items: 4,
+      source_favorites: 0,
+      source_resume: 0,
+      source_playlists: 0,
     });
     const job = await finish(await service.migrateUsers(['e-alex']));
     expect(job.status).toBe('partial');
@@ -373,6 +377,473 @@ describe('account migration and subscription safety', () => {
     await expect(
       service.migrateUsers(['e-alex', 'e-river'], { 'e-alex': 'same', 'e-river': 'same' }),
     ).rejects.toThrow('different');
+  });
+  function approveMapping(
+    sourceId: string,
+    targetName: string,
+    targetId: string | null = null,
+    discordId: string | null = null,
+  ) {
+    const source = servers.users.emby.find((user) => user.Id === sourceId)!;
+    return service.mappings.save(
+      {
+        source_user_id: sourceId,
+        source_username: source.Name,
+        target_user_id: targetId,
+        target_username: targetName,
+        discord_user_id: discordId,
+        discord_username: discordId ? 'verified.original' : null,
+      },
+      store.settings(),
+    );
+  }
+  it('migrates favorites, resume position, counts, ratings and original dates across playable and container types', async () => {
+    servers.media.push(
+      { Id: 'series', Type: 'Series', Name: 'Continuing show', ProviderIds: { Tvdb: '100' } },
+      {
+        Id: 'season',
+        Type: 'Season',
+        Name: 'Season one',
+        SeriesProviderIds: { Tvdb: '100' },
+        IndexNumber: 1,
+      },
+    );
+    servers.userData['e-sam'] = {
+      '1': {
+        IsFavorite: true,
+        PlaybackPositionTicks: 300_000_000,
+        PlayCount: 5,
+        LastPlayedDate: '2026-10-07T01:00:00.000Z',
+        Likes: false,
+        Rating: 7.5,
+      },
+      '3': { LastPlayedDate: '2023-03-14T18:00:00.000Z' },
+      series: { IsFavorite: true },
+      season: { IsFavorite: true },
+    };
+    const preview = await service.preview(['e-sam']);
+    expect(preview.users[0]?.stats).toMatchObject({
+      source_items: 4,
+      source_played: 1,
+      source_favorites: 3,
+      source_resume: 1,
+    });
+    const job = await finish(await service.migrateUsers(['e-sam']));
+    expect(job.status).toBe('completed');
+    const target = servers.users.jellyfin.find((user) => user.Name === 'sam')!;
+    expect(servers.userData[target.Id]?.['1']).toMatchObject({
+      IsFavorite: true,
+      PlaybackPositionTicks: 300_000_000,
+      PlayCount: 5,
+      LastPlayedDate: '2026-10-07T01:00:00.000Z',
+      Likes: false,
+      Rating: 7.5,
+    });
+    expect(servers.userData[target.Id]?.['3']?.LastPlayedDate).toBe('2023-03-14T18:00:00.000Z');
+    expect(servers.userData[target.Id]?.series?.IsFavorite).toBe(true);
+    expect(servers.userData[target.Id]?.season?.IsFavorite).toBe(true);
+    expect(job.results[0]?.data).toMatchObject({
+      favorites: 3,
+      resume_positions: 1,
+      play_counts: 2,
+      last_played_dates: 2,
+      ratings: 1,
+      failed_items: 0,
+    });
+    const repeat = await finish(await service.migrateUsers(['e-sam']));
+    expect(repeat.results[0]?.applied).toBe(0);
+    expect(repeat.results[0]?.data?.items_updated).toBe(0);
+  });
+  it('copies only portable preferences and the avatar for newly created accounts', async () => {
+    servers.users.emby[2]!.Policy = { IsAdministrator: true, EnableAllFolders: false };
+    servers.users.emby[2]!.Configuration = {
+      AudioLanguagePreference: 'spa',
+      SubtitleMode: 'Always',
+      EnableNextEpisodeAutoPlay: true,
+      OrderedViews: ['emby-library-id'],
+      private_token: 'private-source-config-secret',
+    };
+    const picture = {
+      contentType: 'image/png' as const,
+      data: new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+    };
+    servers.images['e-sam'] = picture;
+    const job = await finish(await service.migrateUsers(['e-sam']));
+    const target = servers.users.jellyfin.find((user) => user.Name === 'sam')!;
+    expect(target.Policy).toEqual(servers.users.jellyfin[0]!.Policy);
+    expect(target.Configuration).toMatchObject({
+      AudioLanguagePreference: 'spa',
+      SubtitleMode: 'Always',
+      EnableNextEpisodeAutoPlay: true,
+      DisplayMissingEpisodes: false,
+    });
+    expect(target.Configuration).not.toHaveProperty('OrderedViews');
+    expect(target.Configuration).not.toHaveProperty('private_token');
+    expect(servers.images[target.Id]).toEqual(picture);
+    expect(job.results[0]?.data?.avatar).toBe(true);
+    expect(job.results[0]?.data?.preferences).toEqual(
+      expect.arrayContaining([
+        'AudioLanguagePreference',
+        'SubtitleMode',
+        'EnableNextEpisodeAutoPlay',
+      ]),
+    );
+    expect(JSON.stringify(job)).not.toContain('private-source-config-secret');
+  });
+  it('preserves existing preferences, avatar, favorites, ratings and newer Jellyfin playback progress', async () => {
+    const river = servers.users.jellyfin[1]!;
+    river.Configuration = { AudioLanguagePreference: 'fra' };
+    servers.users.emby[1]!.Configuration = { AudioLanguagePreference: 'spa' };
+    servers.images['e-river'] = { contentType: 'image/png', data: new Uint8Array([1, 2]) };
+    servers.images['j-river'] = { contentType: 'image/png', data: new Uint8Array([3, 4]) };
+    servers.userData['e-river'] = {
+      '2': {
+        IsFavorite: false,
+        PlaybackPositionTicks: 100,
+        LastPlayedDate: '2025-01-01T00:00:00.000Z',
+        PlayCount: 2,
+        Likes: true,
+        Rating: 7,
+      },
+    };
+    servers.userData['j-river'] = {
+      '2': {
+        IsFavorite: true,
+        PlaybackPositionTicks: 200,
+        LastPlayedDate: '2026-01-01T00:00:00.000Z',
+        PlayCount: 10,
+        Likes: false,
+        Rating: 9,
+      },
+    };
+    const before = structuredClone(river);
+    const job = await finish(await service.migrateUsers(['e-river']));
+    expect(river).toEqual(before);
+    expect(servers.images['j-river']?.data).toEqual(new Uint8Array([3, 4]));
+    expect(servers.userData['j-river']?.['2']).toMatchObject({
+      IsFavorite: true,
+      PlaybackPositionTicks: 200,
+      PlayCount: 10,
+      Likes: false,
+      Rating: 9,
+      LastPlayedDate: '2026-01-01T00:00:00.000Z',
+    });
+    expect(job.results[0]?.data).toMatchObject({ avatar: false, preferences: [] });
+  });
+  it('imports private playlists with order and duplicates while preserving existing playlists and preventing repeated imports', async () => {
+    servers.playlists['e-river'] = [
+      {
+        Id: 'source-playlist',
+        Name: 'Favorites',
+        Type: 'Playlist',
+        MediaType: 'Video',
+        items: ['2', '1', '2', 'not-present'],
+      },
+    ];
+    servers.playlists['j-river'] = [
+      { Id: 'existing', Name: 'Favorites', Type: 'Playlist', MediaType: 'Video', items: ['3'] },
+    ];
+    const job = await finish(await service.migrateUsers(['e-river']));
+    expect(job.status).toBe('partial');
+    const lists = servers.playlists['j-river']!;
+    expect(lists).toHaveLength(2);
+    expect(lists[0]?.items).toEqual(['3']);
+    expect(lists[1]).toMatchObject({
+      IsPublic: false,
+      OwnerUserId: 'j-river',
+      items: ['2', '1', '2'],
+    });
+    expect(job.results[0]?.data).toMatchObject({
+      playlists_created: 1,
+      playlist_items_added: 3,
+      playlist_items_skipped: 1,
+    });
+    const repeat = await finish(await service.migrateUsers(['e-river']));
+    expect(servers.playlists['j-river']).toHaveLength(2);
+    expect(repeat.results[0]?.data?.playlists_created).toBe(0);
+  });
+  it('uses explicit mappings for unusual source names, pins created target IDs and does not DM a label', async () => {
+    servers.users.emby[2]!.Name = '<Source / Account>';
+    const mapping = approveMapping('e-sam', 'simple.alias');
+    const bot = new FakeBot();
+    service.bot = bot;
+    const preview = await service.preview(['e-sam']);
+    expect(preview.users[0]).toMatchObject({
+      source_username: '<Source / Account>',
+      username: 'simple.alias',
+      mapping_id: mapping.id,
+      mapping_revision: mapping.revision,
+      target_exists: false,
+      discord_user_id: null,
+    });
+    const job = await finish(
+      await service.migrateUsers(['e-sam'], {}, { 'e-sam': mapping.revision }),
+    );
+    expect(job.status).toBe('completed');
+    const target = servers.users.jellyfin.find((user) => user.Name === 'simple.alias')!;
+    const bound = service.mappings.getForSource('e-sam', store.settings())!;
+    expect(bound.target_user_id).toBe(target.Id);
+    expect(bound.revision).not.toBe(mapping.revision);
+    expect(store.takeCredentials(job.id)[0]?.username).toBe('simple.alias');
+    expect(bot.delivered).toEqual([]);
+    const repeat = await finish(await service.migrateUsers(['e-sam']));
+    expect(repeat.status).toBe('completed');
+    expect(repeat.results[0]?.created).toBe(false);
+    expect(servers.users.jellyfin.filter((user) => user.Name === 'simple.alias')).toHaveLength(1);
+  });
+  it('permits different usernames only through a mapping with the verified stable Discord ID', async () => {
+    const bot = new FakeBot();
+    bot.username = 'current.discord';
+    service.bot = bot;
+    approveMapping('e-sam', 'friendly.alias', null, '123456789');
+    const job = await finish(await service.migrateUsers(['e-sam'], { 'e-sam': '123456789' }));
+    expect(job.status).toBe('completed');
+    expect(bot.delivered[0]?.[1]).toBe('friendly.alias');
+    expect(store.link('123456789')?.username).toBe('friendly.alias');
+    await expect(service.createAccount('current.discord', '123456789')).rejects.toThrow(
+      'approved Emby mapping',
+    );
+  });
+  it('does not use username-only Discord labels to claim an identity', async () => {
+    const bot = new FakeBot();
+    bot.username = 'current.discord';
+    service.bot = bot;
+    const mapping = approveMapping('e-sam', 'friendly.alias');
+    service.mappings.save({ ...mapping, discord_username: 'current.discord' }, store.settings());
+    const before = structuredClone(servers.users.jellyfin);
+    const job = await finish(await service.migrateUsers(['e-sam'], { 'e-sam': '123456789' }));
+    expect(job.status).toBe('failed');
+    expect(job.results[0]?.error).toContain('verified user ID');
+    expect(servers.users.jellyfin).toEqual(before);
+    expect(store.link('123456789')).toBeNull();
+    expect(bot.delivered).toEqual([]);
+  });
+  it('rejects changed mapping revisions between preview, queueing and execution', async () => {
+    const mapping = approveMapping('e-sam', 'first.alias');
+    const changed = service.mappings.save(
+      { ...mapping, target_username: 'second.alias' },
+      store.settings(),
+    );
+    await expect(
+      service.migrateUsers(['e-sam'], {}, { 'e-sam': mapping.revision }),
+    ).rejects.toThrow('after preview');
+    await expect(service.migrateUsers(['e-sam'], {}, {})).rejects.toThrow('exactly');
+    await expect(
+      service.migrateUsers(['e-sam'], {}, { 'e-sam': changed.revision, extra: null }),
+    ).rejects.toThrow('exactly');
+    const job = await service.migrateUsers(['e-sam'], {}, { 'e-sam': changed.revision });
+    service.mappings.save({ ...changed, target_username: 'third.alias' }, store.settings());
+    const finished = await finish(job);
+    expect(finished.status).toBe('failed');
+    expect(finished.results[0]?.error).toContain('queued');
+    expect(servers.users.jellyfin).toHaveLength(2);
+  });
+  it('rejects a newly added mapping when the preview explicitly showed no mapping', async () => {
+    const preview = await service.preview(['e-sam']);
+    expect(preview.users[0]?.mapping_revision).toBeNull();
+    approveMapping('e-sam', 'new.alias');
+    await expect(service.migrateUsers(['e-sam'], {}, { 'e-sam': null })).rejects.toThrow(
+      'after preview',
+    );
+  });
+  it('revalidates mapped source names, target IDs, and protection before mutations', async () => {
+    const mapping = approveMapping('e-sam', 'river', 'j-river');
+    const before = structuredClone(servers.played['j-river']);
+    servers.users.emby[2]!.Name = 'renamed-source';
+    expect((await finish(await service.migrateUsers(['e-sam']))).results[0]?.error).toContain(
+      'Emby account was renamed',
+    );
+    servers.users.emby[2]!.Name = mapping.source_username;
+    servers.users.jellyfin[1]!.Policy!.IsAdministrator = true;
+    expect((await finish(await service.migrateUsers(['e-sam']))).results[0]?.error).toContain(
+      'permissions changed',
+    );
+    servers.users.jellyfin[1]!.Policy!.IsAdministrator = false;
+    servers.users.jellyfin[1]!.Name = 'renamed-target';
+    expect((await finish(await service.migrateUsers(['e-sam']))).results[0]?.error).toContain(
+      'removed or renamed',
+    );
+    expect(servers.played['j-river']).toEqual(before);
+  });
+  it('does not claim a new mapped name that appeared after approval', async () => {
+    approveMapping('e-sam', 'reserved.alias');
+    servers.users.jellyfin.push({
+      Id: 'external-account',
+      Name: 'reserved.alias',
+      Policy: { IsAdministrator: false, IsDisabled: false },
+    });
+    const before = structuredClone(servers.users.jellyfin);
+    const job = await finish(await service.migrateUsers(['e-sam']));
+    expect(job.status).toBe('failed');
+    expect(job.results[0]?.error).toContain('now exists');
+    expect(servers.users.jellyfin).toEqual(before);
+  });
+  it('honors verified mappings during subscription provisioning and later lifecycle actions', async () => {
+    const bot = new FakeBot();
+    bot.username = 'different.discord';
+    service.bot = bot;
+    approveMapping('e-sam', 'river', 'j-river', '123456789');
+    await service.recordSubscription({
+      id: 'mapped-subscribe',
+      action: 'subscribe',
+      discord_user_id: '123456789',
+      source: 'mee6_message',
+    });
+    expect((await service.applySubscription('mapped-subscribe')).status).toBe('applied');
+    expect(store.link('123456789')?.remote_id).toBe('j-river');
+    expect(bot.delivered).toEqual([]);
+    await service.recordSubscription({
+      id: 'mapped-expire',
+      action: 'expire',
+      discord_user_id: '123456789',
+      source: 'mee6_message',
+    });
+    await service.applySubscription('mapped-expire');
+    expect(servers.users.jellyfin[1]!.Policy?.IsDisabled).toBe(true);
+    await service.recordSubscription({
+      id: 'mapped-renew',
+      action: 'subscribe',
+      discord_user_id: '123456789',
+      source: 'mee6_message',
+    });
+    await service.applySubscription('mapped-renew');
+    expect(servers.users.jellyfin[1]!.Policy?.IsDisabled).toBe(false);
+  });
+  it('protects disabled accounts in ordinary preview and migration', async () => {
+    servers.users.jellyfin[1]!.Policy!.IsDisabled = true;
+    await expect(service.preview(['e-river'])).rejects.toThrow('disabled');
+    const before = structuredClone(servers.users.jellyfin[1]);
+    const job = await finish(await service.migrateUsers(['e-river']));
+    expect(job.status).toBe('failed');
+    expect(job.results[0]?.error).toContain('disabled');
+    expect(servers.users.jellyfin[1]).toEqual(before);
+  });
+  it('projects preview issues to safe summaries instead of exposing upstream plugin data', async () => {
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      if (args[2] === 'emby') {
+        const original = client.migrationItems!.bind(client);
+        client.migrationItems = async (...parameters) =>
+          (await original(...parameters)).map((item) => ({
+            ...item,
+            private_plugin_token: 'private-library-token',
+          }));
+      }
+      return client;
+    };
+    const preview = await service.preview(['e-alex']);
+    expect(JSON.stringify(preview)).not.toContain('private-library-token');
+    expect(preview.users[0]?.unmatched[0]).toEqual({
+      Id: 'missing',
+      Name: 'An unmatched library item',
+      Type: 'Movie',
+    });
+  });
+  it('prevents an unmapped source or fresh create from claiming a reserved destination ID or name', async () => {
+    approveMapping('e-sam', 'river', 'j-river');
+    const before = structuredClone(servers.played['j-river']);
+    await expect(service.preview(['e-river'])).rejects.toThrow('reserved');
+    await expect(service.createAccount('river')).rejects.toThrow('reserved');
+    const first = await finish(await service.migrateUsers(['e-river']));
+    expect(first.status).toBe('failed');
+    expect(first.results[0]?.error).toContain('reserved');
+    // Renaming the upstream account cannot escape its stable-ID reservation.
+    servers.users.jellyfin[1]!.Name = 'renamed';
+    servers.users.emby[1]!.Name = 'renamed';
+    const renamed = await finish(await service.migrateUsers(['e-river']));
+    expect(renamed.status).toBe('failed');
+    expect(renamed.results[0]?.error).toContain('reserved');
+    expect(servers.played['j-river']).toEqual(before);
+  });
+  it('reserves a mapped new alias before its Jellyfin account is created', async () => {
+    approveMapping('e-sam', 'reserved.new');
+    servers.users.emby[1]!.Name = 'reserved.new';
+    await expect(service.createAccount('reserved.new')).rejects.toThrow('reserved');
+    const job = await finish(await service.migrateUsers(['e-river']));
+    expect(job.status).toBe('failed');
+    expect(job.results[0]?.error).toContain('reserved');
+    expect(servers.users.jellyfin.some((user) => user.Name === 'reserved.new')).toBe(false);
+  });
+  it('rechecks destination ownership after asynchronous item reads before writing state', async () => {
+    const before = structuredClone(servers.played['j-river']);
+    let changed = false;
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      if (args[2] === 'jellyfin') {
+        const original = client.userData!.bind(client);
+        client.userData = async (...parameters) => {
+          const data = await original(...parameters);
+          if (!changed) {
+            changed = true;
+            approveMapping('e-sam', 'river', 'j-river');
+          }
+          return data;
+        };
+      }
+      return client;
+    };
+    const job = await finish(await service.migrateUsers(['e-river']));
+    expect(job.status).toBe('failed');
+    expect(job.results[0]?.error).toContain('reserved');
+    expect(servers.played['j-river']).toEqual(before);
+  });
+  it('preserves generated credentials if the mapping changes during the final Discord membership check', async () => {
+    const bot = new FakeBot();
+    service.bot = bot;
+    approveMapping('e-sam', 'mapped.alias', null, '123456789');
+    let validations = 0;
+    bot.validateRecipient = async () => {
+      if (++validations === 2) {
+        const mapping = service.mappings.getForSource('e-sam', store.settings())!;
+        service.mappings.save({ ...mapping, discord_username: bot.username }, store.settings());
+      }
+    };
+    const job = await finish(await service.migrateUsers(['e-sam'], { 'e-sam': '123456789' }));
+    expect(job.status).toBe('partial');
+    expect(job.results[0]?.discord_delivery).toBe('failed');
+    expect(bot.delivered).toEqual([]);
+    expect(store.takeCredentials(job.id)[0]?.username).toBe('mapped.alias');
+  });
+  it('recovers an explicitly inspected uncertain mapped creation and then pins its target ID', async () => {
+    approveMapping('e-sam', 'recover.alias');
+    let first = true;
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      if (args[2] === 'jellyfin') {
+        const original = client.createUser.bind(client);
+        client.createUser = async (...parameters) => {
+          const created = await original(...parameters);
+          if (first) {
+            first = false;
+            throw new MediaError('Creation response timed out.');
+          }
+          return created;
+        };
+      }
+      return client;
+    };
+    expect((await finish(await service.migrateUsers(['e-sam']))).status).toBe('failed');
+    expect(store.account('recover.alias')?.status).toBe('uncertain');
+    const target = servers.users.jellyfin.find((user) => user.Name === 'recover.alias')!;
+    const info = await service.recoveryInfo('recover.alias');
+    expect(info.eligible).toBe(true);
+    const recovered = await finish(await service.recoverAccount('recover.alias', target.Id));
+    expect(recovered.status).toBe('completed');
+    expect(service.mappings.getForSource('e-sam', store.settings())?.target_user_id).toBe(
+      target.Id,
+    );
+    expect(servers.users.jellyfin.filter((user) => user.Name === 'recover.alias')).toHaveLength(1);
+    expect(store.takeCredentials(recovered.id)).toHaveLength(1);
+  });
+  it('retains printable existing target names through explicit ID mappings', async () => {
+    servers.users.jellyfin[1]!.Name = 'Existing / Family Account';
+    approveMapping('e-sam', 'Existing / Family Account', 'j-river');
+    const before = structuredClone(servers.users.jellyfin[1]);
+    const job = await finish(await service.migrateUsers(['e-sam']));
+    expect(job.status).toBe('completed');
+    expect(job.results[0]?.username).toBe('Existing / Family Account');
+    expect(servers.users.jellyfin[1]).toEqual(before);
+    expect(store.takeCredentials(job.id)).toEqual([]);
   });
 });
 

@@ -26,6 +26,7 @@ import {
   type BotService,
 } from '../server/bot.js';
 import type { Settings } from '../server/types.js';
+import type { UserMapping } from '../server/user-mappings.js';
 
 function member(
   id = '22',
@@ -97,6 +98,7 @@ async function fixture(extra: Partial<Settings> = {}) {
     })),
     migrateUsers: vi.fn(async () => ({ id: 'job_2', status: 'queued' })),
     embyUsers: vi.fn(async () => [{ Id: 'emby_1', Name: 'jlogan35' }]),
+    resolveDiscordMapping: vi.fn((_discordId: string): UserMapping | null => null),
     getJob: vi.fn(() => ({
       id: 'job_1',
       status: 'running',
@@ -377,6 +379,92 @@ describe('Bot lifecycle and commands', () => {
     expect(service.migrateUsers).toHaveBeenCalledWith(['emby_1'], { emby_1: '22' });
     await manager.handleMigrate(asInteraction(interaction()), { id: '22' }, 'JLOGAN35');
     expect(service.migrateUsers).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses a verified Discord ID mapping to migrate a differently named Emby user', async () => {
+    const { manager, service } = await fixture();
+    service.embyUsers.mockResolvedValue([
+      { Id: 'emby_1', Name: 'Mr. Complex Emby Name !' },
+      { Id: 'emby_2', Name: 'jlogan35' },
+    ]);
+    service.resolveDiscordMapping.mockReturnValue({
+      source_user_id: 'emby_1',
+      discord_user_id: '22',
+      target_username: 'SimpleName',
+      discord_username: 'an.old.username',
+    } as UserMapping);
+    const request = interaction();
+    await manager.handleMigrate(asInteraction(request), { id: '22' });
+    expect(service.resolveDiscordMapping).toHaveBeenCalledWith('22');
+    expect(service.migrateUsers).toHaveBeenCalledWith(['emby_1'], { emby_1: '22' });
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('job_2'),
+    });
+  });
+
+  it.each([null, '33'])(
+    'never resolves a source from a Discord username label or another ID (%s)',
+    async (discordId) => {
+      const { manager, service } = await fixture();
+      service.embyUsers.mockResolvedValue([{ Id: 'emby_1', Name: 'someone.else' }]);
+      service.resolveDiscordMapping.mockReturnValue({
+        source_user_id: 'emby_1',
+        discord_user_id: discordId,
+        discord_username: 'jlogan35',
+        target_username: 'SimpleName',
+      } as UserMapping);
+      await manager.handleMigrate(asInteraction(interaction()), { id: '22' });
+      expect(service.migrateUsers).not.toHaveBeenCalled();
+    },
+  );
+
+  it('requires an explicit source name to agree with the verified mapping', async () => {
+    const { manager, service } = await fixture();
+    service.embyUsers.mockResolvedValue([
+      { Id: 'emby_1', Name: 'Mapped Emby Name' },
+      { Id: 'emby_2', Name: 'another.user' },
+    ]);
+    service.resolveDiscordMapping.mockReturnValue({
+      source_user_id: 'emby_1',
+      discord_user_id: '22',
+    } as UserMapping);
+    const conflict = interaction();
+    await manager.handleMigrate(asInteraction(conflict), { id: '22' }, 'another.user');
+    expect(service.migrateUsers).not.toHaveBeenCalled();
+    expect(conflict.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('differs from'),
+    });
+    await manager.handleMigrate(asInteraction(interaction()), { id: '22' }, 'Mapped Emby Name');
+    expect(service.migrateUsers).toHaveBeenCalledWith(['emby_1'], { emby_1: '22' });
+  });
+
+  it('guides mapped members through migration instead of creating a differently named fresh account', async () => {
+    const { manager, service } = await fixture();
+    service.resolveDiscordMapping.mockReturnValue({
+      source_user_id: 'emby_1',
+      discord_user_id: '22',
+      target_username: 'SimpleName',
+    } as UserMapping);
+    const request = interaction();
+    await manager.handleCreate(asInteraction(request), { id: '22' });
+    expect(service.createAccount).not.toHaveBeenCalled();
+    expect(service.migrateUsers).not.toHaveBeenCalled();
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('Use /jellyport migrate'),
+    });
+  });
+
+  it('retains membership and guild checks before reading a mapping or queuing a migration', async () => {
+    const { manager, service, guild, admin } = await fixture();
+    guild.members.fetch.mockImplementation(async (options) =>
+      options.user === '11' ? admin : member('22', 'jlogan35', { roles: [] }),
+    );
+    await manager.handleMigrate(asInteraction(interaction()), { id: '22' });
+    expect(service.resolveDiscordMapping).not.toHaveBeenCalled();
+    expect(service.migrateUsers).not.toHaveBeenCalled();
+    await manager.handleMigrate(asInteraction(interaction('456')), { id: '22' });
+    expect(service.resolveDiscordMapping).not.toHaveBeenCalled();
+    expect(service.migrateUsers).not.toHaveBeenCalled();
   });
 
   it('redacts upstream exceptions and status secrets', async () => {

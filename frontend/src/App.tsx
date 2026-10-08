@@ -12,6 +12,7 @@ import {
 } from './components';
 import SettingsPage from './SettingsPage';
 import AuthScreen from './AuthScreen';
+import UserMappingsPage from './UserMappingsPage';
 import {
   AccountsPage,
   ActivityPage,
@@ -35,11 +36,13 @@ import {
   type Settings,
   type SubscriptionEvent,
   type Users,
+  type UserMapping,
 } from './types';
 
 const pages: Record<Page, { title: string; icon: string }> = {
   overview: { title: 'Overview', icon: 'grid' },
   migrate: { title: 'Migrate users', icon: 'migrate' },
+  mappings: { title: 'User mappings', icon: 'link' },
   accounts: { title: 'Create account', icon: 'userPlus' },
   subscriptions: { title: 'Subscriptions', icon: 'inbox' },
   activity: { title: 'Activity', icon: 'activity' },
@@ -73,6 +76,7 @@ export default function App() {
   const [loginError, setLoginError] = useState('');
   const [overview, setOverview] = useState<Overview | null>(null);
   const [users, setUsers] = useState<Users>(emptyUsers);
+  const [mappings, setMappings] = useState<UserMapping[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
@@ -128,6 +132,7 @@ export default function App() {
     setSession(null);
     setOverview(null);
     setUsers(emptyUsers);
+    setMappings([]);
     setSettings(null);
     setJobs([]);
     setEvents([]);
@@ -234,6 +239,17 @@ export default function App() {
               (current) =>
                 new Set([...current].filter((id) => value.emby.some((user) => user.Id === id))),
             );
+          }
+        } else if (target === 'mappings') {
+          const [value, listed, configuration] = await Promise.all([
+            api<{ mappings: UserMapping[] }>('/api/user-mappings'),
+            api<Users>('/api/users'),
+            api<Settings>('/api/settings'),
+          ]);
+          if (version === loadVersion.current) {
+            setMappings(value.mappings || []);
+            setUsers(listed);
+            setSettings(configuration);
           }
         } else if (target === 'accounts') {
           const [value, summary] = await Promise.all([
@@ -390,15 +406,22 @@ export default function App() {
     if (dialog?.kind !== 'preview') return;
     const values = new FormData(event.currentTarget);
     const recipients: Record<string, string> = {};
+    const mappingRevisions: Record<string, string | null> = {};
     dialog.preview.users.forEach((user) => {
       const value = String(values.get(user.source_user_id) || '').trim();
       if (value) recipients[user.source_user_id] = value;
+      if (user.mapping_revision !== undefined)
+        mappingRevisions[user.source_user_id] = user.mapping_revision;
     });
     const ids = dialog.preview.users.map((user) => user.source_user_id);
     void work('migration', async () => {
       const job = await api<Job>('/api/migrations', {
         method: 'POST',
-        body: { source_user_ids: ids, discord_recipients: recipients },
+        body: {
+          source_user_ids: ids,
+          discord_recipients: recipients,
+          ...(Object.keys(mappingRevisions).length ? { mapping_revisions: mappingRevisions } : {}),
+        },
       });
       setSelected(new Set());
       created(job);
@@ -514,6 +537,17 @@ export default function App() {
         preview={preview}
         busy={busy.has('preview')}
         navigate={navigate}
+      />
+    );
+  else if (page === 'mappings')
+    content = (
+      <UserMappingsPage
+        mappings={mappings}
+        users={users}
+        templateUserId={settings?.template_user_id}
+        api={api}
+        notify={notify}
+        refresh={() => load('mappings')}
       />
     );
   else if (page === 'accounts' && overview && settings)
@@ -706,7 +740,7 @@ function DialogContent({
     return (
       <Modal
         title="Review your migration"
-        description={`${users.length} ${users.length === 1 ? 'user' : 'users'} selected · played status will be merged`}
+        description={`${users.length} ${users.length === 1 ? 'user' : 'users'} selected · merge progress, favorites and playlists`}
         wide
         close={close}
         footer={
@@ -727,8 +761,8 @@ function DialogContent({
         }
       >
         <Callout icon="shield" title="Preview before you move.">
-          Matched items marked played in Emby will be marked played in Jellyfin. Existing played
-          status stays intact. Unmatched and ambiguous items are skipped.
+          Watched flags and favorites are combined. Newer Jellyfin progress stays intact, and
+          playlists become private copies. Unmatched and ambiguous items are skipped.
         </Callout>
         <form id="migration-preview-form" onSubmit={startMigration}>
           {users.map((user) => (
@@ -739,10 +773,18 @@ function DialogContent({
                   {user.target_exists ? 'Merge into existing account' : 'Create new account'}
                 </span>
               </div>
+              {user.mapping_id && (
+                <p className="subtle text-small">
+                  Mapped Emby account: {user.source_username} → Jellyfin: {user.username}
+                </p>
+              )}
               <div className="preview-stats">
                 {[
                   { value: user.stats.source_played, label: 'Played in Emby', color: '' },
                   { value: user.stats.matched, label: 'Matched to Jellyfin', color: 'mint' },
+                  { value: user.stats.source_favorites, label: 'Favorites in Emby', color: '' },
+                  { value: user.stats.source_resume, label: 'Resume positions', color: '' },
+                  { value: user.stats.source_playlists, label: 'Playlists', color: '' },
                   {
                     value: user.stats.unmatched,
                     label: 'Unmatched',
@@ -761,6 +803,11 @@ function DialogContent({
                 ))}
               </div>
               <div className="preview-user-body">
+                {user.warnings?.map((warning, index) => (
+                  <p className="subtle text-small" key={index}>
+                    {warning}
+                  </p>
+                ))}
                 {!!user.stats.already_played && (
                   <p className="subtle text-tiny mb-14">
                     {num(user.stats.already_played)} matched items are already played on Jellyfin.
@@ -792,12 +839,16 @@ function DialogContent({
                     inputMode="numeric"
                     pattern="[0-9]{15,22}"
                     autoComplete="off"
+                    defaultValue={user.discord_user_id || ''}
+                    readOnly={!!user.discord_user_id}
                   />
                   <small>
                     {user.target_exists
                       ? 'Link this member for membership management. Their existing password is preserved.'
                       : 'Send the new username and password in a private message.'}{' '}
-                    For a new Discord link, this username must match the member’s Discord username.
+                    {user.discord_user_id
+                      ? `Saved verified mapping: ${user.discord_username || user.discord_user_id}.`
+                      : 'Different usernames require an administrator-approved user mapping. A manually entered Discord name alone cannot receive credentials.'}
                   </small>
                 </div>
               </div>
@@ -862,6 +913,11 @@ function DialogContent({
               <h3>{result.username || 'User'}</h3>
               <Status value={result.status} />
             </div>
+            {result.source_username && result.source_username !== result.username && (
+              <p className="subtle text-small">
+                Emby: {result.source_username} → Jellyfin: {result.username}
+              </p>
+            )}
             <div className="job-meta">
               {result.created && (
                 <span>
@@ -875,7 +931,39 @@ function DialogContent({
               {!!result.already_played && <span>{num(result.already_played)} already played</span>}
               {!!result.unmatched && <span>{num(result.unmatched)} unmatched</span>}
               {!!result.ambiguous && <span>{num(result.ambiguous)} ambiguous</span>}
+              {result.data && (
+                <>
+                  <span>{num(result.data.items_updated)} items updated</span>
+                  {!!result.data.favorites && <span>{num(result.data.favorites)} favorites</span>}
+                  {!!result.data.resume_positions && (
+                    <span>{num(result.data.resume_positions)} resume positions</span>
+                  )}
+                  {!!result.data.play_counts && (
+                    <span>{num(result.data.play_counts)} play counts</span>
+                  )}
+                  {!!result.data.last_played_dates && (
+                    <span>{num(result.data.last_played_dates)} playback dates</span>
+                  )}
+                  {!!result.data.ratings && <span>{num(result.data.ratings)} ratings / likes</span>}
+                  <span>{num(result.data.playlists_created)} playlists created</span>
+                  {!!result.data.playlists_existing && (
+                    <span>{num(result.data.playlists_existing)} playlists already imported</span>
+                  )}
+                  {!!result.data.playlist_items_added && (
+                    <span>{num(result.data.playlist_items_added)} playlist entries</span>
+                  )}
+                  {!!result.data.preferences.length && (
+                    <span>{result.data.preferences.length} playback preferences</span>
+                  )}
+                  {result.data.avatar && <span>Profile image copied</span>}
+                </>
+              )}
             </div>
+            {result.data?.warnings.map((warning, index) => (
+              <div className="error-block" key={index}>
+                {warning}
+              </div>
+            ))}
             {result.discord_delivery && (
               <p>
                 <Icon name="discord" /> Discord delivery:{' '}

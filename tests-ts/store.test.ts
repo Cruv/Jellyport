@@ -198,6 +198,8 @@ describe('demo and production data isolation', () => {
     'links',
     'subscriptions',
     'job_queue',
+    'user_mappings',
+    'migration_playlists',
   ] as const;
   function snapshot(db: DatabaseSync) {
     return Object.fromEntries(
@@ -273,43 +275,58 @@ describe('demo and production data isolation', () => {
     assertRejectedWithoutChanges(path, store);
   });
 
-  it.each(['jobs', 'accounts', 'credentials', 'links', 'subscriptions', 'job_queue'] as const)(
-    'rejects blank settings with preexisting %s records',
-    (table) => {
-      const path = directory();
-      const store = new Store(path);
-      store.saveSettings(DEFAULT_SETTINGS);
-      if (table === 'jobs') store.saveJob(job('running'));
-      if (table === 'accounts')
-        store.saveAccount('private-member', 'private-id', 'provisioning', 'private-password');
-      if (table === 'credentials')
-        store.saveCredentials(
-          'private-job',
-          'private-member',
-          'private-password',
-          'https://private.example',
-        );
-      if (table === 'links') store.saveLink('123456', 'private-member', 'private-id');
-      if (table === 'subscriptions')
-        store.saveSubscription({
-          id: 'private-event',
-          action: 'expire',
-          status: 'processing',
-          created_at: '2026-10-07',
-        });
-      if (table === 'job_queue')
-        store.db
-          .prepare('INSERT INTO job_queue VALUES (?,?)')
-          .run(
-            'private-queued-job',
-            store.encrypt({
-              requests: [{ username: 'private-member' }],
-              settings: DEFAULT_SETTINGS,
-            }),
-          );
-      assertRejectedWithoutChanges(path, store);
-    },
-  );
+  it.each([
+    'jobs',
+    'accounts',
+    'credentials',
+    'links',
+    'subscriptions',
+    'job_queue',
+    'user_mappings',
+    'migration_playlists',
+  ] as const)('rejects blank settings with preexisting %s records', (table) => {
+    const path = directory();
+    const store = new Store(path);
+    store.saveSettings(DEFAULT_SETTINGS);
+    if (table === 'jobs') store.saveJob(job('running'));
+    if (table === 'accounts')
+      store.saveAccount('private-member', 'private-id', 'provisioning', 'private-password');
+    if (table === 'credentials')
+      store.saveCredentials(
+        'private-job',
+        'private-member',
+        'private-password',
+        'https://private.example',
+      );
+    if (table === 'links') store.saveLink('123456', 'private-member', 'private-id');
+    if (table === 'subscriptions')
+      store.saveSubscription({
+        id: 'private-event',
+        action: 'expire',
+        status: 'processing',
+        created_at: '2026-10-07',
+      });
+    if (table === 'job_queue')
+      store.db.prepare('INSERT INTO job_queue VALUES (?,?)').run(
+        'private-queued-job',
+        store.encrypt({
+          requests: [{ username: 'private-member' }],
+          settings: DEFAULT_SETTINGS,
+        }),
+      );
+    if (table === 'user_mappings')
+      store.db
+        .prepare('INSERT INTO user_mappings VALUES (?,?)')
+        .run('private-map', store.encrypt({ source_username: 'private-member' }));
+    if (table === 'migration_playlists')
+      store.savePlaylistImport('private-playlist', {
+        name: 'Private family films',
+        targetId: 'private-id',
+        status: 'complete',
+        content_hash: 'private-hash',
+      });
+    assertRejectedWithoutChanges(path, store);
+  });
 
   it('accepts a fresh directory and recognized isolated demo fixtures on repeat startup', () => {
     const path = directory();

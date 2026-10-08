@@ -97,21 +97,32 @@ API keys and the Discord bot token are encrypted in the application database. Le
 
 ## Migrate users
 
-Select 1–100 distinct Emby users, review the preview, and start the migration. Destination usernames must match the Emby usernames exactly, including letter case. Case-only conflicts and duplicate destination names require administrator review.
+Select 1–100 distinct Emby users, review the preview, and start the migration. Usernames match exactly by default. Use **User mappings** for simplified usernames, different existing Jellyfin usernames, or other identity exceptions; case-only conflicts are never guessed.
 
-The migration merges watched status for **movies and episodes**. An item marked played in Emby is marked played in Jellyfin when it can be matched confidently. An item already played in Jellyfin remains played, even if Emby marks it unplayed. For a fresh account, the remaining items retain their default unplayed status.
+Migration combines watched flags and favorites, preserves the larger play count and later playback date, and transfers resume positions when the source is demonstrably newer or Jellyfin has no competing progress. Existing Jellyfin progress wins when chronology is unknown or tied. Personal ratings and likes fill empty fields. Movies, episodes, music, books, photos, and identifiable containers are supported; aggregate season/series completion is derived from episode history instead of copied.
 
 Matching uses provider IDs, series identity with season/episode numbers, and exact file paths with optional prefix mappings. It does not guess from titles. Conflicting metadata and duplicate editions are reported as ambiguous; missing matches are reported as unmatched. Those items are skipped and the job is marked partial so you can review them, correct metadata or mappings, and rerun the merge.
 
-Original play timestamps, play counts, favorites, ratings, resume positions, music, and other user data are not migrated. Marking an item played may create Jellyfin's own current playback metadata; the Emby metadata is not copied.
+User-visible Emby playlists become **private copies owned by the destination user**, with matched entries in order. Existing Jellyfin playlists are preserved. Jellyfin 12 preserves repeated entries; 10.9–10.11 removes duplicates and the migration reports this. Creation sets privacy and all entries in one request. An encrypted import journal prevents blind replay after an uncertain response; later migrations never append to copies that their owners might have made public or shared.
 
-New destination accounts receive a generated 24-character password and the template's policy and configuration. Ordinary existing Jellyfin accounts keep their passwords and permissions; migration only merges their watched flags. Jellyfin administrators and the template user are protected from migration and account lifecycle actions.
+New destination accounts receive a generated 24-character password and the template's permissions. Portable playback preferences and a bounded profile image can also transfer to new accounts. Existing accounts keep their passwords, permissions, preferences, and profile images. Administrators, disabled accounts, and the template user are protected from migration.
+
+Jellyfin **10.9+** is required for detailed user data and explicit private playlists. Older versions receive a limited watched/favorite merge with warnings. Next Up and Continue Watching are rebuilt by Jellyfin from the migrated episode history, original dates, and resume positions; client cutoffs and unavailable media can affect their appearance. See [migration capabilities and limitations](docs/migration-capabilities.md) for everything supported, excluded, and reported.
+
+### Map accounts with different usernames
+
+1. Open **User mappings** and choose the source Emby account.
+2. Select an existing enabled Jellyfin account, or enter the simplified username for a new account. Selecting an existing account preserves its username and password.
+3. Optionally record a Discord username. To enable credential delivery and identity resolution, also provide the member's numeric Discord user ID with the bot connected. Jellyport verifies that ID against the configured Discord server.
+4. Save, then review the migration preview. It shows the source and destination names and any verified Discord recipient.
+
+Mappings are encrypted, scoped to the configured servers, and one-to-one. Queued work pins its mapping revision and refuses changed mappings. A created destination is pinned by Jellyfin ID so a replacement account cannot silently receive another user's data. Discord names alone are labels; verified IDs and durable account links drive automation. Saving a mapping does not itself change an account or send a message.
 
 ## Create accounts and deliver passwords
 
 Use the account creation form for a new member. With a connected Discord bot, provide the member's numeric Discord user ID and their current Discord username. Jellyport uses the actual username (`member.user.username`), rather than a server nickname or display name.
 
-For the first Discord link, the account's username must match the member's current Discord username exactly. An Emby user with a different legacy username can still be migrated without selecting a Discord recipient. Verify and resolve that mismatch before linking; Jellyport does not guess ownership or rename accounts automatically.
+For the first Discord link, the account's username must match the member's current Discord username exactly unless an administrator has saved a mapping with that verified Discord ID. For mapped existing Emby members, use migration (including `/jellyport migrate`) so their approved destination name and history are used. Jellyport does not guess ownership or rename accounts automatically.
 
 When a recipient is selected, account provisioning stores the Discord user ID and Jellyfin account ID as a durable link. Membership actions use this link even if the member later changes their Discord username.
 
@@ -153,7 +164,7 @@ docker compose start jellyport
 
 Restore the database and `secret.key` together while the service is stopped. Without the original key, saved secrets cannot be decrypted. Keep the volume when rebuilding or upgrading. The saved Jellyfin pairing is part of this data directory.
 
-New jobs persist their requests and an encrypted settings snapshot before execution. Jobs that have never started can resume after a restart. Running jobs are marked interrupted for review and are not silently replayed: a remote creation or policy change may already have succeeded. Rerunning a reviewed migration merges remaining watched flags without resetting ordinary existing accounts.
+New jobs persist their requests and an encrypted settings snapshot before execution. Jobs that have never started can resume after a restart. Running jobs are marked interrupted for review and are not silently replayed: a remote creation or policy change may already have succeeded. Rerunning a reviewed migration merges remaining data without resetting ordinary existing accounts.
 
 ### Upgrading from the Python version
 

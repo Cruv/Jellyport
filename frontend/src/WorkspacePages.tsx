@@ -133,7 +133,7 @@ export function OverviewPage({
                   page: 'migrate' as Page,
                   icon: 'migrate',
                   title: 'Migrate existing users',
-                  text: 'Keep usernames and played status.',
+                  text: 'Bring progress, favorites and playlists.',
                 },
                 {
                   page: 'accounts' as Page,
@@ -167,8 +167,8 @@ export function OverviewPage({
             <div className="panel-body">
               <h3>Your users. Their progress.</h3>
               <p className="muted text-small mt-9">
-                Preview the match before you migrate. Existing Jellyfin played status is preserved
-                as Emby history is added.
+                Preview the match before you migrate. Existing Jellyfin activity is preserved as
+                Emby progress, favorites and playlists are added.
               </p>
               <div className="flow">
                 <div className="flow-node">
@@ -241,7 +241,7 @@ export function MigratePage({
     <>
       <Heading
         title="Migrate users"
-        description="Same usernames. A new home. Bring Emby played status into Jellyfin."
+        description="Bring Emby progress, favorites and playlists into Jellyfin. Set name exceptions in User mappings."
         actions={
           <button
             id="preview-migration"

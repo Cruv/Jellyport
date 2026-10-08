@@ -1,0 +1,70 @@
+# Emby to Jellyfin migration capabilities
+
+Jellyport migrates user records through the servers' authenticated APIs. Both servers must already contain the media. It does not copy media files or either server's database. Exact usernames are the default; an administrator-approved identity mapping can associate accounts with different names.
+
+The merge preserves existing Jellyfin activity. Watched and favorite flags are combined, play counts use the larger value, and valid last-played dates use the later date. Confident matching is required; missing and ambiguous media are reported instead of guessed. Existing Jellyfin passwords and permission policies remain intact. New accounts receive a generated password and the selected Jellyfin template's permissions.
+
+## What can move
+
+| Data | Migration behavior and limitations |
+| --- | --- |
+| Played / unplayed | Merge played flags for matched playable items. Emby's unplayed flag never erases a Jellyfin played flag. Fresh accounts retain unplayed defaults for untouched items. |
+| Play count | Preserve the larger valid count, rather than adding counts and duplicating history on reruns. |
+| Last played | Preserve the later valid timestamp through Jellyfin 10.9+ user-data updates. Emby's additional `UserDataLastPlayedDate` and `UserDataPlayCount` fields are requested where supported. Older Jellyfin watched endpoints may record the current date when no source date exists; this is reported. |
+| Resume position | Copy a valid source position when the destination has no competing activity or the source activity is demonstrably newer. Preserve the destination when chronology is tied or unknown. Positions are not transferred beyond the destination item's duration. |
+| Favorites | Merge favorites on confidently matched items, including series, seasons, albums, artists, books, photos, and collections when those records are exposed and identifiable on both servers. A favorite remains a favorite. |
+| Personal likes and ratings | Copy valid personal values into empty destination fields. Preserve existing Jellyfin choices because preference changes have no reliable individual timestamps. `Likes` is copied only when the source actually supplies it; Emby's published DTO does not promise this field. Community/critic ratings are library metadata and are not user ratings. |
+| Continue Watching | Jellyfin rebuilds the row from migrated resume positions, dates, playable items, and its own resume thresholds and client settings. Tile order and exact appearance can differ. |
+| Next Up / future seasons | Migrate individual episode watched flags and available dates. Jellyfin then selects the next unwatched episode, including episodes from a new season after they are scanned. There is no permanent cross-server "follow this show" record to import. See the explanation below. |
+| Playlists | Recreate user-visible playlists as private copies owned by the destination user. Match each member separately and retain supported order. Merge available playlist favorites/likes/ratings after confirming the copy. Missing members are reported. Existing unrelated Jellyfin playlists are preserved. Original public visibility, collaborators, description/artwork, and edit permissions are not copied. |
+| Repeated playlist entries | Jellyfin 12 supports repeated entries. Jellyfin 10.9–10.11 removes duplicates during playlist insertion; migration must report that limitation rather than claiming an exact copy. |
+| Portable playback preferences | For newly created accounts, copy an explicit allowlist of shared audio/subtitle language, subtitle mode, autoplay, remembered track selection, missing-episode display, and hide-played preferences over the template configuration. Keep the template's permission policy and server-specific configuration. Existing users keep their Jellyfin preferences. |
+| Profile image | For newly created accounts, transfer a bounded PNG/JPEG profile image from the configured Emby server's user-image endpoint. Request a small image, validate its signature, and preserve existing Jellyfin profiles. No image URL from upstream metadata is fetched. |
+
+The portable item-data write contract is `POST /UserItems/{itemId}/UserData?userId={userId}`. Jellyfin persists `Played`, `PlaybackPositionTicks`, `PlayCount`, `LastPlayedDate`, `IsFavorite`, `Likes`, and `Rating` when supplied. Although its update DTO also declares `PlayedPercentage`, `UnplayedItemCount`, `Key`, and `ItemId`, these are not independent values that Jellyport should import: percentages and aggregate counts are derived, while keys and IDs belong to the destination server. These behaviors were checked against Jellyfin's [item controller](https://github.com/jellyfin/jellyfin/blob/v12.2/Jellyfin.Api/Controllers/ItemsController.cs), [update DTO](https://github.com/jellyfin/jellyfin/blob/v12.2/MediaBrowser.Model/Dto/UpdateUserItemDataDto.cs), and [user-data manager](https://github.com/jellyfin/jellyfin/blob/v10.11.10/Emby.Server.Implementations/Library/UserDataManager.cs).
+
+## Shows awaiting a future season
+
+Suppose a user finished season 2 in Emby and season 3 is not yet in Jellyfin. Jellyport transfers the matched episodes' watched state and original last-played dates. It leaves future episodes unplayed. Once season 3 is available and scanned, Jellyfin can select its first unwatched episode for Next Up.
+
+This is derived behavior, not a guarantee that a show remains visible indefinitely while no new episode exists. Jellyfin applies the client's Next Up date cutoff, library exclusions, special-episode settings, and other display choices. Old or missing source dates can affect eligibility. Jellyport does not manufacture recent activity to force a tile onto the home screen. Favorited series also remain available in Favorites.
+
+The server selects eligible series from episode activity and then determines the next episode; it does not require a copied "series completed" flag. Copying aggregate season/series completion would be misleading when the libraries contain different episodes. See Jellyfin's [Next Up implementation](https://github.com/jellyfin/jellyfin/blob/v12.2/Emby.Server.Implementations/TV/TVSeriesManager.cs) and the [episode activity selection](https://github.com/jellyfin/jellyfin/blob/v10.11.10/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs).
+
+## Playlist safety and compatibility
+
+Private playlist creation and direct user-data updates require Jellyfin **10.9 or later**. Jellyfin 10.8 lacks the checked update route and explicit private-playlist creation field. Unsupported or unknown capabilities must produce a warning; Jellyport must not fall back to a public playlist.
+
+Creation uses `POST /Playlists` with the destination `UserId`, explicit `IsPublic: false`, and no shared users. Entry readback specifies the destination user. Ordinary API-key access does not provide a safe owner context for every playlist delete/reorder/share route, so migration preserves existing playlists instead of rewriting their membership. Source playlists shared with a user become that user's private copy, not a new public or shared resource. See the [playlist controller](https://github.com/jellyfin/jellyfin/blob/v12.2/Jellyfin.Api/Controllers/PlaylistsController.cs) and [create request](https://github.com/jellyfin/jellyfin/blob/v10.9.0/Jellyfin.Api/Models/PlaylistDtos/CreatePlaylistDto.cs).
+
+The destination's insertion behavior matters: [Jellyfin 10.11 deduplicates members](https://github.com/jellyfin/jellyfin/blob/v10.11.10/Emby.Server.Implementations/Playlists/PlaylistManager.cs), whereas [Jellyfin 12 retains repeated entries](https://github.com/jellyfin/jellyfin/blob/v12.2/Emby.Server.Implementations/Playlists/PlaylistManager.cs). Jellyport creates each copy with its full matched entry list and private visibility in one request, then verifies ordered readback. Names include an `Emby import` suffix with a unique identifier. The encrypted journal binds each import to both servers and user IDs.
+
+Reruns never append to an imported playlist: its owner may have made it public or shared since creation, and ordinary API-key access cannot safely prove its current sharing state across supported versions. An unchanged copy is recognized; source changes, destination edits, incomplete readback, or an uncertain creation are reported for manual review. A timed-out creation is never blindly repeated. This favors privacy and duplicate prevention over automatic playlist synchronization. Read-only confirmation can finish a previously created copy when its complete contents match.
+
+Reads are bounded to 500 source playlists and 100,000 total entries per user. A single private creation is limited to 100,000 matched entries and a 4 MiB request body. Exceeding a limit produces a partial result instead of silently claiming a complete migration.
+
+## Data without a safe automatic equivalent
+
+| Data | Reason / achievable alternative |
+| --- | --- |
+| Passwords, PINs, login tokens, sessions, device authentication, Emby Connect links | Authentication systems are different. Generate new Jellyfin passwords; never import these secrets. |
+| Emby permission policies and library-access IDs | Use the Jellyfin template. Emby IDs and privilege flags must not override destination access controls. |
+| Every historical playback event, watch duration, device, IP, plugin statistics | Core item data exposes a count and latest date, not the full event ledger. Playback-reporting, Trakt, or other plugin data requires a separate explicitly supported integration. |
+| Hidden-from-resume state | Emby has a hide endpoint, but its published readable user-data DTO does not expose a portable hide field, and the checked Jellyfin update DTO has no matching write field. Do not erase legitimate resume positions to approximate hiding. |
+| Client themes, home layouts, sorting, device-local settings | Display preferences are scoped by client and item IDs, with no general export of all clients. Blindly copying custom preference dictionaries can retain invalid IDs or change security-sensitive behavior. Users can recreate these settings in Jellyfin. |
+| Server-specific ordered views, excluded library IDs, local-password switches, profile PINs, cast receiver IDs | These are deliberately excluded from the portable configuration allowlist. |
+| Emby intro-skip mode, rewind seconds, unsupported subtitle modes | The checked Jellyfin user-configuration model has no exact shared field or enum value. Client/plugin capabilities differ. |
+| Smart playlist rules, external URLs, unsupported media, deleted or unavailable items | Copy only confidently matched destination library members. Dynamic rules and remote sources need a separate compatible feature; report unavailable members. |
+| Library metadata, posters, collection membership, subtitles, intro/chapter analysis, DVR schedules | These belong to the library/server or another integration, not an account's portable user data. A favorite on an existing matched collection can move; creating or changing the shared collection cannot be inferred safely from a user migration. |
+
+Configuration compatibility was checked against [Emby's user configuration](https://dev.emby.media/reference/RestAPI/UserService/getUsersById.html) and [Jellyfin's configuration model](https://github.com/jellyfin/jellyfin/blob/v12.2/MediaBrowser.Model/Configuration/UserConfiguration.cs). Display-preference scoping is documented by [Emby](https://dev.emby.media/reference/RestAPI/DisplayPreferencesService/getDisplaypreferencesById.html) and implemented by [Jellyfin](https://github.com/jellyfin/jellyfin/blob/v12.2/Jellyfin.Api/Controllers/DisplayPreferencesController.cs). Emby's [hide-from-resume contract](https://dev.emby.media/reference/RestAPI/UserLibraryService/postUsersByUseridItemsByIdHidefromresume.html) documents the write-only migration gap above.
+
+Profile-image uploads use the authenticated user-image route and a base64 body, as implemented by Jellyfin's [image controller](https://github.com/jellyfin/jellyfin/blob/v12.2/Jellyfin.Api/Controllers/ImageController.cs). They do not import image URLs, arbitrary files, or SVG markup.
+
+## Reviewing a migration
+
+Preview before a bulk migration. Review unmatched and ambiguous media, unsupported capabilities, missing dates, and playlist differences. Newer or uncertain destination resume positions are retained automatically. Test one representative account against the actual Emby/Jellyfin versions first: API and client behavior can differ even when a request succeeds.
+
+Jellyport refreshes each destination item's user data immediately before merging. The upstream API has no conditional update transaction, so concurrent playback during the brief read/write interval can still race with a migration. Run a user's migration while they are not actively watching for the most reliable result. Jobs explicitly report partial results and preserve ordinary existing account credentials and permissions.
+
+Research checked primary API documentation and tagged Jellyfin source on **2026-10-08**, including 10.8.13, 10.9.0, 10.10.7, 10.11.10, and 12.2. The migration behavior above is implemented in Jellyport 0.4.0 and checked with local API fixtures; it has not been run against your production users or servers.

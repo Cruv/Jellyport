@@ -9,7 +9,7 @@ RUN npm run build
 
 FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS runtime
 LABEL org.opencontainers.image.source="https://github.com/Cruv/Jellyport" \
-      org.opencontainers.image.description="Jellyport - Emby to Jellyfin account and watched status migration"
+      org.opencontainers.image.description="Jellyport - Emby to Jellyfin account, progress, favorites and playlist migration"
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN apt-get update && \

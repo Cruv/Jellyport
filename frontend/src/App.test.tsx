@@ -387,6 +387,103 @@ describe('React account safeguards', () => {
       discord_recipients: { 'e-river': '123456789012345678' },
     });
   });
+  it('shows approved identity exceptions and submits the preview mapping revision with its verified recipient', async () => {
+    responses['/api/users'] = { emby: [{ Id: 'complex', Name: 'Mr. Complex !' }], jellyfin: [] };
+    responses['/api/migrations/preview'] = {
+      users: [
+        {
+          source_user_id: 'complex',
+          source_username: 'Mr. Complex !',
+          username: 'simple',
+          target_exists: true,
+          mapping_id: 'map-1',
+          mapping_revision: 'approved-revision',
+          discord_user_id: '123456789012345678',
+          discord_username: 'discord.original',
+          stats: {
+            source_played: 2,
+            source_favorites: 3,
+            source_resume: 1,
+            source_playlists: 2,
+            matched: 5,
+          },
+          warnings: ['Some source playlists could not be read.'],
+        },
+      ],
+    };
+    responses['/api/migrations'] = { ...job, kind: 'migrate' };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (1)' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(
+      within(dialog).getByText('Mapped Emby account: Mr. Complex ! → Jellyfin: simple'),
+    ).toBeTruthy();
+    expect(within(dialog).getByText('Some source playlists could not be read.')).toBeTruthy();
+    expect(within(dialog).getByText('Favorites in Emby')).toBeTruthy();
+    expect(within(dialog).getByText('Resume positions')).toBeTruthy();
+    expect(within(dialog).getByText('Playlists')).toBeTruthy();
+    const recipient = within(dialog).getByLabelText(/Discord recipient/) as HTMLInputElement;
+    expect(recipient.value).toBe('123456789012345678');
+    expect(recipient.readOnly).toBe(true);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
+    );
+    expect(
+      JSON.parse(
+        String(requests.find((request) => request.path === '/api/migrations')!.options?.body),
+      ),
+    ).toEqual({
+      source_user_ids: ['complex'],
+      discord_recipients: { complex: '123456789012345678' },
+      mapping_revisions: { complex: 'approved-revision' },
+    });
+  });
+  it('reports detailed migration results and escapes source names and warnings', async () => {
+    responses['/api/jobs/job-1'] = {
+      ...job,
+      kind: 'migrate',
+      status: 'partial',
+      results: [
+        {
+          username: 'simple',
+          source_username: '<script>source()</script>',
+          status: 'partial',
+          data: {
+            items_updated: 4,
+            favorites: 2,
+            resume_positions: 1,
+            play_counts: 3,
+            last_played_dates: 2,
+            ratings: 1,
+            preferences: ['SubtitleMode'],
+            avatar: true,
+            playlists_created: 1,
+            playlists_existing: 2,
+            playlist_items_added: 3,
+            playlist_items_skipped: 1,
+            playlist_duplicates_skipped: 0,
+            failed_items: 0,
+            history_dates_missing: 0,
+            warnings: ['<img src=x onerror=unsafe()>'],
+          },
+        },
+      ],
+    };
+    const dialog = await openJob();
+    expect(within(dialog).getByText('4 items updated')).toBeTruthy();
+    expect(within(dialog).getByText('2 favorites')).toBeTruthy();
+    expect(within(dialog).getByText('1 resume positions')).toBeTruthy();
+    expect(within(dialog).getByText('1 playlists created')).toBeTruthy();
+    expect(within(dialog).getByText('Profile image copied')).toBeTruthy();
+    expect(
+      within(dialog).getByText('Emby: <script>source()</script> → Jellyfin: simple'),
+    ).toBeTruthy();
+    expect(within(dialog).getByText('<img src=x onerror=unsafe()>')).toBeTruthy();
+    expect(dialog.querySelector('script,img')).toBeNull();
+  });
   it('closes mobile navigation when moving to a page and dismisses private dialogs with Escape', async () => {
     await openJob();
     fireEvent.keyDown(document, { key: 'Escape' });

@@ -1,6 +1,22 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import { MediaError, ServiceError } from './errors.js';
-import { caseFold, matchItems, type MatchPlan } from './matching.js';
+import { caseFold, type MatchPlan } from './matching.js';
+import {
+  UserMappings,
+  validateExistingMappingUsername,
+  type UserMapping,
+} from './user-mappings.js';
+import {
+  readMigrationSource,
+  statePlan,
+  migrateItemState,
+  migratePlaylists,
+  migrationDetails,
+  migrationWarning,
+  portableConfiguration,
+  type MigrationDetails,
+  type SourceSnapshot,
+} from './migration.js';
 import {
   isObject,
   MediaClient,
@@ -10,6 +26,7 @@ import {
   type MediaItem,
   type MediaKind,
   type MediaUser,
+  type MediaUserImage,
 } from './media.js';
 import type { Store } from './store.js';
 import type { Settings } from './types.js';
@@ -20,6 +37,8 @@ export interface JobRequest {
   source_user_id?: string;
   discord_user_id?: string | null;
   recover_target_id?: string;
+  mapping_id?: string;
+  mapping_revision?: string;
 }
 export interface JobStats {
   source_played: number;
@@ -27,6 +46,10 @@ export interface JobStats {
   unmatched: number;
   ambiguous: number;
   already_played: number;
+  source_items: number;
+  source_favorites: number;
+  source_resume: number;
+  source_playlists: number;
 }
 export interface JobResult extends Partial<JobStats> {
   username: string;
@@ -37,6 +60,9 @@ export interface JobResult extends Partial<JobStats> {
   discord_delivery?: string;
   delivery_error?: string;
   error?: string;
+  source_username?: string;
+  mapping_id?: string;
+  data?: MigrationDetails;
   unmatched_items?: Array<{ name: string; type: string; id: string }>;
   ambiguous_items?: Array<{ name: string; id: string; candidate_ids: string[] }>;
 }
@@ -90,12 +116,18 @@ export interface ServiceOptions {
 }
 interface PreviewUser {
   source_user_id: string;
+  source_username: string;
   username: string;
   target_user_id: string | null;
   target_exists: boolean;
   stats: JobStats;
   unmatched: MediaItem[];
   ambiguous: MatchPlan['ambiguous'];
+  mapping_id: string | null;
+  mapping_revision: string | null;
+  discord_user_id: string | null;
+  discord_username: string | null;
+  warnings: string[];
 }
 
 class Mutex {
@@ -166,6 +198,7 @@ export class Service {
   private readonly clients = new Set<MediaAPI>();
   private stopping = false;
   readonly demo: boolean;
+  readonly mappings: UserMappings;
   constructor(
     readonly store: Store,
     options: ServiceOptions = {},
@@ -173,6 +206,10 @@ export class Service {
     this.clientFactory =
       options.clientFactory ?? ((url, key, kind) => new MediaClient(url, key, kind));
     this.demo = options.demo ?? false;
+    this.mappings = new UserMappings(store);
+  }
+  resolveDiscordMapping(discordId: string): UserMapping | null {
+    return this.mappings.getForDiscord(discordId, this.store.settings());
   }
 
   client(settings: Settings, kind: MediaKind): MediaAPI {
@@ -279,9 +316,22 @@ export class Service {
     source: MediaItem[],
     target: MediaItem[],
     settings: Settings,
+    sourcePlaylists = 0,
   ): [MatchPlan, JobStats] {
-    const played = source.filter((item) => item.UserData?.Played === true);
-    const plan = matchItems(played, target, settings.path_mappings);
+    const playable = new Set([
+      'Movie',
+      'Episode',
+      'Audio',
+      'MusicVideo',
+      'Video',
+      'Book',
+      'AudioBook',
+      'Trailer',
+    ]);
+    const played = source.filter(
+      (item) => playable.has(item.Type ?? '') && item.UserData?.Played === true,
+    );
+    const plan = statePlan(source, target, settings);
     return [
       plan,
       {
@@ -289,9 +339,115 @@ export class Service {
         matched: plan.matches.length,
         unmatched: plan.unmatched.length,
         ambiguous: plan.ambiguous.length,
-        already_played: plan.matches.filter((match) => match.target.UserData?.Played).length,
+        already_played: plan.matches.filter(
+          (match) =>
+            match.source.UserData?.Played === true && match.target.UserData?.Played === true,
+        ).length,
+        source_items: plan.matches.length + plan.unmatched.length + plan.ambiguous.length,
+        source_favorites: source.filter((item) => item.UserData?.IsFavorite === true).length,
+        source_resume: source.filter(
+          (item) =>
+            playable.has(item.Type ?? '') &&
+            typeof item.UserData?.PlaybackPositionTicks === 'number' &&
+            Number.isSafeInteger(item.UserData.PlaybackPositionTicks) &&
+            item.UserData.PlaybackPositionTicks > 0,
+        ).length,
+        source_playlists: sourcePlaylists,
       },
     ];
+  }
+  private mappedTarget(
+    users: MediaUser[],
+    mapping: UserMapping | null,
+    username: string,
+    settings: Settings,
+    recoverTargetId?: string,
+  ): MediaUser | null {
+    if (!mapping?.target_user_id) {
+      const target = this.target(users, username);
+      this.assertDestinationMapping(mapping, target?.Id ?? null, username, settings);
+      if (mapping && target) {
+        const local = this.store.account(username);
+        const explicitRecovery =
+          recoverTargetId === target.Id &&
+          local &&
+          ['uncertain', 'provisioning'].includes(local.status) &&
+          (!local.remote_id || local.remote_id === target.Id);
+        if (
+          !explicitRecovery &&
+          (local?.remote_id !== target.Id || local.status !== 'provisioning')
+        )
+          throw new ServiceError(
+            'The mapped new username now exists. Select the existing Jellyfin account explicitly before migrating.',
+          );
+      }
+      return target;
+    }
+    const target = users.find((user) => user.Id === mapping.target_user_id);
+    this.assertDestinationMapping(
+      mapping,
+      target?.Id ?? mapping.target_user_id,
+      username,
+      settings,
+    );
+    if (!target || target.Name !== mapping.target_username)
+      throw new ServiceError(
+        'The mapped Jellyfin account was removed or renamed. Review its mapping.',
+      );
+    if (
+      target.Policy?.IsAdministrator !== false ||
+      (target.Policy?.IsDisabled !== false && recoverTargetId !== target.Id)
+    )
+      throw new ServiceError(
+        'The mapped Jellyfin account is disabled or its permissions changed. Review it before migrating.',
+      );
+    return target;
+  }
+  private assertDestinationMapping(
+    mapping: UserMapping | null,
+    targetId: string | null,
+    username: string,
+    settings: Settings,
+  ): void {
+    const owner = this.mappings.getForTarget(targetId, username, settings);
+    if (owner && owner.id !== mapping?.id)
+      throw new ServiceError(
+        'This Jellyfin account or username is reserved by another approved Emby mapping. Use that mapping instead.',
+      );
+  }
+  private requestMapping(request: JobRequest, settings: Settings): UserMapping | null {
+    if (!request.source_user_id) return null;
+    const mapping = this.mappings.getForSource(request.source_user_id, settings);
+    if (request.mapping_id || request.mapping_revision) {
+      if (
+        !mapping ||
+        mapping.id !== request.mapping_id ||
+        mapping.revision !== request.mapping_revision
+      )
+        throw new ServiceError(
+          'The user mapping changed after this job was queued. Review a new preview before migrating.',
+        );
+      return mapping;
+    }
+    if (mapping)
+      throw new ServiceError(
+        'A user mapping was added after this job was queued. Review a new preview before migrating.',
+      );
+    return null;
+  }
+  private assertMapping(
+    mapping: UserMapping | null,
+    sourceId: string | undefined,
+    settings: Settings,
+  ): void {
+    if (!sourceId) return;
+    const current = this.mappings.getForSource(sourceId, settings);
+    if (
+      mapping
+        ? current?.id !== mapping.id || current.revision !== mapping.revision
+        : current !== null
+    )
+      throw new ServiceError('The user mapping changed. Review a new preview before migrating.');
   }
   async preview(sourceUserIds: string[]): Promise<{ users: PreviewUser[]; mode: 'merge' }> {
     const settings = this.store.settings();
@@ -301,26 +457,67 @@ export class Service {
           targets = await jellyfin.users();
         const users: PreviewUser[] = [];
         for (const sourceId of sourceUserIds) {
-          const sourceUser = await emby.user(sourceId),
-            username = validateUsername(sourceUser.Name),
-            target = this.target(targets, username);
+          const source = await readMigrationSource(emby, sourceId);
+          if (source.user.Id !== sourceId)
+            throw new ServiceError(
+              'Emby returned a different source account. Reload the user list.',
+            );
+          const mapping = this.mappings.getForSource(sourceId, settings);
+          if (mapping && source.user.Name !== mapping.source_username)
+            throw new ServiceError('The mapped Emby account was renamed. Review its mapping.');
+          const username = mapping?.target_user_id
+              ? validateExistingMappingUsername(mapping.target_username)
+              : validateUsername(mapping?.target_username ?? source.user.Name),
+            target = this.mappedTarget(targets, mapping, username, settings);
           if (target && (target.Id === template.Id || target.Policy?.IsAdministrator))
             throw new ServiceError(
               'A migration cannot target your template user or a Jellyfin administrator.',
             );
-          const source = await emby.items(sourceId);
-          let targetItems = await jellyfin.items(target?.Id ?? template.Id);
+          if (target?.Policy?.IsDisabled)
+            throw new ServiceError(
+              'A disabled Jellyfin account cannot be a migration destination.',
+            );
+          let targetItems = await (jellyfin.migrationItems
+            ? jellyfin.migrationItems(target?.Id ?? template.Id)
+            : jellyfin.items(target?.Id ?? template.Id));
           if (!target)
             targetItems = targetItems.map((item) => ({ ...item, UserData: { Played: false } }));
-          const [plan, stats] = this.plan(source, targetItems, settings);
+          const [plan, stats] = this.plan(
+            source.items,
+            targetItems,
+            settings,
+            source.playlists.length,
+          );
+          const warnings = [
+            ...source.warnings,
+            ...source.playlists.flatMap((entry) => (entry.error ? [entry.error] : [])),
+          ];
+          this.assertMapping(mapping, sourceId, settings);
           users.push({
             source_user_id: sourceId,
+            source_username: source.user.Name,
             username,
             target_user_id: target?.Id ?? null,
             target_exists: Boolean(target),
             stats,
-            unmatched: plan.unmatched,
-            ambiguous: plan.ambiguous,
+            unmatched: plan.unmatched.map((item) => ({
+              Id: item.Id,
+              Name: item.Name,
+              Type: item.Type,
+            })),
+            ambiguous: plan.ambiguous.map((entry) => ({
+              source: { Id: entry.source.Id, Name: entry.source.Name, Type: entry.source.Type },
+              candidates: entry.candidates.map((item) => ({
+                Id: item.Id,
+                Name: item.Name,
+                Type: item.Type,
+              })),
+            })),
+            mapping_id: mapping?.id ?? null,
+            mapping_revision: mapping?.revision ?? null,
+            discord_user_id: mapping?.discord_user_id ?? null,
+            discord_username: mapping?.discord_username ?? null,
+            warnings,
           });
         }
         return { users, mode: 'merge' };
@@ -346,6 +543,11 @@ export class Service {
   }
   async createAccount(username: string, discordUserId?: string | null): Promise<Job> {
     validateUsername(username);
+    this.assertDestinationMapping(null, null, username, this.store.settings());
+    if (discordUserId && this.resolveDiscordMapping(discordUserId))
+      throw new ServiceError(
+        'This Discord user has an approved Emby mapping. Use migration to preserve their existing data.',
+      );
     if (discordUserId) {
       await this.validateRecipients([discordUserId]);
       const identity = await this.requireBot().recipientIdentity(discordUserId);
@@ -357,9 +559,7 @@ export class Service {
     this.requireServer(this.store.settings(), 'jellyfin');
     return this.queue('create', [{ username, discord_user_id: discordUserId }]);
   }
-  async recoveryInfo(
-    username: string,
-  ): Promise<{
+  async recoveryInfo(username: string): Promise<{
     username: string;
     target_exists: boolean;
     target_user_id: string | null;
@@ -400,20 +600,36 @@ export class Service {
       throw new ServiceError(
         'The inspected recovery target is no longer eligible. Refresh its details before proceeding.',
       );
+    const mapping = this.mappings.getForTarget(targetUserId, username, this.store.settings());
     if (discordUserId) {
       await this.validateRecipients([discordUserId]);
-      if ((await this.requireBot().recipientIdentity(discordUserId)).username !== username)
+      if (
+        (await this.requireBot().recipientIdentity(discordUserId)).username !== username &&
+        mapping?.discord_user_id !== discordUserId
+      )
         throw new ServiceError(
           "Use the recipient's Discord username when recovering and linking an account.",
         );
     }
     return this.queue('recover', [
-      { username, discord_user_id: discordUserId, recover_target_id: targetUserId },
+      {
+        username,
+        discord_user_id: discordUserId,
+        recover_target_id: targetUserId,
+        ...(mapping
+          ? {
+              source_user_id: mapping.source_user_id,
+              mapping_id: mapping.id,
+              mapping_revision: mapping.revision,
+            }
+          : {}),
+      },
     ]);
   }
   async migrateUsers(
     sourceUserIds: string[],
     discordRecipients: Record<string, string> = {},
+    expectedMappingRevisions?: Record<string, string | null>,
   ): Promise<Job> {
     if (
       !sourceUserIds.length ||
@@ -425,14 +641,41 @@ export class Service {
       throw new ServiceError('A Discord recipient must belong to a selected source user.');
     if (new Set(Object.values(discordRecipients)).size !== Object.keys(discordRecipients).length)
       throw new ServiceError('Choose a different Discord recipient for each account.');
+    if (
+      expectedMappingRevisions &&
+      (Object.keys(expectedMappingRevisions).length !== sourceUserIds.length ||
+        Object.keys(expectedMappingRevisions).some((id) => !sourceUserIds.includes(id)) ||
+        sourceUserIds.some((id) => !Object.hasOwn(expectedMappingRevisions, id)))
+    )
+      throw new ServiceError('Mapping revisions must cover exactly the selected Emby users.');
     await this.validateRecipients(Object.values(discordRecipients));
     const settings = this.store.settings();
     this.requireServer(settings, 'emby');
     this.requireServer(settings, 'jellyfin');
-    return this.queue(
-      'migrate',
-      sourceUserIds.map((id) => ({ source_user_id: id, discord_user_id: discordRecipients[id] })),
-    );
+    const requests = sourceUserIds.map((id): JobRequest => {
+      const mapping = this.mappings.getForSource(id, settings);
+      if (expectedMappingRevisions && expectedMappingRevisions[id] !== (mapping?.revision ?? null))
+        throw new ServiceError(
+          'The user mapping changed after preview. Review a new preview before migrating.',
+        );
+      const recipient = Object.hasOwn(discordRecipients, id) ? discordRecipients[id] : undefined;
+      if (recipient && mapping?.discord_user_id && mapping.discord_user_id !== recipient)
+        throw new ServiceError(
+          'The selected Discord recipient differs from this approved user mapping.',
+        );
+      return {
+        source_user_id: id,
+        discord_user_id: recipient,
+        ...(mapping
+          ? {
+              username: mapping.target_username,
+              mapping_id: mapping.id,
+              mapping_revision: mapping.revision,
+            }
+          : {}),
+      };
+    });
+    return this.queue('migrate', requests);
   }
   private queue(kind: string, requests: JobRequest[]): Job {
     if (this.stopping) throw new ServiceError('The app is stopping. Retry after it restarts.');
@@ -473,13 +716,24 @@ export class Service {
     username: string,
     allowExisting: boolean,
     recoverTargetId?: string,
+    mapping: UserMapping | null = null,
+    guard: () => void = () => {},
   ): Promise<[MediaUser, boolean, string | null]> {
-    let target = this.target(await jellyfin.users(), username);
+    let target = this.mappedTarget(
+      await jellyfin.users(),
+      mapping,
+      username,
+      settings,
+      recoverTargetId,
+    );
+    guard();
     const local = this.store.account(username);
     if (target?.Id === template.Id)
       throw new ServiceError('The template account cannot be a destination account.');
     if (target?.Policy?.IsAdministrator)
       throw new ServiceError('A Jellyfin administrator cannot be a destination account.');
+    if (target?.Policy?.IsDisabled && !recoverTargetId)
+      throw new ServiceError('A disabled Jellyfin account cannot be a migration destination.');
     let password: string | null = null;
     if (recoverTargetId) {
       if (
@@ -494,6 +748,7 @@ export class Service {
         );
       password = generatePassword();
       this.store.saveAccount(username, target.Id, 'provisioning', password);
+      guard();
       await jellyfin.setPassword(target.Id, password);
     }
     if (target) {
@@ -501,6 +756,7 @@ export class Service {
         /* Explicit inspected recovery already reset this tracked account. */
       } else if (local && local.remote_id === target.Id && local.status === 'provisioning') {
         password = this.store.accountPassword(local) ?? generatePassword();
+        guard();
         await jellyfin.setPassword(target.Id, password);
       } else if (allowExisting) return [target, false, null];
       else
@@ -514,6 +770,7 @@ export class Service {
         );
       password = generatePassword();
       this.store.saveAccount(username, null, 'provisioning', password);
+      guard();
       try {
         target = await jellyfin.createUser(username, password);
       } catch (error) {
@@ -528,7 +785,9 @@ export class Service {
       }
       this.store.saveAccount(username, target.Id, 'provisioning', password);
     }
+    guard();
     await jellyfin.setPolicy(target.Id, templatePolicy(template));
+    guard();
     await jellyfin.setConfiguration(target.Id, structuredClone(template.Configuration ?? {}));
     return [target, true, password];
   }
@@ -539,35 +798,67 @@ export class Service {
     jellyfin: MediaAPI,
     template: MediaUser,
   ): Promise<void> {
-    let sourceItems: MediaItem[] | null = null,
-      username: string;
+    let source: SourceSnapshot | null = null;
+    let avatar: MediaUserImage | null = null;
+    let mapping = this.requestMapping(request, settings);
+    let destinationId: string | null = null;
+    let username: string;
+    const guard = () => {
+      this.checkStopped();
+      this.assertMapping(mapping, request.source_user_id, settings);
+      this.assertDestinationMapping(mapping, destinationId, username, settings);
+    };
     if (request.source_user_id) {
-      const source = await this.withClient(settings, 'emby', async (emby) => ({
-        user: await emby.user(request.source_user_id!),
-        items: await emby.items(request.source_user_id),
-      }));
-      username = validateUsername(source.user.Name);
-      sourceItems = source.items;
+      source = await this.withClient(settings, 'emby', (emby) =>
+        readMigrationSource(emby, request.source_user_id!),
+      );
+      if (source.user.Id !== request.source_user_id)
+        throw new ServiceError('Emby returned a different source account. Reload the user list.');
+      if (mapping && source.user.Name !== mapping.source_username)
+        throw new ServiceError('The mapped Emby account was renamed. Review its mapping.');
+      username = mapping?.target_user_id
+        ? validateExistingMappingUsername(mapping.target_username)
+        : validateUsername(mapping?.target_username ?? source.user.Name);
     } else username = validateUsername(request.username ?? '');
+    guard();
+    const currentTarget = this.mappedTarget(
+      await jellyfin.users(),
+      mapping,
+      username,
+      settings,
+      request.recover_target_id,
+    );
+    destinationId = currentTarget?.Id ?? null;
+    guard();
     const recipient = request.discord_user_id;
     if (recipient) {
       const identity = await this.requireBot().recipientIdentity(recipient),
         link = this.store.link(recipient);
-      if (link && link.username !== username)
+      if (identity.id && identity.id !== recipient)
+        throw new ServiceError(
+          'Discord returned a different recipient identity. Review the mapping.',
+        );
+      const memberMapping = this.mappings.getForDiscord(recipient, settings);
+      if (memberMapping && memberMapping.id !== mapping?.id)
+        throw new ServiceError(
+          'This Discord user is approved for a different Emby mapping. Existing ownership was preserved.',
+        );
+      if (link && (link.username !== username || link.remote_id !== currentTarget?.Id))
         throw new ServiceError(
           'This Discord user is already linked to a different Jellyfin account. Existing identity link was preserved.',
         );
-      if (!link && username !== identity.username)
+      if (!link && username !== identity.username && mapping?.discord_user_id !== recipient)
         throw new ServiceError(
-          "The Emby username must match this recipient's Discord username when first linking an account.",
+          "The destination username must match this recipient's Discord username or an approved mapping with their verified user ID.",
         );
-      const currentTarget = this.target(await jellyfin.users(), username);
       const existing = currentTarget ? this.store.linkForRemote(currentTarget.Id) : null;
       if (existing && existing.discord_user_id !== recipient)
         throw new ServiceError('This Jellyfin account is already linked to another Discord user.');
     }
     const result: JobResult = {
       username,
+      ...(source ? { source_username: source.user.Name } : {}),
+      ...(mapping ? { mapping_id: mapping.id } : {}),
       status: 'running',
       created: false,
       applied: 0,
@@ -577,6 +868,24 @@ export class Service {
       already_played: 0,
       discord_delivery: 'not_requested',
     };
+    if (source) {
+      result.data = migrationDetails();
+      for (const warning of source.warnings) migrationWarning(result.data, warning);
+      // Read optional profile data before creating an account. It never enters persisted jobs.
+      if (!currentTarget || this.store.account(username)?.status === 'provisioning')
+        await this.withClient(settings, 'emby', async (emby) => {
+          if (!emby.userImage) return;
+          try {
+            avatar = await emby.userImage(source!.user.Id);
+          } catch {
+            migrationWarning(
+              result.data!,
+              'The source profile picture could not be read. Other account data can still migrate.',
+            );
+          }
+        });
+    }
+    guard();
     job.results.push(result);
     this.save(job);
     try {
@@ -587,8 +896,32 @@ export class Service {
         username,
         Boolean(request.source_user_id),
         request.recover_target_id,
+        mapping,
+        guard,
       );
       Object.assign(result, { created, target_user_id: target.Id });
+      destinationId = target.Id;
+      const publicUrl = settings.jellyfin_public_url || settings.jellyfin_url;
+      if (password) {
+        this.store.saveCredentials(job.id, username, password, publicUrl);
+        this.store.saveAccount(username, target.Id, 'ready');
+      }
+      guard();
+      if (mapping && !mapping.target_user_id)
+        mapping = this.mappings.bindTarget(mapping.id, mapping.revision, target.Id, settings);
+      // Recheck the stable identity and protection flags after provisioning, before personal data.
+      const liveTarget = await jellyfin.user(target.Id);
+      if (
+        liveTarget.Id !== target.Id ||
+        liveTarget.Name !== username ||
+        liveTarget.Id === template.Id ||
+        liveTarget.Policy?.IsAdministrator ||
+        liveTarget.Policy?.IsDisabled
+      )
+        throw new ServiceError(
+          'The destination account changed or became protected. Review it before retrying.',
+        );
+      guard();
       if (recipient) {
         const existing = this.store.linkForRemote(target.Id);
         if (existing && existing.discord_user_id !== recipient)
@@ -596,6 +929,10 @@ export class Service {
             'This Jellyfin account is already linked to another Discord user.',
           );
         const previous = this.store.link(recipient);
+        if (previous && (previous.remote_id !== target.Id || previous.username !== username))
+          throw new ServiceError(
+            'This Discord user is already linked to a different Jellyfin account. Existing identity link was preserved.',
+          );
         this.store.saveLink(
           recipient,
           username,
@@ -603,13 +940,48 @@ export class Service {
           Boolean(previous?.disabled_by_jellyport),
         );
       }
-      const publicUrl = settings.jellyfin_public_url || settings.jellyfin_url;
-      if (password) {
-        this.store.saveCredentials(job.id, username, password, publicUrl);
-        this.store.saveAccount(username, target.Id, 'ready');
-      }
-      if (sourceItems !== null) {
-        const [plan, stats] = this.plan(sourceItems, await jellyfin.items(target.Id), settings);
+      if (source && result.data) {
+        if (created) {
+          const preferences = portableConfiguration(
+            source.user.Configuration,
+            template.Configuration,
+          );
+          if (preferences.copied.length) {
+            guard();
+            try {
+              await jellyfin.setConfiguration(target.Id, preferences.configuration);
+              result.data.preferences = preferences.copied;
+            } catch {
+              migrationWarning(
+                result.data,
+                'Playback preferences could not be copied. The template configuration was preserved.',
+              );
+            }
+          }
+          if (avatar && jellyfin.setUserImage) {
+            guard();
+            try {
+              await jellyfin.setUserImage(target.Id, avatar);
+              result.data.avatar = true;
+            } catch {
+              migrationWarning(
+                result.data,
+                'The profile picture could not be copied. Other account data can still migrate.',
+              );
+            }
+          } else if (avatar)
+            migrationWarning(result.data, 'This Jellyfin client cannot copy profile pictures.');
+        }
+        guard();
+        const targetItems = await (jellyfin.migrationItems
+          ? jellyfin.migrationItems(target.Id)
+          : jellyfin.items(target.Id));
+        const [plan, stats] = this.plan(
+          source.items,
+          targetItems,
+          settings,
+          source.playlists.length,
+        );
         Object.assign(result, stats);
         result.unmatched_items = plan.unmatched.map((item) => ({
           name: item.Name ?? '',
@@ -622,18 +994,36 @@ export class Service {
           candidate_ids: item.candidates.map((candidate) => candidate.Id),
         }));
         this.save(job);
-        for (const match of plan.matches) {
-          this.checkStopped();
-          if (!match.target.UserData?.Played) {
-            await jellyfin.markPlayed(target.Id, match.target.Id);
-            result.applied = (result.applied ?? 0) + 1;
-            if (result.applied % 20 === 0) this.save(job);
-          }
-        }
+        result.applied = await migrateItemState(jellyfin, target.Id, plan, result.data, guard, () =>
+          this.save(job),
+        );
+        guard();
+        await migratePlaylists(
+          this.store,
+          settings,
+          source.user.Id,
+          target.Id,
+          source.playlists,
+          targetItems,
+          jellyfin,
+          result.data,
+          guard,
+          () => this.save(job),
+        );
+        guard();
       }
       if (recipient && password)
         try {
           await this.requireBot().validateRecipient(recipient);
+          const identity = await this.requireBot().recipientIdentity(recipient);
+          if (
+            (identity.id && identity.id !== recipient) ||
+            this.store.link(recipient)?.remote_id !== target.Id
+          )
+            throw new ServiceError(
+              'The Discord recipient identity changed. Credentials were preserved for administrator review.',
+            );
+          guard();
           await this.requireBot().sendCredentials(recipient, username, password, publicUrl);
           result.discord_delivery = 'sent';
           this.store.deleteCredentials(job.id, username);
@@ -644,7 +1034,11 @@ export class Service {
         }
       else if (recipient) result.discord_delivery = 'skipped_existing_account';
       result.status =
-        result.unmatched || result.ambiguous || result.discord_delivery === 'failed'
+        result.unmatched ||
+        result.ambiguous ||
+        result.discord_delivery === 'failed' ||
+        result.data?.failed_items ||
+        result.data?.warnings.length
           ? 'partial'
           : 'completed';
     } catch (error) {
@@ -778,28 +1172,40 @@ export class Service {
           }
         }
         if (event.action === 'subscribe' && !link) {
-          const username = identity!.username;
-          const target = await this.withClient(settings, 'jellyfin', async (jellyfin) =>
-            this.target(await jellyfin.users(), username),
-          );
-          if (target)
-            throw new ServiceError(
-              'A Jellyfin account already exists without a Discord identity link. Link it through an admin-approved migration first.',
+          const mapping = this.mappings.getForDiscord(memberId, settings);
+          if (mapping) {
+            const job = await this.migrateUsers([mapping.source_user_id], {
+              [mapping.source_user_id]: memberId,
+            });
+            event.job_id = job.id;
+            this.store.saveSubscription(event);
+            await this.jobTasks.get(job.id);
+            if (['failed', 'interrupted'].includes(this.getJob(job.id).status))
+              throw new ServiceError('Mapped account migration failed. Review the linked job.');
+          } else {
+            const username = identity!.username;
+            const target = await this.withClient(settings, 'jellyfin', async (jellyfin) =>
+              this.target(await jellyfin.users(), username),
             );
-          const sources =
-            settings.emby_url && settings.emby_api_key
-              ? (await this.embyUsers()).filter((user) => user.Name === username)
-              : [];
-          if (sources.length > 1)
-            throw new ServiceError('More than one Emby account matches this username.');
-          const job = sources.length
-            ? await this.migrateUsers([sources[0]!.Id], { [sources[0]!.Id]: memberId })
-            : await this.createAccount(username, memberId);
-          event.job_id = job.id;
-          this.store.saveSubscription(event);
-          await this.jobTasks.get(job.id);
-          if (['failed', 'interrupted'].includes(this.getJob(job.id).status))
-            throw new ServiceError('Account provisioning failed. Review the linked job.');
+            if (target)
+              throw new ServiceError(
+                'A Jellyfin account already exists without a Discord identity link. Link it through an admin-approved migration first.',
+              );
+            const sources =
+              settings.emby_url && settings.emby_api_key
+                ? (await this.embyUsers()).filter((user) => user.Name === username)
+                : [];
+            if (sources.length > 1)
+              throw new ServiceError('More than one Emby account matches this username.');
+            const job = sources.length
+              ? await this.migrateUsers([sources[0]!.Id], { [sources[0]!.Id]: memberId })
+              : await this.createAccount(username, memberId);
+            event.job_id = job.id;
+            this.store.saveSubscription(event);
+            await this.jobTasks.get(job.id);
+            if (['failed', 'interrupted'].includes(this.getJob(job.id).status))
+              throw new ServiceError('Account provisioning failed. Review the linked job.');
+          }
         } else {
           if (!link)
             throw new ServiceError(

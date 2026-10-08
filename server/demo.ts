@@ -8,10 +8,16 @@ import type {
   MediaItem,
   MediaKind,
   MediaUser,
+  MediaUserDataPatch,
+  MediaPlaylist,
+  MediaUserImage,
 } from './media.js';
 
 /** Isolated simulated servers for local preview; never contacts real services. */
 export class DemoServers {
+  userData: Record<string, Record<string, MediaUserDataPatch>> = {};
+  playlists: Record<string, Array<MediaPlaylist & { items: string[] }>> = {};
+  images: Record<string, MediaUserImage> = {};
   users: Record<MediaKind, MediaUser[]> = {
     emby: [
       { Id: 'e-alex', Name: 'alex', Policy: {} },
@@ -89,6 +95,10 @@ export class DemoClient implements MediaAPI {
     for (const value of values)
       value.UserData = {
         Played: userId ? (this.servers.played[userId]?.has(value.Id) ?? false) : false,
+        ...(userId && this.servers.played[userId]?.has(value.Id)
+          ? { PlayCount: 1, LastPlayedDate: '2026-10-01T12:00:00.000Z' }
+          : {}),
+        ...(userId ? this.servers.userData[userId]?.[value.Id] : {}),
       };
     return values;
   }
@@ -113,7 +123,71 @@ export class DemoClient implements MediaAPI {
   async setConfiguration(id: string, configuration: JsonObject): Promise<void> {
     this.findUser(id).Configuration = structuredClone(configuration);
   }
-  async markPlayed(userId: string, itemId: string): Promise<void> {
+  async markPlayed(userId: string, itemId: string, datePlayed?: string): Promise<void> {
     (this.servers.played[userId] ??= new Set()).add(itemId);
+    if (datePlayed)
+      (this.servers.userData[userId] ??= {})[itemId] = {
+        ...this.servers.userData[userId]?.[itemId],
+        LastPlayedDate: datePlayed,
+      };
+  }
+  async migrationItems(userId?: string): Promise<MediaItem[]> {
+    return this.items(userId);
+  }
+  async migrationCapabilities() {
+    return { userData: true, privatePlaylists: true, playlistDuplicates: true, version: '12.2.0' };
+  }
+  async userData(userId: string, itemId: string): Promise<MediaUserDataPatch> {
+    return (await this.items(userId)).find((item) => item.Id === itemId)?.UserData ?? {};
+  }
+  async updateUserData(userId: string, itemId: string, patch: MediaUserDataPatch): Promise<void> {
+    if (patch.Played) await this.markPlayed(userId, itemId, patch.LastPlayedDate ?? undefined);
+    (this.servers.userData[userId] ??= {})[itemId] = {
+      ...this.servers.userData[userId]?.[itemId],
+      ...patch,
+    };
+  }
+  async markFavorite(userId: string, itemId: string): Promise<void> {
+    await this.updateUserData(userId, itemId, { IsFavorite: true });
+  }
+  async playlists(userId: string): Promise<MediaPlaylist[]> {
+    return structuredClone(this.servers.playlists[userId] ?? []);
+  }
+  async playlistItems(id: string, userId: string): Promise<MediaItem[]> {
+    const playlist = this.servers.playlists[userId]?.find((entry) => entry.Id === id);
+    if (!playlist) throw new MediaError('Playlist not found.', 404);
+    const library = await this.items(userId);
+    return playlist.items.map((itemId, index) => ({
+      ...(library.find((item) => item.Id === itemId) ?? { Id: itemId }),
+      PlaylistItemId: String(index),
+    }));
+  }
+  async createPlaylist(
+    userId: string,
+    name: string,
+    mediaType?: string,
+    ids: string[] = [],
+  ): Promise<MediaPlaylist> {
+    const playlist = {
+      Id: randomUUID().replaceAll('-', ''),
+      Name: name,
+      MediaType: mediaType,
+      items: [...ids],
+      IsPublic: false,
+      OwnerUserId: userId,
+    };
+    (this.servers.playlists[userId] ??= []).push(playlist);
+    return structuredClone(playlist);
+  }
+  async addPlaylistItems(id: string, userId: string, ids: string[]): Promise<void> {
+    const playlist = this.servers.playlists[userId]?.find((entry) => entry.Id === id);
+    if (!playlist) throw new MediaError('Playlist not found.', 404);
+    playlist.items.push(...ids);
+  }
+  async userImage(userId: string): Promise<MediaUserImage | null> {
+    return this.servers.images[userId] ?? null;
+  }
+  async setUserImage(userId: string, image: MediaUserImage): Promise<void> {
+    this.servers.images[userId] = structuredClone(image);
   }
 }

@@ -23,7 +23,9 @@ Configure an optional membership role ID to require recipients to hold your MEE6
 /jellyport status job_id:YOUR_JOB_ID
 ```
 
-Create uses the recipient's current Discord username, `member.user.username`. Its optional `username` argument is only a confirmation and must match exactly. Migration's optional `emby_username` selects an exact Emby username; when omitted, it defaults to the member's current Discord username. The first identity link still requires the Emby and Discord usernames to match. Nicknames and display names are not identities.
+Create uses the recipient's current Discord username, `member.user.username`. Its optional `username` argument is only a confirmation and must match exactly. For members with an approved user mapping, use migrate instead: it selects the mapped Emby account by verified Discord ID and uses the saved Jellyfin destination. Otherwise, migration's optional `emby_username` selects an exact source username, defaulting to the member's current Discord username. A conflicting explicit source is rejected.
+
+The first identity link requires matching usernames or an administrator-approved mapping with that verified Discord ID. Set name exceptions under **User mappings** in the web app. A manually entered Discord name without an ID is an unverified label and never selects a command recipient or authorizes an account link. Nicknames and display names are not identities.
 
 Replies are ephemeral job statuses visible to the administrator. There is no automatic status polling; check the job with `/jellyport status` or the web page. New credentials are sent by DM only to the selected member. Users need to allow DMs from server members. Failed delivery leaves the new password available through the web app's one-time reveal for up to 24 hours. Existing Jellyfin passwords are not reset or sent by an ordinary migration.
 
@@ -54,7 +56,7 @@ To observe membership role events, set `discord_member_role_id` to the role repr
 
 All automatic actions start disabled. Recognized events enter the web app's subscription queue, where you can apply or ignore them. An unresolved event requires a verified manual account action rather than an automatic username guess.
 
-Enabling automatic provisioning applies resolved subscribe events. For an unlinked member, Jellyport migrates an exact matching Emby user when present, or creates a fresh template-based Jellyfin account otherwise. If a Jellyfin account already exists without a Discord link, an admin-approved migration must establish ownership first. Once linked, returning members can regain access to the same account if Jellyport disabled it.
+Enabling automatic provisioning applies resolved subscribe events. For an unlinked member with a verified mapping, Jellyport migrates the mapped source to its approved destination. Otherwise it migrates an exact matching Emby user when present, or creates a fresh template-based Jellyfin account. An existing unmapped Jellyfin account requires an admin-approved migration to establish ownership first. Once linked, returning members can regain access to the same account if Jellyport disabled it. Saving a mapping alone does not establish the lifecycle link; the approved migration does.
 
 Enabling automatic disabling applies expire events to linked accounts. Cancellation announcements remain for review by default: cancelling renewal does not establish when paid access ends. The separate “disable on cancellation” option also applies cancellations immediately when automatic disabling is enabled. Manually applying a cancellation event disables its linked account immediately, regardless of that automatic-action option.
 
@@ -62,4 +64,4 @@ Disabling changes account access while preserving passwords and watched history.
 
 Jellyport does not query MEE6 billing, determine paid-through dates, or recover old announcement messages. With role events enabled, it reconciles linked memberships on startup/reconnect and every five minutes, using current membership rather than replaying old changes. It can detect missing roles and departed linked users after downtime. With automatic provisioning also enabled, it scans current active-role members for unlinked subscribers, including members who joined during downtime. Enabling this combination can provision **all current active-role members without an identity link**, so check that role's membership first. With only message events enabled, announcements missed while the app was offline require a new recognized event or an administrator action.
 
-Discord IDs are the durable link; usernames can change. Lifecycle actions keep using the saved Jellyfin account and do not rename it. Resolve legacy Emby/Discord username mismatches before the first link, and inspect stale queued events before applying them.
+Discord IDs are the durable link; usernames can change. Lifecycle actions keep using the saved Jellyfin account and do not rename it. Use a verified mapping for legacy username mismatches, and inspect stale queued events before applying them. Mapping edits invalidate queued migrations using an older revision instead of redirecting their data or credentials.

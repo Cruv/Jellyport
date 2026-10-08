@@ -45,6 +45,7 @@ assert.equal(
   401,
   'Encoded API routes must require authentication.',
 );
+assert.equal((await fetch(new URL('/api/user-mappings', base))).status, 401);
 assert.equal(
   (
     await fetch(new URL('/%61pi/accounts', base), {
@@ -66,10 +67,13 @@ assert(!Object.hasOwn(settings, 'jellyfin_api_key'));
 assert(settings.jellyfin_api_key_set);
 const users = await request('/api/users');
 assert.equal(users.emby.length, 3);
+assert.deepEqual(await request('/api/user-mappings'), { mappings: [] });
 const preview = await request('/api/migrations/preview', 'POST', {
   source_user_ids: users.emby.map((user) => user.Id),
 });
 assert.equal(preview.users.length, 3);
+assert(preview.users.every((user) => Number.isInteger(user.stats.source_items)));
+assert(preview.users.every((user) => user.mapping_revision === null));
 const job = await request('/api/migrations', 'POST', {
   source_user_ids: users.emby.map((user) => user.Id),
 });
@@ -82,6 +86,8 @@ for (let attempt = 0; attempt < 100; attempt++) {
 assert.equal(finished.status, 'partial');
 assert.equal(finished.progress.processed, 3);
 assert(!JSON.stringify(finished).includes('password'));
+assert(finished.results.every((result) => result.data && Array.isArray(result.data.warnings)));
+assert(finished.results.some((result) => result.data.last_played_dates > 0));
 const credentials = await request(`/api/jobs/${job.id}/credentials`, 'POST');
 assert.equal(credentials.credentials.length, 2);
 assert((await request(`/api/jobs/${job.id}/credentials`, 'POST')).credentials.length === 0);

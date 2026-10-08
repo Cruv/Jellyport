@@ -6,6 +6,7 @@ import Fastify, {
 } from 'fastify';
 import cookie from '@fastify/cookie';
 import staticFiles from '@fastify/static';
+import { registerUserMappingRoutes } from './user-mappings.js';
 import { randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
@@ -55,6 +56,7 @@ interface RecoveryRequest extends AccountRequest {
 interface MigrationRequest {
   source_user_ids: string[];
   discord_recipients?: Record<string, string>;
+  mapping_revisions?: Record<string, string | null>;
 }
 export interface CreateAppOptions {
   demoPassword?: string;
@@ -97,6 +99,11 @@ const migrationSchema = {
       type: 'object',
       maxProperties: 100,
       additionalProperties: { type: 'string', pattern: '^[0-9]{5,22}$' },
+    },
+    mapping_revisions: {
+      type: 'object',
+      maxProperties: 100,
+      additionalProperties: { anyOf: [id, { type: 'null' }] },
     },
   },
 };
@@ -788,7 +795,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       reply
         .code(202)
         .send(
-          await service.migrateUsers(request.body.source_user_ids, request.body.discord_recipients),
+          await service.migrateUsers(
+            request.body.source_user_ids,
+            request.body.discord_recipients,
+            request.body.mapping_revisions,
+          ),
         ),
   );
   app.post<{ Body: AccountRequest }>(
@@ -859,6 +870,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     '/api/subscriptions/:event_id/ignore',
     async (request) => service.ignoreSubscription(request.params.event_id),
   );
+  registerUserMappingRoutes(app);
   const staticDir = resolve(options.staticDir ?? 'dist/client');
   if (existsSync(resolve(staticDir, 'index.html'))) {
     await app.register(staticFiles, { root: staticDir, index: false });

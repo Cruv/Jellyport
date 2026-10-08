@@ -82,6 +82,12 @@ No fixed Bookworm package was available for these two matches during the review.
 
 The pinned Fastify 5.12.5 version is newer than the published fixes for the [malformed-URL authentication bypass](https://github.com/fastify/fastify/security/advisories/GHSA-p68q-wchp-6fh7) and [proxy hop-count spoofing](https://github.com/fastify/fastify/security/advisories/GHSA-3m5p-2c4r-xxw2). The reviewed runtime uses Node 24.21.0; follow [Node's security announcements](https://nodejs.org/en/blog/vulnerability) and apply future updates. Workflow pinning follows [GitHub's secure-use guidance](https://docs.github.com/en/actions/reference/security/secure-use), and weekly Dependabot checks maintain Docker and action references.
 
+## Migration and mapping follow-up — 0.4.0
+
+The 0.4.0 migration and manual-mapping changes received an additional focused source review and fixture regressions. Mapping records and playlist journals are encrypted and scoped to the configured server pair; explicit destination IDs and revisions prevent queued work from silently following edits or replacement accounts. Verified Discord IDs, rather than free-text labels, authorize differing-name links. Browser logout clears mapping data, and upstream user/item objects are projected before preview responses.
+
+Detailed writes allow only portable user-data fields and refresh destination activity before merging. New-account preference copying uses an allowlist, and profile images use fixed authenticated endpoints with raster, size, and dimension checks. Imported playlists set private visibility, owner, and all matched entries in one request; subsequent runs never append to potentially shared copies. Uncertain creation is journaled before the request and requires review. Source playlist counts, aggregate entries, and creation payloads are bounded. These changes do not remove the deployment and native-package limitations documented above.
+
 ## Deployment boundaries that remain important
 
 Keep the administration interface on a trusted LAN or VPN, or behind an HTTPS reverse proxy with restricted access. Configure `JELLYPORT_ALLOWED_HOSTS` for the proxy hostname. Preserve Host headers and keep the raw application port private. Forwarded client addresses are not trusted; requests through one proxy share its peer address for rate limits.

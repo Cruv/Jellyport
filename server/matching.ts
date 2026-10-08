@@ -20,6 +20,25 @@ export interface MatchPlan {
   unmatched: MediaItem[];
   ambiguous: AmbiguousMatch[];
 }
+/** Lists library item types with a supported, conservative identity strategy. */
+export const MIGRATABLE_ITEM_TYPES = [
+  'Movie',
+  'Episode',
+  'Series',
+  'Season',
+  'Audio',
+  'MusicAlbum',
+  'MusicArtist',
+  'MusicVideo',
+  'Video',
+  'Book',
+  'AudioBook',
+  'Photo',
+  'PhotoAlbum',
+  'Trailer',
+  'BoxSet',
+] as const;
+const supportedTypes = new Set<string>(MIGRATABLE_ITEM_TYPES.map((type) => type.toLowerCase()));
 const providerNames: Record<string, string> = {
   imdb: 'imdb',
   tmdb: 'tmdb',
@@ -31,13 +50,55 @@ const providerNames: Record<string, string> = {
   anilist: 'anilist',
   myanimelist: 'myanimelist',
   kitsu: 'kitsu',
+  tmdbcollection: 'tmdbcollection',
+  musicbrainzrecording: 'musicbrainzrecording',
+  musicbrainztrack: 'musicbrainztrack',
+  musicbrainzreleasetrack: 'musicbrainztrack',
+  musicbrainzalbum: 'musicbrainzalbum',
+  musicbrainzrelease: 'musicbrainzalbum',
+  musicbrainzreleasegroup: 'musicbrainzreleasegroup',
+  musicbrainzartist: 'musicbrainzartist',
+  musicbrainzalbumartist: 'musicbrainzartist',
+  audiodbalbum: 'audiodbalbum',
+  audiodbartist: 'audiodbartist',
+  isbn: 'isbn',
+  isbn10: 'isbn',
+  isbn13: 'isbn',
+  googlebooks: 'googlebooks',
+  comicvine: 'comicvine',
+};
+const videoProviders = new Set([
+  'imdb',
+  'tmdb',
+  'tvdb',
+  'tvmaze',
+  'anidb',
+  'anilist',
+  'myanimelist',
+  'kitsu',
+]);
+const typeProviders: Record<string, ReadonlySet<string>> = {
+  movie: videoProviders,
+  episode: videoProviders,
+  series: videoProviders,
+  season: videoProviders,
+  musicvideo: videoProviders,
+  video: videoProviders,
+  // Album/artist IDs can appear on every song and must never identify an Audio item.
+  audio: new Set(['musicbrainzrecording', 'musicbrainztrack']),
+  musicalbum: new Set(['musicbrainzalbum', 'musicbrainzreleasegroup', 'audiodbalbum']),
+  musicartist: new Set(['musicbrainzartist', 'audiodbartist']),
+  boxset: new Set(['tmdbcollection']),
+  book: new Set(['isbn', 'googlebooks', 'comicvine']),
+  audiobook: new Set(['isbn']),
 };
 export const caseFold = nameKey;
 
-function providers(item: MediaItem, field: string): Record<string, string> {
+function providers(item: MediaItem, field: string): Map<string, Set<string>> {
   const raw = item[field];
-  if (!isObject(raw)) return {};
-  const result: Record<string, string> = {};
+  const result = new Map<string, Set<string>>();
+  if (!isObject(raw)) return result;
+  const allowed = field === 'SeriesProviderIds' ? videoProviders : typeProviders[kind(item)];
   for (const [key, value] of Object.entries(raw)) {
     const providerKey = caseFold(key.trim());
     const provider = Object.hasOwn(providerNames, providerKey)
@@ -45,10 +106,18 @@ function providers(item: MediaItem, field: string): Record<string, string> {
       : undefined;
     if (
       provider &&
-      (typeof value === 'string' || (typeof value === 'number' && Number.isInteger(value)))
+      allowed?.has(provider) &&
+      (typeof value === 'string' || (typeof value === 'number' && Number.isSafeInteger(value)))
     ) {
-      const normalized = caseFold(String(value).trim());
-      if (normalized) result[provider] = normalized;
+      const normalized =
+        provider === 'googlebooks'
+          ? String(value).trim()
+          : provider === 'isbn'
+            ? caseFold(String(value).trim().replaceAll(/[\s-]/g, ''))
+            : caseFold(String(value).trim());
+      if (!normalized) continue;
+      if (!result.has(provider)) result.set(provider, new Set());
+      result.get(provider)!.add(normalized);
     }
   }
   return result;
@@ -69,6 +138,19 @@ function episodeRange(item: MediaItem): number[] | null {
   const end = number(item.IndexNumberEnd) ?? episode;
   return end < episode ? null : [season, episode, end];
 }
+function seriesNumbers(item: MediaItem): number[] | null {
+  if (kind(item) === 'episode') return episodeRange(item);
+  if (kind(item) === 'season') {
+    const season = number(item.IndexNumber);
+    return season === null ? null : [season];
+  }
+  return null;
+}
+function providerEntries(item: MediaItem, field: string): Array<[string, string]> {
+  return [...providers(item, field)].flatMap(([provider, ids]) =>
+    [...ids].map((id) => [provider, id] as [string, string]),
+  );
+}
 function path(value: unknown): string | null {
   if (typeof value !== 'string' || !value.trim()) return null;
   return (
@@ -87,17 +169,20 @@ function mappedPath(item: MediaItem, mappings: Array<[string, string]>): string 
   return value;
 }
 function compatible(source: MediaItem, target: MediaItem): boolean {
+  if (kind(source) !== kind(target)) return false;
   const fields = ['ProviderIds'];
-  if (kind(source) === 'episode') {
+  if (['episode', 'season'].includes(kind(source))) {
     fields.push('SeriesProviderIds');
-    const a = episodeRange(source),
-      b = episodeRange(target);
+    const a = seriesNumbers(source),
+      b = seriesNumbers(target);
     if (a && b && a.join(',') !== b.join(',')) return false;
   }
   for (const field of fields) {
     const a = providers(source, field),
       b = providers(target, field);
-    if (Object.keys(a).some((key) => key in b && a[key] !== b[key])) return false;
+    // Contradictory aliases must not silently overwrite one another, even for a path match.
+    if ([...a.values(), ...b.values()].some((ids) => ids.size > 1)) return false;
+    if ([...a].some(([key, ids]) => b.has(key) && !b.get(key)!.has([...ids][0]!))) return false;
   }
   return true;
 }
@@ -110,7 +195,7 @@ function lookup(index: Map<string, Set<number>>, key: unknown[]): Set<number> {
   return index.get(JSON.stringify(key)) ?? new Set();
 }
 
-/** Provider identity, complete series/episode identity, then exact mapped path; never titles. */
+/** Type-scoped provider identity, complete series numbering, then exact mapped path; never titles. */
 export function matchItems(
   source: MediaItem[],
   target: MediaItem[],
@@ -121,13 +206,16 @@ export function matchItems(
     pathIndex = new Map<string, Set<number>>();
   target.forEach((item, index) => {
     const type = kind(item);
-    if (!['movie', 'episode'].includes(type)) return;
-    for (const [provider, value] of Object.entries(providers(item, 'ProviderIds')))
-      add(providerIndex, [type, provider, value], index);
-    const numbers = episodeRange(item);
-    if (type === 'episode' && numbers)
-      for (const [provider, value] of Object.entries(providers(item, 'SeriesProviderIds')))
-        add(seriesIndex, [provider, value, ...numbers], index);
+    if (!supportedTypes.has(type)) return;
+    // Season ProviderIds vary between server/provider versions (series IDs or season IDs).
+    // They are checked for contradictions, but only series + number proves season identity.
+    if (type !== 'season')
+      for (const [provider, value] of providerEntries(item, 'ProviderIds'))
+        add(providerIndex, [type, provider, value], index);
+    const numbers = seriesNumbers(item);
+    if (numbers)
+      for (const [provider, value] of providerEntries(item, 'SeriesProviderIds'))
+        add(seriesIndex, [type, provider, value, ...numbers], index);
     const value = path(item.Path);
     if (value) add(pathIndex, [type, value], index);
   });
@@ -141,7 +229,7 @@ export function matchItems(
   const result: MatchPlan = { matches: [], unmatched: [], ambiguous: [] };
   for (const item of source) {
     const type = kind(item);
-    if (!['movie', 'episode'].includes(type)) {
+    if (!supportedTypes.has(type)) {
       result.unmatched.push(item);
       continue;
     }
@@ -149,14 +237,15 @@ export function matchItems(
     const pathCandidates = value ? lookup(pathIndex, [type, value]) : new Set<number>();
     let candidates = new Set<number>(),
       method = 'provider_id';
-    for (const [provider, id] of Object.entries(providers(item, 'ProviderIds')))
-      for (const index of lookup(providerIndex, [type, provider, id])) candidates.add(index);
-    if (!candidates.size && type === 'episode') {
-      const numbers = episodeRange(item);
+    if (type !== 'season')
+      for (const [provider, id] of providerEntries(item, 'ProviderIds'))
+        for (const index of lookup(providerIndex, [type, provider, id])) candidates.add(index);
+    if (!candidates.size && ['episode', 'season'].includes(type)) {
+      const numbers = seriesNumbers(item);
       if (numbers) {
-        method = 'series_episode';
-        for (const [provider, id] of Object.entries(providers(item, 'SeriesProviderIds')))
-          for (const index of lookup(seriesIndex, [provider, id, ...numbers]))
+        method = type === 'episode' ? 'series_episode' : 'series_season';
+        for (const [provider, id] of providerEntries(item, 'SeriesProviderIds'))
+          for (const index of lookup(seriesIndex, [type, provider, id, ...numbers]))
             candidates.add(index);
       }
     }

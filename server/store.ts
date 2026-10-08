@@ -38,6 +38,13 @@ export type AuthState =
   | { kind: 'pending'; generation: string; serverUrl?: string; previousServerId?: string }
   | { kind: 'configured'; serverUrl: string; serverId: string; apiKeyName: string };
 
+export interface PlaylistImport {
+  name: string;
+  targetId?: string;
+  status: 'creating' | 'ready' | 'complete' | 'uncertain';
+  content_hash?: string;
+}
+
 /** Compatible with existing Python SQLite volumes, including encrypted Fernet records. */
 export class Store {
   readonly db: DatabaseSync;
@@ -72,6 +79,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS links (discord_user_id TEXT PRIMARY KEY, username TEXT NOT NULL, remote_id TEXT NOT NULL UNIQUE, disabled_by_jellyport INTEGER NOT NULL DEFAULT 0, pending_disabled INTEGER);
       CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS job_queue (job_id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS migration_playlists (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS user_mappings (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS credentials_expiry ON credentials(expires);
     `);
     const columns = this.db.prepare('PRAGMA table_info(links)').all();
@@ -89,7 +98,8 @@ export class Store {
           `SELECT 1 FROM settings
       UNION ALL SELECT 1 FROM jobs UNION ALL SELECT 1 FROM accounts
       UNION ALL SELECT 1 FROM credentials UNION ALL SELECT 1 FROM links
-      UNION ALL SELECT 1 FROM subscriptions UNION ALL SELECT 1 FROM job_queue LIMIT 1`,
+      UNION ALL SELECT 1 FROM subscriptions UNION ALL SELECT 1 FROM job_queue
+      UNION ALL SELECT 1 FROM migration_playlists UNION ALL SELECT 1 FROM user_mappings LIMIT 1`,
         )
         .get();
     if (options.demo && (auth || (hasData && !recognizedDemo))) {
@@ -147,6 +157,15 @@ export class Store {
   }
   saveSettings(settings: Settings): void {
     this.db.prepare('INSERT OR REPLACE INTO settings VALUES (1,?)').run(this.encrypt(settings));
+  }
+  playlistImport(id: string): PlaylistImport | null {
+    const row = this.db.prepare('SELECT encrypted FROM migration_playlists WHERE id=?').get(id);
+    return row ? this.decrypt<PlaylistImport>(row.encrypted as Uint8Array) : null;
+  }
+  savePlaylistImport(id: string, value: PlaylistImport): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO migration_playlists VALUES (?,?)')
+      .run(id, this.encrypt(value));
   }
   authState(): AuthState | null {
     const row = this.db.prepare('SELECT encrypted FROM auth_state WHERE id=1').get();

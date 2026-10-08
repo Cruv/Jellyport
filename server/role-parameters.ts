@@ -145,6 +145,7 @@ const configuration: Record<string, Check> = {
 };
 
 const homeSection = enumeration(
+  '', // Jellyfin Web saves an empty value when the slot should use its default.
   'none',
   'smalllibrarytiles',
   'librarybuttons',
@@ -194,6 +195,7 @@ const duration: Check = (value) =>
   typeof value === 'string' && /^(0|[1-9][0-9]{0,6})$/.test(value) && Number(value) <= 3_600_000;
 function customCheck(key: string): Check | undefined {
   if (/^homesection[0-9]$/.test(key)) return homeSection;
+  if (key === 'tvhome') return enumeration('', 'horizontal', 'vertical');
   if (/^landing-[A-Za-z0-9_-]{1,128}$/.test(key)) return landing;
   if (
     [
@@ -315,14 +317,19 @@ export function captureRoleParameters(
     if (record(top.CustomPrefs)) {
       const custom: JsonObject = {};
       for (const [key, value] of Object.entries(top.CustomPrefs)) {
-        // Jellyfin serializes some boolean/enum preferences with title case.
+        // Unset TvHome is nullable in Jellyfin's database and GET response.
+        // Persist a safe reset-to-default string; other nullable keys remain excluded.
+        // Jellyfin also serializes some boolean/enum preferences with title case.
         const normalized =
-          typeof value === 'string' &&
-          (customCheck(key) === booleanString ||
-            /^homesection[0-9]$/.test(key) ||
-            /^landing-/.test(key))
-            ? value.toLowerCase()
-            : value;
+          key === 'tvhome' && value === null
+            ? ''
+            : typeof value === 'string' &&
+                (customCheck(key) === booleanString ||
+                  key === 'tvhome' ||
+                  /^homesection[0-9]$/.test(key) ||
+                  /^landing-/.test(key))
+              ? value.toLowerCase()
+              : value;
         if (customCheck(key)?.(normalized)) custom[key] = normalized;
         else customOmitted = true;
       }

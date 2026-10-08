@@ -774,7 +774,7 @@ export class MediaClient implements MediaAPI {
       false,
     );
   }
-  /** Jellyfin Web's account-wide, server-backed preferences use this fixed legacy client ID. */
+  /** Shared account-wide Home preferences used by Web and compatible apps use this legacy client ID. */
   async displayPreferences(userId: string): Promise<JsonObject> {
     this.id(userId);
     return this.object(

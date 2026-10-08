@@ -21,12 +21,12 @@ const sections: { id: RoleSection; name: string; description: string }[] = [
   {
     id: 'configuration',
     name: 'Account preferences',
-    description: 'Supported language, subtitle, autoplay, and library preferences.',
+    description: 'Languages, subtitles, autoplay, library order, and Home library visibility.',
   },
   {
     id: 'display',
     name: 'Home and display preferences',
-    description: 'Supported server-backed home layout and display options.',
+    description: 'Shared server-backed Home rows, TV layout, and display options.',
   },
 ];
 
@@ -469,8 +469,8 @@ export default function AccountRolesPage({
                   </div>
                 )}
                 <p className="roles-help">
-                  Home layouts and playback options vary by client. Only supported server-backed
-                  preferences are copied; device-local options stay with each client.
+                  Copies shared server-backed Home settings used by Jellyfin Web and compatible
+                  TV/mobile apps. Device-local options stay with each client.
                 </p>
                 {stale && (
                   <div className="error-block" role="alert">
@@ -682,6 +682,10 @@ export default function AccountRolesPage({
                   </label>
                 ))}
               </fieldset>
+              <p className="roles-help">
+                Include Account preferences to also copy library order, Home library visibility, and
+                Latest Media preferences.
+              </p>
               {role &&
                 selectedTargets.length > 0 &&
                 selectedTargets.some(

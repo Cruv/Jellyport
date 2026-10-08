@@ -108,6 +108,10 @@ The browser renders snapshots, names, and import warnings as escaped text withou
 
 All 707 fixture tests, the production build, and local hardened demo/fresh-container smoke checks passed. Browser verification covered importing, saving, assigning, selectively applying, and choosing a template-free default role using isolated simulated servers. The full npm dependency audit reported no advisories. No production accounts, media servers, Discord memberships, or billing services were contacted or changed.
 
+### Shared Home settings follow-up — 0.6.1
+
+Home snapshots also preserve the bounded `tvhome` orientation (`horizontal`, `vertical`, or default) and intentional blank defaults in the ten supported Home-row slots. An unset nullable TV layout is normalized to a safe default string during import. Unsupported orientations, prototype-bearing input, arbitrary custom preference keys, and client-local settings remain excluded. These values use the existing authenticated shared preference endpoint and encrypted role records; no new server scopes or credentials are introduced. All 724 fixture tests, the production build, and a local hardened demo-container smoke check passed. The new regressions cover complete Home-row ordering, hidden/default rows, template-free provisioning, and ad hoc Home updates while preserving unrelated account data. No production services were contacted.
+
 ## Deployment boundaries that remain important
 
 Keep the administration interface on a trusted LAN or VPN, or behind an HTTPS reverse proxy with restricted access. Configure `JELLYPORT_ALLOWED_HOSTS` for the proxy hostname. Preserve Host headers and keep the raw application port private. Forwarded client addresses are not trusted; requests through one proxy share its peer address for rate limits.

@@ -118,6 +118,144 @@ describe('role parameter snapshots', () => {
       'Home screen preferences were not available; this role will leave them unchanged.',
     ]);
   });
+  it.each(['horizontal', 'vertical', ''])(
+    'captures and applies the supported TV home orientation %j',
+    (tvhome) => {
+      const captured = captureRoleParameters(
+        { Id: 'source', Name: 'source' },
+        { CustomPrefs: { tvhome: tvhome.toUpperCase() } },
+      );
+      expect(captured.parameters.display).toEqual({ CustomPrefs: { tvhome } });
+      expect(captured.warnings).toEqual([]);
+      expect(() => validateRoleParameters(captured.parameters)).not.toThrow();
+      expect(
+        mergeRoleSection(
+          'display',
+          { CustomPrefs: { tvhome: 'old', untouched: 'target-only' } },
+          captured.parameters,
+        ),
+      ).toEqual({ CustomPrefs: { tvhome, untouched: 'target-only' } });
+    },
+  );
+  it('round-trips all ten ordered Home sections, hidden rows and an explicit default slot', () => {
+    const sections = [
+      'none',
+      'nextup',
+      'resume',
+      'latestmedia',
+      'librarybuttons',
+      'smalllibrarytiles',
+      'resumeaudio',
+      'resumebook',
+      'livetv',
+      '',
+    ];
+    const source = Object.fromEntries(
+      sections.map((section, index) => [`homesection${index}`, section.toUpperCase()]),
+    );
+    const captured = captureRoleParameters(
+      { Id: 'source', Name: 'source' },
+      { CustomPrefs: { ...source, tvhome: 'VERTICAL' } },
+    );
+    const expected = Object.fromEntries(
+      sections.map((section, index) => [`homesection${index}`, section]),
+    );
+    expect(captured.parameters.display).toEqual({
+      CustomPrefs: { ...expected, tvhome: 'vertical' },
+    });
+    const target = {
+      CustomPrefs: {
+        ...Object.fromEntries(sections.map((_, index) => [`homesection${index}`, 'latestmedia'])),
+        tvhome: 'horizontal',
+        targetOnly: 'preserved',
+      },
+    };
+    const merged = mergeRoleSection('display', target, captured.parameters);
+    expect(merged.CustomPrefs).toEqual({
+      ...expected,
+      tvhome: 'vertical',
+      targetOnly: 'preserved',
+    });
+    const roundTrip = captureRoleParameters({ Id: 'target', Name: 'target' }, merged);
+    expect(roundTrip.parameters.display).toEqual(captured.parameters.display);
+    expect(target.CustomPrefs).toMatchObject({ homesection0: 'latestmedia' });
+  });
+  it('preserves blank legacy Home defaults without inventing absent section settings', () => {
+    const captured = captureRoleParameters(
+      { Id: 'source', Name: 'source' },
+      { CustomPrefs: { homesection0: '', homesection3: '', homesection7: 'none' } },
+    );
+    expect(captured.warnings).toEqual([]);
+    expect(captured.parameters.display).toEqual({
+      CustomPrefs: { homesection0: '', homesection3: '', homesection7: 'none' },
+    });
+    const merged = mergeRoleSection(
+      'display',
+      {
+        CustomPrefs: {
+          homesection0: 'nextup',
+          homesection1: 'livetv',
+          homesection3: 'resume',
+          homesection7: 'latestmedia',
+        },
+      },
+      captured.parameters,
+    );
+    expect(merged.CustomPrefs).toEqual({
+      homesection0: '',
+      homesection1: 'livetv',
+      homesection3: '',
+      homesection7: 'none',
+    });
+  });
+  it('captures a nullable unset TV home as an explicit safe default reset', () => {
+    const captured = captureRoleParameters(
+      { Id: 'source', Name: 'source' },
+      { CustomPrefs: { tvhome: null } },
+    );
+    expect(captured.parameters.display).toEqual({ CustomPrefs: { tvhome: '' } });
+    expect(captured.warnings).toEqual([]);
+    expect(
+      mergeRoleSection('display', { CustomPrefs: { tvhome: 'vertical' } }, captured.parameters),
+    ).toEqual({ CustomPrefs: { tvhome: '' } });
+    expect(() =>
+      validateRoleParameters({ ...valid(), display: { CustomPrefs: { tvhome: null } } }),
+    ).toThrow();
+  });
+  it.each([
+    'diagonal',
+    'https://attacker.example',
+    'javascript:alert(1)',
+    '<script>',
+    'horizontal\n',
+    1,
+    false,
+    {},
+  ])('rejects untrusted TV orientation %j without persisting it', (tvhome) => {
+    const candidate = { ...valid(), display: { CustomPrefs: { tvhome } } };
+    expect(() => validateRoleParameters(candidate)).toThrow(
+      'Role parameters contain unsupported fields or invalid values.',
+    );
+    const captured = captureRoleParameters(
+      { Id: 'source', Name: 'source' },
+      { CustomPrefs: { tvhome, homesection0: 'resume' } },
+    );
+    expect(captured.parameters.display).toEqual({ CustomPrefs: { homesection0: 'resume' } });
+    expect(captured.warnings).toHaveLength(1);
+  });
+  it('rejects prototype-bearing Home parameters and unverified local or plugin keys', () => {
+    for (const prefs of [
+      JSON.parse('{"tvhome":"vertical","__proto__":{"tvhome":"horizontal"}}'),
+      Object.create({ tvhome: 'vertical' }),
+      { tvhome: 'vertical', maxDaysForNextUp: '100' },
+      { tvhome: 'vertical', enableRewatchingInNextUp: 'true' },
+      { tvhome: 'vertical', pluginToken: 'secret' },
+    ]) {
+      expect(() => validateRoleParameters({ ...valid(), display: { CustomPrefs: prefs } })).toThrow(
+        'Role parameters contain unsupported fields or invalid values.',
+      );
+    }
+  });
 
   it.each([
     { policy: { IsAdministrator: true } },

@@ -50,6 +50,19 @@ describe('saved role provisioning and controlled account updates', () => {
       CustomPrefs: { homesection0: 'resume', homesection1: 'nextup' },
     },
   };
+  const sharedHomeOrder = {
+    tvhome: 'vertical',
+    homesection0: 'smalllibrarytiles',
+    homesection1: 'resume',
+    homesection2: 'nextup',
+    homesection3: 'latestmedia',
+    homesection4: 'resumeaudio',
+    homesection5: 'resumebook',
+    homesection6: 'livetv',
+    homesection7: 'activerecordings',
+    homesection8: 'none',
+    homesection9: 'none',
+  };
   beforeEach(() => {
     path = mkdtempSync(join(tmpdir(), 'jellyport-role-service-'));
     store = new Store(path);
@@ -261,6 +274,25 @@ describe('saved role provisioning and controlled account updates', () => {
     expect(job.results[0]?.data?.preferences).toEqual(Object.keys(parameters.configuration));
     expect(calls.filter((call) => call.method === 'setConfiguration')).toHaveLength(1);
   });
+  it('provisions all ten shared Home sections and TV layout from a saved role without a template', async () => {
+    const snapshot: RoleParameters = {
+      ...parameters,
+      display: { CustomPrefs: sharedHomeOrder },
+    };
+    const saved = role(true, snapshot);
+    servers.users.jellyfin = servers.users.jellyfin.filter((user) => user.Id !== 'template');
+    const job = await finish(await service.createAccount('casey'));
+    expect(job.status).toBe('completed');
+    const created = servers.users.jellyfin.find((user) => user.Name === 'casey')!;
+    expect(servers.display[created.Id]?.CustomPrefs).toEqual(sharedHomeOrder);
+    expect(
+      calls.find((call) => call.method === 'setDisplayPreferences')?.value?.CustomPrefs,
+    ).toEqual(sharedHomeOrder);
+    expect(service.roles.getAssignment(created.Id, store.settings())?.applied_revision).toBe(
+      saved.revision,
+    );
+    expect(calls.some((call) => call.method === 'user' && call.id === 'template')).toBe(false);
+  });
   it('previews a new migration without a template and explains that the role may limit library access', async () => {
     role(true);
     servers.users.jellyfin = servers.users.jellyfin.filter((user) => user.Id !== 'template');
@@ -370,6 +402,47 @@ describe('saved role provisioning and controlled account updates', () => {
     });
     expect(user.Configuration).toEqual(originalConfiguration);
     expect(writes().map((call) => call.method)).toEqual(['setDisplayPreferences']);
+  });
+  it('applies TV layout and the complete shared Home order ad hoc without changing other account data', async () => {
+    const { saved, user } = assigned({ ...parameters, display: { CustomPrefs: sharedHomeOrder } });
+    servers.display[user.Id] = {
+      ShowSidebar: true,
+      CustomPrefs: {
+        tvhome: 'horizontal',
+        homesection0: 'latestmedia',
+        homesection8: 'resume',
+        homesection9: 'nextup',
+        theme: 'dark',
+      },
+    };
+    servers.userData[user.Id] = {
+      '1': { Played: true, PlaybackPositionTicks: 1234, IsFavorite: true },
+    };
+    const account = structuredClone(user);
+    const played = structuredClone(servers.played),
+      history = structuredClone(servers.userData),
+      playlists = structuredClone(servers.playlists);
+    const job = await finish(
+      await service.applyRole(saved.id, saved.revision, [user.Id], ['display']),
+    );
+    expect(job.status).toBe('completed');
+    expect(servers.display[user.Id]).toEqual({
+      ShowSidebar: true,
+      CustomPrefs: { ...sharedHomeOrder, theme: 'dark' },
+    });
+    expect(
+      calls.find((call) => call.method === 'setDisplayPreferences')?.value?.CustomPrefs,
+    ).toEqual({ ...sharedHomeOrder, theme: 'dark' });
+    expect(user).toEqual(account);
+    expect(servers.played).toEqual(played);
+    expect(servers.userData).toEqual(history);
+    expect(servers.playlists).toEqual(playlists);
+    expect(writes().map((call) => call.method)).toEqual(['setDisplayPreferences']);
+    expect(store.takeCredentials(job.id)).toEqual([]);
+    expect(service.roles.getAssignment(user.Id, store.settings())).toMatchObject({
+      applied_revision: null,
+      applied_sections: { display: saved.revision },
+    });
   });
   it('records completed groups accurately when a later write fails', async () => {
     const { saved, user } = assigned();

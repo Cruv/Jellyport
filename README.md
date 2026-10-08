@@ -103,7 +103,7 @@ Jellyport account roles are reusable settings presets, separate from Discord mem
 | --- | --- |
 | Permissions | Library access, remote access, downloads, parental controls, and playback/transcoding permissions. Administrator access, disabled state, login providers, passwords, and authentication counters are excluded. |
 | Account preferences | Audio/subtitle languages, subtitle mode, autoplay, remembered track selections, library ordering/exclusions, and hiding played items from Latest Media. |
-| Home and display preferences | Supported Jellyfin Web home sections, library landing pages, episode-image choices, skip intervals, and display/sorting preferences. |
+| Home and display preferences | Shared server-backed Home sections and their order, TV layout orientation, library landing pages, episode-image choices, skip intervals, and supported display/sorting preferences. |
 
 To create or revise a role:
 
@@ -117,7 +117,11 @@ Reimporting settings or saving an edited role never automatically updates existi
 
 Application status records the role revision successfully applied to each setting group. **Up to date** means all captured groups were applied successfully; it is not a live comparison with Jellyfin and does not detect later user changes or enforce settings continuously. Refresh roles after a job finishes to see the recorded status. Review Activity for failed or partial updates.
 
-Client support varies. Roles capture a bounded allowlist of server-backed preferences rather than arbitrary client data. TV/mobile apps may use their own home screens and playback settings; device-local themes, subtitle styling, and other local options cannot be configured universally. Unsupported or unavailable fields are reported during import. Users can subsequently change preferences allowed by their Jellyfin permissions.
+Home preferences are copied into Jellyfin's shared server-backed account settings, so compatible TV/mobile apps can use them too. The snapshot includes all supported returned Home rows, their order, hidden rows, default selections, and horizontal/vertical TV layout. Jellyfin Web and compatible clients decide how to render the shared values. Roles capture a bounded allowlist rather than arbitrary client data; genuinely device-local options such as themes, subtitle styling, and some Next Up controls remain local. Unsupported or unavailable fields are reported during import. Users can subsequently change preferences allowed by their Jellyfin permissions.
+
+For a complete Home update on existing accounts, also select **Account preferences** to copy library order, Home library visibility, Latest Media exclusions, and hiding played items. **Home and display preferences** controls Home rows, TV orientation, and the supported display options.
+
+For roles saved before 0.6.1, copy settings from the source account again and replace the role to capture TV layout and explicit default Home-row selections. Apply **Home and display preferences** to existing assigned accounts, or use the refreshed role for future accounts. Replacing the saved role alone does not push changes.
 
 ## Migrate users
 

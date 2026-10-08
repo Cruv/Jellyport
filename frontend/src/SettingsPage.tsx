@@ -28,6 +28,7 @@ function Field({
   hint,
   optional = false,
   numeric = false,
+  readOnly = false,
 }: {
   name: string;
   label: string;
@@ -39,6 +40,7 @@ function Field({
   hint?: string;
   optional?: boolean;
   numeric?: boolean;
+  readOnly?: boolean;
 }) {
   return (
     <div className="field">
@@ -56,6 +58,7 @@ function Field({
         inputMode={numeric ? 'numeric' : undefined}
         pattern={numeric ? '[0-9]*' : undefined}
         autoComplete={secret ? 'new-password' : 'off'}
+        readOnly={readOnly}
       />
       {hint && <small>{hint}</small>}
     </div>
@@ -235,6 +238,21 @@ export default function SettingsPage({
       setBusy('');
     }
   }
+  async function refreshServiceKey() {
+    setBusy('service-key');
+    try {
+      await api<Settings>('/api/auth/service-key', { method: 'POST', body: {} });
+      notify('Jellyfin service key refreshed.');
+      await refresh();
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : 'The Jellyfin service key could not be refreshed.',
+        true,
+      );
+    } finally {
+      setBusy('');
+    }
+  }
   return (
     <>
       <Heading
@@ -281,16 +299,40 @@ export default function SettingsPage({
                   value={s.jellyfin_url}
                   type="url"
                   placeholder="http://jellyfin:8096"
-                  hint="Used by Jellyport to reach the Jellyfin API."
+                  readOnly={s.jellyfin_auth_managed}
+                  hint={
+                    s.jellyfin_auth_managed
+                      ? 'Linked during setup. Jellyfin also verifies administrator sign-in.'
+                      : 'Used by Jellyport to reach the Jellyfin API.'
+                  }
                 />
-                <Field
-                  name="jellyfin_api_key"
-                  label="API key"
-                  type="password"
-                  secret
-                  saved={s.jellyfin_api_key_set}
-                  hint="Generate a key in Jellyfin Dashboard → API Keys."
-                />
+                {s.jellyfin_auth_managed ? (
+                  <div className="field">
+                    <label>Jellyfin service key</label>
+                    <p className="muted text-small">
+                      Jellyport manages a dedicated key for account and watch history operations.
+                    </p>
+                    <button
+                      className="btn btn-small btn-quiet"
+                      type="button"
+                      onClick={() => void refreshServiceKey()}
+                      disabled={!!busy || demo}
+                    >
+                      <Icon name="refresh" />
+                      {busy === 'service-key' ? 'Refreshing key…' : 'Refresh Jellyfin service key'}
+                    </button>
+                    <small>Refresh this key if it has been revoked in Jellyfin.</small>
+                  </div>
+                ) : (
+                  <Field
+                    name="jellyfin_api_key"
+                    label="API key"
+                    type="password"
+                    secret
+                    saved={s.jellyfin_api_key_set}
+                    hint="Generate a key in Jellyfin Dashboard → API Keys."
+                  />
+                )}
               </div>
               <div className="field-row">
                 <Field
@@ -329,7 +371,6 @@ export default function SettingsPage({
                 </div>
               </div>
               <div className="support-note">
-                After saving a new Jellyfin connection, reload Settings to fetch its template users.
                 Use a regular account with the library access you want new members to have.
               </div>
             </div>

@@ -58,7 +58,7 @@ assert.equal(
 let session = await request('/api/session');
 assert(session.demo, 'Smoke tests require JELLYPORT_DEMO=true.');
 csrf = session.csrf_token;
-session = await request('/api/login', 'POST', { password: 'demo-jellyport' });
+session = await request('/api/login', 'POST', { username: 'admin', password: 'demo-jellyport' });
 assert(session.authenticated);
 csrf = session.csrf_token;
 const settings = await request('/api/settings');

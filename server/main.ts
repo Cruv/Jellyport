@@ -6,7 +6,7 @@ import Fastify, {
 } from 'fastify';
 import cookie from '@fastify/cookie';
 import staticFiles from '@fastify/static';
-import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -17,7 +17,14 @@ import { DemoServers } from './demo.js';
 import { ServiceError, MediaError } from './errors.js';
 import { DEFAULT_SETTINGS } from './types.js';
 import { SECRET_FIELDS, validateSettings } from './settings.js';
-import type { ClientFactory } from './media.js';
+import type { ClientFactory, MediaUser } from './media.js';
+import {
+  JellyfinAuthClient,
+  JellyfinAuthError,
+  normalizeJellyfinUrl,
+  type JellyfinAuthentication,
+  type JellyfinIdentity,
+} from './jellyfin-auth.js';
 
 const hashPassword = promisify(scrypt);
 const COOKIE = 'jellyport_session';
@@ -27,6 +34,8 @@ interface Session {
   authenticated: boolean;
   csrf_token: string;
   expires: number;
+  identity?: JellyfinIdentity;
+  connection?: { identity: JellyfinIdentity; serverUrl: string; generation: string };
 }
 interface AccountRequest {
   username: string;
@@ -46,6 +55,8 @@ export interface CreateAppOptions {
   secureCookie?: boolean;
   clientFactory?: ClientFactory;
   staticDir?: string;
+  authClient?: JellyfinAuthentication;
+  onSetupCode?: (code: string) => void;
 }
 export type JellyportApp = FastifyInstance & {
   jellyport: { store: Store; service: Service; bot: BotManager };
@@ -84,16 +95,34 @@ const migrationSchema = {
 
 export async function createApp(options: CreateAppOptions = {}): Promise<JellyportApp> {
   const demo = options.demo ?? process.env.JELLYPORT_DEMO === 'true';
-  const password =
-    options.adminPassword ?? process.env.JELLYPORT_ADMIN_PASSWORD ?? (demo ? 'demo-jellyport' : '');
-  if (password.length < 12 || password.length > 512 || password.startsWith('replace-with'))
+  const legacyPassword = options.adminPassword ?? process.env.JELLYPORT_ADMIN_PASSWORD ?? '';
+  const demoPassword = legacyPassword || 'demo-jellyport';
+  const secureCookie = options.secureCookie ?? process.env.JELLYPORT_SECURE_COOKIE === 'true';
+  const store = new Store(options.dataDir ?? process.env.JELLYPORT_DATA_DIR ?? './data');
+  const authClient = options.authClient ?? new JellyfinAuthClient();
+  const initialAuth = demo ? null : store.ensureAuthState();
+  const setupPassword = initialAuth?.kind === 'pending' ? legacyPassword : '';
+  if (
+    setupPassword &&
+    (setupPassword.length < 12 ||
+      setupPassword.length > 512 ||
+      setupPassword.startsWith('replace-with'))
+  ) {
+    store.close();
     throw new Error(
       'Set JELLYPORT_ADMIN_PASSWORD to a strong password of 12–512 characters before starting Jellyport.',
     );
-  const secureCookie = options.secureCookie ?? process.env.JELLYPORT_SECURE_COOKIE === 'true';
+  }
   const salt = randomBytes(16);
-  const passwordHash = (await hashPassword(password, salt, 64)) as Buffer;
-  const store = new Store(options.dataDir ?? process.env.JELLYPORT_DATA_DIR ?? './data');
+  const passwordHash = (await hashPassword(
+    demo ? demoPassword : setupPassword,
+    salt,
+    64,
+  )) as Buffer;
+  if (initialAuth?.kind === 'pending' && !setupPassword) {
+    if (options.onSetupCode) options.onSetupCode(initialAuth.setupCode);
+    else console.log(`Jellyport setup code: ${initialAuth.setupCode}`);
+  }
   let clientFactory = options.clientFactory;
   if (demo) {
     const servers = new DemoServers();
@@ -122,14 +151,51 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   const attempts = new Map<string, number[]>();
   await app.register(cookie);
 
+  function forget(request: FastifyRequest): Session | undefined {
+    const sid = request.cookies[COOKIE] ?? '';
+    const value = sessions.get(sid);
+    sessions.delete(sid);
+    return value;
+  }
+  async function revoke(value?: Session): Promise<void> {
+    if (demo || !value) return;
+    const identity = value.identity ?? value.connection?.identity;
+    const state = store.authState();
+    const url =
+      value.connection?.serverUrl ?? (state?.kind === 'configured' ? state.serverUrl : '');
+    if (identity && url) await authClient.signOut(url, identity.accessToken).catch(() => {});
+  }
   function session(request: FastifyRequest): Session | undefined {
     const sid = request.cookies[COOKIE];
     const value = sid ? sessions.get(sid) : undefined;
     if (value && value.expires <= Date.now()) {
       sessions.delete(sid!);
+      void revoke(value);
       return undefined;
     }
     return value;
+  }
+  function sessionView(value: Session) {
+    const state = demo ? null : store.authState();
+    return {
+      authenticated: value.authenticated,
+      csrf_token: value.csrf_token,
+      demo,
+      setup_required: !demo && state?.kind !== 'configured',
+      setup_connected:
+        !!value.connection &&
+        state?.kind === 'pending' &&
+        value.connection.generation === state.generation,
+      setup_protection: setupPassword ? 'legacy_password' : 'setup_code',
+      ...(value.authenticated
+        ? {
+            user: {
+              id: value.identity?.userId ?? 'demo-admin',
+              name: value.identity?.username ?? 'admin',
+            },
+          }
+        : {}),
+    };
   }
   function csrf(request: FastifyRequest): void {
     const value = session(request);
@@ -139,18 +205,23 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         statusCode: 403,
       });
   }
-  function newSession(reply: FastifyReply, authenticated = false) {
-    for (const [sid, value] of sessions) if (value.expires <= Date.now()) sessions.delete(sid);
+  function newSession(reply: FastifyReply, attributes: Partial<Session> = {}) {
+    for (const [sid, value] of sessions)
+      if (value.expires <= Date.now()) {
+        sessions.delete(sid);
+        void revoke(value);
+      }
     if (sessions.size >= 10000)
       throw Object.assign(new Error('Too many active sessions. Try again later.'), {
         statusCode: 503,
       });
     const sid = randomBytes(32).toString('base64url');
-    const age = authenticated ? 28800 : 1800;
-    const value = {
-      authenticated,
+    const age = attributes.authenticated ? 28800 : 1800;
+    const value: Session = {
+      authenticated: false,
       csrf_token: randomBytes(32).toString('base64url'),
       expires: Date.now() + age * 1000,
+      ...attributes,
     };
     sessions.set(sid, value);
     reply.setCookie(COOKIE, sid, {
@@ -160,7 +231,60 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       sameSite: 'strict',
       maxAge: age,
     });
-    return { authenticated, csrf_token: value.csrf_token, demo };
+    return sessionView(value);
+  }
+  function rateLimit(request: FastifyRequest) {
+    const now = Date.now();
+    for (const [address, times] of attempts)
+      if (!times.some((time) => time > now - 600000)) attempts.delete(address);
+    const recent = (attempts.get(request.ip) ?? []).filter((time) => time > now - 600000);
+    if (recent.length >= 10 || (!attempts.has(request.ip) && attempts.size >= 10000))
+      throw Object.assign(new Error('Too many sign-in attempts. Wait ten minutes.'), {
+        statusCode: 429,
+      });
+    recent.push(now);
+    attempts.set(request.ip, recent);
+  }
+  async function authorize(request: FastifyRequest): Promise<Session> {
+    const value = session(request);
+    if (!value?.authenticated) throw new JellyfinAuthError('Sign in to Jellyport.', 401);
+    if (demo) return value;
+    const state = store.authState();
+    if (state?.kind !== 'configured' || !value.identity) {
+      forget(request);
+      throw new JellyfinAuthError('Sign in to Jellyport.', 401);
+    }
+    try {
+      const validated = await authClient.validateSession(
+        state.serverUrl,
+        value.identity.accessToken,
+        state.serverId,
+        value.identity.userId,
+      );
+      const current = store.authState();
+      if (
+        session(request) !== value ||
+        current?.kind !== 'configured' ||
+        current.serverId !== state.serverId ||
+        current.serverUrl !== state.serverUrl
+      )
+        throw new JellyfinAuthError(
+          'Your Jellyfin administrator session ended. Sign in again.',
+          401,
+        );
+      value.identity = validated;
+    } catch (error) {
+      if (error instanceof JellyfinAuthError && [401, 403].includes(error.statusCode)) {
+        forget(request);
+        await revoke(value);
+        throw new JellyfinAuthError(
+          'Your Jellyfin administrator session ended. Sign in again.',
+          401,
+        );
+      }
+      throw error;
+    }
+    return value;
   }
   app.addHook('onRequest', async (request, reply) => {
     reply.headers({
@@ -170,20 +294,24 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       'Referrer-Policy': 'no-referrer',
       'Content-Security-Policy': CSP,
     });
-    // Authenticate the matched route, not the raw URL. The router decodes static
-    // path segments, so checking request.url would miss aliases such as /%61pi/.
+    // Use the matched route so encoded aliases receive identical authorization.
     const path = request.routeOptions.url ?? '';
     if (!path.startsWith('/api/')) return;
     if (path === '/api/session' && request.method === 'GET') return;
-    if (path === '/api/login' && request.method === 'POST') {
+    if (
+      ['/api/login', '/api/logout', '/api/setup/connect', '/api/setup/complete'].includes(path) &&
+      request.method === 'POST'
+    ) {
       csrf(request);
       return;
     }
-    if (!session(request)?.authenticated)
-      throw Object.assign(new Error('Sign in to Jellyport.'), { statusCode: 401 });
+    if (path === '/api/setup' && request.method === 'GET') return;
+    await authorize(request);
     if (!['GET', 'HEAD'].includes(request.method)) csrf(request);
   });
   app.setErrorHandler<FastifyError>((error, _request, reply) => {
+    if (error instanceof JellyfinAuthError)
+      return reply.code(error.statusCode).send({ detail: error.message });
     if (error instanceof ServiceError) return reply.code(400).send({ detail: error.message });
     if (error instanceof MediaError) return reply.code(502).send({ detail: error.message });
     if (error.validation)
@@ -191,9 +319,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         .code(422)
         .send({ detail: 'Invalid request. Check the selected users and field values.' });
     const code = error.statusCode ?? 500;
-    const allowed = [401, 403, 429, 503];
     const detail =
-      allowed.includes(code) && !error.code
+      [401, 403, 429, 503].includes(code) && !error.code
         ? error.message
         : code === 413
           ? 'Request too large.'
@@ -206,43 +333,285 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   app.get('/health', async () => ({ status: 'ok' }));
   app.get('/api/session', async (request, reply) => {
     const value = session(request);
-    return value
-      ? { authenticated: value.authenticated, csrf_token: value.csrf_token, demo }
-      : newSession(reply);
+    if (value?.authenticated) {
+      try {
+        await authorize(request);
+      } catch (error) {
+        if (!(error instanceof JellyfinAuthError) || error.statusCode !== 401) throw error;
+      }
+    }
+    const current = session(request);
+    return current ? sessionView(current) : newSession(reply);
   });
-  app.post<{ Body: { password: string } }>(
+  const credentialsSchema = {
+    username: { type: 'string', minLength: 1, maxLength: 256 },
+    password: { type: 'string', minLength: 1, maxLength: 512 },
+  };
+  app.post<{ Body: { username: string; password: string } }>(
     '/api/login',
     {
       schema: {
         body: {
           type: 'object',
           additionalProperties: false,
-          required: ['password'],
-          properties: { password: { type: 'string', maxLength: 512 } },
+          required: ['username', 'password'],
+          properties: credentialsSchema,
         },
       },
     },
     async (request, reply) => {
-      const now = Date.now();
-      const recent = (attempts.get(request.ip) ?? []).filter((time) => time > now - 600000);
-      if (recent.length >= 10)
-        throw Object.assign(new Error('Too many sign-in attempts. Wait ten minutes.'), {
-          statusCode: 429,
-        });
-      recent.push(now);
-      attempts.set(request.ip, recent);
-      const supplied = (await hashPassword(request.body.password, salt, 64)) as Buffer;
-      if (!timingSafeEqual(passwordHash, supplied))
-        throw Object.assign(new Error('Incorrect admin password.'), { statusCode: 401 });
+      rateLimit(request);
+      const originalSession = session(request);
+      if (!originalSession) throw new JellyfinAuthError('Session ended. Reload the page.', 401);
+      let identity: JellyfinIdentity | undefined;
+      if (demo) {
+        const supplied = (await hashPassword(request.body.password, salt, 64)) as Buffer;
+        if (request.body.username !== 'admin' || !timingSafeEqual(passwordHash, supplied))
+          throw new JellyfinAuthError('Incorrect demo username or password.', 401);
+      } else {
+        const state = store.authState();
+        if (state?.kind !== 'configured')
+          throw new JellyfinAuthError('Complete first-time setup before signing in.', 403);
+        identity = await authClient.authenticate(
+          state.serverUrl,
+          request.body.username,
+          request.body.password,
+          state.serverId,
+        );
+        const current = store.authState();
+        if (
+          session(request) !== originalSession ||
+          current?.kind !== 'configured' ||
+          current.serverId !== state.serverId ||
+          current.serverUrl !== state.serverUrl
+        ) {
+          await authClient.signOut(state.serverUrl, identity.accessToken).catch(() => {});
+          throw new JellyfinAuthError('Server configuration changed. Reload the page.', 403);
+        }
+      }
+      if (session(request) !== originalSession)
+        throw new JellyfinAuthError('Session ended. Reload the page.', 401);
+      void revoke(forget(request));
       attempts.delete(request.ip);
-      sessions.delete(request.cookies[COOKIE] ?? '');
-      return newSession(reply, true);
+      return newSession(reply, { authenticated: true, identity });
     },
   );
   app.post('/api/logout', async (request, reply) => {
-    sessions.delete(request.cookies[COOKIE] ?? '');
+    await revoke(forget(request));
     return newSession(reply);
   });
+  function pendingConnection(request: FastifyRequest) {
+    const value = session(request)?.connection;
+    const state = store.authState();
+    if (!value || state?.kind !== 'pending' || state.generation !== value.generation)
+      throw new JellyfinAuthError('Connect Jellyfin in the setup wizard first.', 403);
+    return value;
+  }
+  async function setupView(request: FastifyRequest) {
+    const connection = pendingConnection(request);
+    await authClient.validateSession(
+      connection.serverUrl,
+      connection.identity.accessToken,
+      connection.identity.serverId,
+      connection.identity.userId,
+    );
+    const client = service.clientFactory(
+      connection.serverUrl,
+      connection.identity.accessToken,
+      'jellyfin',
+    );
+    let templates: MediaUser[];
+    try {
+      templates = (await client.users())
+        .filter(
+          (user) => user.Policy?.IsAdministrator === false && user.Policy?.IsDisabled === false,
+        )
+        .map((user) => ({ Id: user.Id, Name: user.Name }));
+    } finally {
+      await client.close();
+    }
+    if (pendingConnection(request) !== connection)
+      throw new JellyfinAuthError('Setup session ended. Reload the page.', 403);
+    const settings = store.settings();
+    return {
+      session: sessionView(session(request)!),
+      server: { url: connection.serverUrl },
+      templates,
+      defaults: {
+        template_user_id: settings.template_user_id,
+        jellyfin_public_url: settings.jellyfin_public_url,
+      },
+    };
+  }
+  app.get('/api/setup', async (request) => setupView(request));
+  app.post<{
+    Body: { setup_code: string; jellyfin_url: string; username: string; password: string };
+  }>(
+    '/api/setup/connect',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['setup_code', 'jellyfin_url', 'username', 'password'],
+          properties: {
+            ...credentialsSchema,
+            setup_code: { type: 'string', minLength: 1, maxLength: 512 },
+            jellyfin_url: { type: 'string', minLength: 1, maxLength: 2048 },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      rateLimit(request);
+      const originalSession = session(request);
+      if (!originalSession) throw new JellyfinAuthError('Session ended. Reload the page.', 401);
+      const state = store.authState();
+      if (demo || state?.kind !== 'pending')
+        throw new JellyfinAuthError('Jellyport is already configured.', 403);
+      const validCode = setupPassword
+        ? timingSafeEqual(
+            passwordHash,
+            (await hashPassword(request.body.setup_code, salt, 64)) as Buffer,
+          )
+        : equal(request.body.setup_code, state.setupCode);
+      if (!validCode)
+        throw new JellyfinAuthError('Incorrect setup code or current Jellyport password.', 401);
+      const serverUrl = normalizeJellyfinUrl(request.body.jellyfin_url);
+      const identity = await authClient.authenticate(
+        serverUrl,
+        request.body.username,
+        request.body.password,
+        state.previousServerId,
+      );
+      try {
+        const client = service.clientFactory(serverUrl, identity.accessToken, 'jellyfin');
+        let templates: MediaUser[];
+        try {
+          templates = (await client.users())
+            .filter(
+              (user) => user.Policy?.IsAdministrator === false && user.Policy?.IsDisabled === false,
+            )
+            .map((user) => ({ Id: user.Id, Name: user.Name }));
+        } finally {
+          await client.close();
+        }
+        const current = store.authState();
+        if (
+          session(request) !== originalSession ||
+          current?.kind !== 'pending' ||
+          current.generation !== state.generation
+        )
+          throw new JellyfinAuthError(
+            'Setup was completed in another session. Reload the page.',
+            403,
+          );
+        void revoke(forget(request));
+        const view = newSession(reply, {
+          connection: { identity, serverUrl, generation: state.generation },
+        });
+        const settings = store.settings();
+        attempts.delete(request.ip);
+        return {
+          session: view,
+          server: { url: serverUrl },
+          templates,
+          defaults: {
+            template_user_id: settings.template_user_id,
+            jellyfin_public_url: settings.jellyfin_public_url,
+          },
+        };
+      } catch (error) {
+        await authClient.signOut(serverUrl, identity.accessToken).catch(() => {});
+        throw error;
+      }
+    },
+  );
+  app.post<{ Body: { template_user_id: string; jellyfin_public_url: string } }>(
+    '/api/setup/complete',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['template_user_id', 'jellyfin_public_url'],
+          properties: {
+            template_user_id: id,
+            jellyfin_public_url: { type: 'string', maxLength: 2048 },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const connection = pendingConnection(request);
+      await authClient.validateSession(
+        connection.serverUrl,
+        connection.identity.accessToken,
+        connection.identity.serverId,
+        connection.identity.userId,
+      );
+      const settings = {
+        ...store.settings(),
+        jellyfin_url: connection.serverUrl,
+        template_user_id: request.body.template_user_id,
+        jellyfin_public_url: request.body.jellyfin_public_url,
+      };
+      validateSettings(settings);
+      const client = service.clientFactory(
+        connection.serverUrl,
+        connection.identity.accessToken,
+        'jellyfin',
+      );
+      try {
+        const template = await client.user(request.body.template_user_id);
+        if (template.Policy?.IsAdministrator !== false || template.Policy?.IsDisabled !== false)
+          throw new ServiceError('Choose an enabled, non-administrator Jellyfin template user.');
+      } finally {
+        await client.close();
+      }
+      const apiKeyName = `Jellyport ${randomUUID()}`;
+      const key = await authClient.createApiKey(
+        connection.serverUrl,
+        connection.identity.accessToken,
+        apiKeyName,
+      );
+      try {
+        if (pendingConnection(request) !== connection)
+          throw new JellyfinAuthError('Setup session ended. Reload the page.', 403);
+        const claimed = store.completeAuth(
+          connection.generation,
+          {
+            kind: 'configured',
+            serverUrl: connection.serverUrl,
+            serverId: connection.identity.serverId,
+            apiKeyName,
+          },
+          (current) => ({
+            ...current,
+            jellyfin_url: connection.serverUrl,
+            jellyfin_api_key: key,
+            template_user_id: request.body.template_user_id,
+            jellyfin_public_url: request.body.jellyfin_public_url.replace(/\/+$/, ''),
+          }),
+        );
+        if (!claimed)
+          throw new JellyfinAuthError(
+            'Setup was completed in another session. Reload the page.',
+            403,
+          );
+      } catch (error) {
+        await authClient
+          .deleteApiKey(connection.serverUrl, connection.identity.accessToken, key)
+          .catch(() => {});
+        throw error;
+      }
+      forget(request); // Transfer the interactive token to the newly rotated authenticated cookie.
+      const result = newSession(reply, { authenticated: true, identity: connection.identity });
+      await service.start();
+      await bot.restart(store.settings());
+      return result;
+    },
+  );
   function publicSettings() {
     const settings = store.settings();
     const result: Record<string, unknown> = { ...settings };
@@ -250,6 +619,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       delete result[key];
       result[`${key}_set`] = Boolean(settings[key]);
     }
+    result.jellyfin_auth_managed = !demo && store.authState()?.kind === 'configured';
     result.bot_invite_url = settings.discord_application_id
       ? `https://discord.com/oauth2/authorize?${new URLSearchParams({ client_id: settings.discord_application_id, scope: 'bot applications.commands', permissions: '68608', guild_id: settings.discord_guild_id, disable_guild_select: 'true' })}`
       : '';
@@ -266,6 +636,22 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         );
       const incoming = { ...request.body };
       for (const key of SECRET_FIELDS) if (incoming[key] === '') delete incoming[key];
+      const binding = store.authState();
+      if (binding?.kind === 'configured') {
+        if (
+          incoming.jellyfin_url !== undefined &&
+          (typeof incoming.jellyfin_url !== 'string' ||
+            normalizeJellyfinUrl(incoming.jellyfin_url) !== binding.serverUrl)
+        )
+          throw new ServiceError(
+            'Jellyfin is managed by administrator sign-in. Use a separate data directory to link another server.',
+          );
+        if (incoming.jellyfin_api_key !== undefined)
+          throw new ServiceError(
+            'Use Refresh Jellyfin service key to replace the managed API key.',
+          );
+        delete incoming.jellyfin_url;
+      }
       const settings = { ...store.settings(), ...incoming };
       validateSettings(settings);
       for (const key of ['emby_url', 'jellyfin_url', 'jellyfin_public_url'] as const)
@@ -275,6 +661,33 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       return publicSettings();
     },
   );
+  let refreshingKey = false;
+  app.post('/api/auth/service-key', async (request) => {
+    if (demo) throw new ServiceError('Demo settings are read-only.');
+    if (refreshingKey) throw new ServiceError('A service key refresh is already in progress.');
+    const state = store.authState();
+    const originalSession = session(request);
+    const identity = originalSession?.identity;
+    if (state?.kind !== 'configured' || !identity)
+      throw new JellyfinAuthError('Sign in to Jellyport.', 401);
+    refreshingKey = true;
+    try {
+      const apiKeyName = `Jellyport ${randomUUID()}`;
+      const key = await authClient.createApiKey(state.serverUrl, identity.accessToken, apiKeyName);
+      try {
+        if (session(request) !== originalSession)
+          throw new JellyfinAuthError('Session ended. Sign in again.', 401);
+        if (!store.updateServiceKey(state.serverId, key, apiKeyName))
+          throw new JellyfinAuthError('Server configuration changed. Reload the page.', 403);
+      } catch (error) {
+        await authClient.deleteApiKey(state.serverUrl, identity.accessToken, key).catch(() => {});
+        throw error;
+      }
+      return publicSettings();
+    } finally {
+      refreshingKey = false;
+    }
+  });
   app.get('/api/users', async () => service.users());
   app.post('/api/connections/test', async () => service.connections());
   app.get('/api/overview', async () => {
@@ -383,12 +796,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     app.get('/', (_request, reply) => reply.sendFile('index.html'));
   } else {
     app.get('/', (_request, reply) =>
-      reply
-        .code(503)
-        .send({
-          detail:
-            'Build the React interface with npm run build, or use npm run dev:ui during development.',
-        }),
+      reply.code(503).send({
+        detail:
+          'Build the React interface with npm run build, or use npm run dev:ui during development.',
+      }),
     );
   }
   let upkeep: Promise<void> | null = null;
@@ -396,7 +807,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     if (upkeep) return;
     upkeep = (async () => {
       store.purgeExpired();
-      if (!demo) await service.reconcileMemberships();
+      for (const [sid, value] of sessions)
+        if (value.expires <= Date.now()) {
+          sessions.delete(sid);
+          await revoke(value);
+        }
+      if (!demo && store.authState()?.kind === 'configured') await service.reconcileMemberships();
     })()
       .catch(() => {})
       .finally(() => {
@@ -408,13 +824,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     clearInterval(maintenance);
     await Promise.all([bot.stop(), service.stop()]);
     await upkeep;
-    store.close();
+    await Promise.all([...sessions.values()].map((value) => revoke(value)));
     sessions.clear();
+    store.close();
     attempts.clear();
   });
   try {
-    if (!demo) await bot.restart(store.settings());
-    await service.start();
+    if (!demo && store.authState()?.kind === 'configured') await bot.restart(store.settings());
+    if (demo || store.authState()?.kind === 'configured') await service.start();
     await app.ready();
     return app;
   } catch (error) {

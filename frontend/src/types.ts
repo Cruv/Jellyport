@@ -3,6 +3,16 @@ export interface Session {
   authenticated: boolean;
   csrf_token: string;
   demo: boolean;
+  setup_required: boolean;
+  setup_connected: boolean;
+  setup_protection: 'setup_code' | 'legacy_password';
+  user?: { id: string; name: string };
+}
+export interface SetupConnection {
+  session: Session;
+  server: { url: string };
+  templates: MediaUser[];
+  defaults: { template_user_id: string; jellyfin_public_url: string };
 }
 export interface MediaUser {
   Id: string;
@@ -106,6 +116,7 @@ export interface Settings {
   emby_api_key_set: boolean;
   jellyfin_url: string;
   jellyfin_api_key_set: boolean;
+  jellyfin_auth_managed: boolean;
   jellyfin_public_url: string;
   template_user_id: string;
   path_mappings: { source: string; target: string }[];

@@ -1,0 +1,553 @@
+import { describe, expect, it, vi } from 'vitest';
+import {
+  JellyfinAuthClient,
+  JellyfinAuthError,
+  normalizeJellyfinUrl,
+} from '../server/jellyfin-auth.js';
+import type { FetchTransport } from '../server/media.js';
+
+const json = (value: unknown, status = 200) =>
+  new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
+const user = {
+  Id: 'admin-id',
+  Name: 'Administrator',
+  ServerId: 'server-id',
+  Policy: { IsAdministrator: true, IsDisabled: false },
+};
+const authentication = { User: user, AccessToken: 'user-token', ServerId: 'server-id' };
+const identity = {
+  serverId: 'server-id',
+  userId: 'admin-id',
+  username: 'Administrator',
+  accessToken: 'user-token',
+};
+
+function successfulTransport(): FetchTransport {
+  return async (address) => {
+    const path = new URL(address).pathname;
+    if (path.endsWith('/Users/AuthenticateByName')) return json(authentication);
+    if (path.endsWith('/System/Info/Public')) return json({ Id: 'server-id' });
+    if (path.endsWith('/Users/Me')) return json(user);
+    if (path.endsWith('/Sessions/Logout')) return new Response(null, { status: 204 });
+    throw new Error('Unexpected authentication test request.');
+  };
+}
+
+describe('Jellyfin authentication client', () => {
+  it('authenticates with the official body and unique device metadata, then checks the server and current administrator', async () => {
+    const seen: Array<{ address: string; init: RequestInit }> = [];
+    const success = successfulTransport();
+    const client = new JellyfinAuthClient({
+      deviceId: 'installation',
+      transport: async (address, init) => {
+        seen.push({ address, init });
+        return success(address, init);
+      },
+    });
+    await expect(
+      client.authenticate('http://jellyfin:8096/base/', 'administrator', 'pw-$!@'),
+    ).resolves.toEqual(identity);
+    expect(seen.map(({ address }) => new URL(address).pathname)).toEqual([
+      '/base/System/Info/Public',
+      '/base/Users/AuthenticateByName',
+      '/base/Users/Me',
+    ]);
+    expect(seen[1]?.init.method).toBe('POST');
+    expect(JSON.parse(String(seen[1]?.init.body))).toEqual({
+      Username: 'administrator',
+      Pw: 'pw-$!@',
+    });
+    const authHeaders = new Headers(seen[1]?.init.headers);
+    expect(authHeaders.get('Authorization')).toMatch(
+      /^MediaBrowser Client="Jellyport", Device="Jellyport", DeviceId="installation-[a-f0-9-]{36}", Version="0\.3\.0"$/,
+    );
+    expect(authHeaders.has('X-Emby-Token')).toBe(false);
+    expect(new Headers(seen[0]?.init.headers).has('Authorization')).toBe(false);
+    expect(new Headers(seen[2]?.init.headers).get('Authorization')).toBe(
+      'MediaBrowser Token="user-token"',
+    );
+    expect(new Headers(seen[2]?.init.headers).has('X-Emby-Authorization')).toBe(false);
+    for (const { address, init } of seen) {
+      expect(init.redirect).toBe('manual');
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      expect(address).not.toContain('pw-$!@');
+      expect(address).not.toContain('user-token');
+      expect(new URL(address).search).toBe('');
+    }
+  });
+
+  it('gives simultaneous browser authentications different device IDs, avoiding Jellyfin token revocation', async () => {
+    const deviceIds: string[] = [];
+    const success = successfulTransport();
+    const client = new JellyfinAuthClient({
+      transport: async (address, init) => {
+        if (address.endsWith('/Users/AuthenticateByName'))
+          deviceIds.push(new Headers(init.headers).get('Authorization')!);
+        return success(address, init);
+      },
+    });
+    await Promise.all([
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ]);
+    expect(deviceIds).toHaveLength(2);
+    expect(deviceIds[0]).not.toBe(deviceIds[1]);
+  });
+
+  it('returns the current canonical username and accepts a user DTO without optional ServerId', async () => {
+    const client = new JellyfinAuthClient({
+      transport: async (address) => {
+        if (address.endsWith('/Users/AuthenticateByName')) return json(authentication);
+        if (address.endsWith('/System/Info/Public')) return json({ Id: 'server-id' });
+        return json({ ...user, Name: 'Renamed Administrator', ServerId: undefined });
+      },
+    });
+    await expect(
+      client.authenticate('https://jellyfin.test', 'Administrator', 'password'),
+    ).resolves.toEqual({
+      ...identity,
+      username: 'Renamed Administrator',
+    });
+  });
+
+  it.each([
+    { IsAdministrator: false, IsDisabled: false },
+    { IsAdministrator: 'true', IsDisabled: false },
+    { IsAdministrator: 1, IsDisabled: false },
+    { IsAdministrator: true, IsDisabled: true },
+    { IsAdministrator: true, IsDisabled: 'false' },
+    { IsAdministrator: true },
+    {},
+    null,
+  ])(
+    'rejects an unverified or disabled administrator policy and revokes the issued token: %j',
+    async (policy) => {
+      const seen: string[] = [];
+      const client = new JellyfinAuthClient({
+        transport: async (address) => {
+          seen.push(new URL(address).pathname);
+          if (address.endsWith('/System/Info/Public')) return json({ Id: 'server-id' });
+          if (address.endsWith('/Sessions/Logout')) return new Response(null, { status: 204 });
+          return json({ ...authentication, User: { ...user, Policy: policy } });
+        },
+      });
+      await expect(
+        client.authenticate('http://jellyfin', 'Administrator', 'password'),
+      ).rejects.toMatchObject({
+        statusCode: 403,
+        message: 'An enabled Jellyfin administrator account is required.',
+      });
+      expect(seen).toEqual([
+        '/System/Info/Public',
+        '/Users/AuthenticateByName',
+        '/Sessions/Logout',
+      ]);
+    },
+  );
+
+  it('checks the live administrator policy even when the authentication response claimed admin access', async () => {
+    const logout = vi.fn();
+    const success = successfulTransport();
+    const client = new JellyfinAuthClient({
+      transport: async (address, init) => {
+        if (address.endsWith('/Users/Me'))
+          return json({ ...user, Policy: { ...user.Policy, IsAdministrator: false } });
+        if (address.endsWith('/Sessions/Logout')) logout();
+        return success(address, init);
+      },
+    });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({ statusCode: 403 });
+    expect(logout).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    null,
+    [],
+    {},
+    { ...authentication, AccessToken: '' },
+    { ...authentication, AccessToken: 'secret\r\nInjected: true' },
+    { ...authentication, ServerId: '' },
+    { ...authentication, ServerId: 1 },
+    { ...authentication, User: { ...user, Id: '' } },
+    { ...authentication, User: { ...user, Name: '' } },
+    { ...authentication, User: { ...user, ServerId: 'other-server' } },
+  ])(
+    'rejects malformed authentication responses without exposing their contents: %j',
+    async (value) => {
+      const client = new JellyfinAuthClient({
+        transport: async (address) => {
+          if (address.endsWith('/System/Info/Public')) return json({ Id: 'server-id' });
+          return address.endsWith('/Sessions/Logout')
+            ? new Response(null, { status: 204 })
+            : json(value);
+        },
+      });
+      await expect(
+        client.authenticate('http://jellyfin', 'Administrator', 'password'),
+      ).rejects.toMatchObject({
+        statusCode: 502,
+        message: 'Jellyfin returned an unexpected authentication response.',
+      });
+    },
+  );
+
+  it.each([null, {}, { Id: 'different-server' }, { Id: '' }])(
+    'rejects another server before disclosing the session token: %j',
+    async (response) => {
+      const requests: RequestInit[] = [];
+      const client = new JellyfinAuthClient({
+        transport: async (_address, init) => {
+          requests.push(init);
+          return json(response);
+        },
+      });
+      await expect(
+        client.validateSession('http://jellyfin', 'user-token', 'server-id', 'admin-id'),
+      ).rejects.toMatchObject({ statusCode: 502 });
+      expect(requests).toHaveLength(1);
+      expect(new Headers(requests[0]?.headers).has('X-Emby-Token')).toBe(false);
+      expect(new Headers(requests[0]?.headers).has('Authorization')).toBe(false);
+    },
+  );
+
+  it('rejects a token attached to another user', async () => {
+    const client = new JellyfinAuthClient({
+      transport: async (address) =>
+        address.endsWith('/System/Info/Public')
+          ? json({ Id: 'server-id' })
+          : json({ ...user, Id: 'different-admin' }),
+    });
+    await expect(
+      client.validateSession('http://jellyfin', 'user-token', 'server-id', 'admin-id'),
+    ).rejects.toMatchObject({ statusCode: 401 });
+  });
+
+  it('checks the pinned server before transmitting a password to an existing installation', async () => {
+    const transport = vi.fn<FetchTransport>(async (address, init) => {
+      expect(new URL(address).pathname).toBe('/System/Info/Public');
+      expect(init.body).toBeUndefined();
+      expect(new Headers(init.headers).has('Authorization')).toBe(false);
+      return json({ Id: 'other-server' });
+    });
+    await expect(
+      new JellyfinAuthClient({ transport }).authenticate(
+        'http://jellyfin',
+        'Administrator',
+        'secret-password',
+        'server-id',
+      ),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'The connected Jellyfin server does not match this installation.',
+    });
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it('checks that authentication came from the server fingerprinted before the password was submitted', async () => {
+    const client = new JellyfinAuthClient({
+      transport: async (address) => {
+        if (address.endsWith('/System/Info/Public')) return json({ Id: 'server-id' });
+        if (address.endsWith('/Sessions/Logout')) return new Response(null, { status: 204 });
+        return json({ ...authentication, ServerId: 'changed-server' });
+      },
+    });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password', 'server-id'),
+    ).rejects.toMatchObject({ statusCode: 502 });
+  });
+
+  it.each([
+    ['invalid-token\nheader', 'server-id', 'admin-id'],
+    ['token"injected', 'server-id', 'admin-id'],
+    ['token\\injected', 'server-id', 'admin-id'],
+    ['token, Token="injected', 'server-id', 'admin-id'],
+    ['user-token', '', 'admin-id'],
+    ['user-token', 'server-id', ''],
+  ])(
+    'rejects invalid stored session fields without making network calls',
+    async (accessToken, serverId, userId) => {
+      const transport = vi.fn<FetchTransport>();
+      const client = new JellyfinAuthClient({ transport });
+      await expect(
+        client.validateSession('http://jellyfin', accessToken, serverId, userId),
+      ).rejects.toMatchObject({ statusCode: 401 });
+      expect(transport).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([401, 403, 429, 500, 503])(
+    'redacts upstream HTTP %i and never retries a rejected authentication',
+    async (status) => {
+      const transport = vi.fn<FetchTransport>(async (address) =>
+        address.endsWith('/System/Info/Public')
+          ? json({ Id: 'server-id' })
+          : new Response('secret-user secret-password secret-token', { status }),
+      );
+      const client = new JellyfinAuthClient({ transport });
+      await expect(
+        client.authenticate('http://jellyfin', 'secret-user', 'secret-password'),
+      ).rejects.toMatchObject({
+        statusCode: [401, 403].includes(status) ? status : 502,
+      });
+      expect(transport).toHaveBeenCalledTimes(2);
+      const error = await client
+        .authenticate('http://jellyfin', 'secret-user', 'secret-password')
+        .catch((value: unknown) => value);
+      expect(String(error)).not.toContain('secret');
+    },
+  );
+
+  it('does not follow redirects with passwords or tokens', async () => {
+    const transport = vi.fn<FetchTransport>(async (_address, init) => {
+      expect(init.redirect).toBe('manual');
+      return new Response(null, { status: 302, headers: { Location: 'https://attacker.invalid' } });
+    });
+    const client = new JellyfinAuthClient({ transport });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({ statusCode: 502 });
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it.each(['network secret-token secret-password', 'secret-host TLS failure'])(
+    'redacts transport errors: %s',
+    async (message) => {
+      const client = new JellyfinAuthClient({
+        transport: async () => {
+          throw new Error(message);
+        },
+      });
+      await expect(
+        client.authenticate('http://jellyfin', 'Administrator', 'password'),
+      ).rejects.toMatchObject({
+        statusCode: 502,
+        message: 'Unable to connect to Jellyfin. Check the server address and availability.',
+      });
+    },
+  );
+
+  it('bounds a stalled fetch even when the injected transport ignores its AbortSignal', async () => {
+    const client = new JellyfinAuthClient({
+      transport: async () => new Promise(() => {}),
+      timeoutMs: 15,
+    });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'The Jellyfin authentication request timed out.',
+    });
+  });
+
+  it('bounds a stalled response stream as well as connection time', async () => {
+    const cancelled = vi.fn();
+    const client = new JellyfinAuthClient({
+      transport: async () => new Response(new ReadableStream({ cancel: cancelled })),
+      timeoutMs: 15,
+    });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'The Jellyfin authentication request timed out.',
+    });
+    expect(cancelled).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    () => new Response('secret-invalid-json'),
+    () => new Response('x', { headers: { 'Content-Length': '1048577' } }),
+    () => new Response('x'.repeat(1_048_577)),
+    () => new Response(null),
+  ])('rejects malformed, missing, or oversized JSON bodies', async (response) => {
+    const client = new JellyfinAuthClient({ transport: async () => response() });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'Jellyfin returned an unexpected authentication response.',
+    });
+  });
+
+  it('logs out only the supplied Jellyfin session without request-body or query credentials', async () => {
+    const transport = vi.fn<FetchTransport>(async (address, init) => {
+      expect(address).toBe('http://jellyfin/base/Sessions/Logout');
+      expect(init.method).toBe('POST');
+      expect(init.body).toBeUndefined();
+      expect(new Headers(init.headers).get('Authorization')).toBe(
+        'MediaBrowser Token="user-token"',
+      );
+      return new Response(null, { status: 204 });
+    });
+    await expect(
+      new JellyfinAuthClient({ transport }).signOut('http://jellyfin/base', 'user-token'),
+    ).resolves.toBeUndefined();
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the original rejected-login error when best-effort logout fails', async () => {
+    const client = new JellyfinAuthClient({
+      transport: async (address) =>
+        address.endsWith('/System/Info/Public')
+          ? json({ Id: 'server-id' })
+          : address.endsWith('/Sessions/Logout')
+            ? new Response('secret', { status: 503 })
+            : json({
+                ...authentication,
+                User: { ...user, Policy: { ...user.Policy, IsAdministrator: false } },
+              }),
+    });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  it.each([
+    'ftp://server',
+    'http://user:secret@server',
+    'http://server?secret=x',
+    'http://server?',
+    'http://server/#fragment',
+    'http://server#',
+    'http://server:bad',
+    'http://server\n.evil',
+    'http://server\\@evil',
+    '',
+  ])('rejects unsafe URLs without disclosing their value: %j', async (address) => {
+    const transport = vi.fn<FetchTransport>();
+    const client = new JellyfinAuthClient({ transport });
+    await expect(client.authenticate(address, 'Administrator', 'password')).rejects.toMatchObject({
+      statusCode: 400,
+    });
+    expect(transport).not.toHaveBeenCalled();
+  });
+
+  it('normalizes HTTP(S), including LAN names and reverse-proxy base paths', () => {
+    expect(normalizeJellyfinUrl('  http://jellyfin:8096/  ')).toBe('http://jellyfin:8096');
+    expect(normalizeJellyfinUrl('https://media.test/jellyfin///')).toBe(
+      'https://media.test/jellyfin',
+    );
+    expect(normalizeJellyfinUrl('http://[::1]:8096/base')).toBe('http://[::1]:8096/base');
+  });
+
+  it.each([
+    { timeoutMs: 0 },
+    { timeoutMs: 60_001 },
+    { deviceId: 'header" injection' },
+    { deviceId: '' },
+  ])('rejects unsafe client options', (options) => {
+    expect(() => new JellyfinAuthClient(options)).toThrow(JellyfinAuthError);
+  });
+});
+
+describe('dedicated Jellyport service API keys', () => {
+  it.each([200, 204])(
+    'supports Jellyfin POST status %i and identifies the exact setup key by its unique name',
+    async (status) => {
+      const requests: Array<{ address: string; init: RequestInit }> = [];
+      const client = new JellyfinAuthClient({
+        transport: async (address, init) => {
+          requests.push({ address, init });
+          if (init.method === 'POST')
+            return status === 204
+              ? new Response(null, { status })
+              : json({ AppName: 'Jellyport setup one', AccessToken: 'dedicated-key' });
+          return json({
+            Items: [
+              { AppName: 'Jellyport setup another', AccessToken: 'unrelated-key' },
+              { AppName: 'Jellyport setup one', AccessToken: 'dedicated-key', IsActive: true },
+            ],
+          });
+        },
+      });
+      await expect(
+        client.createApiKey('http://jellyfin/base', 'admin-token', 'Jellyport setup one'),
+      ).resolves.toBe('dedicated-key');
+      expect(requests).toHaveLength(2);
+      expect(requests[0]?.init.method).toBe('POST');
+      expect(new URL(requests[0]!.address).pathname).toBe('/base/Auth/Keys');
+      expect(new URL(requests[0]!.address).searchParams.get('app')).toBe('Jellyport setup one');
+      expect(requests[1]?.init.method).toBe('GET');
+      expect(new URL(requests[1]!.address).search).toBe('');
+      for (const { address, init } of requests) {
+        expect(new Headers(init.headers).get('Authorization')).toBe(
+          'MediaBrowser Token="admin-token"',
+        );
+        expect(address).not.toContain('admin-token');
+        expect(address).not.toContain('dedicated-key');
+      }
+    },
+  );
+
+  it.each([
+    { Items: [] },
+    { Items: [{ AppName: 'wrong-name', AccessToken: 'unrelated-key' }] },
+    { Items: [{ AppName: 'unique-name', AccessToken: '' }] },
+    { Items: [{ AppName: 'unique-name', AccessToken: 'secret\nheader' }] },
+    { Items: [{ AppName: 'unique-name', AccessToken: 'revoked-key', IsActive: false }] },
+    { Items: [{ AppName: 'unique-name', AccessToken: 'revoked-key', DateRevoked: '2026-10-07' }] },
+    {
+      Items: [
+        { AppName: 'unique-name', AccessToken: 'first' },
+        { AppName: 'unique-name', AccessToken: 'second' },
+      ],
+    },
+  ])('refuses absent, ambiguous, revoked, or malformed setup-key matches: %j', async (value) => {
+    const client = new JellyfinAuthClient({
+      transport: async (_address, init) =>
+        init.method === 'POST' ? new Response(null, { status: 204 }) : json(value),
+    });
+    await expect(
+      client.createApiKey('http://jellyfin', 'admin-token', 'unique-name'),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'Unable to identify the Jellyport API key created by this setup.',
+    });
+  });
+
+  it('never retries an uncertain API key creation', async () => {
+    const transport = vi.fn<FetchTransport>(async () => {
+      throw new Error('secret creation timeout');
+    });
+    const client = new JellyfinAuthClient({ transport });
+    await expect(
+      client.createApiKey('http://jellyfin', 'admin-token', 'unique-name'),
+    ).rejects.toMatchObject({ statusCode: 502 });
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it('revokes only the supplied key using the administrator token', async () => {
+    const transport = vi.fn<FetchTransport>(async (address, init) => {
+      expect(address).toBe('http://jellyfin/base/Auth/Keys/dedicated-key');
+      expect(init.method).toBe('DELETE');
+      expect(init.body).toBeUndefined();
+      expect(new Headers(init.headers).get('Authorization')).toBe(
+        'MediaBrowser Token="admin-token"',
+      );
+      return new Response(null, { status: 204 });
+    });
+    await new JellyfinAuthClient({ transport }).deleteApiKey(
+      'http://jellyfin/base',
+      'admin-token',
+      'dedicated-key',
+    );
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it.each(['', ' name ', 'unsafe\nname'])(
+    'rejects invalid setup-key names before making requests: %j',
+    async (appName) => {
+      const transport = vi.fn<FetchTransport>();
+      await expect(
+        new JellyfinAuthClient({ transport }).createApiKey(
+          'http://jellyfin',
+          'admin-token',
+          appName,
+        ),
+      ).rejects.toMatchObject({ statusCode: 400 });
+      expect(transport).not.toHaveBeenCalled();
+    },
+  );
+});

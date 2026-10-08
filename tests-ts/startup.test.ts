@@ -109,9 +109,7 @@ it.each([
   'private-token-in-error-message',
   null,
 ])('keeps unrecognized startup failures redacted', (error) => {
-  expect(startupFailureDetail(error)).toBe(
-    'Check the admin password, data volume and configuration.',
-  );
+  expect(startupFailureDetail(error)).toBe('Check the data volume and configuration.');
 });
 
 it('closes the application and exits when its HTTP port is already occupied', async () => {

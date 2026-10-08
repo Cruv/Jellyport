@@ -121,9 +121,13 @@ export class MediaClient implements MediaAPI {
           method,
           redirect: 'manual',
           headers: {
-            'X-Emby-Token': this.apiKey,
+            ...(this.kind === 'jellyfin'
+              ? {
+                  Authorization: `MediaBrowser Client="Jellyport", Device="Jellyport", DeviceId="jellyport-service", Version="0.3.0", Token="${this.apiKey.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
+                }
+              : { 'X-Emby-Token': this.apiKey }),
             Accept: 'application/json',
-            'User-Agent': 'Jellyport/0.2',
+            'User-Agent': 'Jellyport/0.3',
             ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
           },
           ...(body !== undefined ? { body: JSON.stringify(body) } : {}),

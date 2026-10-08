@@ -3,11 +3,52 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createApp, type JellyportApp } from '../server/main.js';
+import { JellyfinAuthError, type JellyfinAuthentication } from '../server/jellyfin-auth.js';
 
 const resources: Array<{ app: JellyportApp; directory: string }> = [];
 async function setup(demo = true) {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-api-'));
-  const app = await createApp({ adminPassword: 'testing-password-long', dataDir: directory, demo });
+  const identity = {
+    serverId: 'test-server',
+    userId: 'test-admin',
+    username: 'admin',
+    accessToken: 'test-token',
+  };
+  const authClient: JellyfinAuthentication = {
+    authenticate: async (_url, username, password) => {
+      if (username !== 'admin' || password !== 'testing-password-long')
+        throw new JellyfinAuthError('Incorrect credentials.', 401);
+      return identity;
+    },
+    validateSession: async () => identity,
+    signOut: async () => {},
+    createApiKey: async () => 'service-key',
+    deleteApiKey: async () => {},
+  };
+  const app = await createApp({
+    adminPassword: 'testing-password-long',
+    dataDir: directory,
+    demo,
+    authClient,
+  });
+  if (!demo) {
+    const state = app.jellyport.store.authState();
+    if (state?.kind !== 'pending') throw new Error('Expected fresh setup');
+    app.jellyport.store.completeAuth(
+      state.generation,
+      {
+        kind: 'configured',
+        serverUrl: 'https://jellyfin.example',
+        serverId: identity.serverId,
+        apiKeyName: 'testing',
+      },
+      (settings) => ({
+        ...settings,
+        jellyfin_url: 'https://jellyfin.example',
+        jellyfin_api_key: 'service-key',
+      }),
+    );
+  }
   resources.push({ app, directory });
   return app;
 }
@@ -29,7 +70,7 @@ async function login(app: JellyportApp) {
   const response = await app.inject({
     method: 'POST',
     url: '/api/login',
-    payload: { password: 'testing-password-long' },
+    payload: { username: 'admin', password: 'testing-password-long' },
     headers: { cookie: anonymous.cookie, 'x-csrf-token': anonymous.csrf },
   });
   expect(response.statusCode).toBe(200);
@@ -47,7 +88,7 @@ it('preserves authentication, CSRF, redaction, account creation and one-time cre
       await app.inject({
         method: 'POST',
         url: '/api/login',
-        payload: { password: 'testing-password-long' },
+        payload: { username: 'admin', password: 'testing-password-long' },
       })
     ).statusCode,
   ).toBe(403);
@@ -115,7 +156,7 @@ it('does not echo secret input in validation or malformed JSON errors', async ()
     method: 'POST',
     url: '/api/login',
     headers,
-    payload: { password: secret },
+    payload: { username: 'admin', password: secret },
   });
   expect(response.statusCode).toBe(422);
   expect(response.body).not.toContain(secret);
@@ -139,7 +180,7 @@ it('rate limits repeated incorrect logins and rotates the successful session', a
           method: 'POST',
           url: '/api/login',
           headers,
-          payload: { password: 'incorrect' },
+          payload: { username: 'admin', password: 'incorrect' },
         })
       ).statusCode,
     ).toBe(401);
@@ -149,7 +190,7 @@ it('rate limits repeated incorrect logins and rotates the successful session', a
         method: 'POST',
         url: '/api/login',
         headers,
-        payload: { password: 'testing-password-long' },
+        payload: { username: 'admin', password: 'testing-password-long' },
       })
     ).statusCode,
   ).toBe(429);
@@ -178,7 +219,7 @@ it('validates saved settings and preserves blank secrets without exposing them',
     method: 'PUT',
     url: '/api/settings',
     headers,
-    payload: { jellyfin_url: 'https://jellyfin.example/', jellyfin_api_key: 'secret-key' },
+    payload: { emby_url: 'https://emby.example/', emby_api_key: 'secret-key' },
   });
   expect(response.statusCode).toBe(200);
   expect(response.body).not.toContain('secret-key');
@@ -186,11 +227,11 @@ it('validates saved settings and preserves blank secrets without exposing them',
     method: 'PUT',
     url: '/api/settings',
     headers,
-    payload: { jellyfin_api_key: '' },
+    payload: { emby_api_key: '' },
   });
   expect(response.statusCode).toBe(200);
-  expect(app.jellyport.store.settings().jellyfin_api_key).toBe('secret-key');
-  expect(app.jellyport.store.settings().jellyfin_url).toBe('https://jellyfin.example');
+  expect(app.jellyport.store.settings().emby_api_key).toBe('secret-key');
+  expect(app.jellyport.store.settings().emby_url).toBe('https://emby.example');
   for (const payload of [
     { auto_disable: 'false' },
     { jellyfin_api_key: false },
@@ -237,11 +278,17 @@ it('validates account and migration request shapes without coercion', async () =
     ).statusCode,
   ).toBe(422);
 });
-it('rejects unsafe startup passwords', async () => {
-  await expect(createApp({ adminPassword: 'short' })).rejects.toThrow('strong password');
-  await expect(createApp({ adminPassword: 'replace-with-a-long-random-password' })).rejects.toThrow(
-    'strong password',
-  );
+it('rejects unsafe one-time upgrade passwords without touching a development data directory', async () => {
+  for (const adminPassword of ['short', 'replace-with-a-long-random-password']) {
+    const directory = mkdtempSync(join(tmpdir(), 'jellyport-api-'));
+    try {
+      await expect(createApp({ adminPassword, dataDir: directory })).rejects.toThrow(
+        'strong password',
+      );
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
 });
 
 it('protects encoded API route aliases with the same authentication and CSRF checks', async () => {
@@ -253,7 +300,7 @@ it('protects encoded API route aliases with the same authentication and CSRF che
       await app.inject({
         method: 'POST',
         url: '/%61pi/login',
-        payload: { password: 'testing-password-long' },
+        payload: { username: 'admin', password: 'testing-password-long' },
       })
     ).statusCode,
   ).toBe(403);

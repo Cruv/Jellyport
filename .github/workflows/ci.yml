@@ -34,6 +34,10 @@ jobs:
       - run: docker build -t jellyport:ci .
       - run: docker run -d --name jellyport-ci -p 127.0.0.1:8173:8000 -e JELLYPORT_DEMO=true -e JELLYPORT_ADMIN_PASSWORD=demo-jellyport jellyport:ci
       - run: node scripts/smoke.mjs http://127.0.0.1:8173
+      - name: Smoke test protected first-run setup without an admin password
+        run: |
+          docker run -d --name jellyport-fresh-ci -p 127.0.0.1:8175:8000 jellyport:ci
+          node scripts/smoke-setup.mjs http://127.0.0.1:8175
       - name: Smoke test an unprivileged bind-mount deployment
         run: |
           mkdir -p "${RUNNER_TEMP}/jellyport-bind"
@@ -50,7 +54,9 @@ jobs:
         run: |
           docker logs jellyport-ci || true
           docker logs jellyport-bind-ci || true
+          docker logs jellyport-fresh-ci || true
       - if: always()
         run: |
           docker stop jellyport-ci || true
           docker stop jellyport-bind-ci || true
+          docker stop jellyport-fresh-ci || true

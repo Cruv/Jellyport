@@ -11,6 +11,7 @@ import {
   progressPercent,
 } from './components';
 import SettingsPage from './SettingsPage';
+import AuthScreen from './AuthScreen';
 import {
   AccountsPage,
   ActivityPage,
@@ -136,6 +137,10 @@ export default function App() {
     setMobileOpen(false);
     closeDialog();
   }, [closeDialog]);
+  const acceptSession = useCallback((value: Session) => {
+    sessionRef.current = value;
+    setSession(value);
+  }, []);
   const api: Api = useCallback(
     async <T,>(path: string, options: ApiOptions = {}): Promise<T> => {
       const generation = authGeneration.current;
@@ -168,7 +173,8 @@ export default function App() {
           'This request belongs to a previous session. Sign in and refresh to see its status.',
         );
       if (!response.ok) {
-        if (response.status === 401 && path !== '/api/login') clearSession();
+        if (response.status === 401 && path !== '/api/login' && path !== '/api/setup/connect')
+          clearSession();
         const body = data as { detail?: unknown; error?: unknown; message?: unknown };
         let detail = body.detail || body.error || body.message;
         if (Array.isArray(detail))
@@ -410,24 +416,6 @@ export default function App() {
         showDialog({ kind: 'credentials', credentials: result.credentials || [] });
     });
   }
-  async function login(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const values = new FormData(event.currentTarget);
-    void work('login', async () => {
-      setLoginError('');
-      const anonymous = await api<Session>('/api/session');
-      sessionRef.current = anonymous;
-      setSession(anonymous);
-      const value = await api<Session>('/api/login', {
-        method: 'POST',
-        body: { password: values.get('password') },
-      });
-      if (!value.authenticated)
-        throw new Error('Sign-in was not successful. Check your admin password.');
-      sessionRef.current = value;
-      setSession(value);
-    });
-  }
   function logout() {
     void work('logout', async () => {
       await api('/api/logout', { method: 'POST', body: {} });
@@ -558,48 +546,12 @@ export default function App() {
           <span>Opening Jellyport…</span>
         </div>
       ) : !session?.authenticated ? (
-        <main className="login-screen">
-          <div className="login-card">
-            <div className="brand">
-              <span className="brand-icon">
-                <Icon name="logo" />
-              </span>
-              <div>
-                Jellyport<small>YOUR NEXT CHAPTER</small>
-              </div>
-            </div>
-            <h1>Welcome back</h1>
-            <p>Sign in to manage accounts and bring your users over to Jellyfin.</p>
-            <form className="form-stack" onSubmit={login}>
-              {loginError && (
-                <div className="error-block" role="alert">
-                  {loginError}
-                </div>
-              )}
-              <div className="field">
-                <label htmlFor="admin-password">Admin password</label>
-                <input
-                  id="admin-password"
-                  name="password"
-                  type="password"
-                  autoComplete="current-password"
-                  placeholder="Enter your admin password"
-                  required
-                  autoFocus
-                />
-              </div>
-              <button className="btn btn-primary" type="submit" disabled={busy.has('login')}>
-                {busy.has('login') ? <span className="spinner" /> : <Icon name="lock" />}
-                {busy.has('login') ? 'Signing in…' : 'Sign in'}
-              </button>
-            </form>
-            <div className="login-footer">
-              Use the admin password configured for this Jellyport instance.
-              <br />
-              Emby → Jellyfin, with everyone’s progress intact.
-            </div>
-          </div>
-        </main>
+        <AuthScreen
+          session={session}
+          initialError={loginError}
+          api={api}
+          onSession={acceptSession}
+        />
       ) : (
         <div className="shell">
           <aside
@@ -631,10 +583,12 @@ export default function App() {
             </nav>
             <div className="sidebar-bottom">
               <div className="operator-card">
-                <div className="avatar">AD</div>
+                <div className="avatar">
+                  {(session.user?.name || 'Admin').slice(0, 2).toUpperCase()}
+                </div>
                 <div>
-                  <strong>Administrator</strong>
-                  <span>Local workspace</span>
+                  <strong>{session.user?.name || 'Administrator'}</strong>
+                  <span>Jellyfin administrator</span>
                 </div>
                 <button
                   className="icon-button"

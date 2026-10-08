@@ -1,7 +1,7 @@
 const safeErrors = new Map([
   [
     'Set JELLYPORT_ADMIN_PASSWORD to a strong password of 12–512 characters before starting Jellyport.',
-    'Set JELLYPORT_ADMIN_PASSWORD to a password of 12–512 characters, replace the example value, and redeploy the container.',
+    'Remove JELLYPORT_ADMIN_PASSWORD to use the generated setup code, or set this optional one-time upgrade password to 12–512 characters and replace the example value.',
   ],
   [
     'The Jellyport database has no encryption key. Restore secret.key from the same backup.',
@@ -42,5 +42,5 @@ export function startupFailureDetail(error: unknown): string {
     const safeMessage = safeErrors.get(error.message);
     if (safeMessage) return safeMessage;
   }
-  return 'Check the admin password, data volume and configuration.';
+  return 'Check the data volume and configuration.';
 }

@@ -24,7 +24,6 @@ services:
     container_name: jellyport
     user: "1000:1000" # Host UID:GID.
     environment:
-      - JELLYPORT_ADMIN_PASSWORD=${JELLYPORT_ADMIN_PASSWORD:-}
       - JELLYPORT_DATA_DIR=/data
       - JELLYPORT_SECURE_COOKIE=false # Set true for HTTPS.
       - TZ=Etc/UTC # Optional.
@@ -44,12 +43,13 @@ Replace the host path and prepare that dedicated directory on your Docker host b
 
 ```sh
 sudo install -d -m 700 -o 1000 -g 1000 /path/to/jellyport
-openssl rand -base64 32
 ```
 
-Set `JELLYPORT_ADMIN_PASSWORD` to the generated password in Portainer's stack environment variables, or in a local `.env` beside your Compose file. Never commit it. The app rejects an unset, short, or example password when it starts. `user: "1000:1000"` sets the real process UID and GID; change it and the directory owner together if your host uses different IDs. Jellyport does not use `PUID` or `PGID` environment variables.
+`user: "1000:1000"` sets the real process UID and GID; change it and the directory owner together if your host uses different IDs. Jellyport does not use `PUID` or `PGID` environment variables. A fresh installation does not require a Jellyport admin password environment variable.
 
-Open `http://YOUR_SERVER:8000`. For HTTPS through a reverse proxy, set `JELLYPORT_SECURE_COOKIE=true`. Use [examples/compose.shared-network.yaml](examples/compose.shared-network.yaml) when joining an existing media-server network from a separate stack; set `JELLYPORT_MEDIA_NETWORK` to the actual Docker network name. Jellyport connects through server APIs and only needs its own `/data` mount. It does not need access to media files or the Jellyfin configuration directory.
+Open `http://YOUR_SERVER:8000`. Find `Jellyport setup code:` in the container logs, then use that one-time code in the setup wizard to link your Jellyfin server. Enter an enabled Jellyfin administrator's username and nonempty password, choose your existing template user, and complete setup. Subsequent sign-ins use your Jellyfin administrator account.
+
+For HTTPS through a reverse proxy, set `JELLYPORT_SECURE_COOKIE=true`. Use [examples/compose.shared-network.yaml](examples/compose.shared-network.yaml) when joining an existing media-server network from a separate stack; set `JELLYPORT_MEDIA_NETWORK` to the actual Docker network name. Jellyport connects through server APIs and only needs its own `/data` mount. It does not need access to media files or the Jellyfin configuration directory.
 
 For network details, updates, backups, and moving an existing named-volume deployment, see [Docker and Portainer deployment](docs/docker-deployment.md).
 
@@ -59,30 +59,27 @@ From a checkout of this repository:
 
 ```sh
 cp .env.example .env
-```
-
-Set `JELLYPORT_ADMIN_PASSWORD` in `.env` to a long, random password. Startup rejects passwords shorter than 12 characters and the example placeholder. This password grants access to server configuration, account operations, and generated credentials.
-
-```sh
 docker compose up -d --build
+docker compose logs jellyport
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and sign in. Compose binds to `127.0.0.1:8000` by default. For access from another machine, put your HTTPS reverse proxy in front of this address and set `JELLYPORT_SECURE_COOKIE=true` in `.env`, then recreate the container. A proxy in another container needs a route to the host or an explicitly configured shared Docker network.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and complete setup with the code from the logs and your Jellyfin administrator account. Compose binds to `127.0.0.1:8000` by default. For access from another machine, put your HTTPS reverse proxy in front of this address and set `JELLYPORT_SECURE_COOKIE=true` in `.env`, then recreate the container. A proxy in another container needs a route to the host or an explicitly configured shared Docker network.
 
 The container must be able to reach both media servers. A server URL containing `localhost` refers to the Jellyport container itself. Use reachable hostnames or addresses; reverse proxy base paths are supported.
 
 Serve Jellyport at the root of its own host/subdomain. Run one application worker/replica: mutation coordination, the Discord Gateway connection, and admin sessions are local to that process. Account mutations are serialized, with the lock released between users in a bulk job so other account operations can run.
 
-## Configure your servers
+## Set up Jellyfin sign-in and your servers
 
-In Settings, enter:
+The first-run wizard links Jellyport to one Jellyfin server. The setup code authorizes this initial pairing; it is consumed when setup finishes. Jellyport verifies your administrator credentials with that server and creates a dedicated API key for background account operations. It encrypts the key in its data directory and does not save your Jellyfin password.
 
-1. Your Emby server URL and API key with access to its users and their library data.
-2. Your Jellyfin server URL and API key with administrative rights to manage users and watched status.
-3. The public Jellyfin URL users should receive in their credential message.
-4. Your existing Jellyfin template user. It must be enabled and must not be an administrator. New accounts receive its user policy and configuration, including library permissions.
+Choose an existing, enabled Jellyfin template user that is not an administrator. New accounts receive its user policy and configuration, including library permissions. Set the public Jellyfin URL that users should receive in their credential message. After completing setup, configure the Emby source URL and API key in Settings.
 
-Save the settings and test the connections. Emby is used as a read-only source. Discord and all automatic actions are disabled by default; the web app can operate without a bot.
+After setup, sign in with the linked server's Jellyfin administrator username and password. Only enabled administrator accounts are accepted. Jellyport keeps each interactive Jellyfin token in server memory, checks the account's authorization on protected requests, and revokes that token on sign-out. The background API key is separate, so signing out does not interrupt queued work or the optional bot. Jellyfin sign-in requires the linked server to be reachable.
+
+Settings keeps the sign-in server address fixed. If the background key is revoked, an authenticated administrator can refresh it from Settings. Refresh creates a new key while preserving the previous key for already queued jobs; remove obsolete Jellyport keys in Jellyfin's dashboard after those jobs finish. Use the [local authentication reset](docs/docker-deployment.md#reset-jellyfin-pairing) to recover access or update the linked server's address. Linking a different Jellyfin server requires a new Jellyport data directory, because existing account links and jobs belong to the original server.
+
+Save your Emby settings and test the connections. The Emby key needs access to its users and their library data; Emby is used as a read-only source. Discord and all automatic actions are disabled by default; the web app can operate without a bot.
 
 If the same media files have different mount paths on the two servers, configure source-to-target path prefix mappings. For example, the settings API accepts:
 
@@ -90,7 +87,7 @@ If the same media files have different mount paths on the two servers, configure
 {"path_mappings": [{"source": "/mnt/media", "target": "/media"}]}
 ```
 
-API keys and the Discord bot token are encrypted in the application database. Leaving a saved secret's input blank preserves its current value.
+API keys and the Discord bot token are encrypted in the application database. Leaving a saved editable secret's input blank preserves its current value.
 
 ## Migrate users
 
@@ -148,7 +145,7 @@ docker compose cp jellyport:/data ./jellyport-backup
 docker compose start jellyport
 ```
 
-Restore the database and `secret.key` together while the service is stopped. Without the original key, saved secrets cannot be decrypted. Keep the volume when rebuilding or upgrading. The `.env` admin password is separate from the encrypted volume and should also be kept securely.
+Restore the database and `secret.key` together while the service is stopped. Without the original key, saved secrets cannot be decrypted. Keep the volume when rebuilding or upgrading. The saved Jellyfin pairing is part of this data directory.
 
 New jobs persist their requests and an encrypted settings snapshot before execution. Jobs that have never started can resume after a restart. Running jobs are marked interrupted for review and are not silently replayed: a remote creation or policy change may already have succeeded. Rerunning a reviewed migration merges remaining watched flags without resetting ordinary existing accounts.
 
@@ -157,6 +154,10 @@ New jobs persist their requests and an encrypted settings snapshot before execut
 Keep the same Compose project name, `jellyport-data` volume, and `.env`. Back up the stopped service as described above, pull the updated repository, then run `docker compose up -d --build`. The Node application reads the original SQLite schema and Fernet-encrypted records using the existing `secret.key`; no Python runtime or export/import step is required. It adds the queued-job table on startup. Old queued/running jobs lack a durable execution record and are marked interrupted for review. Settings, credentials within their retention period, account links, and audit history remain available.
 
 Do not run both versions against the same volume. Keep your pre-upgrade backup if you need to roll back, and restore it while the service is stopped.
+
+### Upgrading from shared-password sign-in
+
+Keep the same data mount and back it up before updating the image. On the first visit after upgrading, complete the Jellyfin setup wizard. If the container still receives `JELLYPORT_ADMIN_PASSWORD`, use that existing password as the one-time setup code. Otherwise, use the generated code in the container logs. Existing accounts, jobs, links, and settings remain in the data directory. After setup, remove the old password environment variable; ordinary sign-in uses Jellyfin credentials.
 
 ## Development and local demo
 
@@ -169,33 +170,36 @@ npm test
 npm run build
 ```
 
-For real local operation, set the admin password in `.env` and run:
+For real local operation, run:
 
 ```sh
 HOST=127.0.0.1 npm start
 ```
+
+Use the setup code printed in the terminal to complete the Jellyfin pairing wizard.
 
 The demo uses simulated in-memory servers, makes no Emby/Jellyfin/Discord API calls, and keeps settings read-only. Use a separate data directory:
 
 ```sh
 JELLYPORT_DEMO=true \
 JELLYPORT_DATA_DIR=/tmp/jellyport-demo \
-JELLYPORT_ADMIN_PASSWORD=demo-jellyport \
 JELLYPORT_SECURE_COOKIE=false \
 HOST=127.0.0.1 npm start
 ```
 
-Sign in with `demo-jellyport`. Demo server fixtures reset when the process restarts.
+Sign in with username `admin` and password `demo-jellyport`. Demo server fixtures reset when the process restarts.
 
 For development with hot reload, run `npm run dev` for the API and `npm run dev:ui` in a second terminal. Open Vite's local URL at [http://127.0.0.1:5173](http://127.0.0.1:5173); it proxies `/api` to the Node service at port 8000. Production uses the compiled `dist/server` and `dist/client` files. Source lives in `server/` and `frontend/src/`; Vitest covers backend, Discord, persistence compatibility, and React safeguards. CI checks Node 22 and 24, the production build, dependency vulnerabilities, and a Docker demo smoke test.
 
 ## API
 
-The browser uses authenticated session cookies. Mutating API requests require the session's `X-CSRF-Token`; get an anonymous session from `GET /api/session` before calling `POST /api/login`. `/health` is unauthenticated. There is no public subscription webhook endpoint.
+The browser uses authenticated session cookies. Mutating API requests require the session's `X-CSRF-Token`; get an anonymous session from `GET /api/session` before calling `POST /api/login` with a Jellyfin `username` and `password`. First-run setup uses the same CSRF protection plus its one-time setup code. Jellyfin access tokens and API keys are not returned to the browser. `/health` is unauthenticated. There is no public subscription webhook endpoint.
 
 | Operation | Endpoint |
 | --- | --- |
 | Read or update configuration | `GET` / `PUT /api/settings` |
+| Connect Jellyfin and complete first-run setup | `GET /api/setup`, `POST /api/setup/connect`, `POST /api/setup/complete` |
+| Refresh the managed background API key | `POST /api/auth/service-key` |
 | Test server connections | `POST /api/connections/test` |
 | List source and destination users | `GET /api/users` |
 | Preview or queue migrations | `POST /api/migrations/preview`, `POST /api/migrations` |

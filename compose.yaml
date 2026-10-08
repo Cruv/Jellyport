@@ -9,6 +9,7 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     environment:
+      # Optional one-time setup protection when upgrading an existing installation.
       - JELLYPORT_ADMIN_PASSWORD=${JELLYPORT_ADMIN_PASSWORD:-}
       - JELLYPORT_SECURE_COOKIE=${JELLYPORT_SECURE_COOKIE:-false}
       - JELLYPORT_DATA_DIR=/data

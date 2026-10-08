@@ -33,6 +33,9 @@ export interface QueuedJob {
   requests: JobRequest[];
   settings: Settings;
 }
+export type AuthState =
+  | { kind: 'pending'; generation: string; setupCode: string; previousServerId?: string }
+  | { kind: 'configured'; serverUrl: string; serverId: string; apiKeyName: string };
 
 /** Compatible with existing Python SQLite volumes, including encrypted Fernet records. */
 export class Store {
@@ -61,6 +64,7 @@ export class Store {
       PRAGMA journal_mode=WAL;
       PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS auth_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS accounts (name_key TEXT PRIMARY KEY, username TEXT NOT NULL, remote_id TEXT, status TEXT NOT NULL, password BLOB, expires REAL);
       CREATE TABLE IF NOT EXISTS credentials (job_id TEXT NOT NULL, username TEXT NOT NULL, encrypted BLOB NOT NULL, expires REAL NOT NULL, PRIMARY KEY (job_id,username));
@@ -74,6 +78,7 @@ export class Store {
       this.db.exec('ALTER TABLE links ADD COLUMN pending_disabled INTEGER');
     // Authenticate existing settings before starting any worker or bot.
     this.settings();
+    this.authState();
     for (const job of this.jobs()) {
       if (
         job.status === 'running' ||
@@ -123,6 +128,55 @@ export class Store {
   }
   saveSettings(settings: Settings): void {
     this.db.prepare('INSERT OR REPLACE INTO settings VALUES (1,?)').run(this.encrypt(settings));
+  }
+  authState(): AuthState | null {
+    const row = this.db.prepare('SELECT encrypted FROM auth_state WHERE id=1').get();
+    return row ? this.decrypt<AuthState>(row.encrypted as Uint8Array) : null;
+  }
+  ensureAuthState(): AuthState {
+    return this.transaction(() => {
+      const existing = this.authState();
+      if (existing) return existing;
+      return this.resetAuth();
+    });
+  }
+  /** Local operator recovery; run with Jellyport stopped. Existing media data is preserved. */
+  resetAuth(): Extract<AuthState, { kind: 'pending' }> {
+    const previous = this.authState();
+    const previousServerId =
+      previous?.kind === 'configured' ? previous.serverId : previous?.previousServerId;
+    const state = {
+      kind: 'pending' as const,
+      generation: randomBytes(24).toString('base64url'),
+      setupCode: randomBytes(24).toString('base64url'),
+      ...(previousServerId ? { previousServerId } : {}),
+    };
+    this.db.prepare('INSERT OR REPLACE INTO auth_state VALUES (1,?)').run(this.encrypt(state));
+    return state;
+  }
+  completeAuth(
+    generation: string,
+    state: Extract<AuthState, { kind: 'configured' }>,
+    updateSettings: (current: Settings) => Settings,
+  ): boolean {
+    return this.transaction(() => {
+      const current = this.authState();
+      if (current?.kind !== 'pending' || current.generation !== generation) return false;
+      this.saveSettings(updateSettings(this.settings()));
+      this.db.prepare('UPDATE auth_state SET encrypted=? WHERE id=1').run(this.encrypt(state));
+      return true;
+    });
+  }
+  updateServiceKey(serverId: string, apiKey: string, apiKeyName: string): boolean {
+    return this.transaction(() => {
+      const state = this.authState();
+      if (state?.kind !== 'configured' || state.serverId !== serverId) return false;
+      this.saveSettings({ ...this.settings(), jellyfin_api_key: apiKey });
+      this.db
+        .prepare('UPDATE auth_state SET encrypted=? WHERE id=1')
+        .run(this.encrypt({ ...state, apiKeyName }));
+      return true;
+    });
   }
   saveJob(job: Job): void {
     this.db.prepare('INSERT OR REPLACE INTO jobs VALUES (?,?)').run(job.id, JSON.stringify(job));

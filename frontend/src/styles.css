@@ -1936,3 +1936,57 @@ progress.progress-track::-moz-progress-bar {
   font-size: 11px;
   color: var(--subtle);
 }
+
+.setup-card {
+  width: 500px;
+}
+.setup-progress {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 24px;
+  padding-bottom: 20px;
+  margin-bottom: 22px;
+  border-bottom: 1px solid var(--line);
+  color: var(--subtle);
+  font-size: 11px;
+}
+.setup-progress .current {
+  color: var(--purple);
+}
+.setup-server {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  padding: 13px;
+  border-radius: 9px;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.setup-server svg {
+  color: var(--purple);
+  flex-shrink: 0;
+  width: 18px;
+}
+.setup-server strong {
+  color: var(--text);
+  font-weight: 500;
+}
+.setup-refresh {
+  align-self: flex-start;
+  margin-top: 5px;
+}
+.setup-warning {
+  color: var(--yellow) !important;
+}
+.field input[readonly] {
+  color: var(--muted);
+}
+.operator-card strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: block;
+  max-width: 120px;
+}

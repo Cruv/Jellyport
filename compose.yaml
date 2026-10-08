@@ -10,6 +10,7 @@ services:
       - "127.0.0.1:8000:8000"
     environment:
       - JELLYPORT_SECURE_COOKIE=${JELLYPORT_SECURE_COOKIE:-false}
+      - JELLYPORT_ALLOWED_HOSTS=${JELLYPORT_ALLOWED_HOSTS:-}
       - JELLYPORT_DATA_DIR=/data
       - TZ=Etc/UTC
     volumes:
@@ -18,5 +19,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    pids_limit: 128
 volumes:
   jellyport-data:

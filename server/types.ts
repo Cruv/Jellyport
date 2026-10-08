@@ -46,3 +46,13 @@ export const DEFAULT_SETTINGS: Settings = {
   auto_disable: false,
   disable_on_cancel: false,
 };
+
+export const DEMO_SETTINGS: Settings = {
+  ...structuredClone(DEFAULT_SETTINGS),
+  emby_url: 'http://demo-emby',
+  emby_api_key: 'demo',
+  jellyfin_url: 'http://demo-jellyfin',
+  jellyfin_api_key: 'demo',
+  jellyfin_public_url: 'https://jellyfin.example.com',
+  template_user_id: 'template',
+};

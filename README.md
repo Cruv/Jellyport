@@ -26,6 +26,7 @@ services:
     environment:
       - JELLYPORT_DATA_DIR=/data
       - JELLYPORT_SECURE_COOKIE=false # Set true for HTTPS.
+      - JELLYPORT_ALLOWED_HOSTS=${JELLYPORT_ALLOWED_HOSTS:-} # Optional proxy/custom DNS hostnames.
       - TZ=Etc/UTC # Optional.
     volumes:
       - "/path/to/jellyport:/data"
@@ -37,6 +38,10 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    pids_limit: 128
 ```
 
 Replace the host path and prepare that dedicated directory on your Docker host before deployment:
@@ -47,9 +52,11 @@ sudo install -d -m 700 -o 1000 -g 1000 /path/to/jellyport
 
 `user: "1000:1000"` sets the real process UID and GID; change it and the directory owner together if your host uses different IDs. Jellyport does not use `PUID` or `PGID` environment variables.
 
-Open `http://YOUR_SERVER:8000` and complete the setup wizard with your Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password. Choose your existing template user and public Jellyfin URL. Subsequent sign-ins use your Jellyfin administrator account. Keep the first-run page accessible only on your trusted network until pairing is complete.
+Open `http://YOUR_LAN_IP:8000` or `http://localhost:8000` and complete the setup wizard with your Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password. Choose your existing template user and public Jellyfin URL. Subsequent sign-ins use your Jellyfin administrator account. Initial pairing requires both a private connection source and a local hostname or private IP address; complete it before exposing any reverse proxy. The first qualifying visitor can pair the installation.
 
-For HTTPS through a reverse proxy, set `JELLYPORT_SECURE_COOKIE=true`. Use [examples/compose.shared-network.yaml](examples/compose.shared-network.yaml) when joining an existing media-server network from a separate stack; set `JELLYPORT_MEDIA_NETWORK` to the actual Docker network name. Jellyport connects through server APIs and only needs its own `/data` mount. It does not need access to media files or the Jellyfin configuration directory.
+For HTTPS through a reverse proxy, set `JELLYPORT_SECURE_COOKIE=true` and add its hostname to `JELLYPORT_ALLOWED_HOSTS`, for example `jellyport.example.com` (comma-separated hostnames, without schemes or ports). Preserve the browser's Host header. IP literals, single-label local names, and `.local`, `.localhost`, or `.home.arpa` names work by default. A public hostname cannot perform initial pairing. Use [examples/compose.shared-network.yaml](examples/compose.shared-network.yaml) when joining an existing media-server network from a separate stack; set `JELLYPORT_MEDIA_NETWORK` to the actual Docker network name. Jellyport connects through server APIs and only needs its own `/data` mount. It does not need access to media files or the Jellyfin configuration directory.
+
+Use HTTPS or an encrypted VPN to protect administrator passwords and session cookies in transit. Review [the security assessment and deployment assumptions](docs/security-review.md) before exposing the administration interface.
 
 For network details, updates, backups, and moving an existing named-volume deployment, see [Docker and Portainer deployment](docs/docker-deployment.md).
 
@@ -62,7 +69,7 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and complete setup with your Jellyfin server URL and administrator account. Compose binds to `127.0.0.1:8000` by default. For access from another machine, put your HTTPS reverse proxy in front of this address and set `JELLYPORT_SECURE_COOKIE=true` in `.env`, then recreate the container. A proxy in another container needs a route to the host or an explicitly configured shared Docker network.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and complete setup with your Jellyfin server URL and administrator account. Compose binds to `127.0.0.1:8000` by default; an SSH tunnel can provide localhost access from another machine during setup. After pairing, configure your HTTPS reverse proxy, set `JELLYPORT_SECURE_COOKIE=true` and `JELLYPORT_ALLOWED_HOSTS` in `.env`, then recreate the container. A proxy in another container needs a route to the host or an explicitly configured shared Docker network.
 
 The container must be able to reach both media servers. A server URL containing `localhost` refers to the Jellyport container itself. Use reachable hostnames or addresses; reverse proxy base paths are supported.
 
@@ -186,7 +193,7 @@ JELLYPORT_SECURE_COOKIE=false \
 HOST=127.0.0.1 npm start
 ```
 
-Sign in with username `admin` and password `demo-jellyport`. Demo server fixtures reset when the process restarts.
+Sign in with username `admin` and password `demo-jellyport`. Demo server fixtures reset when the process restarts. Demo startup refuses a directory containing production settings, authentication, or user data.
 
 For development with hot reload, run `npm run dev` for the API and `npm run dev:ui` in a second terminal. Open Vite's local URL at [http://127.0.0.1:5173](http://127.0.0.1:5173); it proxies `/api` to the Node service at port 8000. Production uses the compiled `dist/server` and `dist/client` files. Source lives in `server/` and `frontend/src/`; Vitest covers backend, Discord, persistence compatibility, and React safeguards. CI checks Node 22 and 24, the production build, dependency vulnerabilities, and a Docker demo smoke test.
 

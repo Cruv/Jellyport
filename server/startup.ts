@@ -1,5 +1,13 @@
 const safeErrors = new Map([
   [
+    'Demo mode requires a separate empty data directory. Production data was not loaded.',
+    'Demo mode requires a separate empty data directory. Keep production data in its original directory and disable JELLYPORT_DEMO.',
+  ],
+  [
+    'JELLYPORT_ALLOWED_HOSTS must contain comma-separated hostnames.',
+    'JELLYPORT_ALLOWED_HOSTS must contain comma-separated hostnames without schemes, paths, ports, or wildcards.',
+  ],
+  [
     'The Jellyport database has no encryption key. Restore secret.key from the same backup.',
     'The existing database is missing its encryption key. Restore secret.key and the database from the same backup; do not generate a replacement key.',
   ],

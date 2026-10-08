@@ -37,6 +37,25 @@ export interface MediaClientOptions {
   transport?: FetchTransport;
   sleep?: (milliseconds: number) => Promise<unknown>;
   timeoutMs?: number;
+  /** Can lower the 8 MiB response ceiling for constrained deployments and tests. */
+  maxResponseBytes?: number;
+}
+
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+/** Bounds custom transports and streams even when they ignore the fetch signal. */
+async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw signal.reason;
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    operation.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+function cancelBody(response: Response | undefined): void {
+  // Cancellation must not be awaited: a malicious or custom stream may never settle it.
+  if (response?.body) void response.body.cancel().catch(() => {});
 }
 
 export function isObject(value: unknown): value is JsonObject {
@@ -53,6 +72,7 @@ export class MediaClient implements MediaAPI {
   private readonly transport: FetchTransport;
   private readonly sleep: (milliseconds: number) => Promise<unknown>;
   private readonly timeoutMs: number;
+  private readonly maxResponseBytes: number;
   private readonly controller = new AbortController();
 
   constructor(
@@ -91,6 +111,16 @@ export class MediaClient implements MediaAPI {
     this.transport = options.transport ?? fetch;
     this.sleep = options.sleep ?? delay;
     this.timeoutMs = options.timeoutMs ?? 30_000;
+    this.maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
+    if (
+      !Number.isFinite(this.timeoutMs) ||
+      this.timeoutMs <= 0 ||
+      this.timeoutMs > 60_000 ||
+      !Number.isSafeInteger(this.maxResponseBytes) ||
+      this.maxResponseBytes <= 0 ||
+      this.maxResponseBytes > MAX_RESPONSE_BYTES
+    )
+      throw new MediaError('Invalid media server client configuration.');
   }
 
   async close(): Promise<void> {
@@ -115,9 +145,16 @@ export class MediaClient implements MediaAPI {
     for (const [key, value] of Object.entries(params ?? {}))
       url.searchParams.set(key, String(value));
     for (let attempt = 0; attempt < attempts; attempt++) {
-      let response: Response;
+      const timeout = new AbortController();
+      const deadline = Date.now() + this.timeoutMs;
+      const timer = setTimeout(() => timeout.abort(), this.timeoutMs);
+      timer.unref();
+      const signal = AbortSignal.any([this.controller.signal, timeout.signal]);
+      let response: Response | undefined;
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
       try {
-        response = await this.transport(url.toString(), {
+        if (signal.aborted) throw signal.reason;
+        const pending = this.transport(url.toString(), {
           method,
           redirect: 'manual',
           headers: {
@@ -131,39 +168,92 @@ export class MediaClient implements MediaAPI {
             ...(body !== undefined ? { 'Content-Type': 'application/json' } : {}),
           },
           ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
-          signal: AbortSignal.any([this.controller.signal, AbortSignal.timeout(this.timeoutMs)]),
+          signal,
         });
+        // A transport that resolves after the deadline must not leave an unread body open.
+        void pending.then(
+          (late) => {
+            if (signal.aborted) cancelBody(late);
+          },
+          () => {},
+        );
+        response = await abortable(pending, signal);
+        if ([429, 503].includes(response.status) && attempt + 1 < attempts) {
+          const parsed = Number(response.headers.get('Retry-After') ?? '0.2');
+          cancelBody(response);
+          response = undefined;
+          await abortable(
+            this.sleep(Number.isFinite(parsed) ? Math.min(2, Math.max(0, parsed)) * 1000 : 200),
+            signal,
+          );
+          continue;
+        }
+        if (!response.ok)
+          throw new MediaError(
+            `${this.label} rejected the request (HTTP ${response.status}).`,
+            response.status,
+          );
+        if (!decode || response.status === 204) return null;
+        const declaredLength = Number(response.headers.get('Content-Length'));
+        if (Number.isFinite(declaredLength) && declaredLength > this.maxResponseBytes)
+          throw new MediaError(`${this.label} API response exceeds the supported size.`);
+        if (!response.body) throw new MediaError(`${this.label} returned an invalid API response.`);
+        reader = response.body.getReader();
+        let buffer = Buffer.allocUnsafe(Math.min(64 * 1024, this.maxResponseBytes));
+        let bytes = 0;
+        while (true) {
+          // Immediate stream chunks must not starve the deadline's timer callback.
+          if (Date.now() >= deadline) {
+            timeout.abort();
+            throw signal.reason;
+          }
+          const chunk = await abortable(reader.read(), signal);
+          if (chunk.done) break;
+          const nextSize = bytes + chunk.value.byteLength;
+          if (nextSize > this.maxResponseBytes)
+            throw new MediaError(`${this.label} API response exceeds the supported size.`);
+          if (nextSize > buffer.length) {
+            const expanded = Buffer.allocUnsafe(
+              Math.min(this.maxResponseBytes, Math.max(nextSize, buffer.length * 2)),
+            );
+            buffer.copy(expanded, 0, 0, bytes);
+            buffer = expanded;
+          }
+          buffer.set(chunk.value, bytes);
+          bytes = nextSize;
+        }
+        let result: unknown;
+        try {
+          result = JSON.parse(buffer.subarray(0, bytes).toString('utf8'));
+        } catch {
+          throw new MediaError(`${this.label} returned an invalid API response.`);
+        }
+        if (Date.now() >= deadline) {
+          timeout.abort();
+          throw signal.reason;
+        }
+        return result;
       } catch (error) {
+        if (error instanceof MediaError) throw error;
         const timedOut =
-          error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name);
+          signal.aborted ||
+          (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name));
         const suffix =
           method !== 'GET' ? ' The operation may have been applied; check before retrying.' : '';
         throw new MediaError(
           (timedOut ? `${this.label} request timed out.` : `Unable to connect to ${this.label}.`) +
             suffix,
         );
-      }
-      if ([429, 503].includes(response.status) && attempt + 1 < attempts) {
-        const parsed = Number(response.headers.get('Retry-After') ?? '0.2');
-        await response.body?.cancel();
-        await this.sleep(Number.isFinite(parsed) ? Math.min(2, Math.max(0, parsed)) * 1000 : 200);
-        continue;
-      }
-      if (!response.ok) {
-        await response.body?.cancel();
-        throw new MediaError(
-          `${this.label} rejected the request (HTTP ${response.status}).`,
-          response.status,
-        );
-      }
-      if (!decode || response.status === 204) {
-        await response.body?.cancel();
-        return null;
-      }
-      try {
-        return await response.json();
-      } catch {
-        throw new MediaError(`${this.label} returned an invalid API response.`);
+      } finally {
+        clearTimeout(timer);
+        if (reader) {
+          void reader.cancel().catch(() => {});
+          try {
+            reader.releaseLock();
+          } catch {
+            /* The canceled read may still be settling. */
+          }
+        } else cancelBody(response);
       }
     }
     throw new MediaError(`${this.label} request failed.`);

@@ -125,7 +125,8 @@ export default function AuthScreen({
       } else {
         const anonymous = await api<Session>('/api/session');
         if (requestVersion.current !== version) return;
-        onSession(anonymous);
+        // A retained cookie after failed sign-out supplies CSRF, not renewed console access.
+        onSession({ ...anonymous, authenticated: false, user: undefined });
         if (anonymous.setup_required) return;
         const value = await api<Session>('/api/login', { method: 'POST', body });
         if (requestVersion.current !== version) return;

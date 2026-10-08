@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { MediaClient, type FetchTransport } from '../server/media.js';
 import { MediaError } from '../server/errors.js';
 
@@ -180,6 +180,192 @@ describe('media API boundary', () => {
       transport: async () => new Response('secret-invalid-json'),
     });
     await expect(client.systemInfo()).rejects.toThrow('invalid API response');
+    await client.close();
+  });
+
+  it('rejects declared oversized responses before reading and cancels the body', async () => {
+    const canceled = vi.fn();
+    const body = new ReadableStream<Uint8Array>({ cancel: canceled });
+    const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
+      maxResponseBytes: 64,
+      transport: async () => new Response(body, { headers: { 'Content-Length': '65' } }),
+    });
+    await expect(client.users()).rejects.toThrow('exceeds the supported size');
+    expect(canceled).toHaveBeenCalledOnce();
+    await client.close();
+  });
+
+  it.each([undefined, '1'])(
+    'bounds chunked responses even with an absent or false length (%s)',
+    async (length) => {
+      const canceled = vi.fn();
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('[{"Id":"id","Name":"'));
+          controller.enqueue(new TextEncoder().encode('private-response-body'.repeat(20)));
+        },
+        cancel: canceled,
+      });
+      const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
+        maxResponseBytes: 64,
+        transport: async () =>
+          new Response(body, { headers: length ? { 'Content-Length': length } : {} }),
+      });
+      await expect(client.users()).rejects.toThrow('exceeds the supported size');
+      expect(canceled).toHaveBeenCalledOnce();
+      await client.close();
+    },
+  );
+
+  it('accepts a valid response at the exact configured byte ceiling', async () => {
+    const data = JSON.stringify([{ Id: 'id', Name: 'é' }]);
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', {
+      maxResponseBytes: Buffer.byteLength(data),
+      transport: async () => new Response(data),
+    });
+    await expect(client.users()).resolves.toEqual([{ Id: 'id', Name: 'é' }]);
+    await client.close();
+  });
+
+  it('times out stalled streams and never awaits cancellation that also stalls', async () => {
+    const canceled = vi.fn(() => new Promise<void>(() => {}));
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('['));
+      },
+      cancel: canceled,
+    });
+    const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
+      timeoutMs: 25,
+      transport: async () => new Response(body),
+    });
+    await expect(client.users()).rejects.toThrow('Jellyfin request timed out.');
+    expect(canceled).toHaveBeenCalledOnce();
+    await client.close();
+  });
+
+  it('enforces the deadline even when immediate empty chunks would starve timer callbacks', async () => {
+    const canceled = vi.fn();
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(0));
+      },
+      cancel: canceled,
+    });
+    const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
+      timeoutMs: 25,
+      transport: async () => new Response(body),
+    });
+    await expect(client.users()).rejects.toThrow('timed out');
+    expect(canceled).toHaveBeenCalledOnce();
+    await client.close();
+  });
+
+  it('bounds transports that ignore abort and cancels their late response', async () => {
+    let resolve!: (response: Response) => void;
+    const canceled = vi.fn();
+    const transport = vi.fn(
+      () =>
+        new Promise<Response>((done) => {
+          resolve = done;
+        }),
+    );
+    const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
+      timeoutMs: 25,
+      transport,
+    });
+    await expect(client.createUser('alice', 'private-password')).rejects.toThrow(
+      'The operation may have been applied; check before retrying.',
+    );
+    resolve(new Response(new ReadableStream<Uint8Array>({ cancel: canceled })));
+    await Promise.resolve();
+    expect(canceled).toHaveBeenCalledOnce();
+    expect(transport).toHaveBeenCalledOnce();
+    await client.close();
+  });
+
+  it('close aborts an active stalled body and prevents any subsequent transport call', async () => {
+    const canceled = vi.fn();
+    const transport = vi.fn(
+      async () => new Response(new ReadableStream<Uint8Array>({ cancel: canceled })),
+    );
+    const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
+      transport,
+    });
+    const request = client.users();
+    const rejected = expect(request).rejects.toThrow('Jellyfin request timed out.');
+    await vi.waitFor(() => expect(transport).toHaveBeenCalledOnce());
+    await client.close();
+    await rejected;
+    await expect(client.users()).rejects.toThrow('timed out');
+    expect(canceled).toHaveBeenCalledOnce();
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it('never waits for cancellation on error or retry bodies and sanitizes their contents', async () => {
+    const canceled = vi.fn(() => new Promise<void>(() => {}));
+    const transport = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode('PRIVATE-UPSTREAM-SECRET'));
+            },
+            cancel: canceled,
+          }),
+          { status: 503 },
+        ),
+    );
+    const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
+      timeoutMs: 100,
+      transport,
+      sleep: async () => {},
+    });
+    await expect(client.users()).rejects.toMatchObject({
+      statusCode: 503,
+      message: 'Jellyfin rejected the request (HTTP 503).',
+    });
+    expect(transport).toHaveBeenCalledTimes(3);
+    expect(canceled).toHaveBeenCalledTimes(3);
+    await client.close();
+  });
+
+  it('does not retry an oversized mutation response and cancels its body', async () => {
+    const canceled = vi.fn();
+    const transport = vi.fn(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(65));
+            },
+            cancel: canceled,
+          }),
+        ),
+    );
+    const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
+      maxResponseBytes: 64,
+      transport,
+    });
+    await expect(client.createUser('alice', 'private-password')).rejects.toThrow(
+      'exceeds the supported size',
+    );
+    expect(transport).toHaveBeenCalledOnce();
+    expect(canceled).toHaveBeenCalledOnce();
+    await client.close();
+  });
+
+  it('sends the Jellyfin token only in its escaped MediaBrowser Authorization header', async () => {
+    const client = new MediaClient('http://jellyfin.test', 'key"\\value', 'jellyfin', {
+      transport: async (url, init) => {
+        expect(url).not.toContain('key');
+        const headers = init.headers as Record<string, string>;
+        expect(headers.Authorization).toContain('Token="key\\"\\\\value"');
+        expect(headers['X-Emby-Token']).toBeUndefined();
+        return json([]);
+      },
+    });
+    await expect(client.users()).resolves.toEqual([]);
     await client.close();
   });
 });

@@ -1,11 +1,16 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { createApp, type JellyportApp } from '../server/main.js';
 import { JellyfinAuthError, type JellyfinAuthentication } from '../server/jellyfin-auth.js';
+import { DemoServers } from '../server/demo.js';
+import { Store } from '../server/store.js';
+import { DEFAULT_SETTINGS } from '../server/types.js';
 
 const resources: Array<{ app: JellyportApp; directory: string }> = [];
+const standaloneDirectories: string[] = [];
 async function setup(demo = true) {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-api-'));
   const identity = {
@@ -57,6 +62,8 @@ afterEach(async () => {
     await app.close();
     rmSync(directory, { recursive: true, force: true });
   }
+  for (const directory of standaloneDirectories.splice(0))
+    rmSync(directory, { recursive: true, force: true });
 });
 async function session(app: JellyportApp) {
   const response = await app.inject('/api/session');
@@ -328,4 +335,241 @@ it('protects encoded API route aliases with the same authentication and CSRF che
   ).toBe(403);
   expect((await app.inject({ url: '/%61pi/settings', headers })).statusCode).toBe(200);
   expect(app.jellyport.store.jobs()).toEqual([]);
+});
+
+it.each(['configured', 'legacy', 'blank-with-user-records'] as const)(
+  'refuses demo startup with %s production data before replacing settings or exposing records',
+  async (kind) => {
+    const directory = mkdtempSync(join(tmpdir(), 'jellyport-api-isolation-'));
+    standaloneDirectories.push(directory);
+    const store = new Store(directory);
+    if (kind !== 'blank-with-user-records')
+      store.saveSettings({
+        ...DEFAULT_SETTINGS,
+        jellyfin_url: 'https://private-jellyfin.example',
+        jellyfin_api_key: 'private-service-key',
+      });
+    if (kind === 'configured') {
+      const state = store.ensureAuthState();
+      if (state.kind !== 'pending') throw new Error('Expected fixture pending state');
+      store.completeAuth(
+        state.generation,
+        {
+          kind: 'configured',
+          serverUrl: 'https://private-jellyfin.example',
+          serverId: 'private-server-id',
+          apiKeyName: 'private-key-name',
+        },
+        (settings) => settings,
+      );
+    }
+    store.saveJob({
+      id: 'private-job',
+      kind: 'create',
+      status: 'running',
+      created_at: '2026-10-07',
+      updated_at: '2026-10-07',
+      progress: { processed: 0, total: 1 },
+      results: [],
+    });
+    store.saveAccount('private-member', 'private-id', 'provisioning', 'private-password');
+    const before = {
+      settings: store.db.prepare('SELECT * FROM settings').all(),
+      auth: store.db.prepare('SELECT * FROM auth_state').all(),
+      jobs: store.db.prepare('SELECT * FROM jobs').all(),
+      accounts: store.db.prepare('SELECT * FROM accounts').all(),
+    };
+    store.close();
+    let unexpectedApp: JellyportApp | undefined;
+    try {
+      await expect(
+        createApp({ dataDir: directory, demo: true }).then((app) => {
+          unexpectedApp = app;
+          return app;
+        }),
+      ).rejects.toThrow('Demo mode requires a separate empty data directory');
+    } finally {
+      await unexpectedApp?.close();
+    }
+    const db = new DatabaseSync(join(directory, 'jellyport.db'), { readOnly: true });
+    try {
+      expect({
+        settings: db.prepare('SELECT * FROM settings').all(),
+        auth: db.prepare('SELECT * FROM auth_state').all(),
+        jobs: db.prepare('SELECT * FROM jobs').all(),
+        accounts: db.prepare('SELECT * FROM accounts').all(),
+      }).toEqual(before);
+    } finally {
+      db.close();
+    }
+  },
+);
+
+it('supports a fresh isolated demo and repeat startup without consulting production authentication', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'jellyport-api-isolated-demo-'));
+  standaloneDirectories.push(directory);
+  const rejectAuthentication = vi.fn(async () => {
+    throw new Error('No remote authentication is allowed in this fixture.');
+  });
+  const authClient: JellyfinAuthentication = {
+    authenticate: rejectAuthentication,
+    validateSession: rejectAuthentication,
+    signOut: rejectAuthentication,
+    createApiKey: rejectAuthentication,
+    deleteApiKey: rejectAuthentication,
+  };
+  let app = await createApp({
+    dataDir: directory,
+    demo: true,
+    demoPassword: 'testing-password-long',
+    authClient,
+  });
+  try {
+    expect((await app.inject('/api/session')).json()).toMatchObject({
+      demo: true,
+      authenticated: false,
+      setup_required: false,
+    });
+    const headers = await login(app);
+    expect((await app.inject({ url: '/api/users', headers })).statusCode).toBe(200);
+  } finally {
+    await app.close();
+  }
+  app = await createApp({
+    dataDir: directory,
+    demo: true,
+    demoPassword: 'testing-password-long',
+    authClient,
+  });
+  resources.push({ app, directory });
+  const headers = await login(app);
+  expect((await app.inject({ url: '/api/settings', headers })).json()).toMatchObject({
+    emby_url: 'http://demo-emby',
+    jellyfin_url: 'http://demo-jellyfin',
+  });
+  expect(rejectAuthentication).not.toHaveBeenCalled();
+});
+
+it('keeps server tokens, saved secrets and the session cookie out of ordinary API response bodies', async () => {
+  const app = await setup(false);
+  // Inject in-memory media fixtures before using routes that inspect media servers.
+  app.jellyport.service.clientFactory = new DemoServers().factory;
+  app.jellyport.store.saveSettings({
+    ...app.jellyport.store.settings(),
+    emby_url: 'https://emby.example',
+    emby_api_key: 'private-emby-key',
+    discord_bot_token: 'private-discord-token',
+  });
+  const fixtureJob = {
+    id: 'private-fixture-job',
+    kind: 'create',
+    status: 'completed',
+    created_at: '2026-10-07',
+    updated_at: '2026-10-07',
+    progress: { processed: 1, total: 1 },
+    results: [],
+  };
+  app.jellyport.store.saveJob(fixtureJob);
+  app.jellyport.store.saveCredentials(
+    fixtureJob.id,
+    'fixture-member',
+    'private-member-password',
+    'https://jellyfin.example',
+  );
+  const secrets = [
+    'test-token',
+    'service-key',
+    'private-emby-key',
+    'private-discord-token',
+    'private-member-password',
+    'testing-password-long',
+  ];
+  const anonymous = await app.inject('/api/session');
+  expect(anonymous.json()).toMatchObject({ authenticated: false, setup_required: false });
+  expect(anonymous.json()).not.toHaveProperty('user');
+  for (const secret of [...secrets, anonymous.cookies[0].value])
+    expect(anonymous.body).not.toContain(secret);
+  for (const url of [
+    '/api/settings',
+    '/api/users',
+    '/api/jobs',
+    `/api/jobs/${fixtureJob.id}`,
+    '/api/subscriptions',
+    '/api/overview',
+  ]) {
+    const response = await app.inject(url);
+    expect(response.statusCode).toBe(401);
+    for (const secret of [...secrets, fixtureJob.id, 'fixture-member'])
+      expect(response.body).not.toContain(secret);
+  }
+  const headers = await login(app);
+  const sessionCookie = headers.cookie.split('=')[1]!;
+  for (const url of [
+    '/api/session',
+    '/api/settings',
+    '/api/users',
+    '/api/jobs',
+    `/api/jobs/${fixtureJob.id}`,
+    '/api/subscriptions',
+    '/api/overview',
+  ]) {
+    const response = await app.inject({ url, headers });
+    expect(response.statusCode).toBe(200);
+    for (const secret of [...secrets, sessionCookie]) expect(response.body).not.toContain(secret);
+  }
+  const revealed = await app.inject({
+    method: 'POST',
+    url: `/api/jobs/${fixtureJob.id}/credentials`,
+    headers,
+  });
+  expect(revealed.json().credentials).toEqual([
+    {
+      username: 'fixture-member',
+      password: 'private-member-password',
+      server_url: 'https://jellyfin.example',
+    },
+  ]);
+  for (const secret of secrets.filter((secret) => secret !== 'private-member-password'))
+    expect(revealed.body).not.toContain(secret);
+  expect(
+    (
+      await app.inject({ method: 'POST', url: `/api/jobs/${fixtureJob.id}/credentials`, headers })
+    ).json().credentials,
+  ).toEqual([]);
+});
+
+it('returns only browser-required user fields rather than forwarding private upstream DTO fields', async () => {
+  const app = await setup(false);
+  const factory = new DemoServers().factory;
+  app.jellyport.service.clientFactory = (url, key, kind) => {
+    const client = factory(url, key, kind);
+    const users = client.users.bind(client);
+    client.users = async () =>
+      (await users()).map((user) => ({
+        ...user,
+        AccessToken: 'private-upstream-token',
+        Password: 'private-upstream-password',
+        Sessions: [{ Id: 'private-upstream-session' }],
+        Configuration: { Token: 'private-upstream-configuration' },
+        Policy: { ...user.Policy, PluginSecret: 'private-upstream-policy' },
+      }));
+    return client;
+  };
+  app.jellyport.store.saveSettings({
+    ...app.jellyport.store.settings(),
+    emby_url: 'http://demo-emby',
+    emby_api_key: 'demo',
+  });
+  const headers = await login(app);
+  const response = await app.inject({ url: '/api/users', headers });
+  expect(response.statusCode).toBe(200);
+  expect(response.body).not.toContain('private-upstream');
+  for (const user of [...response.json().emby, ...response.json().jellyfin]) {
+    expect(Object.keys(user).sort()).toEqual(['Id', 'Name', 'Policy']);
+    expect(
+      Object.keys(user.Policy).every((key) => ['IsAdministrator', 'IsDisabled'].includes(key)),
+    ).toBe(true);
+    expect(user.Id).toBeTruthy();
+    expect(user.Name).toBeTruthy();
+  }
 });

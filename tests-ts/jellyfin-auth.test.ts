@@ -356,6 +356,170 @@ describe('Jellyfin authentication client', () => {
     expect(cancelled).toHaveBeenCalledOnce();
   });
 
+  it('cancels a response that arrives after its transport deadline', async () => {
+    let resolve!: (response: Response) => void;
+    const canceled = vi.fn();
+    const transport = vi.fn<FetchTransport>(
+      () =>
+        new Promise<Response>((done) => {
+          resolve = done;
+        }),
+    );
+    const client = new JellyfinAuthClient({ transport, timeoutMs: 15 });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'The Jellyfin authentication request timed out.',
+    });
+    resolve(new Response(new ReadableStream<Uint8Array>({ cancel: canceled })));
+    await Promise.resolve();
+    expect(canceled).toHaveBeenCalledOnce();
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it('does not await stalled stream cancellation after the read deadline', async () => {
+    const canceled = vi.fn(() => new Promise<void>(() => {}));
+    const client = new JellyfinAuthClient({
+      transport: async () => new Response(new ReadableStream<Uint8Array>({ cancel: canceled })),
+      timeoutMs: 15,
+    });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'The Jellyfin authentication request timed out.',
+    });
+    expect(canceled).toHaveBeenCalledOnce();
+  });
+
+  it('bounds immediate empty chunks without relying on a timer callback running', async () => {
+    const canceled = vi.fn();
+    const client = new JellyfinAuthClient({
+      transport: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              controller.enqueue(new Uint8Array(0));
+            },
+            cancel: canceled,
+          }),
+        ),
+      timeoutMs: 15,
+    });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'The Jellyfin authentication request timed out.',
+    });
+    expect(canceled).toHaveBeenCalledOnce();
+  });
+
+  it('accepts a valid chunked response at the exact byte ceiling without retaining each tiny chunk', async () => {
+    const maximum = 1_048_576;
+    const framing = JSON.stringify({ Id: 'server-id', Padding: '' });
+    const text = JSON.stringify({
+      Id: 'server-id',
+      Padding: 'x'.repeat(maximum - Buffer.byteLength(framing)),
+    });
+    expect(Buffer.byteLength(text)).toBe(maximum);
+    const success = successfulTransport();
+    const client = new JellyfinAuthClient({
+      transport: async (address, init) => {
+        if (!address.endsWith('/System/Info/Public')) return success(address, init);
+        const bytes = new TextEncoder().encode(text);
+        let offset = 0;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            pull(controller) {
+              if (offset === bytes.length) {
+                controller.close();
+                return;
+              }
+              const end = Math.min(bytes.length, offset + 257);
+              controller.enqueue(bytes.subarray(offset, end));
+              offset = end;
+            },
+          }),
+        );
+      },
+    });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).resolves.toEqual(identity);
+  });
+
+  it('cancels a declared oversized body before reading its stream', async () => {
+    const canceled = vi.fn();
+    const transport = vi.fn<FetchTransport>(
+      async () =>
+        new Response(new ReadableStream<Uint8Array>({ cancel: canceled }), {
+          headers: { 'Content-Length': '1048577' },
+        }),
+    );
+    const client = new JellyfinAuthClient({ transport });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'Jellyfin returned an unexpected authentication response.',
+    });
+    expect(canceled).toHaveBeenCalledOnce();
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it('bounds actual streamed bytes when the content length understates their size', async () => {
+    const canceled = vi.fn();
+    const transport = vi.fn<FetchTransport>(
+      async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array(1_048_576));
+              controller.enqueue(new Uint8Array(1));
+            },
+            cancel: canceled,
+          }),
+          { headers: { 'Content-Length': '1' } },
+        ),
+    );
+    const client = new JellyfinAuthClient({ transport });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'Jellyfin returned an unexpected authentication response.',
+    });
+    expect(canceled).toHaveBeenCalledOnce();
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it('redacts errors from a response stream and does not attach the remote error as a cause', async () => {
+    const client = new JellyfinAuthClient({
+      transport: async () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.error(new Error('private-password private-token'));
+            },
+          }),
+        ),
+    });
+    await expect(
+      client.authenticate('http://jellyfin', 'Administrator', 'password'),
+    ).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'Unable to connect to Jellyfin. Check the server address and availability.',
+    });
+    try {
+      await client.authenticate('http://jellyfin', 'Administrator', 'password');
+    } catch (error) {
+      expect((error as Error).cause).toBeUndefined();
+      expect(String(error)).not.toMatch(/private-password|private-token/);
+    }
+  });
+
   it.each([
     () => new Response('secret-invalid-json'),
     () => new Response('x', { headers: { 'Content-Length': '1048577' } }),

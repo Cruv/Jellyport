@@ -2,9 +2,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { SecretCipher } from './crypto.js';
 import { nameKey } from './identity.js';
-import { DEFAULT_SETTINGS, type Settings } from './types.js';
+import { DEFAULT_SETTINGS, DEMO_SETTINGS, type Settings } from './types.js';
 import type { Job, JobRequest, SubscriptionEvent } from './service.js';
 export { DEFAULT_SETTINGS } from './types.js';
 
@@ -41,7 +42,7 @@ export type AuthState =
 export class Store {
   readonly db: DatabaseSync;
   readonly cipher: SecretCipher;
-  constructor(directory: string) {
+  constructor(directory: string, options: { demo?: boolean } = {}) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const keyfile = join(directory, 'secret.key');
     const database = join(directory, 'jellyport.db');
@@ -77,8 +78,26 @@ export class Store {
     if (!columns.some((row) => row.name === 'pending_disabled'))
       this.db.exec('ALTER TABLE links ADD COLUMN pending_disabled INTEGER');
     // Authenticate existing settings before starting any worker or bot.
-    this.settings();
-    this.authState();
+    const settings = this.settings();
+    const auth = this.authState();
+    // A demo must never replace a real installation's settings or expose its records.
+    const recognizedDemo = !auth && isDeepStrictEqual(settings, DEMO_SETTINGS);
+    const hasData =
+      options.demo &&
+      this.db
+        .prepare(
+          `SELECT 1 FROM settings
+      UNION ALL SELECT 1 FROM jobs UNION ALL SELECT 1 FROM accounts
+      UNION ALL SELECT 1 FROM credentials UNION ALL SELECT 1 FROM links
+      UNION ALL SELECT 1 FROM subscriptions UNION ALL SELECT 1 FROM job_queue LIMIT 1`,
+        )
+        .get();
+    if (options.demo && (auth || (hasData && !recognizedDemo))) {
+      this.db.close();
+      throw new Error(
+        'Demo mode requires a separate empty data directory. Production data was not loaded.',
+      );
+    }
     for (const job of this.jobs()) {
       if (
         job.status === 'running' ||

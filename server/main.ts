@@ -15,8 +15,15 @@ import { Service } from './service.js';
 import { BotManager } from './bot.js';
 import { DemoServers } from './demo.js';
 import { ServiceError, MediaError } from './errors.js';
-import { DEFAULT_SETTINGS } from './types.js';
+import { DEMO_SETTINGS } from './types.js';
 import { SECRET_FIELDS, validateSettings } from './settings.js';
+import {
+  hostPolicy,
+  localSetupHost,
+  privateAddress,
+  sameOrigin,
+  WindowLimiter,
+} from './security.js';
 import type { ClientFactory, MediaUser } from './media.js';
 import {
   JellyfinAuthClient,
@@ -31,6 +38,7 @@ const COOKIE = 'jellyport_session';
 const CSP =
   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 interface Session {
+  address: string;
   authenticated: boolean;
   csrf_token: string;
   expires: number;
@@ -56,6 +64,7 @@ export interface CreateAppOptions {
   clientFactory?: ClientFactory;
   staticDir?: string;
   authClient?: JellyfinAuthentication;
+  allowedHosts?: string[];
 }
 export type JellyportApp = FastifyInstance & {
   jellyport: { store: Store; service: Service; bot: BotManager };
@@ -96,7 +105,14 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   const demo = options.demo ?? process.env.JELLYPORT_DEMO === 'true';
   const demoPassword = options.demoPassword ?? 'demo-jellyport';
   const secureCookie = options.secureCookie ?? process.env.JELLYPORT_SECURE_COOKIE === 'true';
-  const store = new Store(options.dataDir ?? process.env.JELLYPORT_DATA_DIR ?? './data');
+  const allowedHost = hostPolicy(
+    options.allowedHosts ??
+      (process.env.JELLYPORT_ALLOWED_HOSTS ?? '')
+        .split(',')
+        .map((value) => value.trim())
+        .filter(Boolean),
+  );
+  const store = new Store(options.dataDir ?? process.env.JELLYPORT_DATA_DIR ?? './data', { demo });
   const authClient = options.authClient ?? new JellyfinAuthClient();
   if (!demo) store.ensureAuthState();
   const salt = randomBytes(16);
@@ -104,15 +120,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   let clientFactory = options.clientFactory;
   if (demo) {
     const servers = new DemoServers();
-    store.saveSettings({
-      ...structuredClone(DEFAULT_SETTINGS),
-      emby_url: 'http://demo-emby',
-      emby_api_key: 'demo',
-      jellyfin_url: 'http://demo-jellyfin',
-      jellyfin_api_key: 'demo',
-      jellyfin_public_url: 'https://jellyfin.example.com',
-      template_user_id: 'template',
-    });
+    store.saveSettings(structuredClone(DEMO_SETTINGS));
     clientFactory = servers.factory;
   }
   const service = new Service(store, { demo, clientFactory });
@@ -122,18 +130,36 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     logger: false,
     bodyLimit: 65536,
     trustProxy: false,
+    requestTimeout: 30_000,
+    connectionTimeout: 30_000,
+    keepAliveTimeout: 5_000,
+    maxRequestsPerSocket: 100,
     ajv: { customOptions: { coerceTypes: false, removeAdditional: false, useDefaults: false } },
   }) as unknown as JellyportApp;
+  app.server.headersTimeout = 15_000;
   app.decorate('jellyport', { store, service, bot });
   const sessions = new Map<string, Session>();
-  const attempts = new Map<string, number[]>();
+  const anonymousSessions = new Map<string, Session>();
+  const authenticatedSessions = new Map<string, Session>();
+  const addresses = new Map<string, Set<string>>();
+  const attempts = new WindowLimiter(10);
+  const allocations = new WindowLimiter(60);
   await app.register(cookie);
 
+  function removeSession(sid: string): Session | undefined {
+    const value = sessions.get(sid);
+    if (!value) return undefined;
+    sessions.delete(sid);
+    authenticatedSessions.delete(sid);
+    anonymousSessions.delete(sid);
+    const owned = addresses.get(value.address);
+    owned?.delete(sid);
+    if (owned?.size === 0) addresses.delete(value.address);
+    return value;
+  }
   function forget(request: FastifyRequest): Session | undefined {
     const sid = request.cookies[COOKIE] ?? '';
-    const value = sessions.get(sid);
-    sessions.delete(sid);
-    return value;
+    return removeSession(sid);
   }
   async function revoke(value?: Session): Promise<void> {
     if (demo || !value) return;
@@ -147,7 +173,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     const sid = request.cookies[COOKIE];
     const value = sid ? sessions.get(sid) : undefined;
     if (value && value.expires <= Date.now()) {
-      sessions.delete(sid!);
+      removeSession(sid!);
       void revoke(value);
       return undefined;
     }
@@ -185,25 +211,45 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         statusCode: 403,
       });
   }
-  function newSession(reply: FastifyReply, attributes: Partial<Session> = {}) {
-    for (const [sid, value] of sessions)
-      if (value.expires <= Date.now()) {
-        sessions.delete(sid);
-        void revoke(value);
+  function newSession(
+    request: FastifyRequest,
+    reply: FastifyReply,
+    attributes: Partial<Session> = {},
+  ) {
+    if (!attributes.authenticated) {
+      for (const sid of addresses.get(request.ip) ?? []) {
+        const value = sessions.get(sid);
+        if (value && value.expires <= Date.now()) void revoke(removeSession(sid));
       }
-    if (sessions.size >= 10000)
-      throw Object.assign(new Error('Too many active sessions. Try again later.'), {
-        statusCode: 503,
-      });
+      const full = (addresses.get(request.ip)?.size ?? 0) >= 30;
+      if (full || !allocations.allow(request.ip)) {
+        reply.header('Retry-After', full ? '1800' : '600');
+        throw Object.assign(
+          new Error('Too many new sessions. Reuse your browser session or try again later.'),
+          { statusCode: 429 },
+        );
+      }
+    }
+    // Anonymous visitors cannot consume the separate administrator session capacity.
+    const pool = attributes.authenticated ? authenticatedSessions : anonymousSessions;
+    if (pool.size >= (attributes.authenticated ? 1000 : 2000))
+      void revoke(removeSession(pool.keys().next().value!));
     const sid = randomBytes(32).toString('base64url');
     const age = attributes.authenticated ? 28800 : 1800;
     const value: Session = {
+      address: request.ip,
       authenticated: false,
       csrf_token: randomBytes(32).toString('base64url'),
       expires: Date.now() + age * 1000,
       ...attributes,
     };
     sessions.set(sid, value);
+    pool.set(sid, value);
+    if (!value.authenticated) {
+      const owned = addresses.get(request.ip) ?? new Set<string>();
+      owned.add(sid);
+      addresses.set(request.ip, owned);
+    }
     reply.setCookie(COOKIE, sid, {
       path: '/',
       httpOnly: true,
@@ -214,16 +260,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     return sessionView(value);
   }
   function rateLimit(request: FastifyRequest) {
-    const now = Date.now();
-    for (const [address, times] of attempts)
-      if (!times.some((time) => time > now - 600000)) attempts.delete(address);
-    const recent = (attempts.get(request.ip) ?? []).filter((time) => time > now - 600000);
-    if (recent.length >= 10 || (!attempts.has(request.ip) && attempts.size >= 10000))
+    if (!attempts.allow(request.ip))
       throw Object.assign(new Error('Too many sign-in attempts. Wait ten minutes.'), {
         statusCode: 429,
       });
-    recent.push(now);
-    attempts.set(request.ip, recent);
   }
   async function authorize(request: FastifyRequest): Promise<Session> {
     const value = session(request);
@@ -274,9 +314,31 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       'Referrer-Policy': 'no-referrer',
       'Content-Security-Policy': CSP,
     });
+    const host = request.headers.host ?? '';
+    if (!allowedHost(host))
+      throw new JellyfinAuthError(
+        'This hostname is not allowed. Configure JELLYPORT_ALLOWED_HOSTS for your reverse proxy hostname.',
+        403,
+      );
     // Use the matched route so encoded aliases receive identical authorization.
     const path = request.routeOptions.url ?? '';
     if (!path.startsWith('/api/')) return;
+    const origin = request.headers.origin;
+    if (
+      (origin !== undefined && !sameOrigin(host, origin)) ||
+      request.headers['sec-fetch-site'] === 'cross-site'
+    )
+      throw new JellyfinAuthError('Cross-site requests are not allowed.', 403);
+    if (
+      !demo &&
+      store.authState()?.kind === 'pending' &&
+      (path === '/api/session' || path.startsWith('/api/setup')) &&
+      (!privateAddress(request.ip) || !localSetupHost(host))
+    )
+      throw new JellyfinAuthError(
+        'Complete first-time setup through a trusted local network address or localhost.',
+        403,
+      );
     if (path === '/api/session' && request.method === 'GET') return;
     if (
       ['/api/login', '/api/logout', '/api/setup/connect', '/api/setup/complete'].includes(path) &&
@@ -321,7 +383,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       }
     }
     const current = session(request);
-    return current ? sessionView(current) : newSession(reply);
+    return current ? sessionView(current) : newSession(request, reply);
   });
   const credentialsSchema = {
     username: { type: 'string', minLength: 1, maxLength: 256 },
@@ -373,12 +435,19 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         throw new JellyfinAuthError('Session ended. Reload the page.', 401);
       void revoke(forget(request));
       attempts.delete(request.ip);
-      return newSession(reply, { authenticated: true, identity });
+      return newSession(request, reply, { authenticated: true, identity });
     },
   );
   app.post('/api/logout', async (request, reply) => {
-    await revoke(forget(request));
-    return newSession(reply);
+    const value = forget(request);
+    reply.clearCookie(COOKIE, {
+      path: '/',
+      httpOnly: true,
+      secure: secureCookie,
+      sameSite: 'strict',
+    });
+    await revoke(value);
+    return newSession(request, reply);
   });
   function pendingConnection(request: FastifyRequest) {
     const value = session(request)?.connection;
@@ -483,7 +552,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             403,
           );
         void revoke(forget(request));
-        const view = newSession(reply, {
+        const view = newSession(request, reply, {
           connection: { identity, serverUrl, generation: state.generation },
         });
         const settings = store.settings();
@@ -582,7 +651,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         throw error;
       }
       forget(request); // Transfer the interactive token to the newly rotated authenticated cookie.
-      const result = newSession(reply, { authenticated: true, identity: connection.identity });
+      const result = newSession(request, reply, {
+        authenticated: true,
+        identity: connection.identity,
+      });
       await service.start();
       await bot.restart(store.settings());
       return result;
@@ -664,7 +736,28 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       refreshingKey = false;
     }
   });
-  app.get('/api/users', async () => service.users());
+  app.get('/api/users', async () => {
+    const users = await service.users();
+    // Only the fields used by the interface cross the browser boundary. Upstream user
+    // DTOs can contain private configuration and new fields added by server plugins.
+    const summary = (user: MediaUser) => ({
+      Id: user.Id,
+      Name: user.Name,
+      Policy: {
+        ...(typeof user.Policy?.IsAdministrator === 'boolean'
+          ? { IsAdministrator: user.Policy.IsAdministrator }
+          : {}),
+        ...(typeof user.Policy?.IsDisabled === 'boolean'
+          ? { IsDisabled: user.Policy.IsDisabled }
+          : {}),
+      },
+    });
+    return {
+      emby: users.emby.map(summary),
+      jellyfin: users.jellyfin.map(summary),
+      errors: users.errors,
+    };
+  });
   app.post('/api/connections/test', async () => service.connections());
   app.get('/api/overview', async () => {
     const connections = await service.connections();
@@ -785,7 +878,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       store.purgeExpired();
       for (const [sid, value] of sessions)
         if (value.expires <= Date.now()) {
-          sessions.delete(sid);
+          removeSession(sid);
           await revoke(value);
         }
       if (!demo && store.authState()?.kind === 'configured') await service.reconcileMemberships();
@@ -802,6 +895,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     await upkeep;
     await Promise.all([...sessions.values()].map((value) => revoke(value)));
     sessions.clear();
+    anonymousSessions.clear();
+    authenticatedSessions.clear();
+    addresses.clear();
+    allocations.clear();
     store.close();
     attempts.clear();
   });

@@ -7,6 +7,7 @@ services:
     environment:
       - JELLYPORT_DATA_DIR=/data
       - JELLYPORT_SECURE_COOKIE=false # Set true when accessing through HTTPS.
+      - JELLYPORT_ALLOWED_HOSTS=${JELLYPORT_ALLOWED_HOSTS:-} # Optional proxy/custom DNS hostnames.
       - TZ=Etc/UTC # Optional; use your timezone.
     volumes:
       - "/path/to/jellyport:/data" # Application database and encryption key.
@@ -18,6 +19,10 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    pids_limit: 128
     networks:
       - media-network
 

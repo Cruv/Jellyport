@@ -418,8 +418,31 @@ export default function App() {
   }
   function logout() {
     void work('logout', async () => {
-      await api('/api/logout', { method: 'POST', body: {} });
-      clearSession();
+      let anonymous: Session = {
+        authenticated: false,
+        csrf_token: '',
+        demo: !!sessionRef.current?.demo,
+        setup_required: false,
+        setup_connected: false,
+      };
+      let error = '';
+      try {
+        const value = await api<Session>('/api/logout', {
+          method: 'POST',
+          body: {},
+          signal: AbortSignal.timeout(10_000),
+        });
+        anonymous = { ...value, authenticated: false, user: undefined };
+      } catch (reason) {
+        error =
+          'Private data was cleared from this page, but server sign-out could not be confirmed. ' +
+          message(reason);
+      } finally {
+        clearSession();
+        setLoginError(error);
+        // Avoid an automatic session refresh restoring private UI after a failed logout.
+        acceptSession(anonymous);
+      }
     });
   }
   function apply(event: SubscriptionEvent) {

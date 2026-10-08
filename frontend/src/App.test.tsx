@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import App from './App';
 import type { Job, Session, Settings, SetupConnection } from './types';
 
@@ -226,6 +226,113 @@ describe('React account safeguards', () => {
     await screen.findByText('Welcome back');
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.queryByText('<script>bad()</script>')).toBeNull();
+  });
+
+  it.each(['network', 'service', 'allocation'] as const)(
+    'clears private credentials after a %s logout failure without restoring the old session',
+    async (failure) => {
+      await openJob();
+      fireEvent.click(screen.getByRole('button', { name: 'Reveal new credentials' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Reveal credentials' }));
+      await screen.findByText('one-time-secret');
+      const fetch = vi.mocked(globalThis.fetch);
+      const original = fetch.getMockImplementation()!;
+      fetch.mockImplementation(async (input, options) => {
+        if (String(input) === '/api/logout') {
+          if (failure === 'network') throw new TypeError('Synthetic connection failure.');
+          return {
+            ok: false,
+            status: failure === 'service' ? 503 : 429,
+            json: async () => ({
+              detail: failure === 'service' ? 'Service unavailable.' : 'Too many new sessions.',
+            }),
+          } as Response;
+        }
+        return original(input, options);
+      });
+      const previousSessionRequests = requests.filter(
+        (request) => request.path === '/api/session',
+      ).length;
+      fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+      await screen.findByText('Welcome back');
+      expect(screen.getByRole('alert').textContent).toContain(
+        'server sign-out could not be confirmed',
+      );
+      expect(screen.queryByText('one-time-secret')).toBeNull();
+      expect(screen.queryByText('<script>bad()</script>')).toBeNull();
+      expect(screen.queryByText('jellyfin-admin')).toBeNull();
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(requests.filter((request) => request.path === '/api/session')).toHaveLength(
+        previousSessionRequests,
+      );
+      expect(localStorage.length).toBe(0);
+      expect(sessionStorage.length).toBe(0);
+    },
+  );
+
+  it('does not restore private dialogs from a credential response arriving after failed logout', async () => {
+    await openJob();
+    fireEvent.click(screen.getByRole('button', { name: 'Reveal new credentials' }));
+    let resolve!: (value: unknown) => void;
+    const fetch = vi.mocked(globalThis.fetch);
+    const original = fetch.getMockImplementation()!;
+    fetch.mockImplementation(async (input, options) => {
+      if (String(input).endsWith('/credentials'))
+        return {
+          ok: true,
+          status: 200,
+          json: () =>
+            new Promise((done) => {
+              resolve = done;
+            }),
+        } as Response;
+      if (String(input) === '/api/logout') throw new TypeError('Synthetic connection failure.');
+      return original(input, options);
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Reveal credentials' }));
+    await waitFor(() => expect(resolve).toBeTypeOf('function'));
+    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await screen.findByText('Welcome back');
+    await act(async () => {
+      resolve({
+        credentials: [{ username: 'late-private-user', password: 'late-private-password' }],
+      });
+    });
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Revealing…' })).toBeNull());
+    expect(screen.queryByText('late-private-user')).toBeNull();
+    expect(screen.queryByText('late-private-password')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByText('Everyone’s next chapter.')).toBeNull();
+    expect(screen.getByRole('alert').textContent).toContain(
+      'server sign-out could not be confirmed',
+    );
+  });
+
+  it('requires fresh credential verification after a failed logout even when the server retains its session', async () => {
+    await openJob();
+    const fetch = vi.mocked(globalThis.fetch);
+    const original = fetch.getMockImplementation()!;
+    fetch.mockImplementation(async (input, options) => {
+      if (String(input) === '/api/logout') throw new TypeError('Synthetic connection failure.');
+      return original(input, options);
+    });
+    responses['/api/login'] = { detail: 'Incorrect credentials.' };
+    statuses['/api/login'] = 401;
+    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await screen.findByText('Welcome back');
+    fireEvent.change(screen.getByLabelText('Jellyfin username'), {
+      target: { value: 'jellyfin-admin' },
+    });
+    fireEvent.change(screen.getByLabelText('Jellyfin password'), {
+      target: { value: 'incorrect' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    await waitFor(() =>
+      expect(screen.getByRole('alert').textContent).toBe('Incorrect credentials.'),
+    );
+    expect(screen.queryByText('Everyone’s next chapter.')).toBeNull();
+    expect(screen.queryByText('<script>bad()</script>')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
   });
   it('previews selected users and preserves optional Discord links in a bulk migration', async () => {
     responses['/api/users'] = {

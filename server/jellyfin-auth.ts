@@ -126,6 +126,11 @@ async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise
   });
 }
 
+function cancelBody(response: Response | undefined): void {
+  // Never wait on cancellation supplied by a remote or custom response stream.
+  if (response?.body) void response.body.cancel().catch(() => {});
+}
+
 /** Passwords are submitted once to Jellyfin, and only the returned token leaves this client. */
 export class JellyfinAuthClient implements JellyfinAuthentication {
   private readonly transport: FetchTransport;
@@ -163,32 +168,38 @@ export class JellyfinAuthClient implements JellyfinAuthentication {
     if (options.accessToken !== undefined && !token(options.accessToken))
       throw new JellyfinAuthError('The Jellyfin session is invalid. Sign in again.', 401);
     const controller = new AbortController();
+    const deadline = Date.now() + this.timeoutMs;
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     timer.unref();
     let response: Response | undefined;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
-      response = await abortable(
-        this.transport(address.toString(), {
-          method,
-          redirect: 'manual',
-          headers: {
-            Accept: 'application/json',
-            'User-Agent': 'Jellyport/0.3.0',
-            ...(options.deviceId || options.accessToken
-              ? {
-                  Authorization: options.deviceId
-                    ? `MediaBrowser Client="Jellyport", Device="Jellyport", DeviceId="${options.deviceId}", Version="0.3.0"`
-                    : `MediaBrowser Token="${options.accessToken}"`,
-                }
-              : {}),
-            ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
-          },
-          ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
-          signal: controller.signal,
-        }),
-        controller.signal,
+      const pending = this.transport(address.toString(), {
+        method,
+        redirect: 'manual',
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': 'Jellyport/0.3.0',
+          ...(options.deviceId || options.accessToken
+            ? {
+                Authorization: options.deviceId
+                  ? `MediaBrowser Client="Jellyport", Device="Jellyport", DeviceId="${options.deviceId}", Version="0.3.0"`
+                  : `MediaBrowser Token="${options.accessToken}"`,
+              }
+            : {}),
+          ...(options.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
+        },
+        ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+        signal: controller.signal,
+      });
+      // Custom transports can resolve after their deadline; dispose of any late body.
+      void pending.then(
+        (late) => {
+          if (controller.signal.aborted) cancelBody(late);
+        },
+        () => {},
       );
+      response = await abortable(pending, controller.signal);
       if (!response.ok) {
         if (response.status === 401)
           throw new JellyfinAuthError(
@@ -208,20 +219,39 @@ export class JellyfinAuthClient implements JellyfinAuthentication {
         throw invalidResponse();
       if (!response.body) throw invalidResponse();
       reader = response.body.getReader();
-      const chunks: Uint8Array[] = [];
+      let buffer = Buffer.allocUnsafe(Math.min(64 * 1024, MAX_RESPONSE_BYTES));
       let bytes = 0;
       while (true) {
+        // Empty or immediately available chunks cannot starve the timeout callback.
+        if (Date.now() >= deadline) {
+          controller.abort();
+          throw controller.signal.reason;
+        }
         const chunk = await abortable(reader.read(), controller.signal);
         if (chunk.done) break;
-        bytes += chunk.value.byteLength;
-        if (bytes > MAX_RESPONSE_BYTES) throw invalidResponse();
-        chunks.push(chunk.value);
+        const nextSize = bytes + chunk.value.byteLength;
+        if (nextSize > MAX_RESPONSE_BYTES) throw invalidResponse();
+        if (nextSize > buffer.length) {
+          const expanded = Buffer.allocUnsafe(
+            Math.min(MAX_RESPONSE_BYTES, Math.max(nextSize, buffer.length * 2)),
+          );
+          buffer.copy(expanded, 0, 0, bytes);
+          buffer = expanded;
+        }
+        buffer.set(chunk.value, bytes);
+        bytes = nextSize;
       }
+      let result: unknown;
       try {
-        return JSON.parse(Buffer.concat(chunks, bytes).toString('utf8'));
+        result = JSON.parse(buffer.subarray(0, bytes).toString('utf8'));
       } catch {
         throw invalidResponse();
       }
+      if (Date.now() >= deadline) {
+        controller.abort();
+        throw controller.signal.reason;
+      }
+      return result;
     } catch (error) {
       if (error instanceof JellyfinAuthError) throw error;
       throw new JellyfinAuthError(
@@ -235,10 +265,12 @@ export class JellyfinAuthClient implements JellyfinAuthentication {
       // Do not await cancellation: a stalled custom response must not bypass the deadline.
       if (reader) {
         void reader.cancel().catch(() => {});
-        reader.releaseLock();
-      } else if (response?.body) {
-        void response.body.cancel().catch(() => {});
-      }
+        try {
+          reader.releaseLock();
+        } catch {
+          /* A canceled read may still be settling. */
+        }
+      } else cancelBody(response);
     }
   }
 

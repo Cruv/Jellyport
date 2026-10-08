@@ -2,6 +2,8 @@ name: Checks
 on:
   push:
   pull_request:
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -9,8 +11,10 @@ jobs:
       matrix:
         node: [22, 24]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -22,8 +26,10 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
       - name: Validate Compose examples
@@ -45,6 +51,7 @@ jobs:
           sudo chmod 700 "${RUNNER_TEMP}/jellyport-bind"
           docker run -d --name jellyport-bind-ci --user 1000:1000 \
             --cap-drop ALL --security-opt no-new-privileges:true \
+            --read-only --tmpfs /tmp:rw,noexec,nosuid,size=16m --pids-limit 128 \
             -p 127.0.0.1:8174:8000 \
             -e TZ=Etc/UTC -e JELLYPORT_DEMO=true \
             -v "${RUNNER_TEMP}/jellyport-bind:/data" jellyport:ci

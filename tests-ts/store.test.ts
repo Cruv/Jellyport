@@ -178,3 +178,164 @@ describe('persistent operational state', () => {
     }
   });
 });
+
+describe('demo and production data isolation', () => {
+  const demoSettings = {
+    ...DEFAULT_SETTINGS,
+    emby_url: 'http://demo-emby',
+    emby_api_key: 'demo',
+    jellyfin_url: 'http://demo-jellyfin',
+    jellyfin_api_key: 'demo',
+    jellyfin_public_url: 'https://jellyfin.example.com',
+    template_user_id: 'template',
+  };
+  const tables = [
+    'settings',
+    'auth_state',
+    'jobs',
+    'accounts',
+    'credentials',
+    'links',
+    'subscriptions',
+    'job_queue',
+  ] as const;
+  function snapshot(db: DatabaseSync) {
+    return Object.fromEntries(
+      tables.map((table) => [table, db.prepare(`SELECT * FROM ${table}`).all()]),
+    );
+  }
+  function assertRejectedWithoutChanges(path: string, original: Store) {
+    const before = snapshot(original.db);
+    original.close();
+    let unexpectedDemo: Store | undefined;
+    try {
+      expect(() => {
+        unexpectedDemo = new Store(path, { demo: true });
+      }).toThrow('Demo mode requires a separate empty data directory');
+    } finally {
+      unexpectedDemo?.close();
+    }
+    const db = new DatabaseSync(join(path, 'jellyport.db'), { readOnly: true });
+    try {
+      expect(snapshot(db)).toEqual(before);
+    } finally {
+      db.close();
+    }
+  }
+  function privateRecords(store: Store) {
+    store.saveJob(job('running'));
+    store.saveAccount('private-member', 'private-remote-id', 'provisioning', 'private-password');
+    store.saveCredentials('job-1', 'private-member', 'private-password', 'https://private.example');
+    store.db.prepare('UPDATE accounts SET expires=0').run();
+    store.db.prepare('UPDATE credentials SET expires=0').run();
+    store.saveLink('123456', 'private-member', 'private-remote-id');
+    store.saveSubscription({
+      id: 'private-event',
+      action: 'expire',
+      status: 'processing',
+      created_at: '2026-10-07',
+    });
+  }
+
+  it.each(['pending', 'configured'] as const)(
+    'rejects a production %s authentication binding before touching any user records',
+    (kind) => {
+      const path = directory();
+      const store = new Store(path);
+      store.saveSettings(demoSettings);
+      const state = store.ensureAuthState();
+      if (state.kind !== 'pending') throw new Error('Expected fixture pending state');
+      if (kind === 'configured')
+        store.completeAuth(
+          state.generation,
+          {
+            kind: 'configured',
+            serverUrl: 'https://private.example',
+            serverId: 'private-server-id',
+            apiKeyName: 'private-key-name',
+          },
+          (settings) => settings,
+        );
+      privateRecords(store);
+      assertRejectedWithoutChanges(path, store);
+    },
+  );
+
+  it('rejects legacy production settings with no authentication binding and preserves jobs, subscriptions and expired secrets', () => {
+    const path = directory();
+    const store = new Store(path);
+    store.saveSettings({
+      ...DEFAULT_SETTINGS,
+      emby_url: 'https://private-emby.example',
+      emby_api_key: 'private-api-key',
+    });
+    privateRecords(store);
+    assertRejectedWithoutChanges(path, store);
+  });
+
+  it.each(['jobs', 'accounts', 'credentials', 'links', 'subscriptions', 'job_queue'] as const)(
+    'rejects blank settings with preexisting %s records',
+    (table) => {
+      const path = directory();
+      const store = new Store(path);
+      store.saveSettings(DEFAULT_SETTINGS);
+      if (table === 'jobs') store.saveJob(job('running'));
+      if (table === 'accounts')
+        store.saveAccount('private-member', 'private-id', 'provisioning', 'private-password');
+      if (table === 'credentials')
+        store.saveCredentials(
+          'private-job',
+          'private-member',
+          'private-password',
+          'https://private.example',
+        );
+      if (table === 'links') store.saveLink('123456', 'private-member', 'private-id');
+      if (table === 'subscriptions')
+        store.saveSubscription({
+          id: 'private-event',
+          action: 'expire',
+          status: 'processing',
+          created_at: '2026-10-07',
+        });
+      if (table === 'job_queue')
+        store.db
+          .prepare('INSERT INTO job_queue VALUES (?,?)')
+          .run(
+            'private-queued-job',
+            store.encrypt({
+              requests: [{ username: 'private-member' }],
+              settings: DEFAULT_SETTINGS,
+            }),
+          );
+      assertRejectedWithoutChanges(path, store);
+    },
+  );
+
+  it('accepts a fresh directory and recognized isolated demo fixtures on repeat startup', () => {
+    const path = directory();
+    let store = new Store(path, { demo: true });
+    store.saveSettings(demoSettings);
+    store.saveJob(job('completed'));
+    store.close();
+    store = new Store(path, { demo: true });
+    try {
+      expect(store.settings()).toEqual(demoSettings);
+      expect(store.job('job-1')?.status).toBe('completed');
+      expect(store.authState()).toBeNull();
+    } finally {
+      store.close();
+    }
+  });
+
+  it.each([
+    { emby_url: '' },
+    { jellyfin_api_key: 'private-api-key' },
+    { discord_bot_token: 'private-bot-token' },
+    { jellyfin_public_url: 'https://private.example' },
+  ])('rejects incomplete or modified legacy demo settings: %j', (change) => {
+    const path = directory();
+    const store = new Store(path);
+    store.saveSettings({ ...demoSettings, ...change });
+    assertRejectedWithoutChanges(path, store);
+  });
+});

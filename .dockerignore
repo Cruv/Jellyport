@@ -1,6 +1,11 @@
 .git
 .venv
 .env
+**/.env*
+*.db
+*.sqlite*
+secret.key
+setup.code
 data
 __pycache__
 .pytest_cache

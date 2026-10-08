@@ -868,6 +868,59 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     return { credentials: store.takeCredentials(job.id) };
   });
   app.get('/api/subscriptions', async () => ({ events: store.subscriptions() }));
+  app.get('/api/memberships', async () => ({ memberships: service.listMemberships() }));
+  app.post<{
+    Body: {
+      discord_user_id: string;
+      tier_id: string;
+      expected_revision?: string;
+      expected_account_limit?: number;
+      expected_usernames?: string[];
+    };
+  }>(
+    '/api/memberships/provision',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['discord_user_id', 'tier_id'],
+          properties: {
+            discord_user_id: { type: 'string', pattern: '^[0-9]{5,22}$' },
+            tier_id: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' },
+            expected_revision: id,
+            expected_account_limit: { type: 'integer', minimum: 1, maximum: 3 },
+            expected_usernames: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 3,
+              items: { type: 'string', minLength: 1, maxLength: 64 },
+            },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const input = request.body;
+      if ((input.expected_account_limit === undefined) !== (input.expected_usernames === undefined))
+        throw new ServiceError(
+          'Review both the account allowance and account names before applying.',
+        );
+      return reply.code(202).send(
+        await service.provisionMembership(
+          input.discord_user_id,
+          input.tier_id,
+          input.expected_revision,
+          input.expected_account_limit === undefined
+            ? undefined
+            : {
+                account_limit: input.expected_account_limit,
+                usernames: input.expected_usernames!,
+              },
+        ),
+      );
+    },
+  );
   app.post<{ Params: { event_id: string } }>(
     '/api/subscriptions/:event_id/apply',
     async (request) => service.applySubscription(request.params.event_id),

@@ -19,11 +19,14 @@ Configure an optional membership role ID to require recipients to hold your MEE6
 
 ```text
 /jellyport create user:@jlogan35
+/jellyport create user:@jlogan35 tier:brigantine
 /jellyport migrate user:@jlogan35 emby_username:jlogan35
 /jellyport status job_id:YOUR_JOB_ID
 ```
 
-Create uses the recipient's current Discord username, `member.user.username`. Its optional `username` argument is only a confirmation and must match exactly. For members with an approved user mapping, use migrate instead: it selects the mapped Emby account by verified Discord ID and uses the saved Jellyfin destination. Otherwise, migration's optional `emby_username` selects an exact source username, defaulting to the member's current Discord username. A conflicting explicit source is rejected.
+Create provisions the recipient's full account allowance. Its optional `tier` argument selects a configured membership tier; omitting it preserves a saved tier or uses the initial default for a new member. New account names begin with the recipient's current Discord username, `member.user.username`, followed by `_2` and `_3` for additional slots. Existing links and approved slot mappings preserve their saved destination names. Its optional `username` argument is only a confirmation of the current Discord username and must match exactly.
+
+Migration selects a saved Emby mapping by verified Discord ID. When the owner has several mappings, specify the exact `emby_username` to choose the account; an ambiguous command is rejected. An explicit source must belong to one of that owner's approved mappings. Without a mapping, the optional argument selects an exact source username, defaulting to the member's current Discord username, subject to the usual ownership checks.
 
 The first identity link requires matching usernames or an administrator-approved mapping with that verified Discord ID. Set name exceptions under **User mappings** in the web app. A manually entered Discord name without an ID is an unverified label and never selects a command recipient or authorizes an account link. Nicknames and display names are not identities.
 
@@ -32,6 +35,8 @@ The first identity link requires matching usernames or an administrator-approved
 The Discord member picker is available in **User mappings**, migration previews, fresh account creation, and incomplete-account recovery. Search by a prefix of the member's actual username or server nickname, then select the matching result. Search does not use fuzzy matching or display-name queries. Each result shows the actual `@username`, display name, and server nickname; check the actual username before selecting a similar-looking result.
 
 Selection fills the Discord ID automatically. Fresh account creation also fills the current Discord username. Saving a user mapping retains the verified identity for future migrations and membership actions. A saved mapping's recipient is fixed in the migration preview; change it on **User mappings** instead of overriding it for one job. The bot rechecks the selected member before sensitive actions, so a search result does not bypass membership checks.
+
+One verified Discord member can own three separate account slots. Choose slot 1, 2, or 3 in **User mappings** when the account names differ. Each slot can have one approved source and destination mapping. Account history remains separate; sharing the Discord owner does not merge the accounts or their data.
 
 An advanced manual ID fallback remains available when you already know the member's ID. User mappings also allow a manual username label; a label alone is not a verified identity. Searching starts on interaction with the picker, so a bulk migration preview does not perform a Discord lookup for every user on opening. The slash command's `user:@member` selector also supplies the ID without manual entry.
 
@@ -58,17 +63,27 @@ Bad news captain! jlogan35  just cancelled their subscription.
 
 An actual Discord mention such as `<@USER_ID>` is resolved by ID. A plain username must uniquely match a current member's exact Discord username; aliases are ignored. Unresolved identities are recorded for review and cannot trigger automatic account changes. Announcement text in embed titles or descriptions is not currently parsed. Other message formats need a parser update rather than being interpreted loosely.
 
+Automatic tier changes require a new recognized announcement containing the plan name. A shared active-member role cannot identify whether someone pays for one, two, or three accounts. If MEE6 does not announce an upgrade or downgrade in the recognized format, apply the new tier through **Memberships**.
+
 To observe membership role events, set `discord_member_role_id` to the role representing **currently entitled access**, then enable role events. Adding it produces a subscribe event; removing it or leaving the server produces an expire event. Configure MEE6's role behavior so this role remains active for the entire paid access period if you want expiration to follow that period.
 
 ## Review before enabling automatic actions
 
 All automatic actions start disabled. Recognized events enter the web app's subscription queue, where you can apply or ignore them. An unresolved event requires a verified manual account action rather than an automatic username guess.
 
-Enabling automatic provisioning applies resolved subscribe events. For an unlinked member with a verified mapping, Jellyport migrates the mapped source to its approved destination. Otherwise it migrates an exact matching Emby user when present, or creates a fresh Jellyfin account using the configured default account role or optional legacy template. Configure one of these defaults in Settings before provisioning. An existing unmapped Jellyfin account requires an admin-approved migration to establish ownership first. Once linked, returning members can regain access to the same account if Jellyport disabled it. Saving a mapping alone does not establish the lifecycle link; the approved migration does.
+Configure membership tiers in Settings before enabling automatic provisioning. Defaults map `Sloop Crewman Plan` to one account, `Brigantine Crewman Plan` to two, and `Galleon Crewman Plan` to three. Plan names are matched exactly apart from capitalization and surrounding whitespace. Unknown plan names remain for review instead of being assigned an allowance. A generic membership role event does not identify a plan; it keeps a saved tier or uses an initial one-account tier for a new member. With no one-account tier configured, select the tier explicitly in the web app or an administrator command.
+
+Enabling automatic provisioning applies resolved subscribe events to the member's account allowance. Each missing slot migrates its approved mapping or an exact matching Emby username, or creates a fresh Jellyfin account using the configured default account role or optional legacy template. Configure one of these defaults in Settings before provisioning. New numbered accounts use `_2` and `_3`; existing links and mapped names are preserved. Every new account has a separately generated password delivered to the same Discord owner.
+
+An existing unmapped Jellyfin account requires an admin-approved migration to establish ownership first. Once linked, returning members can regain access to the same accounts if Jellyport disabled them. Saving a mapping alone does not establish the lifecycle link; the approved migration does. Use **Memberships** to review and apply upgrades and downgrades manually, with automatic actions left disabled.
+
+Downgrading disables extra slots and keeps all their data. Upgrading later can re-enable those same slots rather than replacing the accounts. Downgrades do not reset passwords or copy another user's history. Automatic subscription downgrades require both automatic provisioning and automatic disabling; with only automatic provisioning enabled, the downgrade remains for review. Manually approving the update applies the downgrade regardless of those switches.
 
 Jellyport account roles are saved permission/preference presets, separate from Discord subscriber roles. The default account role supplies settings for new accounts, including shared server-backed Home preferences used by Web and compatible TV/mobile apps, and takes precedence over portable Emby preferences. Updating or assigning a saved account role does not automatically change existing members' settings; use the web interface to review and apply selected groups. Returning members keep their existing settings when access is restored. Automatic Discord subscription-tier-to-account-role mapping is not implemented. See [account roles and defaults](../README.md#account-roles-and-defaults).
 
-Enabling automatic disabling applies expire events to linked accounts. Cancellation announcements remain for review by default: cancelling renewal does not establish when paid access ends. The separate “disable on cancellation” option also applies cancellations immediately when automatic disabling is enabled. Manually applying a cancellation event disables its linked account immediately, regardless of that automatic-action option.
+Enabling automatic disabling applies expire events to every linked account slot. Cancellation announcements remain for review by default: cancelling renewal does not establish when paid access ends. The separate “disable on cancellation” option also applies cancellations immediately when automatic disabling is enabled. Manually applying a cancellation event disables all of the member's linked account slots immediately, regardless of that automatic-action option.
+
+An applied cancellation remains a hold even if MEE6 leaves the member's active role in place. Routine role reconciliation cannot undo it. A new recognized subscription event, a fresh role-add event, or an administrator's membership update can restore the entitled accounts.
 
 Disabling changes account access while preserving passwords and watched history. Jellyfin administrators and any selected legacy template user are protected. Accounts disabled independently by an administrator are not automatically re-enabled. Missing or changed links and unavailable membership checks are recorded for review instead of assuming an account may be changed.
 

@@ -71,6 +71,7 @@ describe('persistent operational state', () => {
     try {
       expect(store.settings().emby_api_key).toBe('legacy-test-key');
       expect(store.link('123456')).toMatchObject({
+        membership_slot: 1,
         username: 'legacy-user',
         remote_id: 'jf-legacy',
         disabled_by_jellyport: 1,
@@ -87,6 +88,53 @@ describe('persistent operational state', () => {
     const db = new DatabaseSync(join(path, 'jellyport.db'));
     db.close();
     expect(() => new Store(path)).toThrow('Restore secret.key');
+  });
+  it('migrates legacy identity links transactionally and preserves independent account state across restarts', () => {
+    const path = directory();
+    writeFileSync(join(path, 'secret.key'), key);
+    const db = new DatabaseSync(join(path, 'jellyport.db'));
+    db.exec(
+      'CREATE TABLE links(discord_user_id TEXT PRIMARY KEY,username TEXT NOT NULL,remote_id TEXT UNIQUE NOT NULL,disabled_by_jellyport INTEGER DEFAULT 0,pending_disabled INTEGER)',
+    );
+    db.prepare('INSERT INTO links VALUES(?,?,?,?,?)').run('123456', 'Jim', 'jf-jim', 1, 0);
+    db.prepare('INSERT INTO links VALUES(?,?,?,?,?)').run('654321', 'Alex', 'jf-alex', 0, 1);
+    db.close();
+    let store = new Store(path);
+    expect(store.linksForMember('123456')).toEqual([
+      {
+        discord_user_id: '123456',
+        membership_slot: 1,
+        username: 'Jim',
+        remote_id: 'jf-jim',
+        disabled_by_jellyport: 1,
+        pending_disabled: 0,
+      },
+    ]);
+    store.saveLink('123456', 'Jim_2', 'jf-jim-2', false, 2);
+    store.setLinkPending('123456', true, 2);
+    expect(store.link('123456')?.pending_disabled).toBe(0);
+    expect(store.link('123456', 2)?.pending_disabled).toBe(1);
+    store.close();
+    store = new Store(path);
+    try {
+      expect(store.linksForMember('123456').map((value) => value.membership_slot)).toEqual([1, 2]);
+      expect(store.link('123456')?.disabled_by_jellyport).toBe(1);
+      expect(store.link('123456', 2)?.pending_disabled).toBe(1);
+      expect(store.link('654321')?.pending_disabled).toBe(1);
+      expect(() => store.saveLink('123456', 'Jim_3', 'jf-alex', false, 3)).toThrow();
+      expect(() => store.saveLink('654321', 'Alex_2', 'jf-jim-2', false, 2)).toThrow();
+      expect(store.links()).toHaveLength(3);
+    } finally {
+      store.close();
+    }
+  });
+  it.each([0, 4, 1.5, NaN])('rejects invalid membership link slot %s', (slot) => {
+    const store = new Store(directory());
+    try {
+      expect(() => store.saveLink('123456', 'member', 'jf-1', false, slot)).toThrow('slot');
+    } finally {
+      store.close();
+    }
   });
   it('retains never-started jobs and encrypted snapshots across restart and claims once', () => {
     const path = directory();
@@ -200,6 +248,7 @@ describe('demo and production data isolation', () => {
     'job_queue',
     'user_mappings',
     'migration_playlists',
+    'memberships',
   ] as const;
   function snapshot(db: DatabaseSync) {
     return Object.fromEntries(
@@ -284,6 +333,7 @@ describe('demo and production data isolation', () => {
     'job_queue',
     'user_mappings',
     'migration_playlists',
+    'memberships',
   ] as const)('rejects blank settings with preexisting %s records', (table) => {
     const path = directory();
     const store = new Store(path);
@@ -324,6 +374,11 @@ describe('demo and production data isolation', () => {
         targetId: 'private-id',
         status: 'complete',
         content_hash: 'private-hash',
+      });
+    if (table === 'memberships')
+      store.saveMembershipRecord('private-member-record', {
+        discord_user_id: '123456789',
+        base_username: 'private-member',
       });
     assertRejectedWithoutChanges(path, store);
   });

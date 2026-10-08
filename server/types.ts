@@ -1,3 +1,5 @@
+import { DEFAULT_MEMBERSHIP_TIERS, type MembershipTier } from './memberships.js';
+
 export interface PathMapping {
   source: string;
   target: string;
@@ -24,6 +26,7 @@ export interface Settings {
   auto_provision: boolean;
   auto_disable: boolean;
   disable_on_cancel: boolean;
+  membership_tiers?: MembershipTier[];
 }
 export const DEFAULT_SETTINGS: Settings = {
   emby_url: '',
@@ -47,6 +50,7 @@ export const DEFAULT_SETTINGS: Settings = {
   auto_provision: false,
   auto_disable: false,
   disable_on_cancel: false,
+  membership_tiers: structuredClone(DEFAULT_MEMBERSHIP_TIERS),
 };
 
 export const DEMO_SETTINGS: Settings = {

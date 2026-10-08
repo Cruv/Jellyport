@@ -19,6 +19,7 @@ export interface Account {
 }
 export interface Link {
   discord_user_id: string;
+  membership_slot: number;
   username: string;
   remote_id: string;
   disabled_by_jellyport: number;
@@ -76,18 +77,28 @@ export class Store {
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS accounts (name_key TEXT PRIMARY KEY, username TEXT NOT NULL, remote_id TEXT, status TEXT NOT NULL, password BLOB, expires REAL);
       CREATE TABLE IF NOT EXISTS credentials (job_id TEXT NOT NULL, username TEXT NOT NULL, encrypted BLOB NOT NULL, expires REAL NOT NULL, PRIMARY KEY (job_id,username));
-      CREATE TABLE IF NOT EXISTS links (discord_user_id TEXT PRIMARY KEY, username TEXT NOT NULL, remote_id TEXT NOT NULL UNIQUE, disabled_by_jellyport INTEGER NOT NULL DEFAULT 0, pending_disabled INTEGER);
+      CREATE TABLE IF NOT EXISTS links (discord_user_id TEXT NOT NULL, membership_slot INTEGER NOT NULL DEFAULT 1 CHECK(membership_slot BETWEEN 1 AND 3), username TEXT NOT NULL, remote_id TEXT NOT NULL UNIQUE, disabled_by_jellyport INTEGER NOT NULL DEFAULT 0, pending_disabled INTEGER, PRIMARY KEY(discord_user_id,membership_slot));
       CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS job_queue (job_id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS migration_playlists (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS user_mappings (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS account_roles (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS account_role_assignments (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS memberships (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS credentials_expiry ON credentials(expires);
     `);
     const columns = this.db.prepare('PRAGMA table_info(links)').all();
     if (!columns.some((row) => row.name === 'pending_disabled'))
       this.db.exec('ALTER TABLE links ADD COLUMN pending_disabled INTEGER');
+    if (!columns.some((row) => row.name === 'membership_slot'))
+      this.transaction(() => {
+        this.db.exec(`
+          CREATE TABLE links_membership_migration (discord_user_id TEXT NOT NULL, membership_slot INTEGER NOT NULL DEFAULT 1 CHECK(membership_slot BETWEEN 1 AND 3), username TEXT NOT NULL, remote_id TEXT NOT NULL UNIQUE, disabled_by_jellyport INTEGER NOT NULL DEFAULT 0, pending_disabled INTEGER, PRIMARY KEY(discord_user_id,membership_slot));
+          INSERT INTO links_membership_migration (discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled) SELECT discord_user_id,1,username,remote_id,COALESCE(disabled_by_jellyport,0),pending_disabled FROM links;
+          DROP TABLE links;
+          ALTER TABLE links_membership_migration RENAME TO links;
+        `);
+      });
     // Authenticate existing settings before starting any worker or bot.
     const settings = this.settings();
     const auth = this.authState();
@@ -102,7 +113,8 @@ export class Store {
       UNION ALL SELECT 1 FROM credentials UNION ALL SELECT 1 FROM links
       UNION ALL SELECT 1 FROM subscriptions UNION ALL SELECT 1 FROM job_queue
       UNION ALL SELECT 1 FROM migration_playlists UNION ALL SELECT 1 FROM user_mappings
-      UNION ALL SELECT 1 FROM account_roles UNION ALL SELECT 1 FROM account_role_assignments LIMIT 1`,
+      UNION ALL SELECT 1 FROM account_roles UNION ALL SELECT 1 FROM account_role_assignments
+      UNION ALL SELECT 1 FROM memberships LIMIT 1`,
         )
         .get();
     if (options.demo && (auth || (hasData && !recognizedDemo))) {
@@ -182,6 +194,20 @@ export class Store {
   saveAccountRoleRecord(id: string, value: unknown): void {
     this.db
       .prepare('INSERT OR REPLACE INTO account_roles (id,encrypted) VALUES (?,?)')
+      .run(id, this.encrypt(value));
+  }
+  membershipRecords<T>(): Array<{ id: string; value: T }> {
+    return this.db
+      .prepare('SELECT id,encrypted FROM memberships')
+      .all()
+      .map((row) => ({
+        id: row.id as string,
+        value: this.decrypt<T>(row.encrypted as Uint8Array),
+      }));
+  }
+  saveMembershipRecord(id: string, value: unknown): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO memberships (id,encrypted) VALUES (?,?)')
       .run(id, this.encrypt(value));
   }
   deleteAccountRoleRecord(id: string): void {
@@ -365,11 +391,11 @@ export class Store {
       return values;
     });
   }
-  link(id: string): Link | null {
+  link(id: string, slot = 1): Link | null {
     return (
       (this.db
-        .prepare('SELECT * FROM links WHERE discord_user_id=?')
-        .get(String(id)) as unknown as Link) ?? null
+        .prepare('SELECT * FROM links WHERE discord_user_id=? AND membership_slot=?')
+        .get(String(id), slot) as unknown as Link) ?? null
     );
   }
   linkForRemote(id: string): Link | null {
@@ -378,19 +404,34 @@ export class Store {
     );
   }
   links(): Link[] {
-    return this.db.prepare('SELECT * FROM links').all() as unknown as Link[];
+    return this.db
+      .prepare('SELECT * FROM links ORDER BY discord_user_id,membership_slot')
+      .all() as unknown as Link[];
   }
-  saveLink(discordId: string, username: string, remoteId: string, disabled = false): void {
+  linksForMember(id: string): Link[] {
+    return this.db
+      .prepare('SELECT * FROM links WHERE discord_user_id=? ORDER BY membership_slot')
+      .all(String(id)) as unknown as Link[];
+  }
+  saveLink(
+    discordId: string,
+    username: string,
+    remoteId: string,
+    disabled = false,
+    slot = 1,
+  ): void {
+    if (!Number.isInteger(slot) || slot < 1 || slot > 3)
+      throw new Error('Invalid membership account slot.');
     this.db
       .prepare(
-        'INSERT INTO links (discord_user_id,username,remote_id,disabled_by_jellyport,pending_disabled) VALUES (?,?,?,?,NULL) ON CONFLICT(discord_user_id) DO UPDATE SET username=excluded.username, remote_id=excluded.remote_id, disabled_by_jellyport=excluded.disabled_by_jellyport, pending_disabled=NULL',
+        'INSERT INTO links (discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled) VALUES (?,?,?,?,?,NULL) ON CONFLICT(discord_user_id,membership_slot) DO UPDATE SET username=excluded.username, remote_id=excluded.remote_id, disabled_by_jellyport=excluded.disabled_by_jellyport, pending_disabled=NULL',
       )
-      .run(String(discordId), username, remoteId, Number(disabled));
+      .run(String(discordId), slot, username, remoteId, Number(disabled));
   }
-  setLinkPending(discordId: string, disabled: boolean | null): void {
+  setLinkPending(discordId: string, disabled: boolean | null, slot = 1): void {
     this.db
-      .prepare('UPDATE links SET pending_disabled=? WHERE discord_user_id=?')
-      .run(disabled === null ? null : Number(disabled), String(discordId));
+      .prepare('UPDATE links SET pending_disabled=? WHERE discord_user_id=? AND membership_slot=?')
+      .run(disabled === null ? null : Number(disabled), String(discordId), slot);
   }
   subscription(id: string): SubscriptionEvent | null {
     const row = this.db.prepare('SELECT payload FROM subscriptions WHERE id=?').get(id);

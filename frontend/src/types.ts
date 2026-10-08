@@ -4,6 +4,7 @@ export type Page =
   | 'mappings'
   | 'roles'
   | 'accounts'
+  | 'memberships'
   | 'subscriptions'
   | 'activity'
   | 'settings';
@@ -40,6 +41,7 @@ export interface UserMapping {
   target_username: string;
   discord_user_id: string | null;
   discord_username: string | null;
+  membership_slot?: number;
   revision: string;
   source_server_url?: string;
   target_server_url?: string;
@@ -50,6 +52,34 @@ export interface DiscordMember {
   display_name: string | null;
   nickname: string | null;
   membership_active: boolean | null;
+}
+export interface MembershipTier {
+  id: string;
+  name: string;
+  plan_name: string;
+  account_limit: number;
+}
+export const defaultMembershipTiers: MembershipTier[] = [
+  { id: 'sloop', name: 'Sloop', plan_name: 'Sloop Crewman Plan', account_limit: 1 },
+  { id: 'brigantine', name: 'Brigantine', plan_name: 'Brigantine Crewman Plan', account_limit: 2 },
+  { id: 'galleon', name: 'Galleon', plan_name: 'Galleon Crewman Plan', account_limit: 3 },
+];
+export interface MembershipLink {
+  discord_user_id: string;
+  username: string;
+  remote_id: string;
+  membership_slot: number;
+  disabled_by_jellyport: number;
+  pending_disabled: number | null;
+}
+export interface Membership {
+  discord_user_id: string;
+  base_username: string;
+  tier_id: string;
+  account_limit: number;
+  revision: string;
+  active?: boolean;
+  links: MembershipLink[];
 }
 export type RoleSection = 'policy' | 'configuration' | 'display';
 export interface RoleParameters {
@@ -185,6 +215,9 @@ export interface SubscriptionEvent {
   status: string;
   created_at: string;
   source?: string;
+  detail?: string;
+  tier_id?: string;
+  account_limit?: number;
   error?: string;
   job_id?: string;
 }
@@ -222,6 +255,7 @@ export interface Settings {
   auto_provision: boolean;
   auto_disable: boolean;
   disable_on_cancel: boolean;
+  membership_tiers?: MembershipTier[];
   bot_invite_url: string;
 }
 export interface ApiOptions {

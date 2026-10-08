@@ -173,6 +173,87 @@ describe('encrypted explicit user mappings', () => {
     expect(mappings.list(other)).toHaveLength(1);
     expect(mappings.list({ ...settings, emby_url: '' })).toEqual([]);
   });
+  it('maps several distinct Emby accounts to slots owned by one Discord member', () => {
+    const { mappings, store } = unitFixture();
+    const primary = mappings.save(
+      input({ discord_user_id: '123456789', target_username: 'Jim' }),
+      settings,
+    );
+    const second = mappings.save(
+      input({
+        source_user_id: 'source-two',
+        source_username: 'Jim_2',
+        target_username: 'Jim_2',
+        discord_user_id: '123456789',
+        membership_slot: 2,
+      }),
+      settings,
+    );
+    const third = mappings.save(
+      input({
+        source_user_id: 'source-three',
+        source_username: 'Jim_3',
+        target_username: 'Jim_3',
+        discord_user_id: '123456789',
+        membership_slot: 3,
+      }),
+      settings,
+    );
+    expect(primary.membership_slot).toBe(1);
+    expect(mappings.getForDiscord('123456789', settings)).toEqual(primary);
+    expect(mappings.getForDiscord('123456789', settings, 2)).toEqual(second);
+    expect(mappings.getAllForDiscord('123456789', settings)).toEqual([primary, second, third]);
+    expect(() =>
+      mappings.save(
+        input({
+          source_user_id: 'other-source',
+          target_username: 'other-target',
+          discord_user_id: '123456789',
+          membership_slot: 2,
+        }),
+        settings,
+      ),
+    ).toThrow('already mapped');
+    expect(() =>
+      mappings.save(
+        input({
+          source_user_id: 'other-source',
+          target_username: 'Jim_2',
+          discord_user_id: '987654321',
+          membership_slot: 2,
+        }),
+        settings,
+      ),
+    ).toThrow('already mapped');
+    store.saveLink('123456789', 'Jim', 'target-one');
+    store.saveLink('123456789', 'Jim_2', 'target-two', false, 2);
+    const bound = mappings.bindTarget(second.id, second.revision, 'target-two', settings);
+    expect(bound.target_user_id).toBe('target-two');
+    expect(() => mappings.save({ ...bound, membership_slot: 3 }, settings)).toThrow();
+    expect(() => mappings.save({ ...bound, discord_user_id: '987654321' }, settings)).toThrow(
+      'ownership',
+    );
+    expect(store.link('123456789', 2)?.remote_id).toBe('target-two');
+  });
+  it('normalizes legacy encrypted mappings without slots to the primary slot', () => {
+    const { mappings, store } = unitFixture();
+    const legacy = {
+      ...input({ discord_user_id: '123456789' }),
+      id: 'legacy-map',
+      source_server_url: settings.emby_url,
+      target_server_url: settings.jellyfin_url,
+      revision: 'legacy-revision',
+    };
+    store.db
+      .prepare('INSERT INTO user_mappings VALUES (?,?)')
+      .run(legacy.id, store.encrypt(legacy));
+    expect(mappings.getForDiscord('123456789', settings)?.membership_slot).toBe(1);
+    expect(mappings.getForDiscord('123456789', settings, 2)).toBeNull();
+  });
+  it.each([0, 4, 1.5, NaN])('rejects invalid user mapping membership slot %s', (slot) => {
+    const { mappings } = unitFixture();
+    expect(() => mappings.save(input({ membership_slot: slot }), settings)).toThrow('slots');
+  });
   it('enforces one-to-one source IDs, case-folded target names, target IDs and Discord IDs', () => {
     const { mappings } = unitFixture();
     mappings.save(
@@ -473,6 +554,51 @@ describe('administrator mapping routes', () => {
     });
     expect(mismatch.statusCode).toBe(400);
     expect(mismatch.json().detail).toContain('verified username');
+  });
+  it('accepts multiple verified account slots for one Discord member through the admin API', async () => {
+    const { app, headers, bot } = await apiFixture();
+    const primary = await app.inject({
+      method: 'POST',
+      url: '/api/user-mappings',
+      headers,
+      payload: { source_user_id: 'e-alex', target_username: 'Jim', discord_user_id: '123456789' },
+    });
+    expect(primary.statusCode).toBe(200);
+    const second = await app.inject({
+      method: 'POST',
+      url: '/api/user-mappings',
+      headers,
+      payload: {
+        source_user_id: 'e-sam',
+        target_username: 'Jim_2',
+        discord_user_id: '123456789',
+        membership_slot: 2,
+      },
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).toMatchObject({
+      membership_slot: 2,
+      discord_user_id: '123456789',
+      discord_username: 'verified.discord',
+    });
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/api/user-mappings',
+      headers,
+      payload: {
+        source_user_id: 'strange-source',
+        target_username: 'Jim_4',
+        discord_user_id: '123456789',
+        membership_slot: 4,
+      },
+    });
+    expect(invalid.statusCode).toBe(422);
+    expect((await app.inject({ url: '/api/user-mappings', headers })).json().mappings).toHaveLength(
+      2,
+    );
+    expect(bot.sendCredentials).not.toHaveBeenCalled();
+    expect(app.jellyport.store.links()).toEqual([]);
+    expect(app.jellyport.store.jobs()).toEqual([]);
   });
   it('rejects unavailable or conflicting Discord identities and preserves existing account links', async () => {
     const { app, headers, bot } = await apiFixture();

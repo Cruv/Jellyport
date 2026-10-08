@@ -54,6 +54,37 @@ afterEach(() => {
 });
 
 describe('Manual user mappings', () => {
+  it('assigns a second account slot to the same Discord owner without inventing another identity', async () => {
+    const { requests } = page();
+    fireEvent.change(screen.getByLabelText('Emby account'), { target: { value: 'emby-alex' } });
+    expect((screen.getByLabelText('Membership account slot') as HTMLSelectElement).disabled).toBe(
+      true,
+    );
+    fireEvent.change(screen.getByLabelText(/Discord user ID/), {
+      target: { value: '123456789012345678' },
+    });
+    fireEvent.change(screen.getByLabelText('Membership account slot'), { target: { value: '2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save mapping' }));
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0].options?.body).toMatchObject({
+      discord_user_id: '123456789012345678',
+      membership_slot: 2,
+      source_user_id: 'emby-alex',
+    });
+  });
+
+  it('shows an existing third slot and preserves it when the mapping is edited', async () => {
+    const { requests } = page([
+      { ...mapping, discord_user_id: '123456789012345678', membership_slot: 3 },
+    ]);
+    expect(screen.getByText(/Account slot 3/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Edit mapping for Mr. Complex Name !' }));
+    expect((screen.getByLabelText('Membership account slot') as HTMLSelectElement).value).toBe('3');
+    fireEvent.click(screen.getByRole('button', { name: 'Save mapping' }));
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0].options?.body).toMatchObject({ membership_slot: 3 });
+  });
+
   it('searches Discord members and saves the selected stable identity without manually entering an ID', async () => {
     const requests: { path: string; options?: ApiOptions }[] = [];
     const api = vi.fn(async (path: string, options?: ApiOptions) => {

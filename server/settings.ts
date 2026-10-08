@@ -1,5 +1,6 @@
 import { ServiceError } from './errors.js';
 import { DEFAULT_SETTINGS, type Settings } from './types.js';
+import { validateMembershipTiers } from './memberships.js';
 export const SECRET_FIELDS = ['emby_api_key', 'jellyfin_api_key', 'discord_bot_token'] as const;
 const snowflake = /^[0-9]{5,22}$/;
 const control = /[\x00-\x1f]/;
@@ -50,6 +51,11 @@ export function validateSettings(input: unknown): asserts input is Settings {
       throw new ServiceError(`${key} must be a Discord numeric ID.`);
   }
   const mappings = settings.path_mappings;
+  validateMembershipTiers(
+    settings.membership_tiers === undefined
+      ? DEFAULT_SETTINGS.membership_tiers
+      : settings.membership_tiers,
+  );
   if (!Array.isArray(mappings) || mappings.length > 20)
     throw new ServiceError('Provide at most 20 path mappings.');
   for (const item of mappings) {

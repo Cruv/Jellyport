@@ -23,6 +23,10 @@ The merge preserves existing Jellyfin activity. Watched and favorite flags are c
 
 The portable item-data write contract is `POST /UserItems/{itemId}/UserData?userId={userId}`. Jellyfin persists `Played`, `PlaybackPositionTicks`, `PlayCount`, `LastPlayedDate`, `IsFavorite`, `Likes`, and `Rating` when supplied. Although its update DTO also declares `PlayedPercentage`, `UnplayedItemCount`, `Key`, and `ItemId`, these are not independent values that Jellyport should import: percentages and aggregate counts are derived, while keys and IDs belong to the destination server. These behaviors were checked against Jellyfin's [item controller](https://github.com/jellyfin/jellyfin/blob/v12.2/Jellyfin.Api/Controllers/ItemsController.cs), [update DTO](https://github.com/jellyfin/jellyfin/blob/v12.2/MediaBrowser.Model/Dto/UpdateUserItemDataDto.cs), and [user-data manager](https://github.com/jellyfin/jellyfin/blob/v10.11.10/Emby.Server.Implementations/Library/UserDataManager.cs).
 
+## Membership account slots
+
+One Discord membership may own up to three independent Jellyfin account slots. Membership provisioning migrates each slot's matching Emby account, or its explicitly approved user mapping, separately. A slot without a matching source starts fresh; the primary account's history is not copied into its additional accounts. Defaults come from the selected Jellyport role or legacy template. Tier downgrades disable excess slots while retaining all their data, and later upgrades restore the same Jellyport-disabled accounts. Existing installations keep their original links as slot 1. See [membership allowances](../README.md#one-membership-with-several-accounts) for configuration and lifecycle behavior.
+
 ## Jellyfin onboarding roles
 
 Account roles supply destination defaults independently of Emby migration. Import supported settings from an enabled, non-administrator Jellyfin account into a new or existing role. The encrypted snapshot is bound to the linked Jellyfin server and no longer depends on the source account after saving. The wizard can finish without a legacy template; choose a default role or template before creating or migrating accounts.

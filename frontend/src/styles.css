@@ -1082,6 +1082,22 @@ textarea::placeholder {
   gap: 24px;
   max-width: 1060px;
 }
+.membership-tier-fields {
+  min-width: 0;
+  margin: 0;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.membership-tier-fields legend {
+  padding: 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+}
+.membership-tier-fields .field-row {
+  margin-bottom: 14px;
+}
 .settings-actions {
   display: flex;
   justify-content: space-between;

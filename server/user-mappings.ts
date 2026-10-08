@@ -6,6 +6,7 @@ import type { JellyportApp } from './main.js';
 import type { MediaAPI, MediaUser } from './media.js';
 import type { Store } from './store.js';
 import type { Settings } from './types.js';
+import { validateMembershipSlot } from './memberships.js';
 
 export interface UserMapping {
   id: string;
@@ -17,6 +18,7 @@ export interface UserMapping {
   target_username: string;
   discord_user_id: string | null;
   discord_username: string | null;
+  membership_slot?: number;
   revision: string;
 }
 export interface SaveUserMapping {
@@ -27,6 +29,7 @@ export interface SaveUserMapping {
   target_username: string;
   discord_user_id: string | null;
   discord_username: string | null;
+  membership_slot?: number;
 }
 interface MappingRequest {
   id?: string;
@@ -35,6 +38,7 @@ interface MappingRequest {
   target_username?: string;
   discord_user_id?: string | null;
   discord_username?: string | null;
+  membership_slot?: number;
 }
 
 const MAX_MAPPINGS = 10_000;
@@ -68,6 +72,7 @@ const mappingSchema = {
     target_username: { type: 'string', minLength: 1, maxLength: 64 },
     discord_user_id: nullableDiscordId,
     discord_username: nullableDiscordName,
+    membership_slot: { type: 'integer', minimum: 1, maximum: 3 },
   },
 };
 
@@ -94,6 +99,7 @@ export function validateExistingMappingUsername(value: string): string {
   return value;
 }
 function validateInput(input: SaveUserMapping): void {
+  validateMembershipSlot(input.membership_slot ?? 1);
   if (
     (input.id !== undefined && !validIdentifier(input.id)) ||
     !validIdentifier(input.source_user_id) ||
@@ -140,6 +146,7 @@ export class UserMappings {
         target_username: value.target_username,
         discord_user_id: value.discord_user_id,
         discord_username: value.discord_username,
+        membership_slot: value.membership_slot ?? 1,
         revision: value.revision,
       };
     });
@@ -168,7 +175,10 @@ export class UserMappings {
         cache.byTargetId.set(targetIdKey, mapping);
       }
       if (mapping.discord_user_id) {
-        const discordKey = identityKey(servers, mapping.discord_user_id);
+        const discordKey = identityKey(
+          servers,
+          JSON.stringify([mapping.discord_user_id, mapping.membership_slot ?? 1]),
+        );
         if (cache.byDiscord.has(discordKey))
           throw new Error('Conflicting encrypted Discord mappings.');
         cache.byDiscord.set(discordKey, mapping);
@@ -202,14 +212,20 @@ export class UserMappings {
     const mapping = mappingCaches.get(this.store)!.bySource.get(identityKey(servers, sourceUserId));
     return mapping ? structuredClone(mapping) : null;
   }
-  getForDiscord(discordUserId: string, settings: Settings): UserMapping | null {
+  getForDiscord(discordUserId: string, settings: Settings, slot = 1): UserMapping | null {
+    validateMembershipSlot(slot);
     const servers = serverPair(settings);
     if (!servers) return null;
     this.all();
     const mapping = mappingCaches
       .get(this.store)!
-      .byDiscord.get(identityKey(servers, discordUserId));
+      .byDiscord.get(identityKey(servers, JSON.stringify([discordUserId, slot])));
     return mapping ? structuredClone(mapping) : null;
+  }
+  getAllForDiscord(discordUserId: string, settings: Settings): UserMapping[] {
+    return this.list(settings)
+      .filter((mapping) => mapping.discord_user_id === discordUserId)
+      .sort((a, b) => (a.membership_slot ?? 1) - (b.membership_slot ?? 1));
   }
   getForTarget(
     targetId: string | null,
@@ -229,7 +245,8 @@ export class UserMappings {
   }
   private checkLinks(mapping: SaveUserMapping): void {
     if (!mapping.discord_user_id) return;
-    const byDiscord = this.store.link(mapping.discord_user_id);
+    const slot = mapping.membership_slot ?? 1;
+    const byDiscord = this.store.link(mapping.discord_user_id, slot);
     const byTarget = mapping.target_user_id
       ? this.store.linkForRemote(mapping.target_user_id)
       : null;
@@ -237,7 +254,8 @@ export class UserMappings {
       (byDiscord &&
         (byDiscord.remote_id !== mapping.target_user_id ||
           byDiscord.username !== mapping.target_username)) ||
-      (byTarget && byTarget.discord_user_id !== mapping.discord_user_id)
+      (byTarget &&
+        (byTarget.discord_user_id !== mapping.discord_user_id || byTarget.membership_slot !== slot))
     )
       throw new ServiceError(
         'This Discord identity or Jellyfin account already has a different identity link. Existing ownership was preserved.',
@@ -274,7 +292,11 @@ export class UserMappings {
           throw new ServiceError(
             'This Jellyfin account or username is already mapped to another Emby user.',
           );
-        if (input.discord_user_id && mapping.discord_user_id === input.discord_user_id)
+        if (
+          input.discord_user_id &&
+          mapping.discord_user_id === input.discord_user_id &&
+          (mapping.membership_slot ?? 1) === (input.membership_slot ?? 1)
+        )
           throw new ServiceError('This Discord user is already mapped to another Emby user.');
       }
       this.checkLinks(input);
@@ -288,6 +310,7 @@ export class UserMappings {
         target_username: input.target_username,
         discord_user_id: input.discord_user_id,
         discord_username: input.discord_username,
+        membership_slot: input.membership_slot ?? 1,
         revision: randomUUID(),
       };
       this.store.db
@@ -415,6 +438,7 @@ export function registerUserMappingRoutes(app: JellyportApp): void {
             target_username: targetName,
             discord_user_id: discordId,
             discord_username: discordName,
+            membership_slot: input.membership_slot ?? 1,
           },
           settings,
         );

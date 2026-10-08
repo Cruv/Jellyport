@@ -888,6 +888,15 @@ export function SubscriptionsPage({
                     <td>
                       <span>{names[event.action] || event.action}</span>
                       <small>{event.source || 'Discord'}</small>
+                      {event.action === 'subscribe' &&
+                        event.source === 'mee6_message' &&
+                        event.detail && <small>Plan: {event.detail}</small>}
+                      {event.account_limit !== undefined && (
+                        <small>
+                          {event.account_limit} entitled{' '}
+                          {event.account_limit === 1 ? 'account' : 'accounts'}
+                        </small>
+                      )}
                     </td>
                     <td>
                       <Status value={event.status} />

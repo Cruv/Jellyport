@@ -28,6 +28,7 @@ export default function UserMappingsPage({
   const [targetName, setTargetName] = useState('');
   const [discordName, setDiscordName] = useState('');
   const [discordId, setDiscordId] = useState('');
+  const [membershipSlot, setMembershipSlot] = useState(1);
   const [discordMember, setDiscordMember] = useState<DiscordMember | null>(null);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
@@ -54,6 +55,7 @@ export default function UserMappingsPage({
     setTargetName('');
     setDiscordName('');
     setDiscordId('');
+    setMembershipSlot(1);
     setDiscordMember(null);
     setError('');
   }
@@ -64,6 +66,7 @@ export default function UserMappingsPage({
     setTargetName(mapping.target_username);
     setDiscordName(mapping.discord_username || '');
     setDiscordId(mapping.discord_user_id || '');
+    setMembershipSlot(mapping.membership_slot || 1);
     setDiscordMember(
       mapping.discord_user_id
         ? {
@@ -93,6 +96,9 @@ export default function UserMappingsPage({
           ...(targetId ? {} : { target_username: targetName.trim() }),
           discord_username: discordName.trim() || null,
           discord_user_id: discordId.trim() || null,
+          ...(discordId.trim() && (membershipSlot !== 1 || editing?.membership_slot)
+            ? { membership_slot: membershipSlot }
+            : {}),
         },
       });
       if (!mounted.current) return;
@@ -178,6 +184,7 @@ export default function UserMappingsPage({
                       setSourceId(id);
                       setDiscordMember(null);
                       setDiscordId('');
+                      setMembershipSlot(1);
                       setDiscordName('');
                       if (!targetName || targetName === previousName)
                         setTargetName(users.emby.find((user) => user.Id === id)?.Name || '');
@@ -258,6 +265,24 @@ export default function UserMappingsPage({
                 disabled={busy}
                 id="mapping-discord-member"
               />
+              <div className="field">
+                <label htmlFor="mapping-membership-slot">Membership account slot</label>
+                <select
+                  id="mapping-membership-slot"
+                  value={membershipSlot}
+                  disabled={busy || !discordId.trim()}
+                  onChange={(event) => setMembershipSlot(Number(event.target.value))}
+                >
+                  <option value={1}>1 · Primary account</option>
+                  <option value={2}>2 · Second account</option>
+                  <option value={3}>3 · Third account</option>
+                </select>
+                <small>
+                  Link additional Emby accounts to the same Discord owner in separate slots. Assign
+                  their tier on Memberships before migrating extra slots. The member’s tier controls
+                  how many linked accounts can stay enabled.
+                </small>
+              </div>
               <details className="discord-picker-advanced">
                 <summary>Advanced Discord details</summary>
                 <p>
@@ -353,7 +378,7 @@ export default function UserMappingsPage({
                         {mapping.discord_username || 'No username label'}
                         <small>
                           {mapping.discord_user_id
-                            ? `Verified user ID: ${mapping.discord_user_id}`
+                            ? `Verified user ID: ${mapping.discord_user_id} · Account slot ${mapping.membership_slot || 1}`
                             : 'No verified Discord identity'}
                         </small>
                       </td>

@@ -77,6 +77,7 @@ beforeEach(() => {
     },
     '/api/settings': settings,
     '/api/users': { emby: [], jellyfin: [] },
+    '/api/user-mappings': { mappings: [] },
     '/api/account-roles': { roles: [], assignments: [] },
   };
   vi.stubGlobal(
@@ -108,6 +109,71 @@ async function openJob() {
   return screen.findByRole('dialog');
 }
 describe('React account safeguards', () => {
+  it('loads editable tier defaults and only saves their definitions without provisioning accounts', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await screen.findByText('Membership tiers');
+    const tiers = screen.getAllByLabelText('Tier name');
+    const limits = screen.getAllByLabelText('Account allowance');
+    expect(tiers.map((input) => (input as HTMLInputElement).value)).toEqual([
+      'Sloop',
+      'Brigantine',
+      'Galleon',
+    ]);
+    expect(limits.map((input) => (input as HTMLSelectElement).value)).toEqual(['1', '2', '3']);
+    fireEvent.change(tiers[1], { target: { value: 'Brigantine Crew' } });
+    fireEvent.change(screen.getAllByLabelText('Subscription plan name')[1], {
+      target: { value: 'Brigantine Paid Plan' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await screen.findByText('Settings saved. Your connections are ready to test.');
+    const saved = requests.find(
+      (request) => request.path === '/api/settings' && request.options?.method === 'PUT',
+    )!;
+    expect(JSON.parse(String(saved.options?.body)).membership_tiers[1]).toEqual({
+      id: 'brigantine',
+      name: 'Brigantine Crew',
+      plan_name: 'Brigantine Paid Plan',
+      account_limit: 2,
+    });
+    expect(requests.some((request) => request.path === '/api/memberships/provision')).toBe(false);
+  });
+
+  it('clears membership owners and account names when the administrator signs out', async () => {
+    responses['/api/memberships'] = {
+      memberships: [
+        {
+          discord_user_id: '123456789012345678',
+          base_username: 'private-owner',
+          tier_id: 'brigantine',
+          account_limit: 2,
+          active: true,
+          revision: 'revision-1',
+          links: [
+            {
+              discord_user_id: '123456789012345678',
+              username: 'private-family-account',
+              remote_id: 'jf-1',
+              membership_slot: 2,
+              disabled_by_jellyport: 0,
+              pending_disabled: null,
+            },
+          ],
+        },
+      ],
+    };
+    responses['/api/logout'] = { ...session, authenticated: false, user: undefined };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Memberships' }));
+    await screen.findByText('private-family-account');
+    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await screen.findByLabelText('Jellyfin username');
+    expect(screen.queryByText('private-family-account')).toBeNull();
+    expect(screen.queryByText('private-owner')).toBeNull();
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
+
   it('uses a saved default role for fresh account creation without a fallback template', async () => {
     responses['/api/settings'] = { ...settings, template_user_id: '', default_role_id: 'role-1' };
     responses['/api/accounts'] = job;
@@ -364,10 +430,12 @@ describe('React account safeguards', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Review' }));
     const dialog = await screen.findByRole('dialog');
     expect(
-      within(dialog).getByText(/Approving this event manually disables access immediately/),
+      within(dialog).getByText(
+        /Approving this event manually disables all linked account slots immediately/,
+      ),
     ).toBeTruthy();
     expect(requests.some((request) => request.path.endsWith('/apply'))).toBe(false);
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Disable account now' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Disable linked accounts now' }));
     await waitFor(() =>
       expect(requests.some((request) => request.path.endsWith('/apply'))).toBe(true),
     );

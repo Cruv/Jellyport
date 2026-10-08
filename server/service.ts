@@ -33,6 +33,14 @@ import type { Settings } from './types.js';
 import type { DiscordMemberSearchResult } from './discord-members.js';
 import { AccountRoles, type AccountRole, type RoleAssignment } from './account-roles.js';
 import { mergeRoleSection, type RoleSection } from './role-parameters.js';
+import {
+  Memberships,
+  DEFAULT_MEMBERSHIP_TIERS,
+  membershipUsername,
+  resolveMembershipTier,
+  type Membership,
+} from './memberships.js';
+import type { Link } from './store.js';
 
 export { ServiceError } from './errors.js';
 export interface JobRequest {
@@ -48,6 +56,9 @@ export interface JobRequest {
   target_user_id?: string;
   role_sections?: RoleSection[];
   default_role_revision?: string;
+  membership_slot?: number;
+  membership_revision?: string;
+  access_disabled?: boolean;
 }
 export interface JobStats {
   source_played: number;
@@ -88,6 +99,7 @@ export interface Job {
   progress: { processed: number; total: number };
   results: JobResult[];
   error?: string;
+  membership_discord_user_id?: string;
 }
 export interface SubscriptionEvent {
   id: string;
@@ -102,6 +114,8 @@ export interface SubscriptionEvent {
   error?: string | null;
   result?: string;
   job_id?: string;
+  tier_id?: string;
+  account_limit?: number;
 }
 export interface SubscriptionInput {
   id: string;
@@ -217,6 +231,8 @@ export class Service {
   readonly demo: boolean;
   readonly mappings: UserMappings;
   readonly roles: AccountRoles;
+  readonly memberships: Memberships;
+  private readonly membershipMutex = new Mutex();
   constructor(
     readonly store: Store,
     options: ServiceOptions = {},
@@ -226,9 +242,13 @@ export class Service {
     this.demo = options.demo ?? false;
     this.mappings = new UserMappings(store);
     this.roles = new AccountRoles(store, this.demo);
+    this.memberships = new Memberships(store);
   }
   resolveDiscordMapping(discordId: string): UserMapping | null {
     return this.mappings.getForDiscord(discordId, this.store.settings());
+  }
+  resolveDiscordMappings(discordId: string): UserMapping[] {
+    return this.mappings.getAllForDiscord(discordId, this.store.settings());
   }
 
   client(settings: Settings, kind: MediaKind): MediaAPI {
@@ -603,7 +623,302 @@ export class Service {
         );
     }
     this.requireServer(this.store.settings(), 'jellyfin');
-    return this.queue('create', [{ username, discord_user_id: discordUserId }]);
+    const member = discordUserId
+      ? this.memberships.get(discordUserId, this.store.settings())
+      : null;
+    if (member?.active === false)
+      throw new ServiceError(
+        'This membership is inactive. Review and activate its tier before creating an account.',
+      );
+    return this.queue('create', [
+      {
+        username,
+        discord_user_id: discordUserId,
+        ...(member ? { membership_slot: 1, membership_revision: member.revision } : {}),
+      },
+    ]);
+  }
+  listMemberships(): Array<Membership & { links: Link[] }> {
+    const settings = this.store.settings();
+    const records = this.memberships.list(settings);
+    const known = new Set(records.map((member) => member.discord_user_id));
+    // Older single-account installations need no manual database reset or relinking.
+    for (const link of this.store.links()) {
+      if (known.has(link.discord_user_id)) continue;
+      known.add(link.discord_user_id);
+      if (this.memberships.hasOtherScope(link.discord_user_id, settings)) continue;
+      const primary = this.store.link(link.discord_user_id) ?? link;
+      records.push({
+        discord_user_id: link.discord_user_id,
+        server_url: settings.jellyfin_url,
+        base_username: primary.username,
+        tier_id: 'sloop',
+        account_limit: 1,
+        active: !Boolean(primary.disabled_by_jellyport),
+        revision: '',
+      });
+    }
+    return records.map((member) => ({
+      ...member,
+      links: this.store.linksForMember(member.discord_user_id),
+    }));
+  }
+  private assertMembershipRequest(request: JobRequest, settings: Settings): Membership | null {
+    if (!request.membership_revision) return null;
+    const member = request.discord_user_id
+      ? this.memberships.get(request.discord_user_id, this.store.settings())
+      : null;
+    if (
+      !member ||
+      !member.active ||
+      member.revision !== request.membership_revision ||
+      this.store.settings().jellyfin_url !== settings.jellyfin_url ||
+      !Number.isInteger(request.membership_slot) ||
+      request.membership_slot! < 1 ||
+      request.membership_slot! > 3 ||
+      (request.access_disabled === undefined && request.membership_slot! > member.account_limit) ||
+      (request.access_disabled !== undefined &&
+        request.access_disabled !== request.membership_slot! > member.account_limit)
+    )
+      throw new ServiceError('The membership changed. Review its current tier before retrying.');
+    return member;
+  }
+  /** Provision the entire allowance; each slot keeps its own pinned target and access state. */
+  async provisionMembership(
+    discordId: string,
+    tierId?: string,
+    expectedRevision?: string,
+    review?: { account_limit: number; usernames: string[] },
+  ): Promise<Job> {
+    if (this.demo) throw new ServiceError('Demo memberships are read-only.');
+    return this.membershipMutex.run(() =>
+      this.mutationMutex.run(async () => {
+        await this.validateRecipients([discordId]);
+        const identity = await this.requireBot().recipientIdentity(discordId);
+        if (identity.id && identity.id !== discordId)
+          throw new ServiceError('Discord returned a different member. Reload and try again.');
+        const settings = this.store.settings();
+        const existing = this.memberships.get(discordId, settings);
+        if (!existing && this.memberships.hasOtherScope(discordId, settings))
+          throw new ServiceError(
+            'This member belongs to a different paired server configuration. Restore the original server URL before managing its accounts.',
+          );
+        if (expectedRevision !== undefined && expectedRevision !== existing?.revision)
+          throw new ServiceError(
+            'The membership changed. Review its current tier before retrying.',
+          );
+        if (
+          this.store
+            .jobs()
+            .some(
+              (job) =>
+                job.membership_discord_user_id === discordId &&
+                ['queued', 'running'].includes(job.status),
+            )
+        )
+          throw new ServiceError('Wait for this member’s current account job to finish.');
+        const tiers = settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS;
+        const selectedTier =
+          tierId ??
+          existing?.tier_id ??
+          tiers.find((entry) => entry.id === 'sloop' && entry.account_limit === 1)?.id ??
+          tiers.find((entry) => entry.account_limit === 1)?.id;
+        const tier = tiers.find((entry) => entry.id === selectedTier);
+        if (!tier) throw new ServiceError('Choose a configured membership tier.');
+        if (review && review.account_limit !== tier.account_limit)
+          throw new ServiceError(
+            'The tier definition changed. Review the current account allowance before retrying.',
+          );
+        const mappings = this.mappings.getAllForDiscord(discordId, settings);
+        const primaryMapping = mappings.find((entry) => (entry.membership_slot ?? 1) === 1);
+        const primaryLink = this.store.link(discordId);
+        const baseUsername =
+          existing?.base_username ??
+          primaryLink?.username ??
+          primaryMapping?.target_username ??
+          identity.username;
+        const links = this.store.linksForMember(discordId);
+        const requests: JobRequest[] = [];
+        const needsNewSlot = Array.from(
+          { length: tier.account_limit },
+          (_, index) => index + 1,
+        ).some((slot) => !links.some((link) => link.membership_slot === slot));
+        const sources =
+          needsNewSlot && settings.emby_url && settings.emby_api_key ? await this.embyUsers() : [];
+        await this.withClient(settings, 'jellyfin', async (jellyfin) => {
+          const info = await jellyfin.systemInfo();
+          const auth = this.store.authState();
+          if (auth?.kind === 'configured' && info.Id !== auth.serverId)
+            throw new ServiceError(
+              'The paired Jellyfin server changed. No accounts were modified.',
+            );
+          const targets = await jellyfin.users();
+          for (let slot = 1; slot <= 3; slot++) {
+            const link = links.find((entry) => entry.membership_slot === slot);
+            const mapping = mappings.find((entry) => (entry.membership_slot ?? 1) === slot);
+            if (link) {
+              const target = targets.find((entry) => entry.Id === link.remote_id);
+              this.assertLinkedTarget(target, link, settings);
+              if (
+                mapping &&
+                (mapping.target_username !== link.username ||
+                  (mapping.target_user_id && mapping.target_user_id !== link.remote_id))
+              )
+                throw new ServiceError(
+                  'An account link conflicts with its approved mapping. Review it first.',
+                );
+              requests.push({
+                username: link.username,
+                discord_user_id: discordId,
+                target_user_id: link.remote_id,
+                membership_slot: slot,
+                access_disabled: slot > tier.account_limit,
+              });
+              continue;
+            }
+            if (slot > tier.account_limit) continue;
+            const username = mapping?.target_username ?? membershipUsername(baseUsername, slot);
+            if (mapping?.target_user_id) validateExistingMappingUsername(username);
+            else validateUsername(username);
+            const target = this.mappedTarget(targets, mapping ?? null, username, settings);
+            if (target && !mapping?.target_user_id) {
+              const local = this.store.account(username);
+              if (local?.remote_id !== target.Id || local.status !== 'provisioning')
+                throw new ServiceError(
+                  `The username ${username} already exists without an approved identity link. Link it through an admin-approved migration or user mapping before provisioning.`,
+                );
+            }
+            if (
+              target &&
+              (target.Policy?.IsAdministrator !== false ||
+                target.Policy?.IsDisabled !== false ||
+                target.Id === settings.template_user_id)
+            )
+              throw new ServiceError(
+                'A membership cannot use a disabled, administrator, or template account.',
+              );
+            const owner = target ? this.store.linkForRemote(target.Id) : null;
+            if (owner && (owner.discord_user_id !== discordId || owner.membership_slot !== slot))
+              throw new ServiceError(
+                'This Jellyfin account already belongs to another member or slot.',
+              );
+            const matchingSources = mapping
+              ? sources.filter((source) => source.Id === mapping.source_user_id)
+              : sources.filter((source) => source.Name === username);
+            if (matchingSources.length > 1)
+              throw new ServiceError(
+                'More than one Emby account matches a membership slot. Create a mapping.',
+              );
+            if (
+              mapping &&
+              (!matchingSources[0] || matchingSources[0].Name !== mapping.source_username)
+            )
+              throw new ServiceError(
+                'A mapped Emby account was removed or renamed. Review its mapping.',
+              );
+            requests.push({
+              username,
+              discord_user_id: discordId,
+              membership_slot: slot,
+              ...(matchingSources[0] ? { source_user_id: matchingSources[0].Id } : {}),
+              ...(mapping ? { mapping_id: mapping.id, mapping_revision: mapping.revision } : {}),
+            });
+          }
+          if (requests.some((request) => request.access_disabled === undefined))
+            await this.template(jellyfin, settings);
+        });
+        if (
+          review &&
+          JSON.stringify(
+            requests
+              .filter((request) => request.membership_slot! <= tier.account_limit)
+              .map((request) => request.username),
+          ) !== JSON.stringify(review.usernames)
+        )
+          throw new ServiceError(
+            'The account names or mappings changed. Review the current membership before retrying.',
+          );
+        if (
+          JSON.stringify(this.store.settings()) !== JSON.stringify(settings) ||
+          this.memberships.get(discordId, settings)?.revision !== existing?.revision
+        )
+          throw new ServiceError('Configuration or membership changed. Review and try again.');
+        for (const mapping of mappings)
+          if (this.mappings.get(mapping.id, settings)?.revision !== mapping.revision)
+            throw new ServiceError('A user mapping changed. Review and try again.');
+        const member = this.memberships.save(
+          {
+            discord_user_id: discordId,
+            base_username: baseUsername,
+            tier_id: tier.id,
+            account_limit: tier.account_limit,
+            active: true,
+          },
+          settings,
+          existing?.revision,
+        );
+        return this.queue(
+          'membership',
+          requests.map((request) => ({
+            ...request,
+            membership_revision: member.revision,
+          })),
+        );
+      }),
+    );
+  }
+  private assertLinkedTarget(
+    target: MediaUser | undefined,
+    link: Link,
+    settings: Settings,
+  ): asserts target is MediaUser {
+    if (
+      !target ||
+      target.Id !== link.remote_id ||
+      target.Name !== link.username ||
+      target.Policy?.IsAdministrator !== false ||
+      typeof target.Policy.IsDisabled !== 'boolean' ||
+      target.Id === settings.template_user_id ||
+      target.Id === this.store.settings().template_user_id
+    )
+      throw new ServiceError('A linked account changed or is protected. Review it manually.');
+  }
+  private async updateLinkedAccess(
+    jellyfin: MediaAPI,
+    settings: Settings,
+    memberId: string,
+    slot: number,
+    disabled: boolean,
+    guard: () => void = () => {},
+  ): Promise<boolean> {
+    let link = this.store.link(memberId, slot);
+    if (!link) throw new ServiceError('The membership account link no longer exists.');
+    const target = await jellyfin.user(link.remote_id);
+    const auth = this.store.authState();
+    if (auth?.kind === 'configured' && (await jellyfin.systemInfo()).Id !== auth.serverId)
+      throw new ServiceError('The paired Jellyfin server changed. No account access was modified.');
+    guard();
+    this.assertLinkedTarget(target, link, settings);
+    const policy = structuredClone(target.Policy!);
+    const isDisabled = policy.IsDisabled === true;
+    if (link.pending_disabled !== null && isDisabled === Boolean(link.pending_disabled)) {
+      this.store.saveLink(memberId, link.username, link.remote_id, isDisabled, slot);
+      link = this.store.link(memberId, slot)!;
+    }
+    if (disabled && !isDisabled) {
+      policy.IsDisabled = true;
+      guard();
+      await this.setAccess(jellyfin, target.Id, policy, memberId, true, slot);
+      this.store.saveLink(memberId, link.username, target.Id, true, slot);
+    } else if (!disabled && isDisabled && link.disabled_by_jellyport) {
+      policy.IsDisabled = false;
+      guard();
+      await this.setAccess(jellyfin, target.Id, policy, memberId, false, slot);
+      this.store.saveLink(memberId, link.username, target.Id, false, slot);
+    } else if (!isDisabled) {
+      this.store.saveLink(memberId, link.username, target.Id, false, slot);
+    }
+    return disabled || !isDisabled || Boolean(link.disabled_by_jellyport);
   }
   async recoveryInfo(username: string): Promise<{
     username: string;
@@ -647,21 +962,44 @@ export class Service {
         'The inspected recovery target is no longer eligible. Refresh its details before proceeding.',
       );
     const mapping = this.mappings.getForTarget(targetUserId, username, this.store.settings());
+    let slot = mapping?.membership_slot ?? 1;
+    let member: Membership | null = null;
     if (discordUserId) {
       await this.validateRecipients([discordUserId]);
+      member = this.memberships.get(discordUserId, this.store.settings());
+      const link = this.store.linkForRemote(targetUserId);
+      if (link && link.discord_user_id !== discordUserId)
+        throw new ServiceError('This Jellyfin account already belongs to another Discord user.');
+      if (link) slot = link.membership_slot;
+      else if (mapping?.discord_user_id !== discordUserId && member) {
+        const derivedSlot = [1, 2, 3].find(
+          (candidate) => username === membershipUsername(member!.base_username, candidate),
+        );
+        if (derivedSlot) slot = derivedSlot;
+      }
+      const householdName =
+        member?.active &&
+        slot <= member.account_limit &&
+        username === membershipUsername(member.base_username, slot);
       if (
         (await this.requireBot().recipientIdentity(discordUserId)).username !== username &&
-        mapping?.discord_user_id !== discordUserId
+        mapping?.discord_user_id !== discordUserId &&
+        !householdName &&
+        !link
       )
         throw new ServiceError(
           "Use the recipient's Discord username when recovering and linking an account.",
         );
+      if (member && (!member.active || slot > member.account_limit))
+        throw new ServiceError('The active membership does not permit this account slot.');
     }
     return this.queue('recover', [
       {
         username,
         discord_user_id: discordUserId,
         recover_target_id: targetUserId,
+        membership_slot: slot,
+        ...(member ? { membership_revision: member.revision } : {}),
         ...(mapping
           ? {
               source_user_id: mapping.source_user_id,
@@ -685,8 +1023,6 @@ export class Service {
       throw new ServiceError('Select 1–100 distinct Emby users.');
     if (Object.keys(discordRecipients).some((id) => !sourceUserIds.includes(id)))
       throw new ServiceError('A Discord recipient must belong to a selected source user.');
-    if (new Set(Object.values(discordRecipients)).size !== Object.keys(discordRecipients).length)
-      throw new ServiceError('Choose a different Discord recipient for each account.');
     if (
       expectedMappingRevisions &&
       (Object.keys(expectedMappingRevisions).length !== sourceUserIds.length ||
@@ -694,10 +1030,10 @@ export class Service {
         sourceUserIds.some((id) => !Object.hasOwn(expectedMappingRevisions, id)))
     )
       throw new ServiceError('Mapping revisions must cover exactly the selected Emby users.');
-    await this.validateRecipients(Object.values(discordRecipients));
     const settings = this.store.settings();
     this.requireServer(settings, 'emby');
     this.requireServer(settings, 'jellyfin');
+    const recipientSlots = new Set<string>();
     const requests = sourceUserIds.map((id): JobRequest => {
       const mapping = this.mappings.getForSource(id, settings);
       if (expectedMappingRevisions && expectedMappingRevisions[id] !== (mapping?.revision ?? null))
@@ -705,6 +1041,23 @@ export class Service {
           'The user mapping changed after preview. Review a new preview before migrating.',
         );
       const recipient = Object.hasOwn(discordRecipients, id) ? discordRecipients[id] : undefined;
+      const slot = mapping?.membership_slot ?? 1;
+      const member = recipient ? this.memberships.get(recipient, settings) : null;
+      if (recipient) {
+        const slotKey = `${recipient}:${slot}`;
+        if (recipientSlots.has(slotKey))
+          throw new ServiceError(
+            'Choose a different Discord recipient or approved membership slot for each account.',
+          );
+        recipientSlots.add(slotKey);
+        if (slot > 1) {
+          const member = this.memberships.get(recipient, settings);
+          if (!member?.active || slot > member.account_limit)
+            throw new ServiceError(
+              'Assign an active membership tier covering this account slot before migrating.',
+            );
+        }
+      }
       if (recipient && mapping?.discord_user_id && mapping.discord_user_id !== recipient)
         throw new ServiceError(
           'The selected Discord recipient differs from this approved user mapping.',
@@ -712,6 +1065,8 @@ export class Service {
       return {
         source_user_id: id,
         discord_user_id: recipient,
+        membership_slot: slot,
+        ...(member ? { membership_revision: member.revision } : {}),
         ...(mapping
           ? {
               username: mapping.target_username,
@@ -721,6 +1076,7 @@ export class Service {
           : {}),
       };
     });
+    await this.validateRecipients(Object.values(discordRecipients));
     return this.queue('migrate', requests);
   }
   private async requireRoleServer(client: MediaAPI, role: AccountRole): Promise<void> {
@@ -939,9 +1295,16 @@ export class Service {
       updated_at: timestamp,
       progress: { processed: 0, total: requests.length },
       results: [],
+      ...(kind === 'membership'
+        ? { membership_discord_user_id: requests[0]?.discord_user_id ?? undefined }
+        : {}),
     };
     const settings = this.store.settings();
-    if (kind !== 'role_update' && settings.default_role_id) {
+    if (
+      kind !== 'role_update' &&
+      requests.some((request) => request.access_disabled === undefined) &&
+      settings.default_role_id
+    ) {
       const role = this.roles.get(settings.default_role_id, settings);
       if (!role)
         throw new ServiceError('The default account role is unavailable. Review Settings.');
@@ -1100,6 +1463,7 @@ export class Service {
     let username: string;
     const guard = () => {
       this.checkStopped();
+      this.assertMembershipRequest(request, settings);
       this.assertDefaultRole(template, request, settings);
       this.assertMapping(mapping, request.source_user_id, settings);
       this.assertDestinationMapping(mapping, destinationId, username, settings);
@@ -1116,6 +1480,14 @@ export class Service {
         ? validateExistingMappingUsername(mapping.target_username)
         : validateUsername(mapping?.target_username ?? source.user.Name);
     } else username = validateUsername(request.username ?? '');
+    if (
+      request.membership_revision &&
+      request.username !== undefined &&
+      request.username !== username
+    )
+      throw new ServiceError(
+        'The source username changed after membership review. Review its mapping before retrying.',
+      );
     guard();
     const currentTarget = this.mappedTarget(
       await jellyfin.users(),
@@ -1128,13 +1500,14 @@ export class Service {
     guard();
     const recipient = request.discord_user_id;
     if (recipient) {
+      const slot = request.membership_slot ?? mapping?.membership_slot ?? 1;
       const identity = await this.requireBot().recipientIdentity(recipient),
-        link = this.store.link(recipient);
+        link = this.store.link(recipient, slot);
       if (identity.id && identity.id !== recipient)
         throw new ServiceError(
           'Discord returned a different recipient identity. Review the mapping.',
         );
-      const memberMapping = this.mappings.getForDiscord(recipient, settings);
+      const memberMapping = this.mappings.getForDiscord(recipient, settings, slot);
       if (memberMapping && memberMapping.id !== mapping?.id)
         throw new ServiceError(
           'This Discord user is approved for a different Emby mapping. Existing ownership was preserved.',
@@ -1143,12 +1516,31 @@ export class Service {
         throw new ServiceError(
           'This Discord user is already linked to a different Jellyfin account. Existing identity link was preserved.',
         );
-      if (!link && username !== identity.username && mapping?.discord_user_id !== recipient)
+      const member = request.membership_revision
+        ? this.assertMembershipRequest(request, settings)
+        : this.memberships.get(recipient, settings);
+      if (slot > 1 && (!member?.active || slot > member.account_limit))
+        throw new ServiceError('The membership no longer permits this account slot.');
+      const approvedHouseholdName = Boolean(
+        request.membership_revision &&
+        member &&
+        username === membershipUsername(member.base_username, slot),
+      );
+      if (slot > 1 && !link && mapping?.discord_user_id !== recipient && !approvedHouseholdName)
+        throw new ServiceError(
+          'Numbered membership accounts require an approved account slot and username.',
+        );
+      if (
+        !link &&
+        username !== identity.username &&
+        mapping?.discord_user_id !== recipient &&
+        !approvedHouseholdName
+      )
         throw new ServiceError(
           "The destination username must match this recipient's Discord username or an approved mapping with their verified user ID.",
         );
       const existing = currentTarget ? this.store.linkForRemote(currentTarget.Id) : null;
-      if (existing && existing.discord_user_id !== recipient)
+      if (existing && (existing.discord_user_id !== recipient || existing.membership_slot !== slot))
         throw new ServiceError('This Jellyfin account is already linked to another Discord user.');
     }
     const result: JobResult = {
@@ -1280,12 +1672,16 @@ export class Service {
         );
       }
       if (recipient) {
+        const slot = request.membership_slot ?? mapping?.membership_slot ?? 1;
         const existing = this.store.linkForRemote(target.Id);
-        if (existing && existing.discord_user_id !== recipient)
+        if (
+          existing &&
+          (existing.discord_user_id !== recipient || existing.membership_slot !== slot)
+        )
           throw new ServiceError(
             'This Jellyfin account is already linked to another Discord user.',
           );
-        const previous = this.store.link(recipient);
+        const previous = this.store.link(recipient, slot);
         if (previous && (previous.remote_id !== target.Id || previous.username !== username))
           throw new ServiceError(
             'This Discord user is already linked to a different Jellyfin account. Existing identity link was preserved.',
@@ -1295,6 +1691,7 @@ export class Service {
           username,
           target.Id,
           Boolean(previous?.disabled_by_jellyport),
+          slot,
         );
       }
       if (source && result.data) {
@@ -1377,7 +1774,8 @@ export class Service {
           const identity = await this.requireBot().recipientIdentity(recipient);
           if (
             (identity.id && identity.id !== recipient) ||
-            this.store.link(recipient)?.remote_id !== target.Id
+            this.store.link(recipient, request.membership_slot ?? mapping?.membership_slot ?? 1)
+              ?.remote_id !== target.Id
           )
             throw new ServiceError(
               'The Discord recipient identity changed. Credentials were preserved for administrator review.',
@@ -1421,12 +1819,51 @@ export class Service {
     try {
       await this.withClient(settings, 'jellyfin', async (jellyfin) => {
         const template =
-          job.kind === 'role_update' ? null : await this.template(jellyfin, settings);
+          job.kind === 'role_update' ||
+          requests.every((request) => request.access_disabled !== undefined)
+            ? null
+            : await this.template(jellyfin, settings);
         for (const request of requests) {
           await this.mutationMutex.run(async () => {
             this.checkStopped();
             try {
-              if (job.kind === 'role_update')
+              if (request.access_disabled !== undefined) {
+                const member = this.assertMembershipRequest(request, settings);
+                if (!member || !request.discord_user_id || !request.target_user_id)
+                  throw new ServiceError('Invalid queued membership action.');
+                const link = this.store.link(request.discord_user_id, request.membership_slot);
+                if (
+                  !link ||
+                  link.remote_id !== request.target_user_id ||
+                  link.username !== request.username
+                )
+                  throw new ServiceError('The linked membership account changed. Review it first.');
+                await this.requireBot().recipientIdentity(request.discord_user_id);
+                const available = await this.updateLinkedAccess(
+                  jellyfin,
+                  settings,
+                  request.discord_user_id,
+                  request.membership_slot!,
+                  request.access_disabled,
+                  () => {
+                    this.checkStopped();
+                    this.assertMembershipRequest(request, settings);
+                  },
+                );
+                job.results.push({
+                  username: request.username!,
+                  target_user_id: request.target_user_id,
+                  status: available ? 'completed' : 'partial',
+                  created: false,
+                  ...(!available
+                    ? {
+                        warnings: [
+                          'This account was disabled outside Jellyport and remains disabled. Review it in Jellyfin.',
+                        ],
+                      }
+                    : {}),
+                });
+              } else if (job.kind === 'role_update')
                 await this.oneRoleUpdate(job, request, settings, jellyfin);
               else await this.one(job, request, settings, jellyfin, template!);
             } catch (error) {
@@ -1488,10 +1925,28 @@ export class Service {
     };
     this.store.saveSubscription(event);
     const settings = this.store.settings();
-    const automatic =
+    let automatic =
       event.action === 'subscribe'
         ? settings.auto_provision
         : settings.auto_disable && (event.action === 'expire' || settings.disable_on_cancel);
+    if (event.action === 'subscribe') {
+      try {
+        const tier = this.subscriptionTier(event, settings);
+        event.tier_id = tier.id;
+        event.account_limit = tier.account_limit;
+        if (
+          event.discord_user_id &&
+          this.isMembershipDowngrade(event.discord_user_id, tier.account_limit, settings) &&
+          !settings.auto_disable
+        )
+          automatic = false;
+      } catch (error) {
+        if (!(error instanceof ServiceError)) throw error;
+        event.error = error.message;
+        automatic = false;
+      }
+      this.store.saveSubscription(event);
+    }
     if (automatic && event.discord_user_id)
       try {
         await this.applySubscription(event.id, true);
@@ -1500,7 +1955,7 @@ export class Service {
       }
     return this.store.subscription(event.id)!;
   }
-  async applySubscription(id: string, _automatic = false): Promise<SubscriptionEvent> {
+  async applySubscription(id: string, automatic = false): Promise<SubscriptionEvent> {
     return this.subscriptionMutex.run(async () => {
       const event = this.store.subscription(id);
       if (!event) throw new ServiceError('Subscription event not found.');
@@ -1509,15 +1964,29 @@ export class Service {
         throw new ServiceError(
           'This message could not be resolved to one Discord user ID. Use a manual account action after verifying the member.',
         );
+      const emitted = Date.parse(event.emitted_at ?? '');
+      if (
+        Number.isFinite(emitted) &&
+        this.store
+          .subscriptions()
+          .some(
+            (previous) =>
+              previous.discord_user_id === event.discord_user_id &&
+              previous.status === 'applied' &&
+              Date.parse(previous.emitted_at ?? '') > emitted,
+          )
+      ) {
+        event.status = 'ignored';
+        event.result = 'A newer membership event was already applied; obsolete event ignored.';
+        this.store.saveSubscription(event);
+        return event;
+      }
       event.status = 'processing';
       event.error = null;
       this.store.saveSubscription(event);
       try {
-        const memberId = event.discord_user_id,
-          settings = this.store.settings();
-        let link = this.store.link(memberId);
-        const identity =
-          event.action === 'subscribe' ? await this.requireBot().recipientIdentity(memberId) : null;
+        const memberId = event.discord_user_id;
+        const settings = this.store.settings();
         if (
           event.action === 'expire' &&
           ['discord_role', 'role_reconciliation'].includes(event.source ?? '')
@@ -1533,81 +2002,94 @@ export class Service {
             return event;
           }
         }
-        if (event.action === 'subscribe' && !link) {
-          const mapping = this.mappings.getForDiscord(memberId, settings);
-          if (mapping) {
-            const job = await this.migrateUsers([mapping.source_user_id], {
-              [mapping.source_user_id]: memberId,
-            });
-            event.job_id = job.id;
-            this.store.saveSubscription(event);
-            await this.jobTasks.get(job.id);
-            if (['failed', 'interrupted'].includes(this.getJob(job.id).status))
-              throw new ServiceError('Mapped account migration failed. Review the linked job.');
-          } else {
-            const username = identity!.username;
-            const target = await this.withClient(settings, 'jellyfin', async (jellyfin) =>
-              this.target(await jellyfin.users(), username),
-            );
-            if (target)
-              throw new ServiceError(
-                'A Jellyfin account already exists without a Discord identity link. Link it through an admin-approved migration first.',
-              );
-            const sources =
-              settings.emby_url && settings.emby_api_key
-                ? (await this.embyUsers()).filter((user) => user.Name === username)
-                : [];
-            if (sources.length > 1)
-              throw new ServiceError('More than one Emby account matches this username.');
-            const job = sources.length
-              ? await this.migrateUsers([sources[0]!.Id], { [sources[0]!.Id]: memberId })
-              : await this.createAccount(username, memberId);
-            event.job_id = job.id;
-            this.store.saveSubscription(event);
-            await this.jobTasks.get(job.id);
-            if (['failed', 'interrupted'].includes(this.getJob(job.id).status))
-              throw new ServiceError('Account provisioning failed. Review the linked job.');
-          }
-        } else {
-          if (!link)
+        if (event.action === 'subscribe') {
+          const tier = this.subscriptionTier(event, settings);
+          if (
+            automatic &&
+            (!settings.auto_provision ||
+              (this.isMembershipDowngrade(memberId, tier?.account_limit, settings) &&
+                !settings.auto_disable))
+          )
             throw new ServiceError(
-              'This Discord member has no Jellyport identity link. No account was disabled.',
+              'This tier change requires administrator review under the current automation settings.',
             );
-          await this.mutationMutex.run(() =>
-            this.withClient(settings, 'jellyfin', async (jellyfin) => {
+          event.tier_id = tier.id;
+          event.account_limit = tier.account_limit;
+          const job = await this.provisionMembership(memberId, tier.id);
+          event.job_id = job.id;
+          this.store.saveSubscription(event);
+          await this.jobTasks.get(job.id);
+          const outcome = this.getJob(job.id);
+          if (
+            ['failed', 'interrupted'].includes(outcome.status) ||
+            outcome.results.some((result) => result.status === 'failed')
+          )
+            throw new ServiceError('Account provisioning failed. Review the linked job.');
+          event.result =
+            'Membership account allowance applied; existing passwords and history preserved.';
+        } else {
+          if (
+            automatic &&
+            (!settings.auto_disable || (event.action === 'cancel' && !settings.disable_on_cancel))
+          )
+            throw new ServiceError(
+              'This access change requires administrator review under the current automation settings.',
+            );
+          await this.membershipMutex.run(() =>
+            this.mutationMutex.run(async () => {
               this.checkStopped();
-              const target = await jellyfin.user(link!.remote_id),
-                policy = structuredClone(target.Policy ?? {});
-              if (
-                !Object.keys(policy).length ||
-                policy.IsAdministrator ||
-                target.Id === settings.template_user_id ||
-                target.Name !== link!.username
-              )
+              const previous = this.memberships.get(memberId, this.store.settings());
+              if (!previous && this.memberships.hasOtherScope(memberId, this.store.settings()))
                 throw new ServiceError(
-                  'The linked account changed or is protected. Review it manually.',
+                  'This member belongs to a different paired server configuration. No account access was modified.',
                 );
-              const disabled = Boolean(policy.IsDisabled),
-                pending = link!.pending_disabled;
-              if (pending !== null && pending !== undefined && disabled === Boolean(pending)) {
-                this.store.saveLink(memberId, link!.username, target.Id, disabled);
-                link = this.store.link(memberId);
-              }
-              if (event.action === 'subscribe') {
-                if (link!.disabled_by_jellyport && disabled) {
-                  policy.IsDisabled = false;
-                  await this.setAccess(jellyfin, target.Id, policy, memberId, false);
-                  this.store.saveLink(memberId, link!.username, target.Id, false);
-                } else if (!disabled)
-                  this.store.saveLink(memberId, link!.username, target.Id, false);
-              } else if (!disabled) {
-                policy.IsDisabled = true;
-                await this.setAccess(jellyfin, target.Id, policy, memberId, true);
-                this.store.saveLink(memberId, link!.username, target.Id, true);
-              }
+              const links = this.store.linksForMember(memberId);
+              if (!links.length && !previous)
+                throw new ServiceError(
+                  'This Discord member has no Jellyport identity link. No account was disabled.',
+                );
+              const primary = this.store.link(memberId) ?? links[0];
+              await this.withClient(settings, 'jellyfin', async (jellyfin) => {
+                // Capture all slots after an in-flight account mutation finishes.
+                for (const link of links)
+                  this.assertLinkedTarget(await jellyfin.user(link.remote_id), link, settings);
+                const member = this.memberships.save(
+                  {
+                    discord_user_id: memberId,
+                    base_username: previous?.base_username ?? primary!.username,
+                    tier_id: previous?.tier_id ?? 'sloop',
+                    account_limit: previous?.account_limit ?? 1,
+                    active: false,
+                    inactive_reason: event.action as 'cancel' | 'expire',
+                  },
+                  settings,
+                  previous?.revision,
+                );
+                const guard = () => {
+                  this.checkStopped();
+                  if (
+                    this.memberships.get(memberId, this.store.settings())?.revision !==
+                    member.revision
+                  )
+                    throw new ServiceError(
+                      'The membership changed. Review its current access before retrying.',
+                    );
+                };
+                guard();
+                for (const link of links)
+                  await this.updateLinkedAccess(
+                    jellyfin,
+                    settings,
+                    memberId,
+                    link.membership_slot,
+                    true,
+                    guard,
+                  );
+              });
             }),
           );
-          event.result = 'Account access updated; password and watch history preserved.';
+          event.result =
+            'All linked account access disabled; passwords and watch history preserved.';
         }
         event.status = 'applied';
       } catch (error) {
@@ -1622,6 +2104,41 @@ export class Service {
       this.store.saveSubscription(event);
       return event;
     });
+  }
+  private subscriptionTier(event: SubscriptionEvent, settings: Settings) {
+    const tiers = settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS;
+    if (event.source !== 'mee6_message' || !event.detail?.trim()) {
+      const previous = event.discord_user_id
+        ? this.memberships.get(event.discord_user_id, settings)
+        : null;
+      const tier = previous
+        ? tiers.find((entry) => entry.id === previous.tier_id)
+        : (tiers.find((entry) => entry.id === 'sloop' && entry.account_limit === 1) ??
+          tiers.find((entry) => entry.account_limit === 1));
+      if (!tier)
+        throw new ServiceError('Choose a configured membership tier before applying this event.');
+      return tier;
+    }
+    const tier = resolveMembershipTier(event.detail, tiers);
+    if (!tier)
+      throw new ServiceError(
+        'This subscription plan is not configured. Map its exact plan name in Settings and review the event.',
+      );
+    return tier;
+  }
+  private isMembershipDowngrade(
+    memberId: string,
+    limit: number | undefined,
+    settings: Settings,
+  ): boolean {
+    const previous = this.memberships.get(memberId, settings);
+    const desired = limit ?? previous?.account_limit ?? 1;
+    return (
+      desired < (previous?.account_limit ?? 1) ||
+      this.store
+        .linksForMember(memberId)
+        .some((link) => link.membership_slot > desired && !link.disabled_by_jellyport)
+    );
   }
   ignoreSubscription(id: string): SubscriptionEvent {
     const event = this.store.subscription(id);
@@ -1638,8 +2155,9 @@ export class Service {
     policy: JsonObject,
     memberId: string,
     disabled: boolean,
+    slot = 1,
   ): Promise<void> {
-    this.store.setLinkPending(memberId, disabled);
+    this.store.setLinkPending(memberId, disabled, slot);
     try {
       await client.setPolicy(remoteId, policy);
     } catch (error) {
@@ -1649,21 +2167,33 @@ export class Service {
         error.statusCode >= 400 &&
         error.statusCode < 500
       )
-        this.store.setLinkPending(memberId, null);
+        this.store.setLinkPending(memberId, null, slot);
       throw error;
     }
   }
   async reconcileMemberships(): Promise<void> {
     const settings = this.store.settings();
     if (!settings.discord_role_events || !settings.discord_member_role_id || !this.bot) return;
-    for (const link of this.store.links()) {
-      const active = await this.bot.membershipActive(link.discord_user_id);
-      if (
-        active === null ||
-        (active && !link.disabled_by_jellyport) ||
-        (!active && link.disabled_by_jellyport)
-      )
-        continue;
+    const memberIds = new Set(this.store.links().map((link) => link.discord_user_id));
+    for (const memberId of memberIds) {
+      const links = this.store.linksForMember(memberId);
+      const member = this.memberships.get(memberId, settings);
+      if (!member && this.memberships.hasOtherScope(memberId, settings)) continue;
+      const active = await this.bot.membershipActive(memberId);
+      if (active === null) continue;
+      if (active && member?.active === false && member.inactive_reason === 'cancel') continue;
+      const limit = member?.account_limit ?? 1;
+      const needsRenewal =
+        member?.active === false ||
+        links.some(
+          (link) =>
+            link.membership_slot <= limit &&
+            (link.disabled_by_jellyport || link.pending_disabled !== null),
+        );
+      const needsExpiration = member
+        ? member.active !== false
+        : links.some((link) => !link.disabled_by_jellyport);
+      if ((active && !needsRenewal) || (!active && !needsExpiration)) continue;
       const action = active ? 'subscribe' : 'expire';
       if (
         this.store
@@ -1671,17 +2201,17 @@ export class Service {
           .some(
             (event) =>
               event.source === 'role_reconciliation' &&
-              event.discord_user_id === link.discord_user_id &&
+              event.discord_user_id === memberId &&
               event.action === action &&
-              ['pending', 'processing'].includes(event.status),
+              ['pending', 'processing', 'failed'].includes(event.status),
           )
       )
         continue;
       await this.recordSubscription({
         id: `reconcile-${randomUUID()}`,
         action,
-        discord_user_id: link.discord_user_id,
-        username: link.username,
+        discord_user_id: memberId,
+        username: (this.store.link(memberId) ?? links[0])?.username,
         source: 'role_reconciliation',
         emitted_at: now(),
       });
@@ -1690,6 +2220,12 @@ export class Service {
       const members = await this.bot.activeMembers();
       if (members === null) return;
       for (const member of members) {
+        const known = this.memberships.get(member.id, settings);
+        if (
+          (known?.active === false && known.inactive_reason === 'cancel') ||
+          (!known && this.memberships.hasOtherScope(member.id, settings))
+        )
+          continue;
         if (
           this.store.link(member.id) ||
           this.store

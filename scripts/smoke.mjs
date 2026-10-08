@@ -47,6 +47,17 @@ assert.equal(
 );
 assert.equal((await fetch(new URL('/api/user-mappings', base))).status, 401);
 assert.equal((await fetch(new URL('/api/account-roles', base))).status, 401);
+assert.equal((await fetch(new URL('/api/memberships', base))).status, 401);
+assert.equal(
+  (
+    await fetch(new URL('/api/memberships/provision', base), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ discord_user_id: '123456789', tier_id: 'galleon' }),
+    })
+  ).status,
+  401,
+);
 assert.equal(
   (
     await fetch(new URL('/api/account-roles/apply', base), {

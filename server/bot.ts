@@ -19,6 +19,7 @@ import type { Settings as AppSettings } from './types.js';
 import type { Job, SubscriptionInput } from './service.js';
 import type { MediaUser } from './media.js';
 import type { UserMapping } from './user-mappings.js';
+import { DEFAULT_MEMBERSHIP_TIERS } from './memberships.js';
 import type { DiscordMemberSearchResult, DiscordMemberSummary } from './discord-members.js';
 
 export class BotError extends Error {}
@@ -26,9 +27,11 @@ export class BotError extends Error {}
 /** The bot only calls these service operations; Discord never owns account state. */
 export interface BotService {
   createAccount(username: string, discordId?: string): Promise<Job>;
+  provisionMembership?(discordId: string, tierId?: string, expectedRevision?: string): Promise<Job>;
   migrateUsers(ids: string[], recipients?: Record<string, string>): Promise<Job>;
   embyUsers(): Promise<MediaUser[]>;
   resolveDiscordMapping?(discordId: string): UserMapping | null;
+  resolveDiscordMappings?(discordId: string): UserMapping[];
   getJob(id: string): Job | null | undefined;
   recordSubscription(event: SubscriptionInput & { guild_id?: string }): Promise<unknown>;
   reconcileMemberships?(): Promise<unknown>;
@@ -204,7 +207,8 @@ export function botIntents(settings: Settings): GatewayIntentBits[] {
   return intents;
 }
 
-export function botCommand() {
+export function botCommand(settings: Settings = {}) {
+  const tiers = settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS;
   return new SlashCommandBuilder()
     .setName('jellyport')
     .setDescription('Create Jellyfin accounts and migrate Emby users')
@@ -213,12 +217,20 @@ export function botCommand() {
     .addSubcommand((command) =>
       command
         .setName('create')
-        .setDescription('Create an account and privately send its credentials')
+        .setDescription('Provision a member’s account allowance and privately send new credentials')
         .addUserOption((option) =>
           option
             .setName('user')
             .setDescription('Current server member receiving the credentials')
             .setRequired(true),
+        )
+        .addStringOption((option) =>
+          option
+            .setName('tier')
+            .setDescription(
+              'Provision every account included in this tier; defaults to their saved tier',
+            )
+            .addChoices(...tiers.map((tier) => ({ name: tier.name, value: tier.id }))),
         )
         .addStringOption((option) =>
           option
@@ -417,6 +429,7 @@ export class BotManager {
             interaction,
             interaction.options.getUser('user', true),
             interaction.options.getString('username'),
+            interaction.options.getString('tier'),
           );
         if (command === 'migrate')
           await this.handleMigrate(
@@ -477,7 +490,7 @@ export class BotManager {
     this.error = null;
     try {
       if (!this.registered) {
-        await this.wait(this.guild().commands.set([botCommand().toJSON()]), 20_000);
+        await this.wait(this.guild().commands.set([botCommand(this.settings).toJSON()]), 20_000);
         this.checkActive();
         this.registered = true;
       }
@@ -803,12 +816,15 @@ export class BotManager {
     interaction: ChatInputCommandInteraction,
     user: { id: string },
     username?: string | null,
+    tierId?: string | null,
   ): Promise<void> {
     let message: string;
     try {
       await this.prepare(interaction);
       const identity = await this.recipientIdentity(user.id);
-      const mapping = this.service.resolveDiscordMapping?.(identity.id);
+      const mapping = !this.service.provisionMembership
+        ? this.service.resolveDiscordMapping?.(identity.id)
+        : null;
       if (mapping?.discord_user_id === identity.id)
         throw new BotError(
           'This member has a verified Emby migration mapping. Use /jellyport migrate to preserve their data and use the approved Jellyfin destination.',
@@ -818,7 +834,11 @@ export class BotManager {
           "New account usernames must match the recipient's current Discord username.",
         );
       this.checkActive();
-      const job = await this.service.createAccount(identity.username, identity.id);
+      if (tierId != null && !this.service.provisionMembership)
+        throw new BotError('Tier provisioning is unavailable. Use the Jellyport web page.');
+      const job = this.service.provisionMembership
+        ? await this.service.provisionMembership(identity.id, tierId ?? undefined)
+        : await this.service.createAccount(identity.username, identity.id);
       this.checkActive();
       message = jobStatusMessage(job) + ' Use /jellyport status to check progress.';
     } catch (error) {
@@ -840,15 +860,25 @@ export class BotManager {
     try {
       await this.prepare(interaction);
       const identity = await this.recipientIdentity(user.id);
-      const proposedMapping = this.service.resolveDiscordMapping?.(identity.id);
+      const proposedMappings = this.service.resolveDiscordMappings
+        ? this.service.resolveDiscordMappings(identity.id)
+        : [this.service.resolveDiscordMapping?.(identity.id)].filter(
+            (mapping): mapping is UserMapping => !!mapping,
+          );
       // A saved display label is not an identity. Only an exact verified Discord ID may
       // select a source whose name differs from the live member's username.
-      const mapping = proposedMapping?.discord_user_id === identity.id ? proposedMapping : null;
+      const mappings = proposedMappings.filter(
+        (mapping) => mapping.discord_user_id === identity.id,
+      );
+      if (mappings.length > 1 && embyUsername == null)
+        throw new BotError(
+          'This member has multiple mapped Emby accounts. Select the exact emby_username to migrate, or review User mappings in the web page.',
+        );
       const users = await this.service.embyUsers();
       this.checkActive();
       const matches = users.filter((item) =>
-        mapping && embyUsername == null
-          ? item.Id === mapping.source_user_id
+        mappings.length === 1 && embyUsername == null
+          ? item.Id === mappings[0]!.source_user_id
           : item.Name === (embyUsername ?? identity.username),
       );
       if (matches.length !== 1 || !matches[0]!.Id)
@@ -856,7 +886,7 @@ export class BotManager {
           'No unique Emby user matches that exact username. Check the Emby user list in the web page.',
         );
       const id = String(matches[0]!.Id);
-      if (mapping && id !== mapping.source_user_id)
+      if (mappings.length && !mappings.some((mapping) => mapping.source_user_id === id))
         throw new BotError(
           "That Emby account differs from this member's verified mapping. Review User mappings in the web page before migrating.",
         );

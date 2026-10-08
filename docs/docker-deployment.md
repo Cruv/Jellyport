@@ -30,6 +30,8 @@ For a privately published fork, add a **Custom registry** in Portainer with URL 
 
 Create a stack using the selected example and deploy it. For later image updates, use Portainer's stack update option to pull the image again and recreate the container, retaining the same data mount.
 
+Version 0.7.0 upgrades existing identity links and mappings to primary account slot 1 automatically. Keep the existing data directory; no new environment variables are needed. Extra accounts are created only when you apply a membership tier or opt into recognized subscription automation. Keep a stopped, complete backup of the database and `secret.key` before this schema upgrade. Rolling back to an older image requires restoring its matching pre-upgrade data backup.
+
 ## Complete first-run setup
 
 Open Jellyport using its private LAN IP, local hostname, or localhost, and enter the Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password in the setup wizard. Set the public Jellyfin URL that your users should receive; selecting an existing enabled, non-administrator legacy template user is optional. The wizard can finish without one. After completing setup, add the Emby source URL and API key in Settings. Pairing requires both a private/loopback connection source and a local Host header. Complete setup before exposing a reverse proxy; the first qualifying visitor can link the server. A permitted public proxy hostname cannot perform first pairing, even when the proxy connects from a private address. For loopback-only deployments, use a local browser or SSH tunnel.

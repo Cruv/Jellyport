@@ -15,6 +15,7 @@ import AuthScreen from './AuthScreen';
 import UserMappingsPage from './UserMappingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import AccountRolesPage from './AccountRolesPage';
+import MembershipsPage from './MembershipsPage';
 import {
   AccountsPage,
   ActivityPage,
@@ -49,6 +50,7 @@ const pages: Record<Page, { title: string; icon: string }> = {
   mappings: { title: 'User mappings', icon: 'link' },
   roles: { title: 'Account roles', icon: 'shield' },
   accounts: { title: 'Create account', icon: 'userPlus' },
+  memberships: { title: 'Memberships', icon: 'discord' },
   subscriptions: { title: 'Subscriptions', icon: 'inbox' },
   activity: { title: 'Activity', icon: 'activity' },
   settings: { title: 'Settings', icon: 'settings' },
@@ -265,6 +267,9 @@ export default function App() {
             setUsers(listed);
             setSettings(configuration);
           }
+        } else if (target === 'memberships') {
+          const value = await api<Settings>('/api/settings');
+          if (version === loadVersion.current) setSettings(value);
         } else if (target === 'accounts') {
           const [value, summary] = await Promise.all([
             api<Settings>('/api/settings'),
@@ -577,6 +582,8 @@ export default function App() {
         defaultRoleId={settings?.default_role_id}
       />
     );
+  else if (page === 'memberships' && settings)
+    content = <MembershipsPage settings={settings} api={api} notify={notify} created={created} />;
   else if (page === 'accounts' && overview && settings)
     content = (
       <AccountsPage
@@ -1219,7 +1226,7 @@ function DialogContent({
               ? 'Applying…'
               : subscribe
                 ? 'Apply subscription'
-                : 'Disable account now'}
+                : 'Disable linked accounts now'}
           </button>
         </>
       }
@@ -1229,14 +1236,26 @@ function DialogContent({
         warning={!subscribe}
         title={
           subscribe
-            ? 'Create or link this member’s Jellyfin account.'
-            : 'Disable the linked Jellyfin account now.'
+            ? 'Provision this member’s Jellyfin accounts.'
+            : 'Disable all linked Jellyfin accounts now.'
         }
       >
         {subscribe
-          ? 'Jellyport uses the Discord username for a new account, then preserves its linked username for future membership events.'
-          : 'Approving this event manually disables access immediately, even when automatic disabling is off. The account, password, and watch history are preserved.'}
+          ? 'Jellyport uses the member’s subscription tier to provision account slots, preserves linked usernames, and disables extras after a downgrade. Accounts and their data are kept for future upgrades.'
+          : 'Approving this event manually disables all linked account slots immediately, even when automatic disabling is off. Accounts, passwords, and watch history are preserved.'}
       </Callout>
+      {subscribe && event.source === 'mee6_message' && event.detail && (
+        <p className="muted text-small">
+          Reported subscription plan: <strong>{event.detail}</strong>. The configured plan’s account
+          allowance will be applied.
+        </p>
+      )}
+      {subscribe && event.account_limit !== undefined && (
+        <p className="muted text-small">
+          Account allowance: {event.account_limit}{' '}
+          {event.account_limit === 1 ? 'account' : 'accounts'}.
+        </p>
+      )}
       <p className="muted text-small">
         This event was received {date(event.created_at)} from {event.source || 'Discord'}. Review
         your membership settings before applying it.

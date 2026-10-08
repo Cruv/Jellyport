@@ -382,6 +382,117 @@ describe('Bot lifecycle and commands', () => {
     });
   });
 
+  it('provisions the entire selected tier through the membership service and keeps credentials private', async () => {
+    const { manager, service } = await fixture();
+    const provisionMembership = vi.fn(async () => ({
+      id: 'household_1',
+      status: 'queued',
+      password: 'NEVER-IN-CHANNEL',
+      credentials: [{ username: 'jlogan35_2', password: 'SECOND-SECRET' }],
+    }));
+    Object.assign(service, { provisionMembership });
+    service.resolveDiscordMapping.mockReturnValue({
+      source_user_id: 'emby_1',
+      discord_user_id: '22',
+      target_username: 'SimpleName',
+    } as UserMapping);
+    const request = interaction();
+    await manager.handleCreate(asInteraction(request), { id: '22' }, null, 'brigantine');
+    expect(provisionMembership).toHaveBeenCalledWith('22', 'brigantine');
+    expect(service.createAccount).not.toHaveBeenCalled();
+    expect(service.resolveDiscordMapping).not.toHaveBeenCalled();
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: 'Job `household_1`: queued. Use /jellyport status to check progress.',
+      flags: MessageFlags.Ephemeral | MessageFlags.SuppressEmbeds,
+      allowedMentions: { parse: [], repliedUser: false },
+    });
+    expect(JSON.stringify(request.followUp.mock.calls)).not.toMatch(/SECRET|NEVER-IN-CHANNEL/);
+    await manager.handleCreate(asInteraction(interaction()), { id: '22' });
+    expect(provisionMembership).toHaveBeenLastCalledWith('22', undefined);
+  });
+
+  it('does not bypass membership, guild, administrator, or username checks for tier provisioning', async () => {
+    const { manager, service, guild, admin, recipient } = await fixture();
+    const provisionMembership = vi.fn(async () => ({ id: 'household_1', status: 'queued' }));
+    Object.assign(service, { provisionMembership });
+    await manager.handleCreate(asInteraction(interaction('456')), { id: '22' }, null, 'galleon');
+    await manager.handleCreate(asInteraction(interaction()), { id: '22' }, 'Nickname', 'galleon');
+    guild.members.fetch.mockImplementation(async (options) =>
+      options.user === '11' ? member('11', 'admin', { roles: [] }) : recipient,
+    );
+    await manager.handleCreate(asInteraction(interaction()), { id: '22' }, null, 'galleon');
+    guild.members.fetch.mockImplementation(async (options) =>
+      options.user === '11' ? admin : member('22', 'jlogan35', { roles: [] }),
+    );
+    await manager.handleCreate(asInteraction(interaction()), { id: '22' }, null, 'galleon');
+    expect(provisionMembership).not.toHaveBeenCalled();
+    expect(service.createAccount).not.toHaveBeenCalled();
+  });
+
+  it('redacts membership service failures without falling back to single-account creation', async () => {
+    const { manager, service } = await fixture();
+    const provisionMembership = vi.fn(async () => {
+      throw new Error('token SECRET password PRIVATE');
+    });
+    Object.assign(service, { provisionMembership });
+    const request = interaction();
+    await manager.handleCreate(asInteraction(request), { id: '22' }, null, 'galleon');
+    expect(service.createAccount).not.toHaveBeenCalled();
+    expect(request.followUp.mock.calls[0]![0]).toMatchObject({
+      content: 'Account creation could not be queued. Check the Jellyport web page.',
+    });
+    expect(JSON.stringify(request.followUp.mock.calls)).not.toMatch(/SECRET|PRIVATE/);
+  });
+
+  it('registers default tier choices and current customized tier names', () => {
+    const create = botCommand()
+      .toJSON()
+      .options?.find((option) => option.name === 'create');
+    expect(create).toMatchObject({
+      options: expect.arrayContaining([
+        expect.objectContaining({
+          name: 'tier',
+          description: expect.any(String),
+          type: 3,
+          choices: [
+            { name: 'Sloop', value: 'sloop' },
+            { name: 'Brigantine', value: 'brigantine' },
+            { name: 'Galleon', value: 'galleon' },
+          ],
+        }),
+      ]),
+    });
+    const customized = botCommand({
+      membership_tiers: [
+        { id: 'family', name: 'Family', plan_name: 'Family Membership', account_limit: 3 },
+      ],
+    }).toJSON();
+    expect(customized.options?.find((option) => option.name === 'create')).toMatchObject({
+      options: expect.arrayContaining([
+        expect.objectContaining({ name: 'tier', choices: [{ name: 'Family', value: 'family' }] }),
+      ]),
+    });
+  });
+
+  it('passes the selected tier from the registered Discord command to membership provisioning', async () => {
+    const { manager, service, client } = await fixture();
+    const provisionMembership = vi.fn(async () => ({ id: 'household_1', status: 'queued' }));
+    Object.assign(service, { provisionMembership });
+    const request = Object.assign(interaction(), {
+      commandName: 'jellyport',
+      isChatInputCommand: () => true,
+      options: {
+        getSubcommand: () => 'create',
+        getUser: () => ({ id: '22' }),
+        getString: (name: string) => (name === 'tier' ? 'galleon' : null),
+      },
+    });
+    client.emit(Events.InteractionCreate, request);
+    await vi.waitFor(() => expect(provisionMembership).toHaveBeenCalledWith('22', 'galleon'));
+    expect(service.createAccount).not.toHaveBeenCalled();
+    await manager.stop();
+  });
+
   it('migrates only an exact unique source name to the verified recipient', async () => {
     const { manager, service } = await fixture();
     await manager.handleMigrate(asInteraction(interaction()), { id: '22' });
@@ -444,6 +555,57 @@ describe('Bot lifecycle and commands', () => {
       content: expect.stringContaining('differs from'),
     });
     await manager.handleMigrate(asInteraction(interaction()), { id: '22' }, 'Mapped Emby Name');
+    expect(service.migrateUsers).toHaveBeenCalledWith(['emby_1'], { emby_1: '22' });
+  });
+
+  it('requires a source selector for several approved accounts owned by the same Discord member', async () => {
+    const { manager, service } = await fixture();
+    const resolveDiscordMappings = vi.fn(
+      () =>
+        [
+          { source_user_id: 'emby_1', discord_user_id: '22', target_username: 'jlogan35' },
+          { source_user_id: 'emby_2', discord_user_id: '22', target_username: 'jlogan35_2' },
+        ] as UserMapping[],
+    );
+    Object.assign(service, { resolveDiscordMappings });
+    service.embyUsers.mockResolvedValue([
+      { Id: 'emby_1', Name: 'Primary Emby Name' },
+      { Id: 'emby_2', Name: 'Second Emby Name' },
+      { Id: 'emby_3', Name: 'unrelated' },
+    ]);
+    const unspecified = interaction();
+    await manager.handleMigrate(asInteraction(unspecified), { id: '22' });
+    expect(service.migrateUsers).not.toHaveBeenCalled();
+    expect(service.embyUsers).not.toHaveBeenCalled();
+    expect(unspecified.followUp.mock.calls[0]![0]).toMatchObject({
+      content: expect.stringContaining('exact emby_username'),
+    });
+    await manager.handleMigrate(asInteraction(interaction()), { id: '22' }, 'Second Emby Name');
+    expect(service.migrateUsers).toHaveBeenCalledWith(['emby_2'], { emby_2: '22' });
+    await manager.handleMigrate(asInteraction(interaction()), { id: '22' }, 'unrelated');
+    expect(service.migrateUsers).toHaveBeenCalledTimes(1);
+    expect(resolveDiscordMappings).toHaveBeenCalledWith('22');
+    expect(service.resolveDiscordMapping).not.toHaveBeenCalled();
+  });
+
+  it('does not use a secondary mapping whose Discord ID belongs to someone else', async () => {
+    const { manager, service } = await fixture();
+    Object.assign(service, {
+      resolveDiscordMappings: vi.fn(
+        () =>
+          [
+            { source_user_id: 'emby_1', discord_user_id: '22' },
+            { source_user_id: 'emby_2', discord_user_id: '33', discord_username: 'jlogan35' },
+          ] as UserMapping[],
+      ),
+    });
+    service.embyUsers.mockResolvedValue([
+      { Id: 'emby_1', Name: 'Primary Emby Name' },
+      { Id: 'emby_2', Name: 'Second Emby Name' },
+    ]);
+    await manager.handleMigrate(asInteraction(interaction()), { id: '22' }, 'Second Emby Name');
+    expect(service.migrateUsers).not.toHaveBeenCalled();
+    await manager.handleMigrate(asInteraction(interaction()), { id: '22' });
     expect(service.migrateUsers).toHaveBeenCalledWith(['emby_1'], { emby_1: '22' });
   });
 

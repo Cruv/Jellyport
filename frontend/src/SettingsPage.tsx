@@ -2,12 +2,14 @@ import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { Callout, Heading, Icon } from './components';
 import {
   safeUrl,
+  defaultMembershipTiers,
   type Api,
   type Connections,
   type Notify,
   type Settings,
   type Users,
   type AccountRole,
+  type MembershipTier,
 } from './types';
 
 const toggleNames = [
@@ -193,6 +195,9 @@ export default function SettingsPage({
   refresh: () => Promise<void>;
 }) {
   const [mappings, setMappings] = useState(s.path_mappings || []);
+  const [membershipTiers, setMembershipTiers] = useState<MembershipTier[]>(
+    (s.membership_tiers || defaultMembershipTiers).map((tier) => ({ ...tier })),
+  );
   const [busy, setBusy] = useState('');
   const [tested, setTested] = useState<Partial<Connections> | null>(null);
   const [roles, setRoles] = useState<AccountRole[]>([]);
@@ -232,6 +237,23 @@ export default function SettingsPage({
         .filter((row) => row.source || row.target);
       if ((data.path_mappings as typeof mappings).some((row) => !row.source || !row.target))
         throw new Error('Each path mapping needs both an Emby prefix and a Jellyfin prefix.');
+      data.membership_tiers = membershipTiers.map((tier) => ({
+        id: tier.id.trim(),
+        name: tier.name.trim(),
+        plan_name: tier.plan_name.trim(),
+        account_limit: tier.account_limit,
+      }));
+      if (!membershipTiers.length) throw new Error('Configure at least one membership tier.');
+      if (
+        new Set(membershipTiers.map((tier) => tier.id.trim().toLowerCase())).size !==
+        membershipTiers.length
+      )
+        throw new Error('Each membership tier needs a unique stable ID.');
+      if (
+        new Set(membershipTiers.map((tier) => tier.plan_name.trim().toLowerCase())).size !==
+        membershipTiers.length
+      )
+        throw new Error('Each membership tier needs a unique subscription plan name.');
       await api('/api/settings', { method: 'PUT', body: data });
       notify('Settings saved. Your connections are ready to test.');
       await refresh();
@@ -571,10 +593,10 @@ export default function SettingsPage({
               <div className="discord-commands">
                 <h3>Bot commands</h3>
                 <div className="command-row">
-                  <code>/jellyport create user:@member</code>
+                  <code>/jellyport create user:@member tier:brigantine</code>
                   <p>
-                    Create a fresh account using the member’s Discord username and deliver
-                    credentials privately.
+                    Provision every account included in the selected tier and deliver new
+                    credentials privately. Omit tier to use the member’s saved tier or Sloop.
                   </p>
                 </div>
                 <div className="command-row">
@@ -588,6 +610,128 @@ export default function SettingsPage({
                   <code>/jellyport status job_id:…</code>
                   <p>Check the result of an account or migration operation.</p>
                 </div>
+              </div>
+            </div>
+          </Section>
+          <Section
+            title="Membership tiers"
+            description="Set the number of accounts included in each subscription plan."
+          >
+            <div className="form-stack">
+              <p className="muted text-small">
+                All account slots belong to one Discord member. Trusted subscription messages match
+                the plan name exactly. Keep saved tier IDs stable so existing memberships remain
+                associated with their plan.
+              </p>
+              {membershipTiers.map((tier, index) => (
+                <fieldset className="membership-tier-fields" key={index}>
+                  <legend>Tier {index + 1}</legend>
+                  <div className="field-row">
+                    <div className="field">
+                      <label htmlFor={`membership-tier-id-${index}`}>Stable tier ID</label>
+                      <input
+                        id={`membership-tier-id-${index}`}
+                        value={tier.id}
+                        required
+                        maxLength={64}
+                        pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
+                        autoComplete="off"
+                        onChange={(event) =>
+                          setMembershipTiers((rows) =>
+                            rows.map((row, i) =>
+                              i === index ? { ...row, id: event.target.value } : row,
+                            ),
+                          )
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor={`membership-tier-name-${index}`}>Tier name</label>
+                      <input
+                        id={`membership-tier-name-${index}`}
+                        value={tier.name}
+                        required
+                        maxLength={64}
+                        autoComplete="off"
+                        onChange={(event) =>
+                          setMembershipTiers((rows) =>
+                            rows.map((row, i) =>
+                              i === index ? { ...row, name: event.target.value } : row,
+                            ),
+                          )
+                        }
+                      />
+                    </div>
+                  </div>
+                  <div className="field-row">
+                    <div className="field">
+                      <label htmlFor={`membership-tier-plan-${index}`}>
+                        Subscription plan name
+                      </label>
+                      <input
+                        id={`membership-tier-plan-${index}`}
+                        value={tier.plan_name}
+                        required
+                        maxLength={100}
+                        autoComplete="off"
+                        onChange={(event) =>
+                          setMembershipTiers((rows) =>
+                            rows.map((row, i) =>
+                              i === index ? { ...row, plan_name: event.target.value } : row,
+                            ),
+                          )
+                        }
+                      />
+                    </div>
+                    <div className="field">
+                      <label htmlFor={`membership-tier-limit-${index}`}>Account allowance</label>
+                      <select
+                        id={`membership-tier-limit-${index}`}
+                        value={tier.account_limit}
+                        onChange={(event) =>
+                          setMembershipTiers((rows) =>
+                            rows.map((row, i) =>
+                              i === index
+                                ? { ...row, account_limit: Number(event.target.value) }
+                                : row,
+                            ),
+                          )
+                        }
+                      >
+                        <option value={1}>1 account</option>
+                        <option value={2}>2 accounts</option>
+                        <option value={3}>3 accounts</option>
+                      </select>
+                    </div>
+                  </div>
+                  <button
+                    className="btn btn-small btn-quiet"
+                    type="button"
+                    disabled={membershipTiers.length === 1}
+                    aria-label={`Remove tier ${tier.name || index + 1}`}
+                    onClick={() => setMembershipTiers((rows) => rows.filter((_, i) => i !== index))}
+                  >
+                    Remove tier
+                  </button>
+                </fieldset>
+              ))}
+              <button
+                className="btn btn-small btn-quiet"
+                type="button"
+                disabled={membershipTiers.length >= 20}
+                onClick={() =>
+                  setMembershipTiers((rows) => [
+                    ...rows,
+                    { id: '', name: '', plan_name: '', account_limit: 1 },
+                  ])
+                }
+              >
+                <Icon name="plus" /> Add tier
+              </button>
+              <div className="support-note">
+                Saving tier definitions does not change existing accounts. Review and apply a
+                member’s tier on Memberships. A downgrade disables extras and keeps their data; a
+                later upgrade restores the same Jellyport-disabled accounts.
               </div>
             </div>
           </Section>
@@ -630,13 +774,13 @@ export default function SettingsPage({
               <Toggle
                 name="auto_provision"
                 label="Automatically provision subscribed members"
-                description="Create and deliver accounts automatically. With role events enabled, existing active members are also scanned on startup and every five minutes."
+                description="Provision accounts for the member’s tier and deliver new credentials automatically. Automatic downgrades also require automatic disabling. With role events enabled, active members are scanned on startup and every five minutes."
                 checked={s.auto_provision}
               />
               <Toggle
                 name="auto_disable"
                 label="Automatically disable expired memberships"
-                description="Disable the linked Jellyfin account when paid access expires. The account and its history are retained."
+                description="Disable all linked accounts when paid access expires. Also required for automatic tier downgrades. Accounts and their data are retained."
                 checked={s.auto_disable}
               />
               <Toggle

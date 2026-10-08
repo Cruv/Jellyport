@@ -43,6 +43,8 @@ import {
   type Membership,
 } from './memberships.js';
 import type { Link } from './store.js';
+import { AccountProfiles, type AccountProfileInput } from './account-profiles.js';
+import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 
 export { ServiceError } from './errors.js';
 export interface JobRequest {
@@ -246,6 +248,7 @@ export class Service {
   readonly mappings: UserMappings;
   readonly roles: AccountRoles;
   readonly memberships: Memberships;
+  readonly profiles: AccountProfiles;
   private readonly membershipMutex = new Mutex();
   constructor(
     readonly store: Store,
@@ -257,6 +260,7 @@ export class Service {
     this.mappings = new UserMappings(store);
     this.roles = new AccountRoles(store, this.demo);
     this.memberships = new Memberships(store);
+    this.profiles = new AccountProfiles(store);
   }
   resolveDiscordMapping(discordId: string): UserMapping | null {
     return this.mappings.getForDiscord(discordId, this.store.settings());
@@ -690,6 +694,110 @@ export class Service {
       links: this.store.linksForMember(member.discord_user_id),
     }));
   }
+  private assertManageableAccount(
+    target: MediaUser,
+    targetId: string,
+    settings: Settings,
+    kind: MediaKind,
+  ): void {
+    if (
+      target.Id !== targetId ||
+      target.Policy?.IsAdministrator !== false ||
+      typeof target.Policy.IsDisabled !== 'boolean' ||
+      (kind === 'jellyfin' &&
+        (targetId === settings.template_user_id ||
+          targetId === this.store.settings().template_user_id))
+    )
+      throw new ServiceError('Administrator, template, or unverified accounts cannot be changed.');
+  }
+  private async confirmPairedServer(settings: Settings): Promise<void> {
+    const auth = this.store.authState();
+    if (auth?.kind === 'configured') {
+      if (normalizeJellyfinUrl(settings.jellyfin_url) !== normalizeJellyfinUrl(auth.serverUrl))
+        throw new ServiceError(
+          'Restore the paired Jellyfin configuration before changing an account.',
+        );
+      await this.withClient(settings, 'jellyfin', async (client) => {
+        if ((await client.systemInfo()).Id !== auth.serverId)
+          throw new ServiceError('The paired Jellyfin server changed. No account was modified.');
+      });
+    }
+  }
+  /** Only a manual, selected-ID edit can establish a Family exemption. */
+  async saveAccountProfile(input: AccountProfileInput & { expected_revision?: string }) {
+    if (this.demo) throw new ServiceError('Demo account profiles are read-only.');
+    return this.mutationMutex.run(async () => {
+      this.checkStopped();
+      const settings = this.store.settings();
+      await this.confirmPairedServer(settings);
+      return this.withClient(settings, input.kind, async (client) => {
+        const target = await client.user(input.user_id);
+        if (target.Id !== input.user_id)
+          throw new ServiceError('The selected media account changed. Refresh and try again.');
+        if (input.family) this.assertManageableAccount(target, input.user_id, settings, input.kind);
+        if (JSON.stringify(settings) !== JSON.stringify(this.store.settings()))
+          throw new ServiceError('Configuration changed. Refresh and try again.');
+        return this.profiles.save(input, settings, input.expected_revision);
+      });
+    });
+  }
+  /** Explicit administrator access change, separate from subscription automation. */
+  async setAccountAccess(input: {
+    kind: MediaKind;
+    user_id: string;
+    disabled: boolean;
+    expected_username: string;
+    expected_profile_revision: string;
+  }) {
+    if (this.demo) throw new ServiceError('Demo account access is read-only.');
+    if (typeof input.disabled !== 'boolean')
+      throw new ServiceError('Choose the account access state.');
+    return this.mutationMutex.run(async () => {
+      this.checkStopped();
+      const settings = this.store.settings();
+      await this.confirmPairedServer(settings);
+      return this.withClient(settings, input.kind, async (client) => {
+        const target = await client.user(input.user_id);
+        this.assertManageableAccount(target, input.user_id, settings, input.kind);
+        if (
+          target.Name !== input.expected_username ||
+          (this.profiles.get(input.kind, input.user_id, this.store.settings())?.revision ?? '') !==
+            input.expected_profile_revision ||
+          JSON.stringify(settings) !== JSON.stringify(this.store.settings())
+        )
+          throw new ServiceError(
+            'The account, owner notes, or configuration changed. Review access again.',
+          );
+        const policy = structuredClone(target.Policy!);
+        policy.IsDisabled = input.disabled;
+        this.checkStopped();
+        if (target.Policy!.IsDisabled !== input.disabled) await client.setPolicy(target.Id, policy);
+        const confirmed = await client.user(target.Id);
+        this.assertManageableAccount(confirmed, input.user_id, settings, input.kind);
+        if (
+          confirmed.Name !== input.expected_username ||
+          confirmed.Policy!.IsDisabled !== input.disabled ||
+          JSON.stringify(settings) !== JSON.stringify(this.store.settings()) ||
+          (this.profiles.get(input.kind, input.user_id, this.store.settings())?.revision ?? '') !==
+            input.expected_profile_revision
+        )
+          throw new ServiceError('Account access could not be confirmed. Refresh before retrying.');
+        if (input.kind === 'jellyfin') {
+          const link = this.store.linkForRemote(input.user_id);
+          // An explicit administrator action is not a billing-owned disable.
+          if (link)
+            this.store.saveLink(
+              link.discord_user_id,
+              link.username,
+              link.remote_id,
+              false,
+              link.membership_slot,
+            );
+        }
+        return { kind: input.kind, user_id: input.user_id, disabled: input.disabled };
+      });
+    });
+  }
   /** Save an administrator's access decision without touching media accounts. */
   async setMembershipAccess(input: {
     discord_user_id: string;
@@ -1054,6 +1162,9 @@ export class Service {
       throw new ServiceError('The paired Jellyfin server changed. No account access was modified.');
     guard();
     this.assertLinkedTarget(target, link, settings);
+    // Family is a per-account manual decision. Never reconcile pending billing
+    // flags or change access automatically for this selected target ID.
+    if (this.profiles.get('jellyfin', target.Id, this.store.settings())?.family) return false;
     const policy = structuredClone(target.Policy!);
     const isDisabled = policy.IsDisabled === true;
     if (link.pending_disabled !== null && isDisabled === Boolean(link.pending_disabled)) {
@@ -1999,7 +2110,10 @@ export class Service {
                   link.username !== request.username
                 )
                   throw new ServiceError('The linked membership account changed. Review it first.');
-                await this.recipientIdentity(request.discord_user_id);
+                const family =
+                  this.profiles.get('jellyfin', request.target_user_id, this.store.settings())
+                    ?.family === true;
+                if (!family) await this.recipientIdentity(request.discord_user_id);
                 const available = await this.updateLinkedAccess(
                   jellyfin,
                   settings,
@@ -2019,7 +2133,13 @@ export class Service {
                   ...(!available
                     ? {
                         warnings: [
-                          'This account was disabled outside Jellyport and remains disabled. Review it in Jellyfin.',
+                          this.profiles.get(
+                            'jellyfin',
+                            request.target_user_id,
+                            this.store.settings(),
+                          )?.family
+                            ? 'Family account access is managed manually. The membership access change was skipped.'
+                            : 'This account was disabled outside Jellyport and remains disabled. Review it in Jellyfin.',
                         ],
                       }
                     : {}),
@@ -2272,7 +2392,7 @@ export class Service {
           );
           if (event.status !== 'ignored')
             event.result =
-              'All linked account access disabled; passwords and watch history preserved.';
+              'Eligible linked account access disabled; manually flagged Family accounts, passwords, and watch history preserved.';
         }
         if (event.status !== 'ignored') event.status = 'applied';
       } catch (error) {

@@ -299,6 +299,13 @@ export interface DirectoryAccount {
   id: string;
   name: string;
   disabled: boolean;
+  protected: boolean;
+  profile?: {
+    family: boolean;
+    owner_name: string;
+    notes: string;
+    revision: string;
+  } | null;
 }
 export interface DirectoryUser {
   id: string;
@@ -309,6 +316,8 @@ export interface DirectoryUser {
   access_mode: 'subscription' | 'complimentary' | 'standalone' | 'unlinked';
   account_limit: number | null;
   protected: boolean;
+  family?: boolean;
+  requires_review?: boolean;
 }
 export interface DiscordTagRole {
   id: string;

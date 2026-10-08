@@ -100,11 +100,34 @@ assert.equal(settings.discord_emby_only_role, false);
 const directory = await request('/api/user-directory');
 assert(directory.users.some((user) => user.access_mode === 'standalone'));
 assert(directory.users.every((user) => user.discord_user_id === null));
+assert(directory.users.some((user) => user.requires_review));
+assert(directory.users.every((user) => user.family === false));
 assert(!JSON.stringify(directory).includes('Configuration'));
 for (const [path, body] of [
   ['/api/memberships/access', { discord_user_id: '123456789', access_mode: 'complimentary' }],
   ['/api/accounts/link', { discord_user_id: '123456789', jellyfin_user_id: 'j-river' }],
   ['/api/discord/tags/preview', {}],
+  [
+    '/api/account-profiles',
+    {
+      kind: 'jellyfin',
+      user_id: 'j-river',
+      family: true,
+      owner_name: 'Synthetic child',
+      notes: 'Synthetic note',
+      expected_revision: '',
+    },
+  ],
+  [
+    '/api/accounts/access',
+    {
+      kind: 'jellyfin',
+      user_id: 'j-river',
+      disabled: true,
+      expected_username: 'river',
+      expected_profile_revision: '',
+    },
+  ],
 ]) {
   const response = await fetch(new URL(path, base), {
     method: 'POST',
@@ -152,5 +175,5 @@ assert.equal(
   401,
 );
 console.log(
-  'Container smoke passed: React assets, authentication/CSRF, safe user directory, read-only demo organization, bulk migration, preserved existing accounts, and one-time credentials.',
+  'Container smoke passed: React assets, authentication/CSRF, safe user directory and family review, read-only demo organization/access, bulk migration, preserved existing accounts, and one-time credentials.',
 );

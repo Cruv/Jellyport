@@ -4,6 +4,7 @@ import DiscordMemberPicker from './DiscordMemberPicker';
 import { safeUrl } from './types';
 import type {
   Api,
+  DirectoryAccount,
   DirectoryUser,
   DiscordMember,
   DiscordTagPreview,
@@ -35,6 +36,19 @@ const presenceNames = {
 };
 const message = (error: unknown) =>
   error instanceof Error ? error.message : 'This change could not be completed.';
+type ProfileAccount = {
+  key: string;
+  kind: 'emby' | 'jellyfin';
+  account: DirectoryAccount;
+};
+const profileAccounts = (user: DirectoryUser): ProfileAccount[] =>
+  (['jellyfin', 'emby'] as const).flatMap((kind) =>
+    user[kind]
+      .filter((account) => account.protected === false)
+      .map((account) => ({ key: JSON.stringify([kind, account.id]), kind, account })),
+  );
+const familyAccount = (user: DirectoryUser) =>
+  !!user.family || [...user.emby, ...user.jellyfin].some((account) => account.profile?.family);
 
 export default function UserDirectoryPage({
   settings,
@@ -53,7 +67,17 @@ export default function UserDirectoryPage({
   const [search, setSearch] = useState('');
   const [server, setServer] = useState('all');
   const [access, setAccess] = useState('all');
+  const [family, setFamily] = useState('all');
+  const [review, setReview] = useState('all');
   const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState<DirectoryUser | null>(null);
+  const [profileTarget, setProfileTarget] = useState('');
+  const [profileFamily, setProfileFamily] = useState(false);
+  const [ownerName, setOwnerName] = useState('');
+  const [ownerNotes, setOwnerNotes] = useState('');
+  const [accessReview, setAccessReview] = useState<DirectoryUser | null>(null);
+  const [accessTarget, setAccessTarget] = useState('');
+  const [accessDisabled, setAccessDisabled] = useState(false);
   const [linking, setLinking] = useState<DirectoryUser | null>(null);
   const [member, setMember] = useState<DiscordMember | null>(null);
   const [target, setTarget] = useState('');
@@ -153,6 +177,75 @@ export default function UserDirectoryPage({
     );
     setError('');
   }
+  function selectProfile(target: ProfileAccount) {
+    setProfileTarget(target.key);
+    setProfileFamily(!!target.account.profile?.family);
+    setOwnerName(target.account.profile?.owner_name || '');
+    setOwnerNotes(target.account.profile?.notes || '');
+  }
+  function openProfile(user: DirectoryUser) {
+    const account = profileAccounts(user)[0];
+    if (!account) return;
+    setEditing(user);
+    selectProfile(account);
+    setError('');
+  }
+  function saveProfile(event: FormEvent) {
+    event.preventDefault();
+    const target = editing && profileAccounts(editing).find((item) => item.key === profileTarget);
+    if (!target) return;
+    void run(async (signal) => {
+      await api('/api/account-profiles', {
+        method: 'POST',
+        body: {
+          kind: target.kind,
+          user_id: target.account.id,
+          family: profileFamily,
+          owner_name: ownerName,
+          notes: ownerNotes,
+          expected_revision: target.account.profile?.revision || '',
+        },
+        signal,
+      });
+      if (!mounted.current || signal.aborted) return;
+      setEditing(null);
+      notify('Family flag and private owner notes saved.');
+      await reload();
+    });
+  }
+  function openAccessReview(user: DirectoryUser) {
+    const target = profileAccounts(user)[0];
+    if (!target) return;
+    setAccessReview(user);
+    setAccessTarget(target.key);
+    setAccessDisabled(!target.account.disabled);
+    setError('');
+  }
+  function updateAccess(event: FormEvent) {
+    event.preventDefault();
+    const target =
+      accessReview && profileAccounts(accessReview).find((item) => item.key === accessTarget);
+    if (!target || accessDisabled === target.account.disabled) return;
+    void run(async (signal) => {
+      await api('/api/accounts/access', {
+        method: 'POST',
+        body: {
+          kind: target.kind,
+          user_id: target.account.id,
+          disabled: accessDisabled,
+          expected_username: target.account.name,
+          expected_profile_revision: target.account.profile?.revision || '',
+        },
+        signal,
+      });
+      if (!mounted.current || signal.aborted) return;
+      setAccessReview(null);
+      notify(
+        `Account ${accessDisabled ? 'disabled' : 'enabled'}. Its password and media data are preserved.`,
+      );
+      await reload();
+    });
+  }
   function link(event: FormEvent) {
     event.preventDefault();
     if (!member || !target) return;
@@ -227,10 +320,12 @@ export default function UserDirectoryPage({
     }, true);
   }
   const roleName = (id: string) => roles.find((role) => role.id === id)?.name || id;
+  const reviewCount = users.filter((user) => user.requires_review).length;
   const visible = users.filter((user) => {
     const text = [
       ...user.emby.map((item) => item.name),
       ...user.jellyfin.map((item) => item.name),
+      ...[...user.emby, ...user.jellyfin].map((item) => item.profile?.owner_name || ''),
       user.discord_username || '',
     ]
       .join(' ')
@@ -238,7 +333,9 @@ export default function UserDirectoryPage({
     return (
       text.includes(search.trim().toLowerCase()) &&
       (server === 'all' || presence(user) === server) &&
-      (access === 'all' || user.access_mode === access)
+      (access === 'all' || user.access_mode === access) &&
+      (family === 'all' || familyAccount(user) === (family === 'family')) &&
+      (review === 'all' || !!user.requires_review)
     );
   });
   return (
@@ -253,18 +350,34 @@ export default function UserDirectoryPage({
         }
       />
       <Callout icon="users" title="Discord and subscriptions are optional.">
-        Complimentary members keep access under your control. Independent accounts can belong to
-        children or anyone without Discord. Save a complimentary policy in{' '}
+        Mark family accounts and record who owns them using Family and owner notes. Family access
+        stays admin-managed, with no Discord or payment requirement. Paying members require a
+        Discord owner. You can also save complimentary access in{' '}
         <button className="text-button" onClick={() => navigate('memberships')}>
           Memberships
         </button>{' '}
-        before linking a non-paying Discord member. Create independent accounts from{' '}
+        for other non-paying members. Create independent accounts from{' '}
         <button className="text-button" onClick={() => navigate('accounts')}>
           Create account
         </button>
         .
       </Callout>
-      {error && !linking && (
+      {!loading && reviewCount > 0 && (
+        <Callout
+          warning
+          icon="warning"
+          title={`${reviewCount} ${reviewCount === 1 ? 'user needs' : 'users need'} review`}
+        >
+          These users have accounts without a confirmed Discord owner or a family flag. Review who
+          owns them and how their access should be managed. They will not be automatically disabled.
+          <p>
+            <button className="text-button" onClick={() => setReview('review')}>
+              Show users needing review
+            </button>
+          </p>
+        </Callout>
+      )}
+      {error && !linking && !editing && !accessReview && (
         <div className="error-block" role="alert">
           {error}
         </div>
@@ -323,6 +436,29 @@ export default function UserDirectoryPage({
                     ))}
                 </select>
               </div>
+              <div className="field">
+                <label htmlFor="directory-family">Family accounts</label>
+                <select
+                  id="directory-family"
+                  value={family}
+                  onChange={(event) => setFamily(event.target.value)}
+                >
+                  <option value="all">All users</option>
+                  <option value="family">Family only</option>
+                  <option value="other">Other users</option>
+                </select>
+              </div>
+              <div className="field">
+                <label htmlFor="directory-review">Account review</label>
+                <select
+                  id="directory-review"
+                  value={review}
+                  onChange={(event) => setReview(event.target.value)}
+                >
+                  <option value="all">All users</option>
+                  <option value="review">Needs review</option>
+                </select>
+              </div>
             </div>
           </div>
           {loading ? (
@@ -346,6 +482,10 @@ export default function UserDirectoryPage({
                           ? user.emby.map((account) => (
                               <div key={account.id}>
                                 <strong>{account.name}</strong>
+                                {account.profile?.family && <span className="status">Family</span>}
+                                {account.profile?.owner_name && (
+                                  <small>Owner: {account.profile.owner_name}</small>
+                                )}
                                 {account.disabled && <small>Disabled</small>}
                               </div>
                             ))
@@ -356,6 +496,10 @@ export default function UserDirectoryPage({
                           ? user.jellyfin.map((account) => (
                               <div key={account.id}>
                                 <strong>{account.name}</strong>
+                                {account.profile?.family && <span className="status">Family</span>}
+                                {account.profile?.owner_name && (
+                                  <small>Owner: {account.profile.owner_name}</small>
+                                )}
                                 {account.disabled && <small>Disabled</small>}
                               </div>
                             ))
@@ -372,6 +516,8 @@ export default function UserDirectoryPage({
                         <small>
                           {accessNames[user.access_mode]} · {presenceNames[presence(user)]}
                         </small>
+                        {familyAccount(user) && <span className="status">Family accounts</span>}
+                        {user.requires_review && <span className="status warn">Needs review</span>}
                         {user.account_limit !== null && (
                           <small>{user.account_limit} account allowance</small>
                         )}
@@ -380,6 +526,26 @@ export default function UserDirectoryPage({
                         )}
                       </td>
                       <td className="right">
+                        {profileAccounts(user).length > 0 && (
+                          <button
+                            className="btn btn-quiet"
+                            disabled={busy}
+                            onClick={() => openProfile(user)}
+                            aria-label={`Family and owner notes for ${profileAccounts(user)[0]!.account.name}`}
+                          >
+                            Family and owner notes
+                          </button>
+                        )}
+                        {profileAccounts(user).length > 0 && (
+                          <button
+                            className="btn btn-quiet"
+                            disabled={busy}
+                            onClick={() => openAccessReview(user)}
+                            aria-label={`Manage account access for ${profileAccounts(user)[0]!.account.name}`}
+                          >
+                            Manage account access
+                          </button>
+                        )}
                         {user.jellyfin.length > 0 && !user.protected && (
                           <button
                             className="btn btn-quiet"
@@ -390,7 +556,7 @@ export default function UserDirectoryPage({
                             Link Discord owner
                           </button>
                         )}
-                        {user.emby.length > 0 && (
+                        {user.emby.length > 0 && !user.protected && (
                           <button className="btn btn-quiet" onClick={() => navigate('mappings')}>
                             User mappings
                           </button>
@@ -538,6 +704,197 @@ export default function UserDirectoryPage({
           )}
         </section>
       </div>
+      {accessReview && (
+        <Modal
+          title="Review account access"
+          description="Change access for one selected media account."
+          close={() => {
+            if (!busy) {
+              setAccessReview(null);
+              setError('');
+            }
+          }}
+        >
+          <form className="form-stack" onSubmit={updateAccess}>
+            <div className="field">
+              <label htmlFor="directory-access-account">Media account</label>
+              <select
+                id="directory-access-account"
+                value={accessTarget}
+                disabled={busy}
+                onChange={(event) => {
+                  const target = profileAccounts(accessReview).find(
+                    (item) => item.key === event.target.value,
+                  );
+                  if (!target) return;
+                  setAccessTarget(target.key);
+                  setAccessDisabled(!target.account.disabled);
+                }}
+              >
+                {profileAccounts(accessReview).map((target) => (
+                  <option key={target.key} value={target.key}>
+                    {target.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}: {target.account.name}
+                  </option>
+                ))}
+              </select>
+              <small>
+                Currently{' '}
+                {profileAccounts(accessReview).find((target) => target.key === accessTarget)
+                  ?.account.disabled
+                  ? 'disabled'
+                  : 'enabled'}
+                .
+              </small>
+            </div>
+            <div className="field">
+              <label htmlFor="directory-access-change">Access change</label>
+              <select
+                id="directory-access-change"
+                value={accessDisabled ? 'disable' : 'enable'}
+                disabled={busy}
+                onChange={(event) => setAccessDisabled(event.target.value === 'disable')}
+              >
+                <option value="disable">Disable this account</option>
+                <option value="enable">Enable this account</option>
+              </select>
+            </div>
+            <p>
+              {accessDisabled
+                ? 'Disabling prevents this account from signing in. Its password, watch history, favorites, playlists, and preferences are preserved, so you can enable it again later.'
+                : 'Enabling restores access for this account with its existing password and media data.'}
+            </p>
+            <small>
+              Only the selected account changes. Its family flag, notes, and linked owner’s access
+              policy remain as saved.
+            </small>
+            {error && (
+              <div className="error-block" role="alert">
+                {error}
+              </div>
+            )}
+            <div className="form-actions">
+              <button
+                className="btn"
+                type="button"
+                disabled={busy}
+                onClick={() => setAccessReview(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={
+                  busy ||
+                  accessDisabled ===
+                    profileAccounts(accessReview).find((target) => target.key === accessTarget)
+                      ?.account.disabled
+                }
+              >
+                {busy
+                  ? 'Updating…'
+                  : accessDisabled
+                    ? 'Disable selected account'
+                    : 'Enable selected account'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+      {editing && (
+        <Modal
+          title="Family and owner notes"
+          description="Keep account ownership details private in Jellyport."
+          close={() => {
+            if (!busy) {
+              setEditing(null);
+              setError('');
+            }
+          }}
+        >
+          <form className="form-stack" onSubmit={saveProfile}>
+            <div className="field">
+              <label htmlFor="directory-profile-account">Media account</label>
+              <select
+                id="directory-profile-account"
+                value={profileTarget}
+                disabled={busy}
+                onChange={(event) => {
+                  const target = profileAccounts(editing).find(
+                    (item) => item.key === event.target.value,
+                  );
+                  if (target) selectProfile(target);
+                }}
+              >
+                {profileAccounts(editing).map((target) => (
+                  <option key={target.key} value={target.key}>
+                    {target.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}: {target.account.name}
+                  </option>
+                ))}
+              </select>
+              <small>These notes belong to the selected account on this server.</small>
+            </div>
+            <label className="check-line">
+              <input
+                type="checkbox"
+                checked={profileFamily}
+                disabled={busy}
+                onChange={(event) => setProfileFamily(event.target.checked)}
+              />
+              Family account
+            </label>
+            <p>
+              This flag applies only to the selected account. Family accounts are exempt from
+              automatic billing-based access changes. No Discord membership or payment is required.
+            </p>
+            <small>
+              Removing the family flag does not disable the account. Manage the linked owner’s
+              subscription or complimentary access separately in Memberships.
+            </small>
+            <div className="field">
+              <label htmlFor="directory-profile-owner">Owner name</label>
+              <input
+                id="directory-profile-owner"
+                value={ownerName}
+                maxLength={120}
+                disabled={busy}
+                onChange={(event) => setOwnerName(event.target.value)}
+                placeholder="Who this account belongs to"
+              />
+            </div>
+            <div className="field">
+              <label htmlFor="directory-profile-notes">Private owner notes</label>
+              <textarea
+                id="directory-profile-notes"
+                value={ownerNotes}
+                maxLength={2000}
+                rows={4}
+                disabled={busy}
+                onChange={(event) => setOwnerNotes(event.target.value)}
+                placeholder="Details to help you recognize and manage the account"
+              />
+              <small>Visible only to Jellyport administrators. Never sent to Discord.</small>
+            </div>
+            {error && (
+              <div className="error-block" role="alert">
+                {error}
+              </div>
+            )}
+            <div className="form-actions">
+              <button
+                className="btn"
+                type="button"
+                disabled={busy}
+                onClick={() => setEditing(null)}
+              >
+                Cancel
+              </button>
+              <button className="btn btn-primary" disabled={busy}>
+                {busy ? 'Saving…' : 'Save family and owner notes'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
       {linking && (
         <Modal
           title="Link an existing Jellyfin account"

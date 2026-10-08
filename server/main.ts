@@ -875,6 +875,53 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   app.get('/api/subscriptions', async () => ({ events: store.subscriptions() }));
   app.get('/api/memberships', async () => ({ memberships: service.listMemberships() }));
   const organization = new UserOrganization(service);
+  app.post<{ Body: Parameters<Service['saveAccountProfile']>[0] }>(
+    '/api/account-profiles',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['kind', 'user_id', 'family', 'owner_name', 'notes', 'expected_revision'],
+          properties: {
+            kind: { type: 'string', enum: ['emby', 'jellyfin'] },
+            user_id: id,
+            family: { type: 'boolean' },
+            owner_name: { type: 'string', maxLength: 120 },
+            notes: { type: 'string', maxLength: 2000 },
+            expected_revision: { type: 'string', maxLength: 128 },
+          },
+        },
+      },
+    },
+    async (request) => service.saveAccountProfile(request.body),
+  );
+  app.post<{ Body: Parameters<Service['setAccountAccess']>[0] }>(
+    '/api/accounts/access',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: [
+            'kind',
+            'user_id',
+            'disabled',
+            'expected_username',
+            'expected_profile_revision',
+          ],
+          properties: {
+            kind: { type: 'string', enum: ['emby', 'jellyfin'] },
+            user_id: id,
+            disabled: { type: 'boolean' },
+            expected_username: { type: 'string', minLength: 1, maxLength: 256 },
+            expected_profile_revision: { type: 'string', maxLength: 128 },
+          },
+        },
+      },
+    },
+    async (request) => service.setAccountAccess(request.body),
+  );
   app.get('/api/user-directory', async () => organization.directory());
   app.get('/api/discord/tag-roles', async () => organization.listTagRoles());
   app.post('/api/discord/tags/preview', async () => organization.preview());

@@ -8,27 +8,55 @@ const discordId = '123456789012345678';
 const users: DirectoryUser[] = [
   {
     id: 'family',
-    emby: [{ id: 'emby-family', name: 'Family', disabled: false }],
-    jellyfin: [{ id: 'jf-family', name: 'Family', disabled: false }],
+    emby: [
+      {
+        id: 'emby-family',
+        name: 'Family',
+        disabled: false,
+        protected: false,
+        profile: {
+          family: true,
+          owner_name: 'Jordan',
+          notes: 'Emby account details',
+          revision: 'emby-profile-revision',
+        },
+      },
+    ],
+    jellyfin: [
+      {
+        id: 'jf-family',
+        name: 'Family',
+        disabled: false,
+        protected: false,
+        profile: {
+          family: true,
+          owner_name: 'Sam',
+          notes: 'Private family details',
+          revision: 'jf-profile-revision',
+        },
+      },
+    ],
     discord_user_id: discordId,
     discord_username: 'family_owner',
     access_mode: 'complimentary',
     account_limit: 2,
     protected: false,
+    family: true,
   },
   {
     id: 'child',
     emby: [],
-    jellyfin: [{ id: 'jf-child', name: 'Child', disabled: false }],
+    jellyfin: [{ id: 'jf-child', name: 'Child', disabled: false, protected: false }],
     discord_user_id: null,
     discord_username: null,
     access_mode: 'standalone',
     account_limit: null,
     protected: false,
+    requires_review: true,
   },
   {
     id: 'legacy',
-    emby: [{ id: 'emby-legacy', name: 'Legacy', disabled: false }],
+    emby: [{ id: 'emby-legacy', name: 'Legacy', disabled: false, protected: false }],
     jellyfin: [],
     discord_user_id: null,
     discord_username: null,
@@ -39,7 +67,7 @@ const users: DirectoryUser[] = [
   {
     id: 'admin',
     emby: [],
-    jellyfin: [{ id: 'jf-admin', name: 'Admin', disabled: false }],
+    jellyfin: [{ id: 'jf-admin', name: 'Admin', disabled: false, protected: true }],
     discord_user_id: null,
     discord_username: null,
     access_mode: 'unlinked',
@@ -75,6 +103,8 @@ function page(custom?: Api, values = settings) {
           truncated: false,
         };
       if (path === '/api/accounts/link') return {};
+      if (path === '/api/account-profiles') return {};
+      if (path === '/api/accounts/access') return {};
       if (path === '/api/discord/tag-roles')
         return {
           can_manage_roles: true,
@@ -123,6 +153,8 @@ describe('User directory and Discord organization', () => {
     page();
     await screen.findByRole('button', { name: 'Link Discord owner for Child' });
     expect(screen.queryByRole('button', { name: 'Link Discord owner for Admin' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Manage account access for Admin' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Family and owner notes for Admin' })).toBeNull();
     expect(screen.getByText('Complimentary · Both servers')).toBeTruthy();
     expect(screen.getByText('Independent · Jellyfin only')).toBeTruthy();
     fireEvent.change(screen.getByLabelText('Server presence'), { target: { value: 'emby' } });
@@ -135,6 +167,88 @@ describe('User directory and Discord organization', () => {
     expect(screen.getByText('@family_owner')).toBeTruthy();
     expect(screen.queryByText('Legacy')).toBeNull();
   });
+
+  it.each(['emby', 'jellyfin'] as const)(
+    'allows exact-account family and access review when the matching %s account is protected',
+    async (protectedKind) => {
+      const editableKind = protectedKind === 'emby' ? 'jellyfin' : 'emby';
+      const row: DirectoryUser = {
+        id: 'same-name-pair',
+        emby: [
+          {
+            id: 'emby-shared',
+            name: 'Shared',
+            disabled: false,
+            protected: protectedKind === 'emby',
+          },
+        ],
+        jellyfin: [
+          {
+            id: 'jellyfin-shared',
+            name: 'Shared',
+            disabled: false,
+            protected: protectedKind === 'jellyfin',
+          },
+        ],
+        discord_user_id: null,
+        discord_username: null,
+        access_mode: 'standalone',
+        account_limit: null,
+        protected: true,
+        requires_review: true,
+      };
+      const requests: { path: string; options?: ApiOptions }[] = [];
+      const api = vi.fn(async (path: string, options?: ApiOptions) => {
+        requests.push({ path, options });
+        return path === '/api/user-directory' ? { users: [row] } : {};
+      }) as Api;
+      const { notify } = page(api);
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'Family and owner notes for Shared' }),
+      );
+      let dialog = screen.getByRole('dialog');
+      let selector = within(dialog).getByLabelText('Media account');
+      expect(within(selector).getAllByRole('option')).toHaveLength(1);
+      expect(selector).toHaveProperty(
+        'value',
+        JSON.stringify([editableKind, `${editableKind}-shared`]),
+      );
+      fireEvent.click(within(dialog).getByLabelText('Family account'));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Save family and owner notes' }));
+      await waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+      expect(
+        requests.find((entry) => entry.path === '/api/account-profiles')?.options?.body,
+      ).toEqual({
+        kind: editableKind,
+        user_id: `${editableKind}-shared`,
+        family: true,
+        owner_name: '',
+        notes: '',
+        expected_revision: '',
+      });
+      fireEvent.click(
+        await screen.findByRole('button', { name: 'Manage account access for Shared' }),
+      );
+      dialog = screen.getByRole('dialog');
+      selector = within(dialog).getByLabelText('Media account');
+      expect(within(selector).getAllByRole('option')).toHaveLength(1);
+      expect(selector).toHaveProperty(
+        'value',
+        JSON.stringify([editableKind, `${editableKind}-shared`]),
+      );
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Disable selected account' }));
+      await waitFor(() => expect(notify).toHaveBeenCalledTimes(2));
+      expect(
+        requests.find((entry) => entry.path === '/api/accounts/access')?.options?.body,
+      ).toEqual({
+        kind: editableKind,
+        user_id: `${editableKind}-shared`,
+        disabled: true,
+        expected_username: 'Shared',
+        expected_profile_revision: '',
+      });
+    },
+  );
 
   it('confirms an exact existing account ID and a queried non-paying Discord owner without changing passwords', async () => {
     const { requests, notify } = page();
@@ -159,6 +273,294 @@ describe('User directory and Discord organization', () => {
         }),
       },
     ]);
+  });
+
+  it('filters family owners and searches owner names without exposing private notes in the directory', async () => {
+    page();
+    await screen.findByText('Owner: Sam');
+    expect(screen.getByText('Family accounts', { selector: 'span' })).toBeTruthy();
+    expect(screen.queryByText('Private family details')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Family accounts'), { target: { value: 'family' } });
+    expect(screen.getByText('@family_owner')).toBeTruthy();
+    expect(screen.queryByText('Child')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Search users'), { target: { value: 'Jordan' } });
+    expect(screen.getByText('@family_owner')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Family accounts'), { target: { value: 'other' } });
+    expect(screen.queryByText('@family_owner')).toBeNull();
+  });
+
+  it('highlights unlinked non-family accounts for review without proposing automatic disablement', async () => {
+    page();
+    await screen.findByText('1 user needs review');
+    expect(screen.getByText(/They will not be automatically disabled/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Show users needing review' }));
+    expect(screen.getByLabelText('Account review')).toHaveProperty('value', 'review');
+    expect(screen.getByText('Child')).toBeTruthy();
+    expect(screen.queryByText('@family_owner')).toBeNull();
+    expect(screen.queryByText('Legacy')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Account review'), { target: { value: 'all' } });
+    expect(screen.getByText('Legacy')).toBeTruthy();
+  });
+
+  it('edits only the selected account family flag even when another account in the row is family', async () => {
+    const values = users.map((user) =>
+      user.id === 'family'
+        ? {
+            ...user,
+            jellyfin: user.jellyfin.map((account) => ({
+              ...account,
+              profile: { ...account.profile!, family: false },
+            })),
+          }
+        : user,
+    );
+    page(vi.fn(async () => ({ users: values })) as Api);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Family and owner notes for Family' }),
+    );
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByLabelText('Family account')).toHaveProperty('checked', false);
+    fireEvent.change(within(dialog).getByLabelText('Media account'), {
+      target: { value: JSON.stringify(['emby', 'emby-family']) },
+    });
+    expect(within(dialog).getByLabelText('Family account')).toHaveProperty('checked', true);
+  });
+
+  it('saves private metadata for the selected exact server account with its revision', async () => {
+    const { requests, notify } = page();
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Family and owner notes for Family' }),
+    );
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByLabelText('Owner name')).toHaveProperty('value', 'Sam');
+    expect(within(dialog).getByLabelText('Private owner notes')).toHaveProperty(
+      'value',
+      'Private family details',
+    );
+    expect(within(dialog).getByLabelText('Family account')).toHaveProperty('checked', true);
+    expect(within(dialog).getByText(/This flag applies only to the selected account/)).toBeTruthy();
+    expect(within(dialog).getByText(/Never sent to Discord/)).toBeTruthy();
+    fireEvent.change(within(dialog).getByLabelText('Media account'), {
+      target: { value: JSON.stringify(['emby', 'emby-family']) },
+    });
+    expect(within(dialog).getByLabelText('Owner name')).toHaveProperty('value', 'Jordan');
+    expect(within(dialog).getByLabelText('Private owner notes')).toHaveProperty(
+      'value',
+      'Emby account details',
+    );
+    fireEvent.change(within(dialog).getByLabelText('Private owner notes'), {
+      target: { value: 'Shared with Jordan’s family' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save family and owner notes' }));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith('Family flag and private owner notes saved.'),
+    );
+    expect(requests.filter((entry) => entry.options?.method)).toEqual([
+      {
+        path: '/api/account-profiles',
+        options: expect.objectContaining({
+          method: 'POST',
+          body: {
+            kind: 'emby',
+            user_id: 'emby-family',
+            family: true,
+            owner_name: 'Jordan',
+            notes: 'Shared with Jordan’s family',
+            expected_revision: 'emby-profile-revision',
+          },
+        }),
+      },
+    ]);
+  });
+
+  it('marks an independent child account as family without requiring a Discord owner', async () => {
+    const { requests, notify } = page();
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Family and owner notes for Child' }),
+    );
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).queryByLabelText('Discord member')).toBeNull();
+    expect(within(dialog).getByText(/No Discord membership or payment is required/)).toBeTruthy();
+    expect(within(dialog).getByLabelText('Owner name')).toHaveProperty('maxLength', 120);
+    expect(within(dialog).getByLabelText('Private owner notes')).toHaveProperty('maxLength', 2000);
+    fireEvent.click(within(dialog).getByLabelText('Family account'));
+    fireEvent.change(within(dialog).getByLabelText('Owner name'), { target: { value: 'Alex' } });
+    fireEvent.change(within(dialog).getByLabelText('Private owner notes'), {
+      target: { value: 'Kid’s account' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save family and owner notes' }));
+    await waitFor(() => expect(notify).toHaveBeenCalled());
+    expect(requests.find((entry) => entry.path === '/api/account-profiles')?.options?.body).toEqual(
+      {
+        kind: 'jellyfin',
+        user_id: 'jf-child',
+        family: true,
+        owner_name: 'Alex',
+        notes: 'Kid’s account',
+        expected_revision: '',
+      },
+    );
+  });
+
+  it('removes a family flag without requesting subscription management', async () => {
+    const { requests, notify } = page();
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Family and owner notes for Family' }),
+    );
+    const dialog = screen.getByRole('dialog');
+    expect(
+      within(dialog).getByText(/Removing the family flag does not disable the account/),
+    ).toBeTruthy();
+    fireEvent.click(within(dialog).getByLabelText('Family account'));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save family and owner notes' }));
+    await waitFor(() => expect(notify).toHaveBeenCalled());
+    const mutations = requests.filter((entry) => entry.options?.method);
+    expect(mutations).toHaveLength(1);
+    expect(mutations[0].path).toBe('/api/account-profiles');
+    expect(mutations[0].options?.body).toMatchObject({ family: false });
+  });
+
+  it('shows a rejected stale profile save without discarding private drafts', async () => {
+    const api = vi.fn(async (path: string) => {
+      if (path === '/api/user-directory') return { users };
+      throw new Error('Account profile changed. Refresh and review the latest details.');
+    }) as Api;
+    const { notify } = page(api);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Family and owner notes for Child' }),
+    );
+    const dialog = screen.getByRole('dialog');
+    fireEvent.change(within(dialog).getByLabelText('Private owner notes'), {
+      target: { value: 'My unsaved private note' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Save family and owner notes' }));
+    expect(await within(dialog).findByRole('alert')).toHaveProperty(
+      'textContent',
+      'Account profile changed. Refresh and review the latest details.',
+    );
+    expect(within(dialog).getByLabelText('Private owner notes')).toHaveProperty(
+      'value',
+      'My unsaved private note',
+    );
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('aborts profile saves on unmount and ignores late success callbacks', async () => {
+    let finish!: (value: unknown) => void;
+    let signal!: AbortSignal;
+    const api = vi.fn((path: string, options?: ApiOptions) => {
+      if (path === '/api/user-directory') return Promise.resolve({ users });
+      signal = options!.signal!;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    }) as Api;
+    const { unmount, notify } = page(api);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Family and owner notes for Child' }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Save family and owner notes' }));
+    unmount();
+    expect(signal.aborted).toBe(true);
+    await act(async () => finish({}));
+    expect(notify).not.toHaveBeenCalled();
+    expect(api).toHaveBeenCalledTimes(2);
+  });
+
+  it('requires explicit account access review and disables only the selected exact account', async () => {
+    const { requests, notify } = page();
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Manage account access for Family' }),
+    );
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText('Currently enabled.')).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /watch history, favorites, playlists, and preferences are preserved/,
+      ),
+    ).toBeTruthy();
+    expect(requests.filter((entry) => entry.options?.method)).toHaveLength(0);
+    fireEvent.change(within(dialog).getByLabelText('Media account'), {
+      target: { value: JSON.stringify(['emby', 'emby-family']) },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Disable selected account' }));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith(
+        'Account disabled. Its password and media data are preserved.',
+      ),
+    );
+    expect(requests.filter((entry) => entry.options?.method)).toEqual([
+      {
+        path: '/api/accounts/access',
+        options: expect.objectContaining({
+          method: 'POST',
+          body: {
+            kind: 'emby',
+            user_id: 'emby-family',
+            disabled: true,
+            expected_username: 'Family',
+            expected_profile_revision: 'emby-profile-revision',
+          },
+        }),
+      },
+    ]);
+  });
+
+  it('reviews enabling disabled accounts and prevents unchanged access requests', async () => {
+    const requests: { path: string; options?: ApiOptions }[] = [];
+    const values = users.map((user) =>
+      user.id === 'child'
+        ? { ...user, jellyfin: user.jellyfin.map((account) => ({ ...account, disabled: true })) }
+        : user,
+    );
+    const api = vi.fn(async (path: string, options?: ApiOptions) => {
+      requests.push({ path, options });
+      return path === '/api/user-directory' ? { users: values } : {};
+    }) as Api;
+    const { notify } = page(api);
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage account access for Child' }));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText('Currently disabled.')).toBeTruthy();
+    expect(within(dialog).getByLabelText('Access change')).toHaveProperty('value', 'enable');
+    fireEvent.change(within(dialog).getByLabelText('Access change'), {
+      target: { value: 'disable' },
+    });
+    expect(within(dialog).getByRole('button', { name: 'Disable selected account' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    fireEvent.change(within(dialog).getByLabelText('Access change'), {
+      target: { value: 'enable' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Enable selected account' }));
+    await waitFor(() => expect(notify).toHaveBeenCalled());
+    expect(requests.find((entry) => entry.path === '/api/accounts/access')?.options?.body).toEqual({
+      kind: 'jellyfin',
+      user_id: 'jf-child',
+      disabled: false,
+      expected_username: 'Child',
+      expected_profile_revision: '',
+    });
+  });
+
+  it('aborts access changes on unmount and ignores late completion', async () => {
+    let finish!: (value: unknown) => void;
+    let signal!: AbortSignal;
+    const api = vi.fn((path: string, options?: ApiOptions) => {
+      if (path === '/api/user-directory') return Promise.resolve({ users });
+      signal = options!.signal!;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    }) as Api;
+    const { unmount, notify } = page(api);
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage account access for Child' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Disable selected account' }));
+    unmount();
+    expect(signal.aborted).toBe(true);
+    await act(async () => finish({}));
+    expect(notify).not.toHaveBeenCalled();
+    expect(api).toHaveBeenCalledTimes(2);
   });
 
   it('previews organization role additions and removals before applying only the review token', async () => {

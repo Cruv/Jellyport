@@ -125,6 +125,95 @@ afterEach(async () => {
 });
 
 describe('administrator membership HTTP endpoints', () => {
+  it('keeps unlinked accounts enabled for review and saves manual per-account family notes without Discord', async () => {
+    const { app, headers, servers } = await fixture();
+    app.jellyport.service.bot = null;
+    const before = structuredClone(servers.users.jellyfin);
+    const initial = await app.inject({ url: '/api/user-directory', headers });
+    const row = initial
+      .json()
+      .users.find((value: { jellyfin: Array<{ id: string }> }) =>
+        value.jellyfin.some((user) => user.id === 'j-river'),
+      );
+    expect(row).toMatchObject({ discord_user_id: null, family: false, requires_review: true });
+    expect(servers.users.jellyfin).toEqual(before);
+    const saved = await app.inject({
+      method: 'POST',
+      url: '/api/account-profiles',
+      headers,
+      payload: {
+        kind: 'jellyfin',
+        user_id: 'j-river',
+        family: true,
+        owner_name: 'Child owner',
+        notes: 'PRIVATE-FAMILY-NOTE',
+        expected_revision: '',
+      },
+    });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.headers['cache-control']).toBe('no-store');
+    expect(saved.json()).toMatchObject({
+      kind: 'jellyfin',
+      user_id: 'j-river',
+      family: true,
+      owner_name: 'Child owner',
+    });
+    expect(servers.users.jellyfin).toEqual(before);
+    expect(app.jellyport.service.listMemberships()).toEqual([]);
+    const directory = await app.inject({ url: '/api/user-directory', headers });
+    const family = directory
+      .json()
+      .users.find((value: { jellyfin: Array<{ id: string }> }) =>
+        value.jellyfin.some((user) => user.id === 'j-river'),
+      );
+    expect(family).toMatchObject({ family: true, requires_review: false });
+    expect(family.jellyfin[0].profile.notes).toBe('PRIVATE-FAMILY-NOTE');
+    for (const url of ['/api/user-directory', '/api/%75ser-directory']) {
+      const denied = await app.inject(url);
+      expect(denied.statusCode).toBe(401);
+      expect(denied.headers['cache-control']).toBe('no-store');
+      expect(denied.body).not.toContain('PRIVATE-FAMILY-NOTE');
+      expect(denied.body).not.toContain('Child owner');
+    }
+    for (const url of ['/api/settings', '/api/jobs', '/api/memberships'])
+      expect((await app.inject({ url, headers })).body).not.toContain('PRIVATE-FAMILY-NOTE');
+    const stale = await app.inject({
+      method: 'POST',
+      url: '/api/account-profiles',
+      headers,
+      payload: {
+        kind: 'jellyfin',
+        user_id: 'j-river',
+        family: false,
+        owner_name: 'Replacement',
+        notes: '',
+        expected_revision: '',
+      },
+    });
+    expect(stale.statusCode).toBe(400);
+    const disabled = await app.inject({
+      method: 'POST',
+      url: '/api/accounts/access',
+      headers,
+      payload: {
+        kind: 'jellyfin',
+        user_id: 'j-river',
+        disabled: true,
+        expected_username: 'river',
+        expected_profile_revision: saved.json().revision,
+      },
+    });
+    expect(disabled.statusCode).toBe(200);
+    expect(disabled.headers['cache-control']).toBe('no-store');
+    expect(servers.users.jellyfin.find((user) => user.Id === 'j-river')?.Policy?.IsDisabled).toBe(
+      true,
+    );
+    expect(
+      app.jellyport.service.profiles.get('jellyfin', 'j-river', app.jellyport.store.settings())
+        ?.family,
+    ).toBe(true);
+  });
+
   it('rejects unsafe organization configuration and requests Manage Roles only when tags are configured', async () => {
     const { app, headers } = await fixture();
     const before = app.jellyport.store.settings();
@@ -171,6 +260,27 @@ describe('administrator membership HTTP endpoints', () => {
       expect(response.headers['cache-control']).toBe('no-store');
     }
     const requests = [
+      {
+        url: '/api/account-profiles',
+        payload: {
+          kind: 'jellyfin',
+          user_id: 'j-river',
+          family: true,
+          owner_name: 'Private owner',
+          notes: 'Private notes',
+          expected_revision: '',
+        },
+      },
+      {
+        url: '/api/accounts/access',
+        payload: {
+          kind: 'jellyfin',
+          user_id: 'j-river',
+          disabled: true,
+          expected_username: 'river',
+          expected_profile_revision: '',
+        },
+      },
       {
         url: '/api/memberships/access',
         payload: { discord_user_id: owner, access_mode: 'complimentary' },
@@ -243,10 +353,14 @@ describe('administrator membership HTTP endpoints', () => {
           'access_mode',
           'account_limit',
           'protected',
+          'family',
+          'requires_review',
         ].sort(),
       );
       for (const account of [...row.emby, ...row.jellyfin])
-        expect(Object.keys(account).sort()).toEqual(['id', 'name', 'disabled'].sort());
+        expect(Object.keys(account).sort()).toEqual(
+          ['id', 'name', 'disabled', 'protected', 'profile'].sort(),
+        );
     }
   });
 

@@ -2,11 +2,14 @@ import { createHash, randomUUID } from 'node:crypto';
 import { ServiceError } from './errors.js';
 import type { Service, BotAdapter } from './service.js';
 import type { Settings } from './types.js';
+import type { AccountProfile } from './account-profiles.js';
 
 interface AccountSummary {
   id: string;
   name: string;
   disabled: boolean;
+  protected: boolean;
+  profile: AccountProfile | null;
 }
 export interface DirectoryUser {
   id: string;
@@ -17,6 +20,8 @@ export interface DirectoryUser {
   access_mode: 'subscription' | 'complimentary' | 'standalone' | 'unlinked';
   account_limit: number | null;
   protected: boolean;
+  family: boolean;
+  requires_review: boolean;
 }
 interface TagChange {
   discord_user_id: string;
@@ -95,6 +100,8 @@ export class UserOrganization {
           access_mode: discordId ? (membership?.access_mode ?? 'subscription') : 'standalone',
           account_limit: membership?.account_limit ?? (discordId ? 1 : null),
           protected: false,
+          family: false,
+          requires_review: false,
         };
         rows.push(row);
       }
@@ -106,10 +113,20 @@ export class UserOrganization {
       user: (typeof users.emby)[number],
     ) => {
       if (row[kind].some((item) => item.id === user.Id)) return;
-      row[kind].push({ id: user.Id, name: user.Name, disabled: user.Policy?.IsDisabled === true });
-      row.protected ||=
+      const profile = this.service.profiles.get(kind, user.Id, settings);
+      const protectedAccount =
         user.Policy?.IsAdministrator !== false ||
         (kind === 'jellyfin' && user.Id === settings.template_user_id);
+      row[kind].push({
+        id: user.Id,
+        name: user.Name,
+        disabled: user.Policy?.IsDisabled === true,
+        protected: protectedAccount,
+        profile,
+      });
+      row.protected ||= protectedAccount;
+      row.family ||= profile?.family === true;
+      row.requires_review ||= !row.discord_user_id && !profile?.family && !protectedAccount;
       (kind === 'emby' ? usedEmby : usedJellyfin).add(user.Id);
     };
     for (const member of memberships) getRow(member.discord_user_id, '');

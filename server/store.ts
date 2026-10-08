@@ -85,6 +85,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS account_roles (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS account_role_assignments (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS memberships (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS account_profiles (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS credentials_expiry ON credentials(expires);
     `);
     const columns = this.db.prepare('PRAGMA table_info(links)').all();
@@ -114,7 +115,7 @@ export class Store {
       UNION ALL SELECT 1 FROM subscriptions UNION ALL SELECT 1 FROM job_queue
       UNION ALL SELECT 1 FROM migration_playlists UNION ALL SELECT 1 FROM user_mappings
       UNION ALL SELECT 1 FROM account_roles UNION ALL SELECT 1 FROM account_role_assignments
-      UNION ALL SELECT 1 FROM memberships LIMIT 1`,
+      UNION ALL SELECT 1 FROM memberships UNION ALL SELECT 1 FROM account_profiles LIMIT 1`,
         )
         .get();
     if (options.demo && (auth || (hasData && !recognizedDemo))) {
@@ -208,6 +209,24 @@ export class Store {
   saveMembershipRecord(id: string, value: unknown): void {
     this.db
       .prepare('INSERT OR REPLACE INTO memberships (id,encrypted) VALUES (?,?)')
+      .run(id, this.encrypt(value));
+  }
+  accountProfileRecords<T>(): Array<{ id: string; value: T }> {
+    return this.db
+      .prepare('SELECT id,encrypted FROM account_profiles')
+      .all()
+      .map((row) => ({
+        id: row.id as string,
+        value: this.decrypt<T>(row.encrypted as Uint8Array),
+      }));
+  }
+  accountProfileRecord<T>(id: string): T | null {
+    const row = this.db.prepare('SELECT encrypted FROM account_profiles WHERE id=?').get(id);
+    return row ? this.decrypt<T>(row.encrypted as Uint8Array) : null;
+  }
+  saveAccountProfileRecord(id: string, value: unknown): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO account_profiles (id,encrypted) VALUES (?,?)')
       .run(id, this.encrypt(value));
   }
   deleteAccountRoleRecord(id: string): void {

@@ -88,6 +88,14 @@ The 0.4.0 migration and manual-mapping changes received an additional focused so
 
 Detailed writes allow only portable user-data fields and refresh destination activity before merging. New-account preference copying uses an allowlist, and profile images use fixed authenticated endpoints with raster, size, and dimension checks. Imported playlists set private visibility, owner, and all matched entries in one request; subsequent runs never append to potentially shared copies. Uncertain creation is journaled before the request and requires review. Source playlist counts, aggregate entries, and creation payloads are bounded. These changes do not remove the deployment and native-package limitations documented above.
 
+## Discord member discovery follow-up — 0.5.0
+
+Member lookup is protected by the existing administrator session, origin checks, and `no-store` response headers. Searches target only the configured Discord server and return six identity-selection fields, excluding SDK objects, tokens, email addresses, avatars, and role lists. Queries are bounded to 2–64 characters, results to 25 members, and upstream waits to 20 seconds; the route allows 60 searches per source address per minute. Browser searches are debounced and cancelled on changes or unmount, and stale responses are discarded.
+
+Search results are suggestions. Selecting a username or nickname does not bypass the existing fresh Discord ID, membership, account ownership, or mapping-revision checks before saving a verified mapping, provisioning an account, or delivering credentials. Automatic MEE6 username resolution accepts only a unique exact actual username from a complete search; display names and nicknames never establish ownership. Username-only announcements still cannot prove historical ownership after a rename or reuse, so durable IDs and current membership roles remain the reliable lifecycle sources.
+
+All 580 fixture tests, the production build, and local hardened demo/fresh-container smoke checks passed. The full npm dependency audit reported no advisories. This follow-up used synthetic identities and did not contact a live Discord server; the native-package and deployment limitations above remain applicable.
+
 ## Deployment boundaries that remain important
 
 Keep the administration interface on a trusted LAN or VPN, or behind an HTTPS reverse proxy with restricted access. Configure `JELLYPORT_ALLOWED_HOSTS` for the proxy hostname. Preserve Host headers and keep the raw application port private. Forwarded client addresses are not trusted; requests through one proxy share its peer address for rate limits.

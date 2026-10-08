@@ -7,6 +7,7 @@ import Fastify, {
 import cookie from '@fastify/cookie';
 import staticFiles from '@fastify/static';
 import { registerUserMappingRoutes } from './user-mappings.js';
+import { registerDiscordMemberRoutes } from './discord-members.js';
 import { randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
@@ -871,6 +872,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     async (request) => service.ignoreSubscription(request.params.event_id),
   );
   registerUserMappingRoutes(app);
+  registerDiscordMemberRoutes(app);
   const staticDir = resolve(options.staticDir ?? 'dist/client');
   if (existsSync(resolve(staticDir, 'index.html'))) {
     await app.register(staticFiles, { root: staticDir, index: false });

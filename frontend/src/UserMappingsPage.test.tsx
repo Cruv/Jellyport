@@ -54,6 +54,73 @@ afterEach(() => {
 });
 
 describe('Manual user mappings', () => {
+  it('searches Discord members and saves the selected stable identity without manually entering an ID', async () => {
+    const requests: { path: string; options?: ApiOptions }[] = [];
+    const api = vi.fn(async (path: string, options?: ApiOptions) => {
+      requests.push({ path, options });
+      if (path.startsWith('/api/discord/members?'))
+        return {
+          members: [
+            {
+              id: '123456789012345678',
+              username: 'actual.discord.name',
+              display_name: 'Friendly Alias',
+              nickname: null,
+              membership_active: true,
+            },
+          ],
+          truncated: false,
+        };
+      return mapping;
+    }) as Api;
+    const { refresh } = page([], api);
+    fireEvent.change(screen.getByLabelText('Emby account'), { target: { value: 'emby-complex' } });
+    fireEvent.change(screen.getByLabelText('New Jellyfin username'), {
+      target: { value: 'SimpleName' },
+    });
+    expect(requests).toHaveLength(0);
+    fireEvent.change(screen.getByLabelText('Discord member'), {
+      target: { value: 'Friendly Alias' },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Select @actual.discord.name' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save mapping' }));
+    await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    expect(requests[0].path).toBe('/api/discord/members?query=Friendly%20Alias');
+    expect(requests[1]).toEqual({
+      path: '/api/user-mappings',
+      options: {
+        method: 'POST',
+        body: {
+          source_user_id: 'emby-complex',
+          target_user_id: null,
+          target_username: 'SimpleName',
+          discord_username: 'actual.discord.name',
+          discord_user_id: '123456789012345678',
+        },
+      },
+    });
+  });
+
+  it('shows a saved Discord member immediately and allows the administrator to unlink it', async () => {
+    const item = { ...mapping, discord_user_id: '123456789012345678' };
+    const { requests } = page([item]);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit mapping for Mr. Complex Name !' }));
+    expect(screen.getByText('Membership checked when submitted.')).toBeTruthy();
+    expect(requests).toHaveLength(0);
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Clear Discord member @actual.discord.name' }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Save mapping' }));
+    await waitFor(() => expect(requests).toHaveLength(1));
+    expect(requests[0].options?.body).toEqual({
+      id: 'mapping-1',
+      source_user_id: 'emby-complex',
+      target_user_id: 'jf-simple',
+      discord_username: null,
+      discord_user_id: null,
+    });
+  });
+
   it('saves a simpler destination name and an optional Discord label without creating or messaging an account', async () => {
     const { requests, refresh } = page();
     fireEvent.change(screen.getByLabelText('Emby account'), { target: { value: 'emby-complex' } });

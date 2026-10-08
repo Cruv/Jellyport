@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Callout, Empty, Heading, Icon, JobsTable, Status, UserCell } from './components';
 import { ConnectionRows, UserWarnings } from './SettingsPage';
+import DiscordMemberPicker from './DiscordMemberPicker';
 import {
   activeJob,
   date,
   num,
   type Api,
+  type DiscordMember,
   type Job,
   type Notify,
   type Overview,
@@ -436,6 +438,10 @@ export function AccountsPage({
   navigate: (page: Page) => void;
 }) {
   const [busy, setBusy] = useState('');
+  const [accountUsername, setAccountUsername] = useState('');
+  const [accountMember, setAccountMember] = useState<DiscordMember | null>(null);
+  const [recoveryUsername, setRecoveryUsername] = useState('');
+  const [recoveryMember, setRecoveryMember] = useState<DiscordMember | null>(null);
   const [recovery, setRecovery] = useState<Recovery | null>(null);
   const [approved, setApproved] = useState(false);
   const [recoveryRecipient, setRecoveryRecipient] = useState('');
@@ -456,10 +462,14 @@ export function AccountsPage({
         method: 'POST',
         body: {
           username,
-          discord_user_id: String(values.get('discord_user_id') || '').trim() || undefined,
+          discord_user_id:
+            String(values.get('discord_user_id') || values.get('discord_manual_id') || '').trim() ||
+            undefined,
         },
       });
       form.reset();
+      setAccountUsername('');
+      setAccountMember(null);
       created(job);
       notify('Account creation started.');
     } catch (error) {
@@ -481,7 +491,9 @@ export function AccountsPage({
       );
       if (version === recoveryVersion.current) {
         setRecovery(result);
-        setRecoveryRecipient(String(values.get('discord_user_id') || '').trim());
+        setRecoveryRecipient(
+          String(values.get('discord_user_id') || values.get('discord_manual_id') || '').trim(),
+        );
       }
     } catch (error) {
       notify(error instanceof Error ? error.message : 'Account inspection failed.', true);
@@ -544,34 +556,36 @@ export function AccountsPage({
                 <input
                   id="account-username"
                   name="username"
+                  value={accountUsername}
+                  onChange={(event) => setAccountUsername(event.target.value)}
                   placeholder="Enter a username"
                   required
                   maxLength={64}
                   autoComplete="off"
                 />
                 <small>
-                  When a Discord recipient is supplied, use their Discord username, rather than a
-                  server nickname.
+                  Selecting a Discord member fills in their actual username automatically.
                 </small>
               </div>
-              <div className="field">
-                <label htmlFor="account-discord">
-                  Discord user ID <span className="optional">optional</span>
-                </label>
-                <input
-                  id="account-discord"
-                  name="discord_user_id"
-                  inputMode="numeric"
-                  pattern="[0-9]{15,22}"
-                  placeholder="e.g. 123456789012345678"
-                  autoComplete="off"
-                />
-                <small>
-                  {overview.connections.discord.connected
-                    ? 'Jellyport will privately message this member with their credentials.'
-                    : 'Connect your Discord bot in Settings to enable private account delivery.'}
-                </small>
-              </div>
+              <DiscordMemberPicker
+                api={api}
+                value={accountMember}
+                onChange={(member) => {
+                  setAccountMember(member);
+                  if (member) setAccountUsername(member.username);
+                }}
+                suggestedQuery={accountUsername}
+                disabled={!!busy}
+                label="Discord member (optional)"
+                id="account-discord"
+                inputName="discord_user_id"
+              />
+              <p className="subtle text-small">
+                {overview.connections.discord.connected
+                  ? 'Jellyport will privately message this member with their credentials.'
+                  : 'Connect your Discord bot in Settings to enable private account delivery.'}
+              </p>
+              <ManualDiscordId id="account-manual-discord" disabled={!!busy || !!accountMember} />
               <Callout
                 icon="key"
                 title="A password will be generated automatically."
@@ -653,26 +667,31 @@ export function AccountsPage({
               <input
                 id="recovery-username"
                 name="username"
+                value={recoveryUsername}
+                onChange={(event) => setRecoveryUsername(event.target.value)}
                 required
                 maxLength={64}
                 placeholder="Exact Jellyfin username"
                 autoComplete="off"
               />
             </div>
-            <div className="field">
-              <label htmlFor="recovery-discord">
-                Discord user ID <span className="optional">optional</span>
-              </label>
-              <input
-                id="recovery-discord"
-                name="discord_user_id"
-                inputMode="numeric"
-                pattern="[0-9]{15,22}"
-                placeholder="Credential recipient"
-                autoComplete="off"
-              />
-            </div>
+            <DiscordMemberPicker
+              api={api}
+              value={recoveryMember}
+              onChange={(member) => {
+                recoveryVersion.current++;
+                setRecovery(null);
+                setApproved(false);
+                setRecoveryMember(member);
+              }}
+              suggestedQuery={recoveryUsername}
+              disabled={!!busy}
+              label="Recovery Discord member (optional)"
+              id="recovery-discord"
+              inputName="discord_user_id"
+            />
           </div>
+          <ManualDiscordId id="recovery-manual-discord" disabled={!!busy || !!recoveryMember} />
           <div className="form-actions">
             <button className="btn btn-quiet" type="submit" disabled={!!busy}>
               {busy === 'inspect' ? <span className="spinner" /> : <Icon name="search" />}
@@ -729,6 +748,27 @@ export function AccountsPage({
     </>
   );
 }
+function ManualDiscordId({ id, disabled }: { id: string; disabled: boolean }) {
+  return (
+    <details>
+      <summary>Advanced Discord details</summary>
+      <div className="field">
+        <label htmlFor={id}>Discord user ID (advanced)</label>
+        <input
+          id={id}
+          name="discord_manual_id"
+          disabled={disabled}
+          inputMode="numeric"
+          pattern="[0-9]{15,22}"
+          maxLength={22}
+          autoComplete="off"
+        />
+        <small>Use this fallback only when you already know the member’s ID.</small>
+      </div>
+    </details>
+  );
+}
+
 export function ActivityPage({
   jobs,
   refresh,

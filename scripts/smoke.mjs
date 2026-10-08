@@ -46,6 +46,7 @@ assert.equal(
   'Encoded API routes must require authentication.',
 );
 assert.equal((await fetch(new URL('/api/user-mappings', base))).status, 401);
+assert.equal((await fetch(new URL('/api/discord/members?query=alex', base))).status, 401);
 assert.equal(
   (
     await fetch(new URL('/%61pi/accounts', base), {
@@ -92,6 +93,11 @@ const credentials = await request(`/api/jobs/${job.id}/credentials`, 'POST');
 assert.equal(credentials.credentials.length, 2);
 assert((await request(`/api/jobs/${job.id}/credentials`, 'POST')).credentials.length === 0);
 await request('/api/logout', 'POST');
+assert.equal(
+  (await fetch(new URL('/api/discord/members?query=alex', base), { headers: { Cookie: cookie } }))
+    .status,
+  401,
+);
 assert.equal(
   (await fetch(new URL('/api/jobs', base), { headers: { Cookie: cookie } })).status,
   401,

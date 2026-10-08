@@ -184,6 +184,80 @@ describe('React account safeguards', () => {
     expect(screen.queryByRole('button', { name: 'Recover account' })).toBeNull();
     expect(requests.some((request) => request.path === '/api/accounts/recover')).toBe(false);
   });
+  it('selects a Discord member and fills the fresh account username without typing an ID', async () => {
+    responses['/api/discord/members?query=Captain'] = {
+      members: [
+        {
+          id: '123456789012345678',
+          username: 'alex.actual',
+          display_name: 'Alex',
+          nickname: 'Captain Alex',
+          membership_active: true,
+        },
+      ],
+      truncated: false,
+    };
+    responses['/api/accounts'] = job;
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Create account' }));
+    fireEvent.change(await screen.findByLabelText('Discord member (optional)'), {
+      target: { value: 'Captain' },
+    });
+    fireEvent.click(await screen.findByRole('button', { name: 'Select @alex.actual' }));
+    expect((screen.getByLabelText('Username') as HTMLInputElement).value).toBe('alex.actual');
+    fireEvent.click(
+      within(screen.getByLabelText('Username').closest('form')!).getByRole('button', {
+        name: 'Create account',
+      }),
+    );
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === '/api/accounts')).toBe(true),
+    );
+    expect(
+      JSON.parse(
+        String(requests.find((request) => request.path === '/api/accounts')!.options?.body),
+      ),
+    ).toEqual({
+      username: 'alex.actual',
+      discord_user_id: '123456789012345678',
+    });
+  });
+  it('invalidates recovery approval when a searched Discord recipient is selected', async () => {
+    responses['/api/accounts/recovery?username=alex'] = {
+      username: 'alex',
+      eligible: true,
+      reason: 'Tracked incomplete creation',
+      target_user_id: 'jf-alex',
+    };
+    responses['/api/discord/members?query=alex'] = {
+      members: [
+        {
+          id: '123456789012345678',
+          username: 'alex',
+          display_name: null,
+          nickname: null,
+          membership_active: true,
+        },
+      ],
+      truncated: false,
+    };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Create account' }));
+    fireEvent.click(await screen.findByText('Recover an interrupted account creation'));
+    fireEvent.change(screen.getByLabelText('Account to inspect'), { target: { value: 'alex' } });
+    fireEvent.focus(screen.getByLabelText('Recovery Discord member (optional)'));
+    await screen.findByRole('button', { name: 'Select @alex' });
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect account' }));
+    await screen.findByText('alex · Eligible for recovery');
+    fireEvent.click(
+      screen.getByLabelText(
+        'I inspected this Jellyfin account and approve a new password and template permissions.',
+      ),
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Select @alex' }));
+    expect(screen.queryByRole('button', { name: 'Recover account' })).toBeNull();
+    expect(requests.some((request) => request.path === '/api/accounts/recover')).toBe(false);
+  });
   it('states that manual cancellation approval disables access immediately before sending the request', async () => {
     const event = {
       id: 'event-1',
@@ -359,6 +433,18 @@ describe('React account safeguards', () => {
       ],
     };
     responses['/api/migrations'] = { ...job, kind: 'migrate' };
+    responses['/api/discord/members?query=river'] = {
+      members: [
+        {
+          id: '123456789012345678',
+          username: 'river',
+          display_name: 'River Display',
+          nickname: 'River Captain',
+          membership_active: true,
+        },
+      ],
+      truncated: false,
+    };
     render(<App />);
     await screen.findByText('Everyone’s next chapter.');
     fireEvent.click(
@@ -374,9 +460,9 @@ describe('React account safeguards', () => {
         'The existing Jellyfin password and account permissions will be preserved.',
       ),
     ).toBeTruthy();
-    fireEvent.change(within(dialog).getAllByLabelText(/Discord recipient/)[1], {
-      target: { value: '123456789012345678' },
-    });
+    expect(requests.some((request) => request.path.startsWith('/api/discord/members'))).toBe(false);
+    fireEvent.focus(within(dialog).getAllByLabelText('Discord recipient (optional)')[1]);
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Select @river' }));
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
     await waitFor(() =>
       expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
@@ -424,9 +510,16 @@ describe('React account safeguards', () => {
     expect(within(dialog).getByText('Favorites in Emby')).toBeTruthy();
     expect(within(dialog).getByText('Resume positions')).toBeTruthy();
     expect(within(dialog).getByText('Playlists')).toBeTruthy();
-    const recipient = within(dialog).getByLabelText(/Discord recipient/) as HTMLInputElement;
+    const recipient = dialog.querySelector('input[name="complex"]') as HTMLInputElement;
     expect(recipient.value).toBe('123456789012345678');
-    expect(recipient.readOnly).toBe(true);
+    expect(within(dialog).getByText('@discord.original')).toBeTruthy();
+    expect(
+      (
+        within(dialog).getByRole('button', {
+          name: 'Clear Discord member @discord.original',
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
     await waitFor(() =>
       expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),

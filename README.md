@@ -113,14 +113,16 @@ Jellyfin **10.9+** is required for detailed user data and explicit private playl
 
 1. Open **User mappings** and choose the source Emby account.
 2. Select an existing enabled Jellyfin account, or enter the simplified username for a new account. Selecting an existing account preserves its username and password.
-3. Optionally record a Discord username. To enable credential delivery and identity resolution, also provide the member's numeric Discord user ID with the bot connected. Jellyport verifies that ID against the configured Discord server.
+3. With the bot connected, search for the Discord member by username or server nickname and select the result. Jellyport fills in their actual username and Discord ID automatically. Check the actual `@username` when several members have similar names. Advanced details retain a manual username label or ID fallback.
 4. Save, then review the migration preview. It shows the source and destination names and any verified Discord recipient.
 
-Mappings are encrypted, scoped to the configured servers, and one-to-one. Queued work pins its mapping revision and refuses changed mappings. A created destination is pinned by Jellyfin ID so a replacement account cannot silently receive another user's data. Discord names alone are labels; verified IDs and durable account links drive automation. Saving a mapping does not itself change an account or send a message.
+Mappings are encrypted, scoped to the configured servers, and one-to-one. Queued work pins its mapping revision and refuses changed mappings. A created destination is pinned by Jellyfin ID so a replacement account cannot silently receive another user's data. Discord names alone are labels; verified IDs and durable account links drive automation. Saving a mapping does not itself change an account or send a message. The migration preview fixes the recipient for a saved mapping; edit that mapping to choose a different member.
 
 ## Create accounts and deliver passwords
 
-Use the account creation form for a new member. With a connected Discord bot, provide the member's numeric Discord user ID and their current Discord username. Jellyport uses the actual username (`member.user.username`), rather than a server nickname or display name.
+Use the account creation form for a new member. With a connected Discord bot, search for and select the member; their actual Discord username and ID fill in automatically. The same member picker is available in migration previews and incomplete-account recovery. Numeric IDs remain available under Advanced details when needed. Jellyport uses the actual username (`member.user.username`), rather than a server nickname or display name.
+
+Member search matches username and server-nickname prefixes. Results show the actual `@username`, display name, and server nickname so you can select the correct person. It does not guess ownership from a similar name or search by display name. Searches start when you interact with the picker; opening a bulk preview does not query Discord for every user. Member search does not require an extra privileged Gateway intent.
 
 For the first Discord link, the account's username must match the member's current Discord username exactly unless an administrator has saved a mapping with that verified Discord ID. For mapped existing Emby members, use migration (including `/jellyport migrate`) so their approved destination name and history are used. Jellyport does not guess ownership or rename accounts automatically.
 
@@ -149,6 +151,18 @@ Automatic provisioning and automatic disabling are separate switches, both off b
 Cancellation announcements default to review because cancellation can happen before paid access expires. Role removal or departure is treated as expiry; linked memberships are checked on startup/reconnect and every five minutes when role events are enabled. With automatic provisioning also enabled, reconciliation scans current active-role members for unlinked subscribers, including members who joined during downtime. Enabling this combination can provision all currently eligible unlinked members. Immediate disabling on cancellation is an explicit additional option. Jellyport has no direct MEE6 billing API integration or paid-through date tracking.
 
 Lifecycle actions disable accounts rather than deleting them. Passwords and watched history are preserved. Returning members can regain access to accounts that Jellyport disabled; accounts disabled independently by an administrator are not automatically re-enabled.
+
+### Planned automation improvements
+
+The most useful next steps for reducing administrator input are:
+
+1. **Bulk mapping suggestions with approval:** suggest matching Emby, Jellyfin, and Discord accounts together, then approve clear matches in one review while retaining explicit handling for exceptions.
+2. **Role and channel pickers:** discover the server's roles and channels during setup instead of requiring their numeric IDs.
+3. **An exception dashboard:** bring unresolved identities, failed credential delivery, interrupted jobs, and membership-check failures into one actionable queue.
+4. **Scheduled migration catch-up:** repeat the merge for selected linked users until their move is complete, preserving newer Jellyfin activity.
+5. **Billing tiers and paid-through access:** map subscription tiers to permission templates and use verified billing status, renewal dates, and grace periods to manage access.
+
+These are future features. We have not found a documented public MEE6 billing API. Stripe integration needs verification of the connected account's API/webhook access and a reliable Discord identity link. [MEE6's Stripe guide](https://mee6bot.freshdesk.com/support/solutions/articles/101000472733-server-owner-how-to-see-information-about-subscribers-on-stripe) says Standard accounts can expose a subscriber's Discord ID in the initial Checkout Session request logs, which may only remain available for one year; Express account owners must contact MEE6. Seeing those details in the dashboard does not establish that Jellyport can retrieve them through an API.
 
 ## Data and backups
 
@@ -219,6 +233,7 @@ The browser uses authenticated session cookies. Mutating API requests require th
 | Refresh the managed background API key | `POST /api/auth/service-key` |
 | Test server connections | `POST /api/connections/test` |
 | List source and destination users | `GET /api/users` |
+| Search Discord server members | `GET /api/discord/members?query=USERNAME_OR_NICKNAME_PREFIX` |
 | Preview or queue migrations | `POST /api/migrations/preview`, `POST /api/migrations` |
 | Create a new account | `POST /api/accounts` |
 | Inspect or recover an incomplete creation | `GET /api/accounts/recovery`, `POST /api/accounts/recover` |

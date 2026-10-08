@@ -6,7 +6,7 @@ Discord support is optional. Start with administrator commands and the review qu
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications). Copy its application ID and generate its bot token on the Bot page. Keep the token private.
 2. Use a server/guild installation with the `bot` and `applications.commands` scopes. Jellyport uses an outbound Gateway connection; leave the Interactions Endpoint URL unset. No inbound public Discord endpoint is required.
-3. In Jellyport Settings, save the application ID, bot token, and your Discord server ID. Enable Developer Mode in Discord to copy numeric server, user, role, and channel IDs.
+3. In Jellyport Settings, save the application ID, bot token, and your Discord server ID. Enable Developer Mode in Discord to copy numeric server, role, and channel IDs. Individual members can be selected through Jellyport's search without copying their user IDs.
 4. Use Jellyport's generated invite link to install the bot in that server, then enable Discord and check its connection status. Saving settings restarts the bot. Slash commands are synchronized only to the configured server.
 
 The generated invite requests View Channels, Send Messages, and Read Message History. The bot does not need Administrator or Manage Roles permissions. Restrict its channel access to where you run commands and, if enabled, the subscription announcement channel. Discord's [installation guide](https://docs.discord.com/developers/quick-start/getting-started) explains tokens, scopes, and guild installation.
@@ -27,15 +27,23 @@ Create uses the recipient's current Discord username, `member.user.username`. It
 
 The first identity link requires matching usernames or an administrator-approved mapping with that verified Discord ID. Set name exceptions under **User mappings** in the web app. A manually entered Discord name without an ID is an unverified label and never selects a command recipient or authorizes an account link. Nicknames and display names are not identities.
 
+### Select members in the web app
+
+The Discord member picker is available in **User mappings**, migration previews, fresh account creation, and incomplete-account recovery. Search by a prefix of the member's actual username or server nickname, then select the matching result. Search does not use fuzzy matching or display-name queries. Each result shows the actual `@username`, display name, and server nickname; check the actual username before selecting a similar-looking result.
+
+Selection fills the Discord ID automatically. Fresh account creation also fills the current Discord username. Saving a user mapping retains the verified identity for future migrations and membership actions. A saved mapping's recipient is fixed in the migration preview; change it on **User mappings** instead of overriding it for one job. The bot rechecks the selected member before sensitive actions, so a search result does not bypass membership checks.
+
+An advanced manual ID fallback remains available when you already know the member's ID. User mappings also allow a manual username label; a label alone is not a verified identity. Searching starts on interaction with the picker, so a bulk migration preview does not perform a Discord lookup for every user on opening. The slash command's `user:@member` selector also supplies the ID without manual entry.
+
 Replies are ephemeral job statuses visible to the administrator. There is no automatic status polling; check the job with `/jellyport status` or the web page. New credentials are sent by DM only to the selected member. Users need to allow DMs from server members. Failed delivery leaves the new password available through the web app's one-time reveal for up to 24 hours. Existing Jellyfin passwords are not reset or sent by an ordinary migration.
 
 ## Choose event sources and intents
 
-Privileged intents must be enabled both in the Developer Portal's Bot settings and through the corresponding Jellyport options. Slash commands alone do not request these intents. Presence Intent is not needed. See Discord's [Gateway intent documentation](https://docs.discord.com/developers/events/gateway#privileged-intents).
+Privileged intents must be enabled both in the Developer Portal's Bot settings and through the corresponding Jellyport options. Slash commands and web member searches alone do not request these intents. Member search uses Discord's HTTP API and does not add a Server Members Intent requirement. Presence Intent is not needed. The role and message event requirements below are unchanged. See Discord's [Gateway intent documentation](https://docs.discord.com/developers/events/gateway#privileged-intents).
 
 | Jellyport option | Developer Portal toggles | Purpose |
 | --- | --- | --- |
-| Commands only | No privileged intents | Admin account actions and credential delivery |
+| Commands and web member search only | No privileged intents | Admin account actions, member selection, and credential delivery |
 | MEE6 message events | Message Content Intent and Server Members Intent | Read trusted announcements; resolve plain usernames against fresh member data |
 | Membership role events | Server Members Intent | Observe active role additions/removals and member departures |
 
@@ -65,3 +73,9 @@ Disabling changes account access while preserving passwords and watched history.
 Jellyport does not query MEE6 billing, determine paid-through dates, or recover old announcement messages. With role events enabled, it reconciles linked memberships on startup/reconnect and every five minutes, using current membership rather than replaying old changes. It can detect missing roles and departed linked users after downtime. With automatic provisioning also enabled, it scans current active-role members for unlinked subscribers, including members who joined during downtime. Enabling this combination can provision **all current active-role members without an identity link**, so check that role's membership first. With only message events enabled, announcements missed while the app was offline require a new recognized event or an administrator action.
 
 Discord IDs are the durable link; usernames can change. Lifecycle actions keep using the saved Jellyfin account and do not rename it. Use a verified mapping for legacy username mismatches, and inspect stale queued events before applying them. Mapping edits invalidate queued migrations using an older revision instead of redirecting their data or credentials.
+
+## MEE6 and Stripe access
+
+A documented public MEE6 billing API has not been identified. The current integration uses trusted Discord announcements and membership roles. A future Stripe integration must first verify that your connected account grants API/webhook access to the necessary subscriptions and provides a reliable Discord identity link.
+
+[MEE6 documents](https://mee6bot.freshdesk.com/support/solutions/articles/101000472733-server-owner-how-to-see-information-about-subscribers-on-stripe) subscriber details for Standard Stripe accounts, including Discord IDs in the initial Checkout Session request logs. Those logs may be retained for only one year. Express account owners are directed to contact MEE6. Dashboard visibility alone does not confirm API access. Reliable billing events could support tier-specific permissions, paid-through dates, and renewal grace periods; Jellyport does not implement those billing features yet.

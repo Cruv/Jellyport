@@ -30,6 +30,7 @@ import {
 } from './media.js';
 import type { Store } from './store.js';
 import type { Settings } from './types.js';
+import type { DiscordMemberSearchResult } from './discord-members.js';
 
 export { ServiceError } from './errors.js';
 export interface JobRequest {
@@ -109,6 +110,7 @@ export interface BotAdapter {
   sendCredentials(id: string, username: string, password: string, url: string): Promise<void>;
   membershipActive(id: string): Promise<boolean | null>;
   activeMembers(): Promise<Array<{ id: string; username: string }> | null>;
+  searchMembers?(query: string): Promise<DiscordMemberSearchResult>;
 }
 export interface ServiceOptions {
   clientFactory?: ClientFactory;

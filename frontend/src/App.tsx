@@ -13,6 +13,7 @@ import {
 import SettingsPage from './SettingsPage';
 import AuthScreen from './AuthScreen';
 import UserMappingsPage from './UserMappingsPage';
+import DiscordMemberPicker from './DiscordMemberPicker';
 import {
   AccountsPage,
   ActivityPage,
@@ -37,6 +38,8 @@ import {
   type SubscriptionEvent,
   type Users,
   type UserMapping,
+  type DiscordMember,
+  type PreviewUser,
 } from './types';
 
 const pages: Record<Page, { title: string; icon: string }> = {
@@ -408,7 +411,9 @@ export default function App() {
     const recipients: Record<string, string> = {};
     const mappingRevisions: Record<string, string | null> = {};
     dialog.preview.users.forEach((user) => {
-      const value = String(values.get(user.source_user_id) || '').trim();
+      const value = String(
+        values.get(user.source_user_id) || values.get(`manual-${user.source_user_id}`) || '',
+      ).trim();
       if (value) recipients[user.source_user_id] = value;
       if (user.mapping_revision !== undefined)
         mappingRevisions[user.source_user_id] = user.mapping_revision;
@@ -695,6 +700,7 @@ export default function App() {
       )}
       {session?.authenticated && dialog && (
         <DialogContent
+          api={api}
           dialog={dialog}
           close={closeDialog}
           startMigration={startMigration}
@@ -716,7 +722,63 @@ export default function App() {
     </>
   );
 }
+function MigrationRecipient({ user, api }: { user: PreviewUser; api: Api }) {
+  const [member, setMember] = useState<DiscordMember | null>(
+    user.discord_user_id
+      ? {
+          id: user.discord_user_id,
+          username: user.discord_username || user.username,
+          display_name: null,
+          nickname: null,
+          membership_active: null,
+        }
+      : null,
+  );
+  const mapped = !!user.mapping_id && !!user.discord_user_id;
+  return (
+    <>
+      <DiscordMemberPicker
+        api={api}
+        value={member}
+        onChange={setMember}
+        suggestedQuery={user.discord_username || user.source_username || user.username}
+        disabled={mapped}
+        label="Discord recipient (optional)"
+        id={`recipient-${user.source_user_id}`}
+        inputName={user.source_user_id}
+      />
+      <p className="subtle text-tiny">
+        {mapped
+          ? 'This member is linked by your saved user mapping. Edit that mapping to change the recipient.'
+          : user.target_exists
+            ? 'Select a member to link membership management. Existing credentials are preserved.'
+            : 'Select a member for private credential delivery. For different usernames, save a user mapping first.'}
+      </p>
+      {!mapped && (
+        <details>
+          <summary>Advanced Discord details</summary>
+          <div className="field">
+            <label htmlFor={`manual-recipient-${user.source_user_id}`}>
+              Discord recipient ID (advanced)
+            </label>
+            <input
+              id={`manual-recipient-${user.source_user_id}`}
+              name={`manual-${user.source_user_id}`}
+              disabled={!!member}
+              inputMode="numeric"
+              pattern="[0-9]{15,22}"
+              maxLength={22}
+              autoComplete="off"
+            />
+          </div>
+        </details>
+      )}
+    </>
+  );
+}
+
 function DialogContent({
+  api,
   dialog,
   close,
   startMigration,
@@ -726,6 +788,7 @@ function DialogContent({
   busy,
   notify,
 }: {
+  api: Api;
   dialog: Dialog;
   close: () => void;
   startMigration: (event: FormEvent<HTMLFormElement>) => void;
@@ -828,29 +891,11 @@ function DialogContent({
                     The existing Jellyfin password and account permissions will be preserved.
                   </p>
                 )}
-                <div className="field">
-                  <label htmlFor={`recipient-${user.source_user_id}`}>
-                    Discord recipient <span className="optional">optional</span>
-                  </label>
-                  <input
-                    id={`recipient-${user.source_user_id}`}
-                    name={user.source_user_id}
-                    placeholder="Discord user ID, e.g. 123456789012345678"
-                    inputMode="numeric"
-                    pattern="[0-9]{15,22}"
-                    autoComplete="off"
-                    defaultValue={user.discord_user_id || ''}
-                    readOnly={!!user.discord_user_id}
-                  />
-                  <small>
-                    {user.target_exists
-                      ? 'Link this member for membership management. Their existing password is preserved.'
-                      : 'Send the new username and password in a private message.'}{' '}
-                    {user.discord_user_id
-                      ? `Saved verified mapping: ${user.discord_username || user.discord_user_id}.`
-                      : 'Different usernames require an administrator-approved user mapping. A manually entered Discord name alone cannot receive credentials.'}
-                  </small>
-                </div>
+                <MigrationRecipient
+                  key={`${user.source_user_id}:${user.mapping_revision || ''}`}
+                  user={user}
+                  api={api}
+                />
               </div>
             </section>
           ))}

@@ -19,6 +19,7 @@ import type { Settings as AppSettings } from './types.js';
 import type { Job, SubscriptionInput } from './service.js';
 import type { MediaUser } from './media.js';
 import type { UserMapping } from './user-mappings.js';
+import type { DiscordMemberSearchResult, DiscordMemberSummary } from './discord-members.js';
 
 export class BotError extends Error {}
 
@@ -503,7 +504,9 @@ export class BotManager {
   private guild(): Guild {
     this.checkActive();
     if (!this.client?.isReady())
-      throw new BotError('The Discord bot is offline. Connect it before sending credentials.');
+      throw new BotError(
+        'The Discord bot is offline. Connect it before searching members or delivering account credentials.',
+      );
     const id = snowflake(this.settings.discord_guild_id);
     const guild = id ? this.client.guilds.cache.get(id) : undefined;
     if (!guild || !guild.available)
@@ -555,6 +558,81 @@ export class BotManager {
   }
   async validateRecipient(userId: string, requireMembership = true): Promise<void> {
     await this.recipientIdentity(userId, requireMembership);
+  }
+
+  async searchMembers(query: string): Promise<DiscordMemberSearchResult> {
+    const normalized = typeof query === 'string' ? query.trim().replace(/^@/, '') : '';
+    if (normalized.length < 2 || normalized.length > 64 || /\p{C}/u.test(normalized))
+      throw new BotError('Enter 2–64 characters from a Discord username or server nickname.');
+    const guild = this.guild();
+    const client = this.client;
+    try {
+      // Search is a fresh, bounded REST query, without enumerating the full guild or
+      // requiring the privileged gateway members intent used by role reconciliation.
+      const candidates = [
+        ...(
+          await this.wait(
+            guild.members.search({ query: normalized, limit: 26, cache: false }),
+            20_000,
+          )
+        ).values(),
+      ];
+      this.checkActive();
+      if (this.client !== client) throw new Stopped();
+      const summaries = new Map<string, DiscordMemberSummary>();
+      for (const member of candidates) {
+        const id = snowflake(member.id);
+        if (
+          !id ||
+          snowflake(member.user.id) !== id ||
+          typeof member.user.bot !== 'boolean' ||
+          member.partial ||
+          !recipientEligible(member.guild.id, this.settings.discord_guild_id, {
+            bot: member.user.bot,
+            roleIds: member.roles.cache.keys(),
+          }) ||
+          typeof member.user.username !== 'string' ||
+          !member.user.username ||
+          member.user.username.length > 32 ||
+          /\p{C}/u.test(member.user.username)
+        )
+          continue;
+        if (summaries.has(id)) continue;
+        const label = (value: unknown): string | null =>
+          typeof value === 'string' &&
+          value.length > 0 &&
+          [...value].length <= 64 &&
+          !/\p{C}/u.test(value)
+            ? value
+            : null;
+        summaries.set(id, {
+          id,
+          username: member.user.username,
+          display_name: label(member.user.globalName),
+          nickname: label(member.nickname),
+          membership_active: recipientEligible(member.guild.id, this.settings.discord_guild_id, {
+            bot: member.user.bot,
+            roleIds: member.roles.cache.keys(),
+            memberRoleId: this.settings.discord_member_role_id,
+          }),
+        });
+      }
+      const members = [...summaries.values()].sort(
+        (left, right) =>
+          Number(right.username === normalized) - Number(left.username === normalized) ||
+          left.username.localeCompare(right.username) ||
+          left.id.localeCompare(right.id),
+      );
+      return { members: members.slice(0, 25), truncated: candidates.length > 25 };
+    } catch (error) {
+      if (error instanceof Stopped)
+        throw new BotError(
+          'The Discord connection changed. Search again after the bot reconnects.',
+        );
+      throw new BotError(
+        'Discord members could not be searched. Check that the bot is installed in the configured server and has access. If Discord requires it, enable Server Members Intent in the Discord Developer Portal.',
+      );
+    }
   }
 
   async membershipActive(userId: string): Promise<boolean | null> {
@@ -623,13 +701,12 @@ export class BotManager {
   }
 
   async matchingUsername(username: string): Promise<Identity | null> {
-    const members = await this.listMembers(AbortSignal.timeout(30_000));
-    const matches = members.filter(
-      (member) => !member.user.bot && member.user.username === username,
-    );
-    return matches.length === 1
-      ? { id: matches[0]!.id, username: matches[0]!.user.username }
-      : null;
+    const result = await this.searchMembers(username);
+    // Nicknames may collide with usernames, and a truncated prefix query is
+    // incomplete. Only a unique complete match to the actual username is safe.
+    if (result.truncated) return null;
+    const matches = result.members.filter((member) => member.username === username);
+    return matches.length === 1 ? { id: matches[0]!.id, username: matches[0]!.username } : null;
   }
 
   async sendCredentials(

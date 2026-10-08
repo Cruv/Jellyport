@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Callout, Empty, Heading, Icon, Modal } from './components';
 import { UserWarnings } from './SettingsPage';
-import type { Api, Notify, UserMapping, Users } from './types';
+import DiscordMemberPicker from './DiscordMemberPicker';
+import type { Api, DiscordMember, Notify, UserMapping, Users } from './types';
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : 'The mapping could not be saved.';
@@ -27,6 +28,7 @@ export default function UserMappingsPage({
   const [targetName, setTargetName] = useState('');
   const [discordName, setDiscordName] = useState('');
   const [discordId, setDiscordId] = useState('');
+  const [discordMember, setDiscordMember] = useState<DiscordMember | null>(null);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [error, setError] = useState('');
@@ -52,6 +54,7 @@ export default function UserMappingsPage({
     setTargetName('');
     setDiscordName('');
     setDiscordId('');
+    setDiscordMember(null);
     setError('');
   }
   function edit(mapping: UserMapping) {
@@ -61,6 +64,17 @@ export default function UserMappingsPage({
     setTargetName(mapping.target_username);
     setDiscordName(mapping.discord_username || '');
     setDiscordId(mapping.discord_user_id || '');
+    setDiscordMember(
+      mapping.discord_user_id
+        ? {
+            id: mapping.discord_user_id,
+            username: mapping.discord_username || 'Saved Discord member',
+            display_name: null,
+            nickname: null,
+            membership_active: null,
+          }
+        : null,
+    );
     setError('');
   }
   async function save(event: FormEvent<HTMLFormElement>) {
@@ -128,9 +142,9 @@ export default function UserMappingsPage({
       />
       <UserWarnings users={users} />
       <Callout icon="shield" title="Mappings are approved by you.">
-        Usernames can differ across Emby, Jellyfin, and Discord. A Discord name alone is a label; a
-        verified Discord user ID is required for account delivery or membership actions. Saving a
-        mapping does not create an account or send a message.
+        Usernames can differ across Emby, Jellyfin, and Discord. Search for a Discord member to link
+        their stable identity automatically. Saving a mapping does not create an account or send a
+        message.
       </Callout>
       <div className="stack">
         <section className="panel">
@@ -162,6 +176,9 @@ export default function UserMappingsPage({
                       const id = event.target.value;
                       const previousName = users.emby.find((user) => user.Id === sourceId)?.Name;
                       setSourceId(id);
+                      setDiscordMember(null);
+                      setDiscordId('');
+                      setDiscordName('');
                       if (!targetName || targetName === previousName)
                         setTargetName(users.emby.find((user) => user.Id === id)?.Name || '');
                     }}
@@ -221,41 +238,73 @@ export default function UserMappingsPage({
                   </small>
                 </div>
               )}
-              <div className="field-row">
-                <div className="field">
-                  <label htmlFor="mapping-discord-name">
-                    Discord username <span className="optional">optional</span>
-                  </label>
-                  <input
-                    id="mapping-discord-name"
-                    value={discordName}
-                    onChange={(event) => setDiscordName(event.target.value)}
-                    maxLength={64}
-                    disabled={busy}
-                    autoComplete="off"
-                    placeholder="Actual username, not a server nickname"
-                  />
-                  <small>Without a user ID, this is an unverified label.</small>
+              <DiscordMemberPicker
+                key={editing?.id || sourceId || 'new-mapping'}
+                api={api}
+                value={discordMember}
+                onChange={(member) => {
+                  setDiscordMember(member);
+                  setDiscordId(member?.id || '');
+                  setDiscordName(member?.username || '');
+                }}
+                suggestedQuery={
+                  discordName ||
+                  users.jellyfin.find((user) => user.Id === targetId)?.Name ||
+                  targetName ||
+                  users.emby.find((user) => user.Id === sourceId)?.Name ||
+                  ''
+                }
+                allowInactive
+                disabled={busy}
+                id="mapping-discord-member"
+              />
+              <details className="discord-picker-advanced">
+                <summary>Advanced Discord details</summary>
+                <p>
+                  Use a username label or a known Discord ID when a server search is unavailable.
+                </p>
+                <div className="field-row">
+                  <div className="field">
+                    <label htmlFor="mapping-discord-name">
+                      Discord username <span className="optional">optional</span>
+                    </label>
+                    <input
+                      id="mapping-discord-name"
+                      value={discordName}
+                      onChange={(event) => {
+                        setDiscordMember(null);
+                        setDiscordName(event.target.value);
+                      }}
+                      maxLength={64}
+                      disabled={busy}
+                      autoComplete="off"
+                      placeholder="Actual username, not a server nickname"
+                    />
+                    <small>Without a user ID, this is an unverified label.</small>
+                  </div>
+                  <div className="field">
+                    <label htmlFor="mapping-discord-id">
+                      Discord user ID <span className="optional">optional</span>
+                    </label>
+                    <input
+                      id="mapping-discord-id"
+                      value={discordId}
+                      onChange={(event) => {
+                        setDiscordMember(null);
+                        setDiscordId(event.target.value);
+                      }}
+                      inputMode="numeric"
+                      pattern="[0-9]{5,22}"
+                      maxLength={22}
+                      disabled={busy}
+                      autoComplete="off"
+                    />
+                    <small>
+                      The connected Discord bot verifies the member and their actual username.
+                    </small>
+                  </div>
                 </div>
-                <div className="field">
-                  <label htmlFor="mapping-discord-id">
-                    Discord user ID <span className="optional">optional</span>
-                  </label>
-                  <input
-                    id="mapping-discord-id"
-                    value={discordId}
-                    onChange={(event) => setDiscordId(event.target.value)}
-                    inputMode="numeric"
-                    pattern="[0-9]{5,22}"
-                    maxLength={22}
-                    disabled={busy}
-                    autoComplete="off"
-                  />
-                  <small>
-                    The connected Discord bot verifies the member and their actual username.
-                  </small>
-                </div>
-              </div>
+              </details>
               <div className="form-actions">
                 {editing && (
                   <button type="button" className="btn" onClick={reset} disabled={busy}>

@@ -31,14 +31,21 @@ import type { UserMapping } from '../server/user-mappings.js';
 function member(
   id = '22',
   username = 'jlogan35',
-  options: { roles?: string[]; admin?: boolean; bot?: boolean; guildId?: string } = {},
+  options: {
+    roles?: string[];
+    admin?: boolean;
+    bot?: boolean;
+    guildId?: string;
+    displayName?: string;
+    nickname?: string | null;
+  } = {},
 ) {
   return {
     id,
     partial: false,
-    user: { id, username, bot: options.bot ?? false },
+    user: { id, username, globalName: options.displayName ?? null, bot: options.bot ?? false },
     displayName: 'Display alias',
-    nickname: 'Display alias',
+    nickname: options.nickname === undefined ? 'Display alias' : options.nickname,
     guild: { id: options.guildId ?? '123' },
     roles: {
       cache: new Collection((options.roles ?? ['55']).map((role) => [role, { id: role }] as const)),
@@ -86,6 +93,7 @@ function subscriptionMessage(overrides: Record<string, unknown> = {}) {
 
 const managers: BotManager[] = [];
 afterEach(async () => {
+  vi.useRealTimers();
   for (const manager of managers.splice(0)) await manager.stop();
 });
 
@@ -119,6 +127,7 @@ async function fixture(extra: Partial<Settings> = {}) {
         options.user === '11' ? admin : recipient,
       ),
       list: vi.fn(async (_options: unknown) => new Collection([['22', recipient]])),
+      search: vi.fn(async (_options: unknown) => new Collection([['22', recipient]])),
     },
     commands: { set: vi.fn(async (_commands: unknown) => new Collection()) },
   };
@@ -727,7 +736,7 @@ describe('Trusted subscription sources', () => {
   ] as const)('resolves a plain username only when exact and unique', async (names, id) => {
     const { manager, guild, service } = await fixture(sourceSettings);
     const records = names.map((name, index) => member(String(index + 22), name));
-    guild.members.list.mockResolvedValue(new Collection(records.map((item) => [item.id, item])));
+    guild.members.search.mockResolvedValue(new Collection(records.map((item) => [item.id, item])));
     await manager.handleSubscriptionMessage(
       subscriptionMessage({
         content: 'Bad news captain! jlogan35 just cancelled their subscription.',
@@ -800,5 +809,231 @@ describe('Trusted subscription sources', () => {
     resolve(member());
     await Promise.resolve();
     expect(service.recordSubscription).not.toHaveBeenCalled();
+  });
+});
+
+describe('Discord member discovery', () => {
+  it('searches fresh REST members without adding privileged gateway intents', async () => {
+    const { manager, guild, factory } = await fixture();
+    expect(await manager.searchMembers('  @jlogan  ')).toEqual({
+      members: [
+        {
+          id: '22',
+          username: 'jlogan35',
+          display_name: null,
+          nickname: 'Display alias',
+          membership_active: true,
+        },
+      ],
+      truncated: false,
+    });
+    expect(guild.members.search).toHaveBeenCalledWith({
+      query: 'jlogan',
+      limit: 26,
+      cache: false,
+    });
+    expect(guild.members.list).not.toHaveBeenCalled();
+    expect(factory.mock.calls[0]![0].intents).toEqual([GatewayIntentBits.Guilds]);
+  });
+
+  it('keeps real usernames, display names, and server nicknames distinct', async () => {
+    const { manager, guild } = await fixture();
+    const eligible = member('22', 'actual.user', {
+      displayName: 'Global Display Name',
+      nickname: 'Captain Nickname',
+    });
+    const expired = member('23', 'other.user', { roles: [], nickname: null });
+    Object.assign(eligible.user, { email: 'private@example.test', avatar: 'private-avatar' });
+    Object.assign(eligible, { accessToken: 'private-token', premiumSince: new Date() });
+    guild.members.search.mockResolvedValue(
+      new Collection([
+        ['22', eligible],
+        ['23', expired],
+      ]),
+    );
+    const result = await manager.searchMembers('Capt');
+    expect(result.members).toEqual([
+      {
+        id: '22',
+        username: 'actual.user',
+        display_name: 'Global Display Name',
+        nickname: 'Captain Nickname',
+        membership_active: true,
+      },
+      {
+        id: '23',
+        username: 'other.user',
+        display_name: null,
+        nickname: null,
+        membership_active: false,
+      },
+    ]);
+    expect(JSON.stringify(result)).not.toMatch(/private|roles|premiumSince|accessToken|email/);
+  });
+
+  it('marks all human members active when no membership role is configured', async () => {
+    const { manager, guild } = await fixture({ discord_member_role_id: '' });
+    guild.members.search.mockResolvedValue(
+      new Collection([['22', member('22', 'no.role', { roles: [] })]]),
+    );
+    expect((await manager.searchMembers('no')).members[0]!.membership_active).toBe(true);
+  });
+
+  it('excludes bots, foreign guilds, partial members, invalid identities, and duplicates', async () => {
+    const { manager, guild } = await fixture();
+    const wrongUserId = member('24', 'wrong.id');
+    wrongUserId.user.id = '25';
+    const partial = member('26', 'partial');
+    partial.partial = true;
+    guild.members.search.mockResolvedValue(
+      new Collection([
+        ['22', member('22', 'valid.user')],
+        ['duplicate', member('22', 'valid.user')],
+        ['23', member('23', 'robot', { bot: true })],
+        ['foreign', member('30', 'other.guild', { guildId: '456' })],
+        ['invalid', member('not-a-snowflake', 'invalid')],
+        ['wrong', wrongUserId],
+        ['partial', partial],
+        ['control', member('27', 'unsafe\nusername')],
+        ['too-long', member('28', 'x'.repeat(33))],
+      ]),
+    );
+    expect((await manager.searchMembers('va')).members.map((item) => item.id)).toEqual(['22']);
+  });
+
+  it('puts an exact actual username first and limits incomplete search results to 25', async () => {
+    const { manager, guild } = await fixture();
+    const members = Array.from({ length: 26 }, (_, index) =>
+      member(String(index + 22), `prefix${String(index).padStart(2, '0')}`),
+    );
+    members[25] = member('99', 'prefix');
+    guild.members.search.mockResolvedValue(new Collection(members.map((item) => [item.id, item])));
+    const result = await manager.searchMembers('prefix');
+    expect(result.members).toHaveLength(25);
+    expect(result.members[0]!.username).toBe('prefix');
+    expect(result.truncated).toBe(true);
+    expect(await manager.matchingUsername('prefix')).toBeNull();
+  });
+
+  it('does not auto-match a nickname or display name to an account username', async () => {
+    const { manager, guild } = await fixture();
+    guild.members.search.mockResolvedValue(
+      new Collection([
+        ['22', member('22', 'real.account', { nickname: 'nickname', displayName: 'nickname' })],
+      ]),
+    );
+    expect(await manager.matchingUsername('nickname')).toBeNull();
+  });
+
+  it('requires exact actual username casing for automatic identity matches', async () => {
+    const { manager } = await fixture();
+    expect(await manager.matchingUsername('JLOGAN35')).toBeNull();
+    expect(await manager.matchingUsername('jlogan35')).toEqual({ id: '22', username: 'jlogan35' });
+  });
+
+  it.each(['a', '  ', 'x'.repeat(65), 'bad\nquery', '\u0000username'])(
+    'rejects invalid query before calling Discord (%j)',
+    async (query) => {
+      const { manager, guild } = await fixture();
+      await expect(manager.searchMembers(query)).rejects.toThrow('2–64 characters');
+      expect(guild.members.search).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([{ discord_enabled: false }, { discord_bot_token: '' }])(
+    'fails clearly when the bot is disabled or disconnected',
+    async (settings) => {
+      const { manager, guild } = await fixture(settings);
+      await expect(manager.searchMembers('valid')).rejects.toThrow('offline');
+      expect(guild.members.search).not.toHaveBeenCalled();
+    },
+  );
+
+  it('searches only the configured available guild', async () => {
+    const { manager, guild } = await fixture();
+    guild.available = false;
+    await expect(manager.searchMembers('valid')).rejects.toThrow('configured Discord server');
+    expect(guild.members.search).not.toHaveBeenCalled();
+  });
+
+  it('searches all-numeric usernames as names rather than interpreting them as IDs', async () => {
+    const { manager, guild } = await fixture();
+    guild.members.search.mockResolvedValue(
+      new Collection([['22', member('22', '123456789012345678')]]),
+    );
+    const result = await manager.searchMembers('123456789012345678');
+    expect(result.members[0]!.id).toBe('22');
+    expect(result.members[0]!.username).toBe('123456789012345678');
+    expect(guild.members.search).toHaveBeenCalledWith({
+      query: '123456789012345678',
+      limit: 26,
+      cache: false,
+    });
+    expect(guild.members.fetch).not.toHaveBeenCalled();
+  });
+
+  it('automatically resolves a complete exact all-numeric username to its real user ID', async () => {
+    const { manager, guild } = await fixture();
+    guild.members.search.mockResolvedValue(
+      new Collection([['22', member('22', '123456789012345678')]]),
+    );
+    expect(await manager.matchingUsername('123456789012345678')).toEqual({
+      id: '22',
+      username: '123456789012345678',
+    });
+    expect(guild.members.fetch).not.toHaveBeenCalled();
+  });
+
+  it('returns no matches for a missing username and sanitizes all API errors', async () => {
+    const { manager, guild } = await fixture();
+    guild.members.search.mockResolvedValue(new Collection());
+    expect(await manager.searchMembers('123456789012345678')).toEqual({
+      members: [],
+      truncated: false,
+    });
+    guild.members.search.mockRejectedValue({
+      code: 50001,
+      status: 403,
+      message: 'private bot-token server data',
+    });
+    await expect(manager.searchMembers('name')).rejects.toThrow('Server Members Intent');
+    await expect(manager.searchMembers('name')).rejects.not.toThrow('private');
+  });
+
+  it('bounds a stalled Discord query to twenty seconds without accepting a late result', async () => {
+    const { manager, guild } = await fixture();
+    let finish!: (value: Collection<string, ReturnType<typeof member>>) => void;
+    guild.members.search.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    vi.useFakeTimers();
+    const task = manager.searchMembers('name');
+    const assertion = expect(task).rejects.toThrow('could not be searched');
+    await vi.advanceTimersByTimeAsync(20_000);
+    await assertion;
+    finish(new Collection([['22', member()]]));
+    await Promise.resolve();
+    expect(guild.members.search).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts search on bot restart and discards responses from the prior connection', async () => {
+    const { manager, guild, settings } = await fixture();
+    let finish!: (value: Collection<string, ReturnType<typeof member>>) => void;
+    guild.members.search.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const task = manager.searchMembers('name');
+    const assertion = expect(task).rejects.toThrow('connection changed');
+    await manager.restart(settings);
+    await assertion;
+    finish(new Collection([['22', member()]]));
+    await Promise.resolve();
+    expect(guild.members.search).toHaveBeenCalledTimes(1);
   });
 });

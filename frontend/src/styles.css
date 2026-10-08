@@ -1990,3 +1990,62 @@ progress.progress-track::-moz-progress-bar {
   display: block;
   max-width: 120px;
 }
+.discord-picker-search,
+.discord-picker-selection {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.discord-picker-search input {
+  min-width: 0;
+  flex: 1;
+}
+.discord-picker-selection {
+  justify-content: space-between;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  overflow-wrap: anywhere;
+}
+.discord-picker-selection small,
+.discord-picker-results small {
+  display: block;
+}
+.discord-picker-results {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  max-height: 260px;
+  overflow: auto;
+}
+.discord-picker-results li + li {
+  border-top: 1px solid var(--line);
+}
+.discord-picker-results button {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+.discord-picker-results button:hover,
+.discord-picker-results button:focus-visible {
+  background: var(--bg);
+}
+.discord-picker-advanced summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.discord-picker-advanced p {
+  margin: 12px 0;
+  color: var(--muted);
+}

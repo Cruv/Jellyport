@@ -37,6 +37,13 @@ export interface UserMapping {
   source_server_url?: string;
   target_server_url?: string;
 }
+export interface DiscordMember {
+  id: string;
+  username: string;
+  display_name: string | null;
+  nickname: string | null;
+  membership_active: boolean | null;
+}
 export interface Connection {
   connected?: boolean;
   configured?: boolean;

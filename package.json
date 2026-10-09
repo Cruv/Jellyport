@@ -1,6 +1,6 @@
 {
   "name": "jellyport",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "private": true,
   "type": "module",
   "description": "Self-hosted Emby to Jellyfin migration and Discord account management",

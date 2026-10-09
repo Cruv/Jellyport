@@ -77,7 +77,7 @@ Serve Jellyport at the root of its own host/subdomain. Run one application worke
 
 ## Set up Jellyfin sign-in and your servers
 
-The first-run wizard links Jellyport to one Jellyfin server. Enter the server URL and an enabled administrator's username and password. Jellyport verifies those credentials with Jellyfin and creates a dedicated API key for background account operations. It encrypts the key in its data directory and does not save your Jellyfin password.
+The first-run wizard links Jellyport to one Jellyfin server. Enter the server URL and an enabled administrator's username and password. Jellyport verifies those credentials with Jellyfin and creates a dedicated API key for background account operations. You do not need to create or name an API key yourself. It encrypts the key in its data directory and does not save your Jellyfin password.
 
 The wizard can finish without a template user. After setup, use **Account roles** to capture an enabled, non-administrator Jellyfin account's supported settings, then choose that saved role as the default in Settings. Alternatively, select a legacy template user in Settings to copy its policy and configuration during provisioning. A default account role takes precedence when both are configured. Set the public Jellyfin URL that users should receive in their credential message, and configure the Emby source URL and API key in Settings.
 

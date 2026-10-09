@@ -366,11 +366,12 @@ export class JellyfinAuthClient implements JellyfinAuthentication {
     // setup-attempt name supports both, without guessing or accidentally adopting another key.
     const result = await this.request(baseUrl, 'GET', 'Auth/Keys', { accessToken: adminToken });
     if (!isObject(result) || !Array.isArray(result.Items)) throw invalidResponse();
+    // Jellyfin's API-key DTO leaves IsActive at its default false, even for usable keys.
+    // Identify our key by its exact unique name; DateRevoked still rules out revoked keys.
     const matches = result.Items.filter(
       (item: unknown) =>
         isObject(item) &&
         item.AppName === appName &&
-        (item.IsActive === undefined || item.IsActive === true) &&
         (item.DateRevoked === undefined || item.DateRevoked === null),
     );
     if (matches.length !== 1 || !isObject(matches[0]) || !token(matches[0].AccessToken))

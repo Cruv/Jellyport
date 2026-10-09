@@ -98,7 +98,13 @@ it('runs production HTTP clients through a Jellyfin 10.11 wizard, managed servic
           Items: [...serviceKeys].map(([AccessToken, AppName]) => ({
             AccessToken,
             AppName,
-            IsActive: true,
+            // Jellyfin 10.11 leaves this legacy DTO flag at its default false for live API keys.
+            IsActive: false,
+            DateRevoked: null,
+            UserId: '00000000000000000000000000000000',
+            DeviceId: '',
+            DeviceName: '',
+            AppVersion: '',
           })),
           TotalRecordCount: serviceKeys.size,
         });

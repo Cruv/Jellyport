@@ -607,9 +607,16 @@ describe('Jellyfin authentication client', () => {
 });
 
 describe('dedicated Jellyport service API keys', () => {
-  it.each([200, 204])(
-    'supports Jellyfin POST status %i and identifies the exact setup key by its unique name',
-    async (status) => {
+  it.each([
+    { status: 200, isActive: false },
+    { status: 204, isActive: false },
+    { status: 200, isActive: true },
+    { status: 204, isActive: true },
+    { status: 200, isActive: undefined },
+    { status: 204, isActive: undefined },
+  ])(
+    'supports Jellyfin key creation with POST status $status and IsActive $isActive',
+    async ({ status, isActive }) => {
       const requests: Array<{ address: string; init: RequestInit }> = [];
       const client = new JellyfinAuthClient({
         transport: async (address, init) => {
@@ -621,7 +628,11 @@ describe('dedicated Jellyport service API keys', () => {
           return json({
             Items: [
               { AppName: 'Jellyport setup another', AccessToken: 'unrelated-key' },
-              { AppName: 'Jellyport setup one', AccessToken: 'dedicated-key', IsActive: true },
+              {
+                AppName: 'Jellyport setup one',
+                AccessToken: 'dedicated-key',
+                IsActive: isActive,
+              },
             ],
           });
         },
@@ -650,12 +661,20 @@ describe('dedicated Jellyport service API keys', () => {
     { Items: [{ AppName: 'wrong-name', AccessToken: 'unrelated-key' }] },
     { Items: [{ AppName: 'unique-name', AccessToken: '' }] },
     { Items: [{ AppName: 'unique-name', AccessToken: 'secret\nheader' }] },
-    { Items: [{ AppName: 'unique-name', AccessToken: 'revoked-key', IsActive: false }] },
-    { Items: [{ AppName: 'unique-name', AccessToken: 'revoked-key', DateRevoked: '2026-10-07' }] },
+    {
+      Items: [
+        {
+          AppName: 'unique-name',
+          AccessToken: 'revoked-key',
+          IsActive: false,
+          DateRevoked: '2026-10-07',
+        },
+      ],
+    },
     {
       Items: [
         { AppName: 'unique-name', AccessToken: 'first' },
-        { AppName: 'unique-name', AccessToken: 'second' },
+        { AppName: 'unique-name', AccessToken: 'second', IsActive: false },
       ],
     },
   ])('refuses absent, ambiguous, revoked, or malformed setup-key matches: %j', async (value) => {

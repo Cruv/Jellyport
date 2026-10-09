@@ -1,6 +1,6 @@
 import { afterEach, expect, it } from 'vitest';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
@@ -8,10 +8,13 @@ import {
   decryptDatabase,
   encryptDatabase,
   readEnvelope,
+  recoverSnapshotHelper,
   seal,
   snapshotKey,
   unseal,
   writeEnvelope,
+  type CaptureRequest,
+  type CaptureResult,
 } from '../server/snapshot-files.js';
 import { snapshotProcess } from '../server/snapshot-process.js';
 import { readSnapshotItems } from '../server/emby-snapshot-reader.js';
@@ -167,6 +170,132 @@ it('sanitizes worker failures without returning source paths or database content
   }
   expect(rejected).toBeInstanceOf(Error);
   expect((rejected as Error).message).not.toMatch(/private-user|capture-fixture|\/Users|\/var\//);
+});
+
+function recoveryRequest(id = randomUUID()): CaptureRequest {
+  return {
+    id,
+    requested_at: new Date(Date.now() - 30_000).toISOString(),
+    binding: { url: 'http://emby.fixture', server_id: 'fixture-server', version: '4.10.1.0' },
+    user_ids: ['51b10a51a1064e538a0aef64703aaa86'],
+  };
+}
+
+it('recovers interrupted encryption immediately while preserving queued work and published files', async () => {
+  const path = await directory();
+  const key = randomBytes(32);
+  const request = recoveryRequest();
+  const queued = recoveryRequest();
+  const previous = randomUUID();
+  const published = Buffer.from('preserve-published-ciphertext');
+  await writeEnvelope(join(path, `${request.id}.working`), request, key);
+  await writeFile(join(path, `${request.id}.db.enc.pending`), Buffer.from('partial-ciphertext'));
+  // A kill after publishing ciphertext but before publishing its result must not
+  // delete that published file during recovery either.
+  await writeFile(join(path, `${request.id}.db.enc`), published);
+  await writeFile(join(path, `${previous}.db.enc`), published);
+  await writeEnvelope(join(path, `${previous}.result`), { id: previous, ok: true }, key);
+  await writeEnvelope(join(path, `${queued.id}.request`), queued, key);
+  const queuedBytes = await readFile(join(path, `${queued.id}.request`));
+  const previousResult = await readFile(join(path, `${previous}.result`));
+  await recoverSnapshotHelper(path, key);
+  await expect(stat(join(path, `${request.id}.working`))).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect(stat(join(path, `${request.id}.db.enc.pending`))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+  const result = await readEnvelope<CaptureResult>(join(path, `${request.id}.result`), key);
+  expect(result).toMatchObject({
+    ...request,
+    ok: false,
+    error:
+      'Database capture was interrupted. The last good capture is preserved. Capture Emby again.',
+  });
+  expect(Number.isFinite(Date.parse(result.finished_at))).toBe(true);
+  expect(result.finished_at).toBe(result.started_at);
+  expect(await readFile(join(path, `${request.id}.db.enc`))).toEqual(published);
+  expect(await readFile(join(path, `${previous}.db.enc`))).toEqual(published);
+  expect(await readFile(join(path, `${previous}.result`))).toEqual(previousResult);
+  expect(await readFile(join(path, `${queued.id}.request`))).toEqual(queuedBytes);
+  const resultBytes = await readFile(join(path, `${request.id}.result`));
+  await recoverSnapshotHelper(path, key);
+  expect(await readFile(join(path, `${request.id}.result`))).toEqual(resultBytes);
+});
+
+it('preserves an authenticated completed capture result and removes only its interrupted markers', async () => {
+  const path = await directory();
+  const key = randomBytes(32);
+  for (const ok of [true, false]) {
+    const request = recoveryRequest();
+    const now = new Date().toISOString();
+    const result: CaptureResult = {
+      ...request,
+      ok,
+      started_at: now,
+      finished_at: now,
+      ...(ok
+        ? { bytes: 4, schema: 'emby-4.10.1.0', identities: { [request.user_ids![0]!]: 2 } }
+        : { error: 'An already published safe failure.' }),
+    };
+    const ciphertext = randomBytes(32);
+    await writeEnvelope(join(path, `${request.id}.working`), request, key);
+    await writeEnvelope(join(path, `${request.id}.result`), result, key);
+    await writeFile(join(path, `${request.id}.db.enc`), ciphertext);
+    await writeFile(join(path, `${request.id}.db.enc.pending`), randomBytes(12));
+    const resultBytes = await readFile(join(path, `${request.id}.result`));
+    await recoverSnapshotHelper(path, key);
+    expect(await readFile(join(path, `${request.id}.result`))).toEqual(resultBytes);
+    expect(await readFile(join(path, `${request.id}.db.enc`))).toEqual(ciphertext);
+    await expect(stat(join(path, `${request.id}.working`))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(stat(join(path, `${request.id}.db.enc.pending`))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  }
+});
+
+it('fails closed on malformed recovery messages and never follows artifact symlinks or payload paths', async () => {
+  const path = await directory();
+  const outside = await directory();
+  const key = randomBytes(32);
+  const sentinel = join(outside, 'untouched');
+  await writeFile(sentinel, Buffer.from('private-target-preserved'));
+  const malformedIds = [randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+  await writeFile(join(path, `${malformedIds[0]}.working`), Buffer.from('unauthenticated'));
+  await writeEnvelope(join(path, `${malformedIds[1]}.working`), recoveryRequest(), key);
+  await writeEnvelope(
+    join(path, `${malformedIds[2]}.working`),
+    { ...recoveryRequest(malformedIds[2]), id: '../untouched' },
+    key,
+  );
+  await symlink(sentinel, join(path, `${malformedIds[3]}.working`));
+  const pendingId = randomUUID();
+  await symlink(sentinel, join(path, `${pendingId}.db.enc.pending`));
+  const invalidFilename = join(path, 'not-a-valid-uuid.db.enc.pending');
+  await writeFile(invalidFilename, Buffer.from('not-owned'));
+  const directoryArtifact = join(path, `${randomUUID()}.working`);
+  await mkdir(directoryArtifact);
+  await writeFile(join(directoryArtifact, 'untouched'), Buffer.from('not-recursive'));
+  const interrupted = recoveryRequest();
+  await writeEnvelope(join(path, `${interrupted.id}.working`), interrupted, key);
+  await symlink(sentinel, join(path, `${interrupted.id}.result`));
+  await recoverSnapshotHelper(path, key);
+  for (const id of malformedIds) {
+    await expect(stat(join(path, `${id}.working`))).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(stat(join(path, `${id}.result`))).rejects.toMatchObject({ code: 'ENOENT' });
+  }
+  await expect(stat(join(path, `${pendingId}.db.enc.pending`))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+  expect(await readFile(sentinel, 'utf8')).toBe('private-target-preserved');
+  expect(await readFile(invalidFilename, 'utf8')).toBe('not-owned');
+  expect(await readFile(join(directoryArtifact, 'untouched'), 'utf8')).toBe('not-recursive');
+  expect(
+    await readEnvelope<CaptureResult>(join(path, `${interrupted.id}.result`), key),
+  ).toMatchObject({
+    id: interrupted.id,
+    ok: false,
+  });
 });
 
 it('captures a consistent local WAL view while writes continue and publishes only migration tables', async () => {

@@ -7,6 +7,7 @@ import {
   SNAPSHOT_VERSION,
   encryptDatabase,
   readEnvelope,
+  recoverSnapshotHelper,
   regular,
   snapshotId,
   snapshotKey,
@@ -64,6 +65,7 @@ const heartbeat = setInterval(() => {
 }, 2000);
 heartbeat.unref();
 let stopping = false;
+let recovered = false;
 const controller = new AbortController();
 for (const signal of ['SIGTERM', 'SIGINT'] as const)
   process.on(signal, () => {
@@ -77,6 +79,10 @@ for (const name of await readdir(workDirectory))
 while (!stopping) {
   try {
     const key = await snapshotKey(directory);
+    if (!recovered) {
+      await recoverSnapshotHelper(directory, key);
+      recovered = true;
+    }
     await writeEnvelope(
       join(directory, 'helper.status'),
       {

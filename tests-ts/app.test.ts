@@ -369,7 +369,7 @@ it.each([
     );
     const queued = await app.inject({ method: 'POST', url: '/api/migrations', headers, payload });
     expect(queued.statusCode).toBe(202);
-    expect(migrate).toHaveBeenCalledWith(['e-alex'], undefined, undefined, expected);
+    expect(migrate).toHaveBeenCalledWith(['e-alex'], undefined, undefined, expected, undefined);
   },
 );
 it('rejects unknown or coerced migration scopes before preview or queue work starts', async () => {

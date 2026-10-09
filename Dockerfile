@@ -20,7 +20,8 @@ RUN apt-get update && \
     rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/yarn /usr/local/bin/yarnpkg && \
     groupadd --system --gid 10001 jellyport && \
     useradd --system --uid 10001 --gid 10001 --create-home jellyport && \
-    mkdir /data && chown jellyport:jellyport /data
+    mkdir /data /work && chown jellyport:jellyport /data /work
+# Includes the optional network-isolated snapshot-helper entry point.
 COPY --from=build /app/dist ./dist
 RUN find dist node_modules -type f -name '*.map' -delete
 USER jellyport

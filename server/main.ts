@@ -71,6 +71,8 @@ interface MigrationRequest {
   discord_recipients?: Record<string, string>;
   mapping_revisions?: Record<string, string | null>;
   migration_scope?: MigrationScope;
+  use_snapshots?: boolean;
+  source_snapshot_ids?: Record<string, string>;
 }
 export interface CreateAppOptions {
   demoPassword?: string;
@@ -92,6 +94,10 @@ const equal = (left: string, right: string): boolean => {
   return a.length === b.length && timingSafeEqual(a, b);
 };
 const id = { type: 'string', minLength: 1, maxLength: 128 };
+const snapshotId = {
+  type: 'string',
+  pattern: '^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$',
+};
 const discordId = { anyOf: [{ type: 'null' }, { type: 'string', pattern: '^[0-9]{5,22}$' }] };
 const accountFields = {
   username: { type: 'string', minLength: 1, maxLength: 64 },
@@ -110,6 +116,14 @@ const migrationSchema = {
   properties: {
     source_user_ids: { type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: id },
     migration_scope: { type: 'string', enum: ['complete', 'watched_only'] },
+    use_snapshots: { type: 'boolean' },
+    source_snapshot_ids: {
+      type: 'object',
+      minProperties: 1,
+      maxProperties: 100,
+      propertyNames: id,
+      additionalProperties: snapshotId,
+    },
     discord_recipients: {
       type: 'object',
       maxProperties: 100,
@@ -122,6 +136,17 @@ const migrationSchema = {
     },
   },
 };
+function validateSnapshotSelection(request: MigrationRequest): void {
+  if (!request.source_snapshot_ids) return;
+  const keys = Object.keys(request.source_snapshot_ids);
+  if (
+    keys.length !== request.source_user_ids.length ||
+    request.source_user_ids.some(
+      (sourceId) => !Object.hasOwn(request.source_snapshot_ids!, sourceId),
+    )
+  )
+    throw new ServiceError('Review snapshots for every selected source user before migrating.');
+}
 
 export async function createApp(options: CreateAppOptions = {}): Promise<JellyportApp> {
   const demo = options.demo ?? process.env.JELLYPORT_DEMO === 'true';
@@ -715,6 +740,47 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     return result;
   }
   app.get('/api/settings', async () => publicSettings());
+  app.get('/api/source-snapshots', async () => service.sourceSnapshots.status());
+  app.put<{
+    Body: {
+      enabled: boolean;
+      hour: number;
+      minute: number;
+      time_zone: string;
+      scope: MigrationScope;
+      expected_revision: string;
+    };
+  }>(
+    '/api/source-snapshots/schedule',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['enabled', 'hour', 'minute', 'time_zone', 'scope', 'expected_revision'],
+          properties: {
+            enabled: { type: 'boolean' },
+            hour: { type: 'integer', minimum: 0, maximum: 23 },
+            minute: { type: 'integer', minimum: 0, maximum: 59 },
+            time_zone: { type: 'string', minLength: 1, maxLength: 128 },
+            scope: { type: 'string', enum: ['complete', 'watched_only'] },
+            expected_revision: id,
+          },
+        },
+      },
+    },
+    async (request) => service.sourceSnapshots.configure(request.body),
+  );
+  const noSnapshotBody = {
+    schema: { body: { type: 'object', maxProperties: 0, additionalProperties: false } },
+    preValidation: async (request: FastifyRequest) => {
+      if (request.body === undefined) request.body = {};
+    },
+  };
+  app.post('/api/source-snapshots/refresh', noSnapshotBody, async (_request, reply) =>
+    reply.code(202).send(await service.sourceSnapshots.refresh()),
+  );
+  app.delete('/api/source-snapshots', noSnapshotBody, async () => service.sourceSnapshots.clear());
   app.get('/api/discord/admin-alerts', async () => ({
     ...service.adminAlerts.status(store.settings()),
     connected: bot.status().connected,
@@ -870,8 +936,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   app.post<{ Body: MigrationRequest }>(
     '/api/migrations/preview',
     { schema: { body: migrationSchema } },
-    async (request, reply) =>
-      reply
+    async (request, reply) => {
+      validateSnapshotSelection(request.body);
+      if (request.body.source_snapshot_ids)
+        throw new ServiceError('Start a new preview to select its source snapshots.');
+      return reply
         .code(202)
         .send(
           previews.start(
@@ -879,8 +948,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             previewContext(),
             request.body.source_user_ids,
             request.body.migration_scope ?? 'complete',
+            request.body.use_snapshots ?? false,
           ),
-        ),
+        );
+    },
   );
   const previewParams = {
     type: 'object',
@@ -910,8 +981,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   app.post<{ Body: MigrationRequest }>(
     '/api/migrations',
     { schema: { body: migrationSchema } },
-    async (request, reply) =>
-      reply
+    async (request, reply) => {
+      validateSnapshotSelection(request.body);
+      if (request.body.use_snapshots && !request.body.source_snapshot_ids)
+        throw new ServiceError('Review source snapshots before starting the migration.');
+      return reply
         .code(202)
         .send(
           await service.migrateUsers(
@@ -919,8 +993,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             request.body.discord_recipients,
             request.body.mapping_revisions,
             request.body.migration_scope ?? 'complete',
+            request.body.source_snapshot_ids,
           ),
-        ),
+        );
+    },
   );
   app.post<{ Body: AccountRequest }>(
     '/api/accounts',

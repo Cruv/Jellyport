@@ -9,6 +9,7 @@ import {
   Loading,
   Modal,
   Status,
+  SourceSnapshotNote,
   UserCell,
 } from './components';
 import SettingsPage from './SettingsPage';
@@ -112,6 +113,7 @@ export default function App() {
   const [events, setEvents] = useState<SubscriptionEvent[]>([]);
   const [selected, setSelected] = useState(new Set<string>());
   const [migrationScope, setMigrationScope] = useState<MigrationScope>('complete');
+  const [useSnapshots, setUseSnapshots] = useState(false);
   const [search, setSearch] = useState('');
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const dialogRef = useRef(dialog);
@@ -178,6 +180,7 @@ export default function App() {
     setEvents([]);
     setSelected(new Set());
     setMigrationScope('complete');
+    setUseSnapshots(false);
     setSearch('');
     setToasts([]);
     setMobileOpen(false);
@@ -450,6 +453,7 @@ export default function App() {
     }
     const generation = authGeneration.current;
     const scope = migrationScope;
+    const savedSource = useSnapshots;
     const controller = new AbortController();
     let taskId = '';
     let cancellationSent = false;
@@ -488,7 +492,11 @@ export default function App() {
       try {
         let task = await api<PreviewTask>('/api/migrations/preview', {
           method: 'POST',
-          body: { source_user_ids: [...selected], migration_scope: scope },
+          body: {
+            source_user_ids: [...selected],
+            migration_scope: scope,
+            ...(savedSource ? { use_snapshots: true } : {}),
+          },
           // Receive the task ID even if the user leaves while this short request is in flight.
           // Polling is independently abortable, and an abandoned task is cancelled below.
         });
@@ -512,9 +520,31 @@ export default function App() {
           throw new Error(
             'No users were returned for this preview. Reload the Emby user list and try again.',
           );
+        if (
+          savedSource &&
+          (!task.preview.source_snapshot_ids ||
+            Object.keys(task.preview.source_snapshot_ids).length !== task.preview.users.length ||
+            task.preview.users.some((user) => {
+              const pins = task.preview!.source_snapshot_ids!;
+              return (
+                !Object.hasOwn(pins, user.source_user_id) ||
+                typeof pins[user.source_user_id] !== 'string' ||
+                !pins[user.source_user_id]
+              );
+            }))
+        )
+          throw new Error(
+            'The saved snapshot preview is incomplete. Refresh saved snapshots in Settings or choose live Emby reads.',
+          );
         showDialog({
           kind: 'preview',
-          preview: { ...task.preview, migration_scope: task.preview.migration_scope ?? 'complete' },
+          preview: {
+            ...task.preview,
+            migration_scope: task.preview.migration_scope ?? 'complete',
+            ...(task.preview.source_snapshot_ids
+              ? { source_snapshot_ids: { ...task.preview.source_snapshot_ids } }
+              : {}),
+          },
         });
       } catch (error) {
         if (active()) notify(message(error), true);
@@ -551,6 +581,9 @@ export default function App() {
         body: {
           source_user_ids: ids,
           migration_scope: dialog.preview.migration_scope ?? 'complete',
+          ...(dialog.preview.source_snapshot_ids
+            ? { source_snapshot_ids: dialog.preview.source_snapshot_ids }
+            : {}),
           discord_recipients: recipients,
           ...(Object.keys(mappingRevisions).length ? { mapping_revisions: mappingRevisions } : {}),
         },
@@ -670,6 +703,8 @@ export default function App() {
         preview={preview}
         migrationScope={migrationScope}
         setMigrationScope={setMigrationScope}
+        useSnapshots={useSnapshots}
+        setUseSnapshots={setUseSnapshots}
         busy={busy.has('preview')}
         navigate={navigate}
       />
@@ -995,6 +1030,13 @@ function DialogContent({
             ? 'Watched-only combines watched flags from either server and keeps original playback dates when safe. Imported favorites, resume positions, ratings, play counts, playlists, profile pictures, and preferences are skipped. New accounts still use your account role or template defaults. Unmatched and ambiguous items are skipped.'
             : 'Watched flags and favorites are combined. Newer Jellyfin progress stays intact, and playlists become private copies. Unmatched and ambiguous items are skipped.'}
         </Callout>
+        {dialog.preview.source_snapshot_ids && (
+          <Callout icon="info" title="Saved Emby data selected.">
+            This migration uses the captured snapshots shown below. Their versions stay fixed after
+            approval, even if a newer capture finishes. Activity after each capture window is not
+            included.
+          </Callout>
+        )}
         <form id="migration-preview-form" onSubmit={startMigration}>
           {users.map((user) => (
             <section className="preview-user" key={user.source_user_id}>
@@ -1009,6 +1051,7 @@ function DialogContent({
                   Mapped Emby account: {user.source_username} → Jellyfin: {user.username}
                 </p>
               )}
+              {user.source_snapshot && <SourceSnapshotNote snapshot={user.source_snapshot} />}
               <div className="preview-stats">
                 {[
                   { value: user.stats.source_played, label: 'Played in Emby', color: '' },
@@ -1131,6 +1174,7 @@ function DialogContent({
                 Emby: {result.source_username} → Jellyfin: {result.username}
               </p>
             )}
+            {result.source_snapshot && <SourceSnapshotNote snapshot={result.source_snapshot} />}
             {result.role_name && (
               <p className="subtle text-small">
                 Account role: {result.role_name} · Applied groups:{' '}

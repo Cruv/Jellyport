@@ -1,5 +1,12 @@
 import { useEffect, useRef, type ReactNode } from 'react';
-import { type Job, activeJob, date, num, type ItemIssue } from './types';
+import {
+  type Job,
+  activeJob,
+  date,
+  num,
+  type ItemIssue,
+  type SourceSnapshotMetadata,
+} from './types';
 
 const icons: Record<string, ReactNode> = {
   logo: (
@@ -473,6 +480,17 @@ export function JobProgressDetails({ job }: { job: Job }) {
         </>
       )}
     </div>
+  );
+}
+export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetadata }) {
+  return (
+    <p className="subtle text-small">
+      Saved Emby snapshot · Emby {snapshot.source_server_version} ·{' '}
+      {snapshot.scope === 'watched_only' ? 'watched-only' : 'complete'} · captured{' '}
+      {new Date(snapshot.finished_at).toLocaleString()}. Read window:{' '}
+      {new Date(snapshot.started_at).toLocaleString()} –{' '}
+      {new Date(snapshot.finished_at).toLocaleString()}. Activity after this window is not included.
+    </p>
   );
 }
 export function Modal({

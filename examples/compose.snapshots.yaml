@@ -1,0 +1,63 @@
+---
+services:
+  jellyport:
+    image: ghcr.io/cruv/jellyport:latest
+    container_name: jellyport
+    user: '1000:1000' # Host UID:GID; use the same UID:GID for both services.
+    environment:
+      - JELLYPORT_DATA_DIR=/data
+      - JELLYPORT_SNAPSHOT_DIR=/snapshots
+      - JELLYPORT_SECURE_COOKIE=false # Set true for browser HTTPS; local setup still works.
+      - JELLYPORT_ALLOWED_HOSTS=${JELLYPORT_ALLOWED_HOSTS:-}
+      - TZ=Etc/UTC
+    volumes:
+      - '/path/to/jellyport:/data'
+      - '/path/to/jellyport-snapshots:/snapshots' # Private helper exchange; contains encryption material.
+    ports:
+      - '8000:8000'
+    restart: unless-stopped
+    stop_grace_period: 35s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    pids_limit: 128
+
+  jellyport-snapshot-helper:
+    image: ghcr.io/cruv/jellyport:latest # Keep this version identical to Jellyport.
+    container_name: jellyport-snapshot-helper
+    user: '1000:1000'
+    command: ['node', 'dist/server/snapshot-helper.js']
+    environment:
+      - JELLYPORT_SNAPSHOT_DIR=/snapshots
+      - JELLYPORT_SNAPSHOT_WORK_DIR=/work
+      - JELLYPORT_EMBY_DATA_DIR=/emby-data
+      - JELLYPORT_EMBY_VERSION=4.10.1.0 # Must match the supported Emby version.
+      - TZ=Etc/UTC
+    volumes:
+      - type: bind
+        source: /path/to/emby/data # Same Docker host's local database directory, never SMB/NFS.
+        target: /emby-data
+        read_only: true
+        bind:
+          create_host_path: false
+      - '/path/to/jellyport-snapshots:/snapshots'
+      - '/path/to/jellyport-snapshot-work:/work' # Raw temporary copies; helper only, never web-mounted.
+    network_mode: none
+    healthcheck:
+      disable: true # The helper has no HTTP listener; the app reports its capture status.
+    restart: unless-stopped
+    stop_grace_period: 35s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    pids_limit: 128
+    cpus: 0.50
+    mem_limit: 512m

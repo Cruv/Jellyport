@@ -211,13 +211,16 @@ export async function readMigrationSource(
   emby: MediaAPI,
   sourceId: string,
   scope: MigrationScope = 'complete',
+  savedItems?: MediaItem[],
 ): Promise<SourceSnapshot> {
   const user = await emby.user(sourceId);
-  const items = await (scope === 'watched_only' && emby.watchedItems
-    ? emby.watchedItems(sourceId)
-    : emby.migrationItems
-      ? emby.migrationItems(sourceId)
-      : emby.items(sourceId));
+  const items =
+    savedItems ??
+    (await (scope === 'watched_only' && emby.watchedItems
+      ? emby.watchedItems(sourceId)
+      : emby.migrationItems
+        ? emby.migrationItems(sourceId)
+        : emby.items(sourceId)));
   const result: SourceSnapshot = { user, items, playlists: [], warnings: [] };
   if (scope === 'watched_only') return result;
   if (!emby.playlists || !emby.playlistItems) {

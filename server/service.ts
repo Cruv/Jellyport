@@ -47,9 +47,11 @@ import type { Link } from './store.js';
 import { AccountProfiles, type AccountProfileInput } from './account-profiles.js';
 import { AdminAlerts } from './admin-alerts.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
+import { SourceSnapshots, type SnapshotMetadata } from './source-snapshots.js';
 
 export { ServiceError } from './errors.js';
 export interface JobRequest {
+  source_snapshot_id?: string;
   migration_scope?: MigrationScope;
   username?: string;
   source_user_id?: string;
@@ -79,6 +81,7 @@ export interface JobStats {
   source_playlists: number;
 }
 export interface JobResult extends Partial<JobStats> {
+  source_snapshot?: SnapshotMetadata;
   username: string;
   status: string;
   created?: boolean;
@@ -98,6 +101,7 @@ export interface JobResult extends Partial<JobStats> {
   ambiguous_items?: Array<{ name: string; id: string; candidate_ids: string[] }>;
 }
 export interface Job {
+  source_snapshot_ids?: Record<string, string>;
   id: string;
   kind: string;
   status: string;
@@ -182,6 +186,7 @@ interface ProvisioningDefaults extends MediaUser {
   accountRole?: AccountRole;
 }
 interface PreviewUser {
+  source_snapshot?: SnapshotMetadata;
   source_user_id: string;
   source_username: string;
   username: string;
@@ -284,6 +289,7 @@ export class Service {
   readonly memberships: Memberships;
   readonly profiles: AccountProfiles;
   readonly adminAlerts: AdminAlerts;
+  readonly sourceSnapshots: SourceSnapshots;
   private readonly membershipMutex = new Mutex();
   constructor(
     readonly store: Store,
@@ -297,6 +303,10 @@ export class Service {
     this.memberships = new Memberships(store);
     this.profiles = new AccountProfiles(store);
     this.adminAlerts = new AdminAlerts(store);
+    this.sourceSnapshots = new SourceSnapshots(store, {
+      demo: this.demo,
+      clientFactory: () => this.clientFactory,
+    });
   }
   resolveDiscordMapping(discordId: string): UserMapping | null {
     return this.mappings.getForDiscord(discordId, this.store.settings());
@@ -331,6 +341,7 @@ export class Service {
   }
   async start(): Promise<void> {
     this.stopping = false;
+    await this.sourceSnapshots.start();
     for (const { job, requests, settings } of this.store.queuedJobs())
       this.schedule(job, requests, settings);
   }
@@ -594,8 +605,14 @@ export class Service {
       signal?: AbortSignal;
       progress?: (processed: number, total: number) => void;
       migration_scope?: MigrationScope;
+      use_snapshots?: boolean;
     } = {},
-  ): Promise<{ users: PreviewUser[]; mode: 'merge'; migration_scope: MigrationScope }> {
+  ): Promise<{
+    users: PreviewUser[];
+    mode: 'merge';
+    migration_scope: MigrationScope;
+    source_snapshot_ids?: Record<string, string>;
+  }> {
     const scope = migrationScope(options.migration_scope);
     const checkCanceled = () => {
       if (options.signal?.aborted) throw new ServiceError('History matching was canceled.');
@@ -619,6 +636,16 @@ export class Service {
           const targets = await jellyfin.users();
           checkCanceled();
           const users: PreviewUser[] = [];
+          const snapshotIds: Record<string, string> = {};
+          const snapshotInfo = options.use_snapshots ? await emby.systemInfo() : null;
+          if (
+            snapshotInfo &&
+            (snapshotInfo.Version !== '4.10.1.0' || typeof snapshotInfo.Id !== 'string')
+          )
+            throw new ServiceError(
+              'Database snapshots require the verified Emby 4.10.1.0 connection.',
+            );
+          let captureId: string | undefined;
           // Only new destinations share this preview's catalog. Strip template personal data
           // before reuse; existing destinations always read their own user-scoped state.
           let newTargetCatalog: Promise<MediaItem[]> | undefined;
@@ -661,12 +688,27 @@ export class Service {
               );
             // Validate account identity first, then overlap independent catalog reads. Preview
             // needs only playlist metadata; entries are fetched during the actual migration.
+            const saved = snapshotInfo
+              ? await this.sourceSnapshots.select(
+                  sourceId,
+                  settings,
+                  snapshotInfo.Id as string,
+                  captureId,
+                )
+              : null;
+            if (saved) {
+              captureId = saved.id;
+              snapshotIds[sourceId] = saved.id;
+              saved.metadata.source_username = sourceUser.Name;
+            }
             const [sourceItems, targetCatalog, playlists] = await Promise.all([
-              scope === 'watched_only' && emby.watchedItems
-                ? emby.watchedItems(sourceId)
-                : emby.migrationItems
-                  ? emby.migrationItems(sourceId)
-                  : emby.items(sourceId),
+              saved
+                ? this.sourceSnapshots.items(saved, sourceId, scope, options.signal)
+                : scope === 'watched_only' && emby.watchedItems
+                  ? emby.watchedItems(sourceId)
+                  : emby.migrationItems
+                    ? emby.migrationItems(sourceId)
+                    : emby.items(sourceId),
               targetCatalogFor(target),
               scope === 'watched_only'
                 ? Promise.resolve({ count: 0, warnings: [] })
@@ -699,6 +741,7 @@ export class Service {
               );
             this.assertMapping(mapping, sourceId, settings);
             users.push({
+              ...(saved ? { source_snapshot: saved.metadata } : {}),
               source_user_id: sourceId,
               source_username: sourceUser.Name,
               username,
@@ -719,7 +762,12 @@ export class Service {
             options.progress?.(users.length, sourceUserIds.length);
             checkCanceled();
           }
-          return { users, mode: 'merge', migration_scope: scope };
+          return {
+            users,
+            mode: 'merge',
+            migration_scope: scope,
+            ...(options.use_snapshots ? { source_snapshot_ids: snapshotIds } : {}),
+          };
         } catch (error) {
           checkCanceled();
           throw error;
@@ -1402,6 +1450,7 @@ export class Service {
     discordRecipients: Record<string, string> = {},
     expectedMappingRevisions?: Record<string, string | null>,
     requestedScope?: MigrationScope,
+    sourceSnapshotIds?: Record<string, string>,
   ): Promise<Job> {
     const scope = migrationScope(requestedScope);
     if (
@@ -1422,6 +1471,20 @@ export class Service {
     const settings = this.store.settings();
     this.requireServer(settings, 'emby');
     this.requireServer(settings, 'jellyfin');
+    if (sourceSnapshotIds) {
+      if (
+        Object.keys(sourceSnapshotIds).length !== sourceUserIds.length ||
+        sourceUserIds.some((id) => !Object.hasOwn(sourceSnapshotIds, id))
+      )
+        throw new ServiceError('Database captures must cover exactly the selected users.');
+      await this.withClient(settings, 'emby', async (client) => {
+        const info = await client.systemInfo();
+        if (info.Version !== '4.10.1.0' || typeof info.Id !== 'string')
+          throw new ServiceError('Emby version or identity changed. Review a new preview.');
+        for (const id of sourceUserIds)
+          await this.sourceSnapshots.select(id, settings, info.Id, sourceSnapshotIds[id]);
+      });
+    }
     const recipientSlots = new Set<string>();
     const requests = sourceUserIds.map((id): JobRequest => {
       const mapping = this.mappings.getForSource(id, settings);
@@ -1453,6 +1516,7 @@ export class Service {
         );
       return {
         migration_scope: scope,
+        ...(sourceSnapshotIds ? { source_snapshot_id: sourceSnapshotIds[id] } : {}),
         source_user_id: id,
         discord_user_id: recipient,
         membership_slot: slot,
@@ -1685,6 +1749,15 @@ export class Service {
       updated_at: timestamp,
       progress: { processed: 0, total: requests.length },
       results: [],
+      ...(requests.some((request) => request.source_snapshot_id)
+        ? {
+            source_snapshot_ids: Object.fromEntries(
+              requests
+                .filter((request) => request.source_snapshot_id && request.source_user_id)
+                .map((request) => [request.source_user_id!, request.source_snapshot_id!]),
+            ),
+          }
+        : {}),
       ...(kind === 'migrate'
         ? { migration_scope: requests[0]?.migration_scope ?? 'complete' }
         : {}),
@@ -1853,6 +1926,7 @@ export class Service {
   ): Promise<void> {
     const scope = migrationScope(request.migration_scope);
     let source: SourceSnapshot | null = null;
+    let savedMetadata: SnapshotMetadata | undefined;
     let avatar: MediaUserImage | null = null;
     let mapping = this.requestMapping(request, settings);
     let destinationId: string | null = null;
@@ -1871,11 +1945,29 @@ export class Service {
     };
     if (request.source_user_id) {
       phase('reading_source');
-      source = await this.withClient(settings, 'emby', (emby) =>
-        readMigrationSource(emby, request.source_user_id!, scope),
-      );
+      source = await this.withClient(settings, 'emby', async (emby) => {
+        if (!request.source_snapshot_id)
+          return readMigrationSource(emby, request.source_user_id!, scope);
+        const info = await emby.systemInfo();
+        if (info.Version !== '4.10.1.0' || typeof info.Id !== 'string')
+          throw new ServiceError('Emby version or identity changed. Review a new preview.');
+        const selected = await this.sourceSnapshots.select(
+          request.source_user_id!,
+          settings,
+          info.Id,
+          request.source_snapshot_id,
+        );
+        savedMetadata = selected.metadata;
+        return readMigrationSource(
+          emby,
+          request.source_user_id!,
+          scope,
+          await this.sourceSnapshots.items(selected, request.source_user_id!, scope),
+        );
+      });
       if (source.user.Id !== request.source_user_id)
         throw new ServiceError('Emby returned a different source account. Reload the user list.');
+      if (savedMetadata) savedMetadata.source_username = source.user.Name;
       if (mapping && source.user.Name !== mapping.source_username)
         throw new ServiceError('The mapped Emby account was renamed. Review its mapping.');
       username = mapping?.target_user_id
@@ -1950,6 +2042,7 @@ export class Service {
     const result: JobResult = {
       username,
       ...(source ? { source_username: source.user.Name } : {}),
+      ...(savedMetadata ? { source_snapshot: savedMetadata } : {}),
       ...(mapping ? { mapping_id: mapping.id } : {}),
       status: 'running',
       created: false,
@@ -2391,6 +2484,7 @@ export class Service {
   }
   async stop(): Promise<void> {
     this.stopping = true;
+    await this.sourceSnapshots.stop();
     await Promise.allSettled([...this.clients].map((client) => client.close()));
     await Promise.allSettled([...this.jobTasks.values()]);
   }

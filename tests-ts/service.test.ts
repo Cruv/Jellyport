@@ -627,6 +627,160 @@ describe('account migration and subscription safety', () => {
     expect(reads).not.toHaveBeenCalled();
     expect(store.jobs()).toEqual([]);
   });
+
+  it.each(['complete', 'watched_only'] as const)(
+    'uses approved database history for %s preview and execution without live source catalogs',
+    async (scope) => {
+      const approved = '7d1a6301-8c1c-4c1c-a1b1-b2139d712b80';
+      let latest = approved;
+      const sourceItems = await servers.factory('http://emby', 'fixture', 'emby').items('e-river');
+      const captured = (id: string, userId: string) => {
+        const timestamp = new Date().toISOString();
+        return {
+          id,
+          metadata: {
+            id,
+            source_server_url: 'http://emby',
+            source_server_id: 'fixture-source-server',
+            source_server_version: '4.10.1.0',
+            source_user_id: userId,
+            source_username: 'river',
+            scope: 'complete' as const,
+            started_at: timestamp,
+            finished_at: timestamp,
+            expires_at: new Date(Date.now() + 48 * 60 * 60_000).toISOString(),
+            items: sourceItems.length,
+            playlists: 0,
+            playlist_entries: 0,
+            bytes: 4096,
+            avatar: false,
+            source_type: 'sqlite_online_backup' as const,
+            schema: 'emby-4.10.1.0',
+          },
+          result: {
+            id,
+            requested_at: timestamp,
+            binding: {
+              url: 'http://emby',
+              server_id: 'fixture-source-server',
+              version: '4.10.1.0',
+            },
+            ok: true,
+            started_at: timestamp,
+            finished_at: timestamp,
+            identities: { 'e-river': 1 },
+            schema: 'emby-4.10.1.0',
+            bytes: 4096,
+          },
+        };
+      };
+      const select = vi
+        .spyOn(service.sourceSnapshots, 'select')
+        .mockImplementation(async (userId, _settings, serverId, id) => {
+          expect(serverId).toBe('fixture-source-server');
+          return captured(id ?? latest, userId);
+        });
+      const items = vi
+        .spyOn(service.sourceSnapshots, 'items')
+        .mockImplementation(async (selected, userId, selectedScope) => {
+          expect(selected.id).toBe(approved);
+          expect(userId).toBe('e-river');
+          expect(selectedScope).toBe(scope);
+          return structuredClone(sourceItems);
+        });
+      const forbiddenSourceReads = vi.fn(async () => {
+        throw new Error('Saved history must not scan the live source library.');
+      });
+      const freshTargetReads = vi.fn();
+      const sourcePlaylists = vi.fn();
+      service.clientFactory = (...args) => {
+        const client = servers.factory(...args);
+        if (args[2] === 'emby') {
+          client.systemInfo = async () => ({ Version: '4.10.1.0', Id: 'fixture-source-server' });
+          client.items = forbiddenSourceReads;
+          client.migrationItems = forbiddenSourceReads;
+          client.watchedItems = forbiddenSourceReads;
+          const playlists = client.playlists!.bind(client);
+          client.playlists = async (id) => {
+            sourcePlaylists(id);
+            return playlists(id);
+          };
+        } else {
+          const userData = client.userData!.bind(client);
+          client.userData = async (userId, itemId) => {
+            freshTargetReads(userId, itemId);
+            return userData(userId, itemId);
+          };
+        }
+        return client;
+      };
+      const preview = await service.preview(['e-river'], {
+        migration_scope: scope,
+        use_snapshots: true,
+      });
+      expect(preview.source_snapshot_ids).toEqual({ 'e-river': approved });
+      expect(preview.users[0]?.source_snapshot).toMatchObject({
+        id: approved,
+        source_username: 'river',
+      });
+      latest = '99b59955-98ea-453d-9d25-a2b3f3cbac0b';
+      const job = await finish(
+        await service.migrateUsers(['e-river'], {}, undefined, scope, preview.source_snapshot_ids),
+      );
+      expect(job.status).toBe('completed');
+      expect(job.source_snapshot_ids).toEqual({ 'e-river': approved });
+      expect(job.results[0]?.source_snapshot).toMatchObject({ id: approved });
+      expect(items).toHaveBeenCalledTimes(2);
+      expect(select.mock.calls.map((call) => call[3])).toEqual([undefined, approved, approved]);
+      expect(forbiddenSourceReads).not.toHaveBeenCalled();
+      expect(freshTargetReads).toHaveBeenCalledWith('j-river', '2');
+      expect(servers.played['j-river']).toEqual(new Set(['1', '2']));
+      expect(store.takeCredentials(job.id)).toEqual([]);
+      if (scope === 'complete') expect(sourcePlaylists).toHaveBeenCalled();
+      else expect(sourcePlaylists).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['expired', 'unsupported', 'missing'])(
+    'refuses %s database captures before creating a job or writing to Jellyfin',
+    async (reason) => {
+      const before = structuredClone(servers.users.jellyfin);
+      const played = structuredClone(servers.played);
+      const snapshot = '7d1a6301-8c1c-4c1c-a1b1-b2139d712b80';
+      const sourceReads = vi.fn();
+      const targetWrites = vi.fn(async () => {});
+      service.clientFactory = (...args) => {
+        const client = servers.factory(...args);
+        if (args[2] === 'emby') {
+          client.systemInfo = async () => ({ Version: '4.10.1.0', Id: 'fixture-source-server' });
+          client.items = async () => {
+            sourceReads();
+            return [];
+          };
+          client.migrationItems = client.items;
+          client.watchedItems = client.items;
+        } else {
+          client.setPolicy = targetWrites;
+          client.setConfiguration = targetWrites;
+          client.updateUserData = targetWrites;
+          client.markPlayed = targetWrites;
+        }
+        return client;
+      };
+      vi.spyOn(service.sourceSnapshots, 'select').mockRejectedValue(
+        new ServiceError(`The saved capture is ${reason}. Capture it again.`),
+      );
+      await expect(service.preview(['e-river'], { use_snapshots: true })).rejects.toThrow(reason);
+      await expect(
+        service.migrateUsers(['e-river'], {}, undefined, 'complete', { 'e-river': snapshot }),
+      ).rejects.toThrow(reason);
+      expect(store.jobs()).toEqual([]);
+      expect(sourceReads).not.toHaveBeenCalled();
+      expect(targetWrites).not.toHaveBeenCalled();
+      expect(servers.users.jellyfin).toEqual(before);
+      expect(servers.played).toEqual(played);
+    },
+  );
   it('does not reset a duplicate fresh account', async () => {
     const before = structuredClone(servers.users.jellyfin[1]);
     const job = await finish(await service.createAccount('river'));

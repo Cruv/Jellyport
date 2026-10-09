@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import App from './App';
-import type { Job, Session, Settings, SetupConnection } from './types';
+import type { Job, Session, Settings, SetupConnection, SourceSnapshotMetadata } from './types';
 
 const session: Session = {
   authenticated: true,
@@ -34,6 +34,25 @@ const overview = {
     discord: { connected: false },
   },
   recent_jobs: [job],
+};
+const sourceSnapshot: SourceSnapshotMetadata = {
+  id: '12345678-1234-4234-8234-123456789012',
+  source_type: 'sqlite_online_backup',
+  schema: 'Emby 4.10 user data',
+  source_server_url: 'http://emby:8096',
+  source_server_id: 'synthetic-source',
+  source_server_version: '4.10.1.0',
+  source_user_id: '',
+  source_username: 'All Emby users',
+  scope: 'complete',
+  started_at: '2026-10-08T03:00:00Z',
+  finished_at: '2026-10-08T03:00:05Z',
+  expires_at: '2026-10-10T03:00:05Z',
+  items: 0,
+  playlists: 0,
+  playlist_entries: 0,
+  bytes: 1024,
+  avatar: false,
 };
 const settings: Settings = {
   emby_url: '',
@@ -79,6 +98,29 @@ beforeEach(() => {
     '/api/users': { emby: [], jellyfin: [] },
     '/api/user-mappings': { mappings: [] },
     '/api/account-roles': { roles: [], assignments: [] },
+    '/api/source-snapshots': {
+      available: false,
+      capture_method: 'sqlite_online_backup',
+      config: {
+        enabled: false,
+        hour: 3,
+        minute: 0,
+        time_zone: 'UTC',
+        scope: 'complete',
+        revision: 'revision-1',
+      },
+      running: false,
+      last_attempt_at: null,
+      last_finished_at: null,
+      last_error: null,
+      users_total: 0,
+      users_processed: 0,
+      users_succeeded: 0,
+      users_failed: 0,
+      snapshots: 0,
+      encrypted_bytes: 0,
+      records: [],
+    },
   };
   vi.stubGlobal(
     'fetch',
@@ -677,6 +719,14 @@ describe('React account safeguards', () => {
     };
     render(<App />);
     await selectAndPreview();
+    expect(screen.getByLabelText('Use saved Emby snapshot')).toHaveProperty('checked', false);
+    expect(
+      JSON.parse(
+        String(
+          requests.find((request) => request.path === '/api/migrations/preview')?.options?.body,
+        ),
+      ),
+    ).not.toHaveProperty('use_snapshots');
     expect(screen.getByLabelText('Migration data')).toHaveProperty('value', 'complete');
     expect(screen.getByLabelText('Migration data')).toHaveProperty('disabled', true);
     expect(
@@ -808,6 +858,110 @@ describe('React account safeguards', () => {
         String(requests.find((request) => request.path === '/api/migrations')?.options?.body),
       ).migration_scope,
     ).toBe('complete');
+  });
+
+  it('pins approved saved source generations independently of a later source selection change', async () => {
+    prepareRunningPreview();
+    const pins = { 'e-alex': sourceSnapshot.id, 'e-river': sourceSnapshot.id };
+    responses['/api/migrations/preview'] = {
+      ...readyPreviewTask,
+      preview: {
+        ...readyPreviewTask.preview,
+        source_snapshot_ids: pins,
+        users: readyPreviewTask.preview.users.map((user) => ({
+          ...user,
+          source_snapshot: sourceSnapshot,
+        })),
+      },
+    };
+    responses['/api/migrations'] = {
+      ...job,
+      kind: 'migrate',
+      results: [{ username: 'alex', status: 'completed', source_snapshot: sourceSnapshot }],
+    };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    fireEvent.click(await screen.findByLabelText('Use saved Emby snapshot'));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('Saved Emby data selected.')).toBeTruthy();
+    expect(within(dialog).getAllByText(/Saved Emby snapshot/)).toHaveLength(2);
+    expect(
+      JSON.parse(
+        String(
+          requests.find((request) => request.path === '/api/migrations/preview')?.options?.body,
+        ),
+      ),
+    ).toMatchObject({ use_snapshots: true });
+    fireEvent.click(screen.getByLabelText('Use saved Emby snapshot'));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
+    await screen.findByRole('heading', { name: 'Migration details' });
+    const body = JSON.parse(
+      String(requests.find((request) => request.path === '/api/migrations')?.options?.body),
+    );
+    expect(body.source_snapshot_ids).toEqual(pins);
+    expect(body).not.toHaveProperty('use_snapshots');
+    expect(screen.getByText(/Saved Emby snapshot/)).toBeTruthy();
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
+
+  it('refuses a saved-source preview without a complete pinned generation map instead of silently using live reads', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview'] = readyPreviewTask;
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    fireEvent.click(await screen.findByLabelText('Use saved Emby snapshot'));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+    await screen.findByText(
+      'The saved snapshot preview is incomplete. Refresh saved snapshots in Settings or choose live Emby reads.',
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(requests.filter((request) => request.path === '/api/migrations/preview')).toHaveLength(
+      1,
+    );
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+  });
+
+  it('shows a missing or expired saved source error without retrying a live preview', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview'] = {
+      detail: 'Saved Emby snapshot expired. Capture again or choose live reads.',
+    };
+    statuses['/api/migrations/preview'] = 409;
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    fireEvent.click(await screen.findByLabelText('Use saved Emby snapshot'));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+    await screen.findByText('Saved Emby snapshot expired. Capture again or choose live reads.');
+    expect(requests.filter((request) => request.path === '/api/migrations/preview')).toHaveLength(
+      1,
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('restores live source selection after sign-out and a new administrator sign-in', async () => {
+    prepareRunningPreview();
+    responses['/api/logout'] = anonymous;
+    responses['/api/login'] = session;
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    fireEvent.click(await screen.findByLabelText('Use saved Emby snapshot'));
+    expect(screen.getByLabelText('Use saved Emby snapshot')).toHaveProperty('checked', true);
+    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await screen.findByText('Welcome back');
+    fireEvent.change(screen.getByLabelText('Jellyfin username'), { target: { value: 'admin' } });
+    fireEvent.change(screen.getByLabelText('Jellyfin password'), {
+      target: { value: 'synthetic-admin-password' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    expect(await screen.findByLabelText('Use saved Emby snapshot')).toHaveProperty(
+      'checked',
+      false,
+    );
   });
 
   it('cancels a preview when leaving the migration page and ignores an already pending late result', async () => {

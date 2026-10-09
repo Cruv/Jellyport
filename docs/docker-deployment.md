@@ -25,6 +25,8 @@ Jellyport pairs with a pre-created Jellyfin API key; ordinary sign-in uses your 
 
 ## Optional local Emby snapshots — 0.12.0
 
+File-copy capture requires Jellyport **0.13.0 or later on both services**. Older helpers do not recognize `JELLYPORT_SNAPSHOT_METHOD` and continue using Online Backup; setting the variable on an older image does not enable file copying.
+
 Use [compose.snapshots.yaml](../examples/compose.snapshots.yaml) when repeated live Emby catalog scans are too expensive. The example opts into `JELLYPORT_SNAPSHOT_METHOD=file_copy`: ordinary best-effort copies of `library.db`, `users.db` and their available `-wal` files, made while Emby runs. No ZFS, downtime, backup plugin or special storage is required. The helper makes no source SQLite queries in this mode, excludes `-shm` and authentication databases, and performs normal WAL recovery plus integrity/schema validation on its private copies. It then builds and encrypts an allowlisted migration projection; only that projection reaches Jellyport. This is not a full Emby restoration backup. Capture still consumes disk bandwidth and CPU.
 
 Live-file copies are not atomic. A structurally valid copy can omit recent changes or combine files collected at different moments; passing integrity checks cannot establish semantic completeness. Unsupported, damaged or unresolvable copies fail without replacing the last good projection. Jellyport does not run `.recover` or adopt salvaged/repaired data. Omitting `JELLYPORT_SNAPSHOT_METHOD` preserves the legacy `sqlite_online_backup` method; set that value explicitly to select it. The existing daily schedule works with either configured helper method.

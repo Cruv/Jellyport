@@ -769,6 +769,94 @@ const connection: SetupConnection = {
 };
 
 describe('Jellyfin administrator sign-in and setup', () => {
+  it('guides secure-cookie HTTP visitors to their HTTPS address without collecting sign-in credentials', async () => {
+    vi.stubGlobal('location', { protocol: 'http:' });
+    responses['/api/session'] = { ...anonymous, secure_cookie: true };
+    render(<App />);
+    await screen.findByRole('heading', { name: 'HTTPS is required for sign-in' });
+    expect(screen.getByText(/Open your HTTPS reverse-proxy address to continue/)).toBeTruthy();
+    expect(screen.queryByLabelText('Jellyfin username')).toBeNull();
+    expect(screen.queryByLabelText('Jellyfin password')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Sign in' })).toBeNull();
+    expect(requests.some((request) => request.path === '/api/login')).toBe(false);
+    expect(requests.some((request) => request.path === '/api/overview')).toBe(false);
+  });
+
+  it('allows secure-cookie HTTP setup and transitions to HTTPS guidance when setup completes', async () => {
+    vi.stubGlobal('location', { protocol: 'http:' });
+    responses['/api/session'] = { ...setupSession, secure_cookie: true };
+    responses['/api/setup/connect'] = {
+      ...connection,
+      session: { ...pendingSession, secure_cookie: true },
+    };
+    responses['/api/setup/complete'] = {
+      ...anonymous,
+      csrf_token: 'finished-csrf',
+      secure_cookie: true,
+    };
+    render(<App />);
+    const apiKey = (await screen.findByLabelText('Jellyfin API key')) as HTMLInputElement;
+    fireEvent.change(screen.getByLabelText('Jellyfin server URL'), {
+      target: { value: 'http://jellyfin:8096' },
+    });
+    fireEvent.change(apiKey, { target: { value: 'local-setup-api-key' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Connect Jellyfin' }));
+    expect(apiKey.value).toBe('');
+    await screen.findByText('Choose account permissions');
+    fireEvent.click(screen.getByRole('button', { name: 'Finish setup' }));
+    await screen.findByText('Setup complete. Your server connection has been saved.');
+    expect(screen.getByRole('heading', { name: 'HTTPS is required for sign-in' })).toBeTruthy();
+    expect(screen.queryByLabelText('Jellyfin API key')).toBeNull();
+    expect(screen.queryByLabelText('Jellyfin username')).toBeNull();
+    expect(screen.queryByLabelText('Jellyfin password')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Sign in' })).toBeNull();
+    expect(requests.some((request) => request.path === '/api/setup/connect')).toBe(true);
+    expect(requests.some((request) => request.path === '/api/setup/complete')).toBe(true);
+    expect(requests.some((request) => request.path === '/api/login')).toBe(false);
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
+
+  it('preserves normal administrator sign-in over HTTPS with secure cookies enabled', async () => {
+    vi.stubGlobal('location', { protocol: 'https:' });
+    responses['/api/session'] = { ...anonymous, secure_cookie: true };
+    responses['/api/login'] = { ...session, secure_cookie: true };
+    render(<App />);
+    fireEvent.change(await screen.findByLabelText('Jellyfin username'), {
+      target: { value: 'jellyfin-admin' },
+    });
+    const password = screen.getByLabelText('Jellyfin password') as HTMLInputElement;
+    fireEvent.change(password, { target: { value: 'https-admin-password' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    expect(password.value).toBe('');
+    await screen.findByText('Everyone’s next chapter.');
+    const login = requests.find((request) => request.path === '/api/login')!;
+    expect(JSON.parse(String(login.options?.body))).toEqual({
+      username: 'jellyfin-admin',
+      password: 'https-admin-password',
+    });
+  });
+
+  it('does not transmit a password if refreshed session policy requires HTTPS on an HTTP page', async () => {
+    vi.stubGlobal('location', { protocol: 'http:' });
+    responses['/api/session'] = anonymous;
+    render(<App />);
+    fireEvent.change(await screen.findByLabelText('Jellyfin username'), {
+      target: { value: 'jellyfin-admin' },
+    });
+    const password = screen.getByLabelText('Jellyfin password') as HTMLInputElement;
+    fireEvent.change(password, { target: { value: 'do-not-send-password' } });
+    responses['/api/session'] = { ...anonymous, secure_cookie: true };
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    expect(password.value).toBe('');
+    await screen.findByRole('heading', { name: 'HTTPS is required for sign-in' });
+    expect(screen.queryByLabelText('Jellyfin password')).toBeNull();
+    expect(requests.some((request) => request.path === '/api/login')).toBe(false);
+    expect(
+      requests.some((request) => String(request.options?.body).includes('do-not-send-password')),
+    ).toBe(false);
+  });
+
   it('retries a failed session fetch from the sign-in page', async () => {
     responses['/api/session'] = { detail: 'Jellyport is temporarily unavailable.' };
     statuses['/api/session'] = 503;

@@ -85,6 +85,7 @@ async function fixture(
     existingServerUrl?: string;
     legacyPendingCode?: string;
     legacyPreviousServerId?: string;
+    secureCookie?: boolean;
   } = {},
 ) {
   const directory = options.directory ?? mkdtempSync(join(tmpdir(), 'jellyport-jellyfin-auth-'));
@@ -121,6 +122,7 @@ async function fixture(
     dataDir: directory,
     authClient: authentication.auth,
     clientFactory,
+    secureCookie: options.secureCookie,
   });
   apps.add(app);
   return { app, directory, servers, mediaCalls, ...authentication };
@@ -138,7 +140,9 @@ afterEach(async () => {
 
 function browser(response: Response, nested = false): Browser {
   const body = nested ? response.json().session : response.json();
-  const cookie = response.cookies.find((value) => value.name === 'jellyport_session');
+  const cookie =
+    response.cookies.find((value) => value.name === 'jellyport_setup_session' && value.value) ??
+    response.cookies.find((value) => value.name === 'jellyport_session' && value.value);
   expect(cookie).toBeDefined();
   return { cookie: `${cookie!.name}=${cookie!.value}`, csrf: body.csrf_token as string };
 }
@@ -213,6 +217,154 @@ async function signIn(value: Fixture, username = 'administrator') {
 }
 
 describe('first-time Jellyfin API-key setup', () => {
+  it('completes local setup with Secure administrator cookies enabled, then requires a fresh sign-in', async () => {
+    const value = await fixture({ secureCookie: true });
+    const initial = await value.app.inject('/api/session');
+    expect(initial.statusCode).toBe(200);
+    expect(initial.json()).toMatchObject({
+      authenticated: false,
+      setup_required: true,
+      secure_cookie: true,
+    });
+    const bootstrap = initial.cookies.find((cookie) => cookie.name === 'jellyport_setup_session');
+    expect(bootstrap).toMatchObject({ path: '/api', httpOnly: true, sameSite: 'Strict' });
+    expect(bootstrap?.secure).not.toBe(true);
+    expect(initial.body).not.toContain(bootstrap!.value);
+    const connected = await connect(value, browser(initial));
+    expect(connected.current.cookie).not.toBe(browser(initial).cookie);
+    const rotated = connected.response.cookies.find(
+      (cookie) => cookie.name === 'jellyport_setup_session' && cookie.value,
+    );
+    expect(rotated).toMatchObject({ path: '/api', httpOnly: true, sameSite: 'Strict' });
+    expect(rotated?.secure).not.toBe(true);
+    expect(connected.response.body).not.toContain(rotated!.value);
+    expect(
+      (await value.app.inject({ url: '/api/setup', headers: headers(connected.current) }))
+        .statusCode,
+    ).toBe(200);
+
+    const completed = await complete(value, connected.current);
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json()).toMatchObject({
+      authenticated: false,
+      setup_required: false,
+      setup_connected: false,
+      secure_cookie: true,
+    });
+    expect(completed.cookies).toContainEqual(
+      expect.objectContaining({ name: 'jellyport_setup_session', value: '', path: '/api' }),
+    );
+    expect(completed.cookies.find((cookie) => cookie.name === 'jellyport_session')).toMatchObject({
+      secure: true,
+      httpOnly: true,
+      sameSite: 'Strict',
+      path: '/',
+    });
+    expect(value.auth.authenticate).not.toHaveBeenCalled();
+    expect(value.auth.signOut).not.toHaveBeenCalled();
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(API_KEY);
+    for (const secret of [API_KEY, JELLYFIN_PASSWORD]) expect(completed.body).not.toContain(secret);
+
+    const signedIn = await signIn(value);
+    expect(signedIn.response.json()).toMatchObject({ authenticated: true, secure_cookie: true });
+    expect(
+      signedIn.response.cookies.find(
+        (cookie) => cookie.name === 'jellyport_session' && cookie.value,
+      ),
+    ).toMatchObject({ secure: true, httpOnly: true, sameSite: 'Strict', path: '/' });
+    expect(
+      signedIn.response.cookies.some(
+        (cookie) => cookie.name === 'jellyport_setup_session' && cookie.value,
+      ),
+    ).toBe(false);
+    const loggedOut = await value.app.inject({
+      method: 'POST',
+      url: '/api/logout',
+      headers: headers(signedIn.current),
+    });
+    expect(loggedOut.statusCode).toBe(200);
+    expect(loggedOut.cookies).toContainEqual(
+      expect.objectContaining({ name: 'jellyport_setup_session', value: '', path: '/api' }),
+    );
+    for (const cookie of loggedOut.cookies.filter((cookie) => cookie.name === 'jellyport_session'))
+      expect(cookie.secure).toBe(true);
+    expect(value.auth.signOut).toHaveBeenCalledWith(SERVER_URL, value.behavior.tokens[0]);
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(API_KEY);
+  });
+
+  it('does not accept a setup session in the normal cookie namespace or as an administrator session', async () => {
+    const value = await fixture({ secureCookie: true });
+    const connected = await connect(value);
+    const setupId = connected.current.cookie.split('=')[1]!;
+    const copied = { ...connected.current, cookie: `jellyport_session=${setupId}` };
+    expect(
+      (await value.app.inject({ url: '/api/setup', headers: headers(copied) })).statusCode,
+    ).toBe(403);
+    expect((await complete(value, copied)).statusCode).toBe(403);
+    expect(
+      (await value.app.inject({ url: '/api/settings', headers: headers(connected.current) }))
+        .statusCode,
+    ).toBe(401);
+    expect((await complete(value, connected.current)).statusCode).toBe(200);
+    const signedIn = await signIn(value);
+    const administratorId = signedIn.current.cookie.split('=')[1]!;
+    for (const stale of [
+      connected.current,
+      copied,
+      { ...signedIn.current, cookie: `jellyport_setup_session=${administratorId}` },
+    ]) {
+      expect(
+        (await value.app.inject({ url: '/api/settings', headers: headers(stale) })).statusCode,
+      ).toBe(401);
+      const session = await value.app.inject({ url: '/api/session', headers: headers(stale) });
+      expect(session.json()).toMatchObject({
+        authenticated: false,
+        setup_required: false,
+        setup_connected: false,
+      });
+      expect(session.body).not.toContain(API_KEY);
+    }
+    expect(
+      (await value.app.inject({ url: '/api/settings', headers: headers(signedIn.current) }))
+        .statusCode,
+    ).toBe(200);
+  });
+
+  it('clears local setup credentials on logout without changing the supplied Jellyfin API key', async () => {
+    const value = await fixture({ secureCookie: true });
+    const connected = await connect(value);
+    const loggedOut = await value.app.inject({
+      method: 'POST',
+      url: '/api/logout',
+      headers: headers(connected.current),
+    });
+    expect(loggedOut.statusCode).toBe(200);
+    expect(loggedOut.json()).toMatchObject({
+      authenticated: false,
+      setup_required: true,
+      setup_connected: false,
+      secure_cookie: true,
+    });
+    // A still-unpaired installation replaces the cleared bootstrap cookie with a fresh,
+    // disconnected session. The cookie serializer keeps the replacement for this path.
+    const replacement = loggedOut.cookies.find(
+      (cookie) => cookie.name === 'jellyport_setup_session',
+    );
+    expect(replacement).toMatchObject({ path: '/api', httpOnly: true, sameSite: 'Strict' });
+    expect(replacement?.secure).not.toBe(true);
+    expect(browser(loggedOut).cookie).not.toBe(connected.current.cookie);
+    expect(
+      (await value.app.inject({ url: '/api/setup', headers: headers(browser(loggedOut)) }))
+        .statusCode,
+    ).toBe(403);
+    expect(loggedOut.cookies).toContainEqual(
+      expect.objectContaining({ name: 'jellyport_session', value: '', path: '/', secure: true }),
+    );
+    expect((await complete(value, connected.current)).statusCode).toBe(403);
+    expect(value.auth.signOut).not.toHaveBeenCalled();
+    expect(value.app.jellyport.store.authState()?.kind).toBe('pending');
+  });
+
   it('offers direct setup while protecting private settings and rejects obsolete credentials', async () => {
     const value = await fixture();
     const initial = await anonymous(value.app);

@@ -44,6 +44,10 @@ jobs:
         run: |
           docker run -d --name jellyport-fresh-ci -p 127.0.0.1:8175:8000 jellyport:ci
           node scripts/smoke-setup.mjs http://127.0.0.1:8175
+      - name: Smoke test local setup with secure administrator cookies
+        run: |
+          docker run -d --name jellyport-secure-setup-ci -p 127.0.0.1:8176:8000 -e JELLYPORT_SECURE_COOKIE=true jellyport:ci
+          node scripts/smoke-setup.mjs http://127.0.0.1:8176 --secure-cookie
       - name: Smoke test an unprivileged bind-mount deployment
         run: |
           mkdir -p "${RUNNER_TEMP}/jellyport-bind"
@@ -62,8 +66,10 @@ jobs:
           docker logs jellyport-ci || true
           docker logs jellyport-bind-ci || true
           docker logs jellyport-fresh-ci || true
+          docker logs jellyport-secure-setup-ci || true
       - if: always()
         run: |
           docker stop jellyport-ci || true
           docker stop jellyport-bind-ci || true
           docker stop jellyport-fresh-ci || true
+          docker stop jellyport-secure-setup-ci || true

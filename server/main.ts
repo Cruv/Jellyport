@@ -39,11 +39,13 @@ import {
 
 const hashPassword = promisify(scrypt);
 const COOKIE = 'jellyport_session';
+const SETUP_COOKIE = 'jellyport_setup_session';
 const CSP =
   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 interface Session {
   address: string;
   authenticated: boolean;
+  setupOnly: boolean;
   csrf_token: string;
   expires: number;
   identity?: JellyfinIdentity;
@@ -174,25 +176,40 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     return value;
   }
   function forget(request: FastifyRequest): Session | undefined {
-    const sid = request.cookies[COOKIE] ?? '';
-    return removeSession(sid);
+    let removed: Session | undefined;
+    for (const name of [COOKIE, SETUP_COOKIE]) {
+      const sid = request.cookies[name];
+      const value = sid ? sessions.get(sid) : undefined;
+      if (!value || (value.setupOnly ? SETUP_COOKIE : COOKIE) !== name) continue;
+      removeSession(sid!);
+      removed ??= value;
+    }
+    return removed;
   }
   async function revoke(value?: Session): Promise<void> {
-    if (demo || !value) return;
+    if (demo || !value || value.setupOnly) return;
     const identity = value.identity;
     const state = store.authState();
     const url = state?.kind === 'configured' ? state.serverUrl : '';
     if (identity && url) await authClient.signOut(url, identity.accessToken).catch(() => {});
   }
   function session(request: FastifyRequest): Session | undefined {
-    const sid = request.cookies[COOKIE];
-    const value = sid ? sessions.get(sid) : undefined;
-    if (value && value.expires <= Date.now()) {
-      removeSession(sid!);
-      void revoke(value);
-      return undefined;
+    for (const name of [COOKIE, SETUP_COOKIE]) {
+      const sid = request.cookies[name];
+      const value = sid ? sessions.get(sid) : undefined;
+      // Setup IDs cannot be promoted by copying them into the administrator cookie.
+      if (!value || (value.setupOnly ? SETUP_COOKIE : COOKIE) !== name) continue;
+      if (
+        value.expires <= Date.now() ||
+        (value.setupOnly && (demo || store.authState()?.kind !== 'pending'))
+      ) {
+        removeSession(sid!);
+        void revoke(value);
+        continue;
+      }
+      return value;
     }
-    return value;
+    return undefined;
   }
   function sessionView(value: Session) {
     const state = demo ? null : store.authState();
@@ -200,6 +217,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       authenticated: value.authenticated,
       csrf_token: value.csrf_token,
       demo,
+      secure_cookie: secureCookie,
       setup_required: !demo && state?.kind !== 'configured',
       setup_connected:
         !!value.connection &&
@@ -231,6 +249,16 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     reply: FastifyReply,
     attributes: Partial<Session> = {},
   ) {
+    // A separate, unauthenticated cookie allows the existing local pairing flow over HTTP
+    // without downgrading the normal administrator cookie's configured HTTPS requirement.
+    const setupOnly = !demo && secureCookie && store.authState()?.kind === 'pending';
+    if (setupOnly && (!privateAddress(request.ip) || !localSetupHost(request.headers.host ?? '')))
+      throw new JellyfinAuthError(
+        'Complete first-time setup through a trusted local network address or localhost.',
+        403,
+      );
+    if (setupOnly && attributes.authenticated)
+      throw new JellyfinAuthError('Complete first-time setup before signing in.', 403);
     if (!attributes.authenticated) {
       for (const sid of addresses.get(request.ip) ?? []) {
         const value = sessions.get(sid);
@@ -257,6 +285,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       csrf_token: randomBytes(32).toString('base64url'),
       expires: Date.now() + age * 1000,
       ...attributes,
+      setupOnly,
     };
     sessions.set(sid, value);
     pool.set(sid, value);
@@ -265,13 +294,20 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       owned.add(sid);
       addresses.set(request.ip, owned);
     }
-    reply.setCookie(COOKIE, sid, {
-      path: '/',
+    reply.setCookie(setupOnly ? SETUP_COOKIE : COOKIE, sid, {
+      path: setupOnly ? '/api' : '/',
       httpOnly: true,
-      secure: secureCookie,
+      secure: setupOnly ? false : secureCookie,
       sameSite: 'strict',
       maxAge: age,
     });
+    if (!setupOnly && request.cookies[SETUP_COOKIE])
+      reply.clearCookie(SETUP_COOKIE, {
+        path: '/api',
+        httpOnly: true,
+        secure: false,
+        sameSite: 'strict',
+      });
     return sessionView(value);
   }
   function rateLimit(request: FastifyRequest) {
@@ -347,7 +383,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     if (
       !demo &&
       store.authState()?.kind === 'pending' &&
-      (path === '/api/session' || path.startsWith('/api/setup')) &&
+      (path === '/api/session' || path === '/api/logout' || path.startsWith('/api/setup')) &&
       (!privateAddress(request.ip) || !localSetupHost(host))
     )
       throw new JellyfinAuthError(
@@ -460,6 +496,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       path: '/',
       httpOnly: true,
       secure: secureCookie,
+      sameSite: 'strict',
+    });
+    reply.clearCookie(SETUP_COOKIE, {
+      path: '/api',
+      httpOnly: true,
+      secure: false,
       sameSite: 'strict',
     });
     await revoke(value);

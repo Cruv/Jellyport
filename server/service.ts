@@ -15,6 +15,7 @@ import {
   migrationWarning,
   portableConfiguration,
   type MigrationDetails,
+  type MigrationScope,
   type SourceSnapshot,
 } from './migration.js';
 import {
@@ -49,6 +50,7 @@ import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 
 export { ServiceError } from './errors.js';
 export interface JobRequest {
+  migration_scope?: MigrationScope;
   username?: string;
   source_user_id?: string;
   discord_user_id?: string | null;
@@ -101,10 +103,27 @@ export interface Job {
   status: string;
   created_at: string;
   updated_at: string;
-  progress: { processed: number; total: number };
+  started_at?: string;
+  finished_at?: string;
+  progress: {
+    processed: number;
+    total: number;
+    current_user?: string;
+    phase?:
+      | 'reading_source'
+      | 'preparing_account'
+      | 'reading_target'
+      | 'transferring_history'
+      | 'transferring_playlists'
+      | 'delivering_credentials';
+    items_processed?: number;
+    items_total?: number;
+    items_updated?: number;
+  };
   results: JobResult[];
   error?: string;
   membership_discord_user_id?: string;
+  migration_scope?: MigrationScope;
 }
 export interface SubscriptionEvent {
   id: string;
@@ -197,6 +216,11 @@ class Mutex {
 class StoppedError extends Error {}
 export function now(): string {
   return new Date().toISOString();
+}
+function migrationScope(value: unknown): MigrationScope {
+  if (value === undefined || value === 'complete') return 'complete';
+  if (value === 'watched_only') return value;
+  throw new ServiceError('Choose complete or watched-only migration.');
 }
 export function generatePassword(): string {
   const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
@@ -403,6 +427,7 @@ export class Service {
     target: MediaItem[],
     settings: Settings,
     sourcePlaylists = 0,
+    scope: MigrationScope = 'complete',
   ): [MatchPlan, JobStats] {
     const playable = new Set([
       'Movie',
@@ -417,7 +442,7 @@ export class Service {
     const played = source.filter(
       (item) => playable.has(item.Type ?? '') && item.UserData?.Played === true,
     );
-    const plan = statePlan(source, target, settings);
+    const plan = statePlan(source, target, settings, scope);
     return [
       plan,
       {
@@ -430,14 +455,20 @@ export class Service {
             match.source.UserData?.Played === true && match.target.UserData?.Played === true,
         ).length,
         source_items: plan.matches.length + plan.unmatched.length + plan.ambiguous.length,
-        source_favorites: source.filter((item) => item.UserData?.IsFavorite === true).length,
-        source_resume: source.filter(
-          (item) =>
-            playable.has(item.Type ?? '') &&
-            typeof item.UserData?.PlaybackPositionTicks === 'number' &&
-            Number.isSafeInteger(item.UserData.PlaybackPositionTicks) &&
-            item.UserData.PlaybackPositionTicks > 0,
-        ).length,
+        source_favorites:
+          scope === 'watched_only'
+            ? 0
+            : source.filter((item) => item.UserData?.IsFavorite === true).length,
+        source_resume:
+          scope === 'watched_only'
+            ? 0
+            : source.filter(
+                (item) =>
+                  playable.has(item.Type ?? '') &&
+                  typeof item.UserData?.PlaybackPositionTicks === 'number' &&
+                  Number.isSafeInteger(item.UserData.PlaybackPositionTicks) &&
+                  item.UserData.PlaybackPositionTicks > 0,
+              ).length,
         source_playlists: sourcePlaylists,
       },
     ];
@@ -559,8 +590,13 @@ export class Service {
   }
   async preview(
     sourceUserIds: string[],
-    options: { signal?: AbortSignal; progress?: (processed: number, total: number) => void } = {},
-  ): Promise<{ users: PreviewUser[]; mode: 'merge' }> {
+    options: {
+      signal?: AbortSignal;
+      progress?: (processed: number, total: number) => void;
+      migration_scope?: MigrationScope;
+    } = {},
+  ): Promise<{ users: PreviewUser[]; mode: 'merge'; migration_scope: MigrationScope }> {
+    const scope = migrationScope(options.migration_scope);
     const checkCanceled = () => {
       if (options.signal?.aborted) throw new ServiceError('History matching was canceled.');
     };
@@ -583,6 +619,18 @@ export class Service {
           const targets = await jellyfin.users();
           checkCanceled();
           const users: PreviewUser[] = [];
+          // Only new destinations share this preview's catalog. Strip template personal data
+          // before reuse; existing destinations always read their own user-scoped state.
+          let newTargetCatalog: Promise<MediaItem[]> | undefined;
+          const targetCatalogFor = (target: MediaUser | null | undefined) => {
+            const read = (userId?: string) =>
+              jellyfin.migrationItems ? jellyfin.migrationItems(userId) : jellyfin.items(userId);
+            if (target) return read(target.Id);
+            newTargetCatalog ??= read(template.Id || undefined).then((items) =>
+              items.map((item) => ({ ...item, UserData: { Played: false } })),
+            );
+            return newTargetCatalog;
+          };
           for (const sourceId of sourceUserIds) {
             checkCanceled();
             const sourceUser = await emby.user(sourceId);
@@ -614,17 +662,25 @@ export class Service {
             // Validate account identity first, then overlap independent catalog reads. Preview
             // needs only playlist metadata; entries are fetched during the actual migration.
             const [sourceItems, targetCatalog, playlists] = await Promise.all([
-              emby.migrationItems ? emby.migrationItems(sourceId) : emby.items(sourceId),
-              jellyfin.migrationItems
-                ? jellyfin.migrationItems(target?.Id || template.Id || undefined)
-                : jellyfin.items(target?.Id || template.Id || undefined),
-              this.previewPlaylists(emby, sourceId),
+              scope === 'watched_only' && emby.watchedItems
+                ? emby.watchedItems(sourceId)
+                : emby.migrationItems
+                  ? emby.migrationItems(sourceId)
+                  : emby.items(sourceId),
+              targetCatalogFor(target),
+              scope === 'watched_only'
+                ? Promise.resolve({ count: 0, warnings: [] })
+                : this.previewPlaylists(emby, sourceId),
             ]);
             checkCanceled();
-            let targetItems = targetCatalog;
-            if (!target)
-              targetItems = targetItems.map((item) => ({ ...item, UserData: { Played: false } }));
-            const [plan, stats] = this.plan(sourceItems, targetItems, settings, playlists.count);
+            const targetItems = targetCatalog;
+            const [plan, stats] = this.plan(
+              sourceItems,
+              targetItems,
+              settings,
+              playlists.count,
+              scope,
+            );
             const warnings = [
               ...playlists.warnings,
               ...(!target && template.accountRole
@@ -663,7 +719,7 @@ export class Service {
             options.progress?.(users.length, sourceUserIds.length);
             checkCanceled();
           }
-          return { users, mode: 'merge' };
+          return { users, mode: 'merge', migration_scope: scope };
         } catch (error) {
           checkCanceled();
           throw error;
@@ -1345,7 +1401,9 @@ export class Service {
     sourceUserIds: string[],
     discordRecipients: Record<string, string> = {},
     expectedMappingRevisions?: Record<string, string | null>,
+    requestedScope?: MigrationScope,
   ): Promise<Job> {
+    const scope = migrationScope(requestedScope);
     if (
       !sourceUserIds.length ||
       sourceUserIds.length > 100 ||
@@ -1394,6 +1452,7 @@ export class Service {
           'The selected Discord recipient differs from this approved user mapping.',
         );
       return {
+        migration_scope: scope,
         source_user_id: id,
         discord_user_id: recipient,
         membership_slot: slot,
@@ -1626,6 +1685,9 @@ export class Service {
       updated_at: timestamp,
       progress: { processed: 0, total: requests.length },
       results: [],
+      ...(kind === 'migrate'
+        ? { migration_scope: requests[0]?.migration_scope ?? 'complete' }
+        : {}),
       ...(kind === 'membership'
         ? { membership_discord_user_id: requests[0]?.discord_user_id ?? undefined }
         : {}),
@@ -1735,8 +1797,10 @@ export class Service {
           'An earlier creation request had an uncertain outcome. Inspect Jellyfin before retrying this username.',
         );
       password = generatePassword();
-      this.store.saveAccount(username, null, 'provisioning', password);
       await roleGuard();
+      // Persist before the POST: a process exit between sending the request and receiving
+      // its response must require inspection, rather than replaying account creation.
+      this.store.saveAccount(username, null, 'uncertain', password);
       try {
         target = await jellyfin.createUser(username, password);
       } catch (error) {
@@ -1744,7 +1808,7 @@ export class Service {
           this.store.saveAccount(username, null, 'rejected');
           throw error;
         }
-        this.store.saveAccount(username, null, 'uncertain');
+        this.store.saveAccount(username, null, 'uncertain', password);
         throw new ServiceError(
           'Account creation outcome is uncertain. Inspect Jellyfin before retrying; no password was reset.',
         );
@@ -1787,11 +1851,17 @@ export class Service {
     jellyfin: MediaAPI,
     template: ProvisioningDefaults,
   ): Promise<void> {
+    const scope = migrationScope(request.migration_scope);
     let source: SourceSnapshot | null = null;
     let avatar: MediaUserImage | null = null;
     let mapping = this.requestMapping(request, settings);
     let destinationId: string | null = null;
     let username: string;
+    const phase = (value: NonNullable<Job['progress']['phase']>) => {
+      job.progress.phase = value;
+      this.save(job);
+    };
+    job.progress.current_user = mapping?.target_username ?? request.username;
     const guard = () => {
       this.checkStopped();
       this.assertMembershipRequest(request, settings);
@@ -1800,8 +1870,9 @@ export class Service {
       this.assertDestinationMapping(mapping, destinationId, username, settings);
     };
     if (request.source_user_id) {
+      phase('reading_source');
       source = await this.withClient(settings, 'emby', (emby) =>
-        readMigrationSource(emby, request.source_user_id!),
+        readMigrationSource(emby, request.source_user_id!, scope),
       );
       if (source.user.Id !== request.source_user_id)
         throw new ServiceError('Emby returned a different source account. Reload the user list.');
@@ -1811,6 +1882,8 @@ export class Service {
         ? validateExistingMappingUsername(mapping.target_username)
         : validateUsername(mapping?.target_username ?? source.user.Name);
     } else username = validateUsername(request.username ?? '');
+    job.progress.current_user = username;
+    phase('preparing_account');
     if (
       request.membership_revision &&
       request.username !== undefined &&
@@ -1891,7 +1964,10 @@ export class Service {
       result.data = migrationDetails();
       for (const warning of source.warnings) migrationWarning(result.data, warning);
       // Read optional profile data before creating an account. It never enters persisted jobs.
-      if (!currentTarget || this.store.account(username)?.status === 'provisioning')
+      if (
+        scope === 'complete' &&
+        (!currentTarget || this.store.account(username)?.status === 'provisioning')
+      )
         await this.withClient(settings, 'emby', async (emby) => {
           if (!emby.userImage) return;
           try {
@@ -2026,7 +2102,7 @@ export class Service {
         );
       }
       if (source && result.data) {
-        if (created) {
+        if (created && scope === 'complete') {
           if (template.accountRole)
             result.data.preferences = Object.keys(template.accountRole.parameters.configuration);
           const preferences = portableConfiguration(
@@ -2060,6 +2136,7 @@ export class Service {
             migrationWarning(result.data, 'This Jellyfin client cannot copy profile pictures.');
         }
         guard();
+        phase('reading_target');
         const targetItems = await (jellyfin.migrationItems
           ? jellyfin.migrationItems(target.Id)
           : jellyfin.items(target.Id));
@@ -2068,39 +2145,96 @@ export class Service {
           targetItems,
           settings,
           source.playlists.length,
+          scope,
         );
         Object.assign(result, stats);
-        result.unmatched_items = plan.unmatched.map((item) => ({
-          name: item.Name ?? '',
-          type: item.Type ?? '',
-          id: item.Id,
-        }));
-        result.ambiguous_items = plan.ambiguous.map((item) => ({
-          name: item.source.Name ?? '',
-          id: item.source.Id,
-          candidate_ids: item.candidates.map((candidate) => candidate.Id),
-        }));
+        result.unmatched_items = plan.unmatched.slice(0, 200).map((item) => {
+          const summary = previewItemSummary(item);
+          return { name: summary.Name ?? '', type: summary.Type ?? '', id: summary.Id };
+        });
+        result.ambiguous_items = plan.ambiguous.slice(0, 200).map((item) => {
+          const summary = previewItemSummary(item.source);
+          return {
+            name: summary.Name ?? '',
+            id: summary.Id,
+            candidate_ids: item.candidates
+              .slice(0, 20)
+              .map((candidate) => previewItemSummary(candidate).Id),
+          };
+        });
+        if (
+          plan.unmatched.length > 200 ||
+          plan.ambiguous.length > 200 ||
+          plan.ambiguous.some((entry) => entry.candidates.length > 20)
+        )
+          migrationWarning(
+            result.data,
+            'Result details are limited to 200 unmatched items, 200 ambiguous items, and 20 candidates per item. Full counts are shown; migration checks every item.',
+          );
+        Object.assign(job.progress, {
+          phase: 'transferring_history',
+          items_processed: 0,
+          items_total: plan.matches.length,
+          items_updated: 0,
+        });
         this.save(job);
-        result.applied = await migrateItemState(jellyfin, target.Id, plan, result.data, guard, () =>
-          this.save(job),
-        );
+        let pendingWrites = 0;
+        let lastCheckpoint = Date.now();
+        const checkpoint = (force = false) => {
+          if (force || pendingWrites >= 20 || Date.now() - lastCheckpoint >= 1000) {
+            this.save(job);
+            pendingWrites = 0;
+            lastCheckpoint = Date.now();
+          }
+        };
+        try {
+          result.applied = await migrateItemState(
+            jellyfin,
+            target.Id,
+            plan,
+            result.data,
+            guard,
+            () => {
+              pendingWrites++;
+            },
+            {
+              migration_scope: scope,
+              progress: (processed, total, updated) => {
+                Object.assign(job.progress, {
+                  items_processed: processed,
+                  items_total: total,
+                  items_updated: updated,
+                });
+                checkpoint();
+              },
+            },
+          );
+        } finally {
+          // Workers have drained before this final checkpoint. Only observational job
+          // updates are batched; account and playlist uncertainty journals stay immediate.
+          checkpoint(true);
+        }
         guard();
-        await migratePlaylists(
-          this.store,
-          settings,
-          source.user.Id,
-          target.Id,
-          source.playlists,
-          targetItems,
-          jellyfin,
-          result.data,
-          guard,
-          () => this.save(job),
-        );
+        if (scope === 'complete') {
+          phase('transferring_playlists');
+          await migratePlaylists(
+            this.store,
+            settings,
+            source.user.Id,
+            target.Id,
+            source.playlists,
+            targetItems,
+            jellyfin,
+            result.data,
+            guard,
+            () => this.save(job),
+          );
+        }
         guard();
       }
       if (recipient && password)
         try {
+          phase('delivering_credentials');
           await this.validateRecipients([recipient]);
           const identity = await this.recipientIdentity(recipient);
           if (
@@ -2152,6 +2286,7 @@ export class Service {
   private async run(job: Job, requests: JobRequest[], settings: Settings): Promise<void> {
     if (this.stopping || !this.store.claimQueuedJob(job.id)) return;
     job.status = 'running';
+    job.started_at = new Date().toISOString();
     this.save(job);
     try {
       await this.withClient(settings, 'jellyfin', async (jellyfin) => {
@@ -2222,6 +2357,11 @@ export class Service {
               });
             }
             job.progress.processed++;
+            delete job.progress.current_user;
+            delete job.progress.phase;
+            delete job.progress.items_processed;
+            delete job.progress.items_total;
+            delete job.progress.items_updated;
             this.save(job);
           });
         }
@@ -2245,6 +2385,7 @@ export class Service {
             : 'Job failed unexpectedly. Check configuration and server availability.';
       }
     } finally {
+      job.finished_at = new Date().toISOString();
       this.save(job);
     }
   }

@@ -168,14 +168,36 @@ export interface MigrationDetails {
   history_dates_missing: number;
   warnings: string[];
 }
+export interface JobProgress {
+  processed?: number;
+  completed?: number;
+  current?: number;
+  total?: number;
+  current_user?: string;
+  phase?:
+    | 'reading_source'
+    | 'preparing_account'
+    | 'reading_target'
+    | 'transferring_history'
+    | 'transferring_playlists'
+    | 'delivering_credentials';
+  items_processed?: number;
+  items_total?: number;
+  items_updated?: number;
+}
+export type MigrationScope = 'complete' | 'watched_only';
 export interface Job {
   id: string;
   kind: string;
   status: string;
   created_at: string;
+  started_at?: string;
+  finished_at?: string;
+  updated_at?: string;
   results?: JobResult[];
   error?: string;
-  progress?: number | { processed?: number; completed?: number; current?: number; total?: number };
+  progress?: number | JobProgress;
+  migration_scope?: MigrationScope;
 }
 export interface Overview {
   counts: { emby_users?: number; jellyfin_users?: number; jobs?: number };
@@ -209,6 +231,7 @@ export interface PreviewUser {
 }
 export interface Preview {
   users: PreviewUser[];
+  migration_scope?: MigrationScope;
 }
 export interface PreviewTask {
   id: string;

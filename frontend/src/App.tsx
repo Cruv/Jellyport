@@ -5,11 +5,11 @@ import {
   Empty,
   Icon,
   Issues,
+  JobProgressDetails,
   Loading,
   Modal,
   Status,
   UserCell,
-  progressPercent,
 } from './components';
 import SettingsPage from './SettingsPage';
 import AuthScreen from './AuthScreen';
@@ -34,6 +34,7 @@ import {
   type ApiOptions,
   type Credential,
   type Job,
+  type MigrationScope,
   type Overview,
   type Page,
   type Preview,
@@ -110,6 +111,7 @@ export default function App() {
   overviewRef.current = overview;
   const [events, setEvents] = useState<SubscriptionEvent[]>([]);
   const [selected, setSelected] = useState(new Set<string>());
+  const [migrationScope, setMigrationScope] = useState<MigrationScope>('complete');
   const [search, setSearch] = useState('');
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const dialogRef = useRef(dialog);
@@ -175,6 +177,7 @@ export default function App() {
     setJobs([]);
     setEvents([]);
     setSelected(new Set());
+    setMigrationScope('complete');
     setSearch('');
     setToasts([]);
     setMobileOpen(false);
@@ -446,6 +449,7 @@ export default function App() {
       return;
     }
     const generation = authGeneration.current;
+    const scope = migrationScope;
     const controller = new AbortController();
     let taskId = '';
     let cancellationSent = false;
@@ -484,7 +488,7 @@ export default function App() {
       try {
         let task = await api<PreviewTask>('/api/migrations/preview', {
           method: 'POST',
-          body: { source_user_ids: [...selected] },
+          body: { source_user_ids: [...selected], migration_scope: scope },
           // Receive the task ID even if the user leaves while this short request is in flight.
           // Polling is independently abortable, and an abandoned task is cancelled below.
         });
@@ -508,7 +512,10 @@ export default function App() {
           throw new Error(
             'No users were returned for this preview. Reload the Emby user list and try again.',
           );
-        showDialog({ kind: 'preview', preview: task.preview });
+        showDialog({
+          kind: 'preview',
+          preview: { ...task.preview, migration_scope: task.preview.migration_scope ?? 'complete' },
+        });
       } catch (error) {
         if (active()) notify(message(error), true);
       } finally {
@@ -543,6 +550,7 @@ export default function App() {
         method: 'POST',
         body: {
           source_user_ids: ids,
+          migration_scope: dialog.preview.migration_scope ?? 'complete',
           discord_recipients: recipients,
           ...(Object.keys(mappingRevisions).length ? { mapping_revisions: mappingRevisions } : {}),
         },
@@ -660,6 +668,8 @@ export default function App() {
         search={search}
         setSearch={setSearch}
         preview={preview}
+        migrationScope={migrationScope}
+        setMigrationScope={setMigrationScope}
         busy={busy.has('preview')}
         navigate={navigate}
       />
@@ -956,10 +966,11 @@ function DialogContent({
 }) {
   if (dialog.kind === 'preview') {
     const users = dialog.preview.users;
+    const watchedOnly = dialog.preview.migration_scope === 'watched_only';
     return (
       <Modal
         title="Review your migration"
-        description={`${users.length} ${users.length === 1 ? 'user' : 'users'} selected · merge progress, favorites and playlists`}
+        description={`${users.length} ${users.length === 1 ? 'user' : 'users'} selected · ${watchedOnly ? 'watched-only' : 'complete migration'}`}
         wide
         close={close}
         footer={
@@ -980,8 +991,9 @@ function DialogContent({
         }
       >
         <Callout icon="shield" title="Preview before you move.">
-          Watched flags and favorites are combined. Newer Jellyfin progress stays intact, and
-          playlists become private copies. Unmatched and ambiguous items are skipped.
+          {watchedOnly
+            ? 'Watched-only combines watched flags from either server and keeps original playback dates when safe. Imported favorites, resume positions, ratings, play counts, playlists, profile pictures, and preferences are skipped. New accounts still use your account role or template defaults. Unmatched and ambiguous items are skipped.'
+            : 'Watched flags and favorites are combined. Newer Jellyfin progress stays intact, and playlists become private copies. Unmatched and ambiguous items are skipped.'}
         </Callout>
         <form id="migration-preview-form" onSubmit={startMigration}>
           {users.map((user) => (
@@ -1001,9 +1013,17 @@ function DialogContent({
                 {[
                   { value: user.stats.source_played, label: 'Played in Emby', color: '' },
                   { value: user.stats.matched, label: 'Matched to Jellyfin', color: 'mint' },
-                  { value: user.stats.source_favorites, label: 'Favorites in Emby', color: '' },
-                  { value: user.stats.source_resume, label: 'Resume positions', color: '' },
-                  { value: user.stats.source_playlists, label: 'Playlists', color: '' },
+                  ...(!watchedOnly
+                    ? [
+                        {
+                          value: user.stats.source_favorites,
+                          label: 'Favorites in Emby',
+                          color: '',
+                        },
+                        { value: user.stats.source_resume, label: 'Resume positions', color: '' },
+                        { value: user.stats.source_playlists, label: 'Playlists', color: '' },
+                      ]
+                    : []),
                   {
                     value: user.stats.unmatched,
                     label: 'Unmatched',
@@ -1069,7 +1089,11 @@ function DialogContent({
         title={
           ['migrate', 'migration'].includes(job.kind) ? 'Migration details' : 'Operation details'
         }
-        description="Follow account changes and review delivery results."
+        description={
+          job.migration_scope === 'watched_only'
+            ? 'Watched-only migration. Follow account changes and review delivery results.'
+            : 'Follow account changes and review delivery results.'
+        }
         close={close}
         footer={
           <>
@@ -1088,25 +1112,13 @@ function DialogContent({
         <div className="job-summary">
           <div>
             <div className="job-id mono">{job.id}</div>
-            <p className="subtle text-tiny mt-5">Started {date(job.created_at)}</p>
+            <p className="subtle text-tiny mt-5">
+              Started {date(job.started_at || job.created_at)}
+            </p>
           </div>
           <Status value={job.status} />
         </div>
-        {activeJob(job) && (
-          <>
-            <progress
-              className="progress-track"
-              aria-label="Operation progress"
-              value={progressPercent(job)}
-              max={100}
-            />
-            <p className="muted text-small">
-              {job.status === 'queued'
-                ? 'Waiting for the operation to begin…'
-                : 'The operation is running. Progress updates automatically.'}
-            </p>
-          </>
-        )}
+        <JobProgressDetails job={job} />
         {job.error && <div className="error-block mt-15">{job.error}</div>}
         {job.results?.map((result, index) => (
           <section className="job-result" key={index}>

@@ -665,6 +665,7 @@ describe('React account safeguards', () => {
     const request = requests.find((value) => value.path === '/api/migrations')!;
     expect(JSON.parse(String(request.options?.body))).toEqual({
       source_user_ids: ['e-alex', 'e-river'],
+      migration_scope: 'complete',
       discord_recipients: { 'e-river': '123456789012345678' },
     });
   });
@@ -676,6 +677,15 @@ describe('React account safeguards', () => {
     };
     render(<App />);
     await selectAndPreview();
+    expect(screen.getByLabelText('Migration data')).toHaveProperty('value', 'complete');
+    expect(screen.getByLabelText('Migration data')).toHaveProperty('disabled', true);
+    expect(
+      JSON.parse(
+        String(
+          requests.find((request) => request.path === '/api/migrations/preview')?.options?.body,
+        ),
+      ).migration_scope,
+    ).toBe('complete');
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.getByRole('button', { name: 'Matching history…' })).toHaveProperty(
       'disabled',
@@ -719,6 +729,85 @@ describe('React account safeguards', () => {
       false,
     );
     expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+  });
+
+  it('reviews watched-only data and submits the preview scope even if the page selection changes', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview'] = {
+      ...readyPreviewTask,
+      preview: {
+        ...readyPreviewTask.preview,
+        migration_scope: 'watched_only',
+        users: readyPreviewTask.preview.users.map((user) => ({
+          ...user,
+          stats: {
+            source_played: 20,
+            matched: 20,
+            source_favorites: 999,
+            source_resume: 999,
+            source_playlists: 999,
+          },
+        })),
+      },
+    };
+    responses['/api/migrations'] = { ...job, kind: 'migrate', migration_scope: 'watched_only' };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    fireEvent.change(await screen.findByLabelText('Migration data'), {
+      target: { value: 'watched_only' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('2 users selected · watched-only')).toBeTruthy();
+    expect(
+      within(dialog).getByText(/New accounts still use your account role or template defaults/),
+    ).toBeTruthy();
+    expect(within(dialog).getAllByText('Played in Emby')).toHaveLength(2);
+    expect(within(dialog).queryByText('Favorites in Emby')).toBeNull();
+    expect(within(dialog).queryByText('Resume positions')).toBeNull();
+    expect(within(dialog).queryByText('Playlists')).toBeNull();
+    const preview = requests.find((request) => request.path === '/api/migrations/preview')!;
+    expect(JSON.parse(String(preview.options?.body))).toEqual({
+      source_user_ids: ['e-alex', 'e-river'],
+      migration_scope: 'watched_only',
+    });
+    fireEvent.change(screen.getByLabelText('Migration data'), { target: { value: 'complete' } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
+    );
+    const migration = requests.find((request) => request.path === '/api/migrations')!;
+    expect(JSON.parse(String(migration.options?.body))).toEqual({
+      source_user_ids: ['e-alex', 'e-river'],
+      migration_scope: 'watched_only',
+      discord_recipients: {},
+    });
+  });
+
+  it('treats a legacy preview without an echoed scope as complete instead of claiming watched-only behavior', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview'] = readyPreviewTask;
+    responses['/api/migrations'] = { ...job, kind: 'migrate' };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    fireEvent.change(await screen.findByLabelText('Migration data'), {
+      target: { value: 'watched_only' },
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByText('2 users selected · complete migration')).toBeTruthy();
+    expect(within(dialog).getAllByText('Favorites in Emby')).toHaveLength(2);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
+    );
+    expect(
+      JSON.parse(
+        String(requests.find((request) => request.path === '/api/migrations')?.options?.body),
+      ).migration_scope,
+    ).toBe('complete');
   });
 
   it('cancels a preview when leaving the migration page and ignores an already pending late result', async () => {
@@ -976,6 +1065,7 @@ describe('React account safeguards', () => {
       ),
     ).toEqual({
       source_user_ids: ['complex'],
+      migration_scope: 'complete',
       discord_recipients: { complex: '123456789012345678' },
       mapping_revisions: { complex: 'approved-revision' },
     });

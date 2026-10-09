@@ -9,6 +9,7 @@ import {
   type Api,
   type DiscordMember,
   type Job,
+  type MigrationScope,
   type Notify,
   type Overview,
   type Page,
@@ -216,6 +217,8 @@ export function MigratePage({
   search,
   setSearch,
   preview,
+  migrationScope,
+  setMigrationScope,
   busy,
   navigate,
 }: {
@@ -226,6 +229,8 @@ export function MigratePage({
   search: string;
   setSearch: (value: string) => void;
   preview: () => void;
+  migrationScope: MigrationScope;
+  setMigrationScope: (scope: MigrationScope) => void;
   busy: boolean;
   navigate: (page: Page) => void;
 }) {
@@ -243,7 +248,11 @@ export function MigratePage({
     <>
       <Heading
         title="Migrate users"
-        description="Bring Emby progress, favorites and playlists into Jellyfin. Set name exceptions in User mappings."
+        description={
+          migrationScope === 'watched_only'
+            ? 'Bring watched status into Jellyfin while preserving watched items from either server. Set name exceptions in User mappings.'
+            : 'Bring Emby progress, favorites and playlists into Jellyfin. Set name exceptions in User mappings.'
+        }
         actions={
           <button
             id="preview-migration"
@@ -258,6 +267,24 @@ export function MigratePage({
           </button>
         }
       />
+      <div className="field mb-17">
+        <label htmlFor="migration-scope">Migration data</label>
+        <select
+          id="migration-scope"
+          aria-describedby="migration-scope-help"
+          value={migrationScope}
+          onChange={(event) => setMigrationScope(event.target.value as MigrationScope)}
+          disabled={busy}
+        >
+          <option value="complete">Complete migration</option>
+          <option value="watched_only">Watched-only</option>
+        </select>
+        <small id="migration-scope-help">
+          {migrationScope === 'watched_only'
+            ? 'Copies watched flags and original playback dates when safe. Other imported personal data is skipped; new accounts still use your account role or template defaults.'
+            : 'Copies watch history, favorites, playlists, and supported personal data while preserving newer Jellyfin activity.'}
+        </small>
+      </div>
       <div className="steps">
         <span className="step active">
           <span className="step-number">1</span>Select users

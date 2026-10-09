@@ -284,50 +284,122 @@ it('validates account and migration request shapes without coercion', async () =
     ).statusCode,
   ).toBe(422);
 });
-it('runs history preview outside the HTTP request and isolates polling and cancellation by session', async () => {
+it.each(['complete', 'watched_only'] as const)(
+  'runs %s history preview outside the HTTP request and isolates polling and cancellation by session',
+  async (migrationScope) => {
+    const app = await setup();
+    const headers = await login(app);
+    const other = await login(app);
+    let signal!: AbortSignal;
+    const preview = vi
+      .spyOn(app.jellyport.service, 'preview')
+      .mockImplementation(async (_ids, controls) => {
+        signal = controls!.signal!;
+        await new Promise<void>((_resolve, reject) =>
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+        );
+        return { users: [], mode: 'merge', migration_scope: migrationScope };
+      });
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/migrations/preview',
+      headers,
+      payload: { source_user_ids: ['e-alex'], migration_scope: migrationScope },
+    });
+    expect(response.statusCode).toBe(202);
+    const task = response.json();
+    expect(task.status).toBe('running');
+    expect(task.preview).toBeUndefined();
+    expect(preview).toHaveBeenCalledOnce();
+    expect(preview).toHaveBeenCalledWith(
+      ['e-alex'],
+      expect.objectContaining({ migration_scope: migrationScope }),
+    );
+    const url = `/api/migrations/preview/${task.id}`;
+    expect((await app.inject({ url, headers })).json().status).toBe('running');
+    expect((await app.inject({ url })).statusCode).toBe(401);
+    expect((await app.inject({ url, headers: other })).statusCode).toBe(404);
+    expect((await app.inject({ method: 'DELETE', url, headers: other })).statusCode).toBe(404);
+    expect(
+      (await app.inject({ method: 'DELETE', url, headers: { cookie: headers.cookie } })).statusCode,
+    ).toBe(403);
+    expect(signal.aborted).toBe(false);
+    expect((await app.inject({ method: 'POST', url: '/api/logout', headers })).statusCode).toBe(
+      200,
+    );
+    expect(signal.aborted).toBe(true);
+    const next = await login(app);
+    expect((await app.inject({ url, headers: next })).statusCode).toBe(404);
+    expect(app.jellyport.store.jobs()).toHaveLength(0);
+  },
+);
+it.each([
+  [undefined, 'complete'],
+  ['complete', 'complete'],
+  ['watched_only', 'watched_only'],
+] as const)(
+  'passes migration scope %s to asynchronous preview and queued migration',
+  async (scope, expected) => {
+    const app = await setup();
+    const headers = await login(app);
+    const preview = vi
+      .spyOn(app.jellyport.service, 'preview')
+      .mockResolvedValue({ users: [], mode: 'merge', migration_scope: expected });
+    const migrate = vi.spyOn(app.jellyport.service, 'migrateUsers').mockResolvedValue({
+      id: 'fixture-job',
+      kind: 'migration',
+      status: 'queued',
+      created_at: '2026-10-08T12:00:00.000Z',
+      updated_at: '2026-10-08T12:00:00.000Z',
+      progress: { processed: 0, total: 1 },
+      results: [],
+    });
+    const payload = { source_user_ids: ['e-alex'], ...(scope ? { migration_scope: scope } : {}) };
+    const started = await app.inject({
+      method: 'POST',
+      url: '/api/migrations/preview',
+      headers,
+      payload,
+    });
+    expect(started.statusCode).toBe(202);
+    await vi.waitFor(() => expect(preview).toHaveBeenCalledOnce());
+    expect(preview).toHaveBeenCalledWith(
+      ['e-alex'],
+      expect.objectContaining({ migration_scope: expected }),
+    );
+    const queued = await app.inject({ method: 'POST', url: '/api/migrations', headers, payload });
+    expect(queued.statusCode).toBe(202);
+    expect(migrate).toHaveBeenCalledWith(['e-alex'], undefined, undefined, expected);
+  },
+);
+it('rejects unknown or coerced migration scopes before preview or queue work starts', async () => {
   const app = await setup();
   const headers = await login(app);
-  const other = await login(app);
-  let signal!: AbortSignal;
-  const preview = vi
-    .spyOn(app.jellyport.service, 'preview')
-    .mockImplementation(async (_ids, controls) => {
-      signal = controls!.signal!;
-      await new Promise<void>((_resolve, reject) =>
-        signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
-      );
-      return { users: [], mode: 'merge' };
-    });
-  const response = await app.inject({
-    method: 'POST',
-    url: '/api/migrations/preview',
-    headers,
-    payload: { source_user_ids: ['e-alex'] },
-  });
-  expect(response.statusCode).toBe(202);
-  const task = response.json();
-  expect(task.status).toBe('running');
-  expect(task.preview).toBeUndefined();
-  expect(preview).toHaveBeenCalledOnce();
-  const url = `/api/migrations/preview/${task.id}`;
-  expect((await app.inject({ url, headers })).json().status).toBe('running');
-  expect((await app.inject({ url })).statusCode).toBe(401);
-  expect((await app.inject({ url, headers: other })).statusCode).toBe(404);
-  expect((await app.inject({ method: 'DELETE', url, headers: other })).statusCode).toBe(404);
-  expect(
-    (await app.inject({ method: 'DELETE', url, headers: { cookie: headers.cookie } })).statusCode,
-  ).toBe(403);
-  expect(signal.aborted).toBe(false);
-  expect((await app.inject({ method: 'POST', url: '/api/logout', headers })).statusCode).toBe(200);
-  expect(signal.aborted).toBe(true);
-  const next = await login(app);
-  expect((await app.inject({ url, headers: next })).statusCode).toBe(404);
+  const preview = vi.spyOn(app.jellyport.service, 'preview');
+  const migrate = vi.spyOn(app.jellyport.service, 'migrateUsers');
+  for (const migrationScope of ['played', 'Watched_only', '', null, true, 1]) {
+    for (const url of ['/api/migrations/preview', '/api/migrations']) {
+      const response = await app.inject({
+        method: 'POST',
+        url,
+        headers,
+        payload: { source_user_ids: ['e-alex'], migration_scope: migrationScope },
+      });
+      expect(response.statusCode).toBe(422);
+    }
+  }
+  expect(preview).not.toHaveBeenCalled();
+  expect(migrate).not.toHaveBeenCalled();
   expect(app.jellyport.store.jobs()).toHaveLength(0);
 });
 it('discards ready history previews when integration settings change', async () => {
   const app = await setup(false);
   const headers = await login(app);
-  vi.spyOn(app.jellyport.service, 'preview').mockResolvedValue({ users: [], mode: 'merge' });
+  vi.spyOn(app.jellyport.service, 'preview').mockResolvedValue({
+    users: [],
+    mode: 'merge',
+    migration_scope: 'complete',
+  });
   const started = await app.inject({
     method: 'POST',
     url: '/api/migrations/preview',

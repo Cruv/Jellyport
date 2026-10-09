@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { matchItems, type MatchPlan } from './matching.js';
+import { createMatcher, matchItems, type MatchPlan } from './matching.js';
 import {
   isObject,
   type MediaAPI,
@@ -22,6 +22,7 @@ const playable = new Set([
   'AudioBook',
   'Trailer',
 ]);
+export type MigrationScope = 'complete' | 'watched_only';
 const count = (value: unknown): number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647
     ? value
@@ -51,10 +52,23 @@ export function hasPersonalState(item: MediaItem): boolean {
 }
 
 /** Additive merge: no unwatch, no unfavorite, no summed counts, and ties favor Jellyfin. */
-export function mergeUserData(source: MediaItem, target: MediaItem): MediaUserDataPatch {
+export function mergeUserData(
+  source: MediaItem,
+  target: MediaItem,
+  scope: MigrationScope = 'complete',
+): MediaUserDataPatch {
   const from = source.UserData ?? {},
     to = target.UserData ?? {};
   const patch: MediaUserDataPatch = {};
+  if (scope === 'watched_only') {
+    if (!playable.has(source.Type ?? '') || from.Played !== true || to.Played === true)
+      return patch;
+    patch.Played = true;
+    const sourceDate = playedDate(from.LastPlayedDate),
+      targetDate = playedDate(to.LastPlayedDate);
+    if (sourceDate && (!targetDate || sourceDate > targetDate)) patch.LastPlayedDate = sourceDate;
+    return patch;
+  }
   if (from.IsFavorite === true && to.IsFavorite !== true) patch.IsFavorite = true;
   if (typeof from.Likes === 'boolean' && typeof to.Likes !== 'boolean') patch.Likes = from.Likes;
   if (rating(from.Rating) && !rating(to.Rating)) patch.Rating = from.Rating;
@@ -84,9 +98,18 @@ export function mergeUserData(source: MediaItem, target: MediaItem): MediaUserDa
   return patch;
 }
 
-export function statePlan(source: MediaItem[], target: MediaItem[], settings: Settings): MatchPlan {
+export function statePlan(
+  source: MediaItem[],
+  target: MediaItem[],
+  settings: Settings,
+  scope: MigrationScope = 'complete',
+): MatchPlan {
   return matchItems(
-    source.filter((item) => item.Type !== 'Playlist' && hasPersonalState(item)),
+    source.filter((item) =>
+      scope === 'watched_only'
+        ? playable.has(item.Type ?? '') && item.UserData?.Played === true
+        : item.Type !== 'Playlist' && hasPersonalState(item),
+    ),
     target,
     settings.path_mappings,
   );
@@ -187,10 +210,16 @@ export function migrationWarning(details: MigrationDetails, message: string): vo
 export async function readMigrationSource(
   emby: MediaAPI,
   sourceId: string,
+  scope: MigrationScope = 'complete',
 ): Promise<SourceSnapshot> {
   const user = await emby.user(sourceId);
-  const items = await (emby.migrationItems ? emby.migrationItems(sourceId) : emby.items(sourceId));
+  const items = await (scope === 'watched_only' && emby.watchedItems
+    ? emby.watchedItems(sourceId)
+    : emby.migrationItems
+      ? emby.migrationItems(sourceId)
+      : emby.items(sourceId));
   const result: SourceSnapshot = { user, items, playlists: [], warnings: [] };
+  if (scope === 'watched_only') return result;
   if (!emby.playlists || !emby.playlistItems) {
     result.warnings.push('This source client cannot read playlists.');
     return result;
@@ -234,7 +263,17 @@ export async function migrateItemState(
   details: MigrationDetails,
   stopped: () => void,
   saved: () => void,
+  options: {
+    concurrency?: number;
+    progress?: (processed: number, total: number, updated: number) => void;
+    migration_scope?: MigrationScope;
+  } = {},
 ): Promise<number> {
+  const concurrency = options.concurrency ?? 4;
+  const scope = options.migration_scope ?? 'complete';
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4)
+    throw new ServiceError('Migration concurrency must be between 1 and 4.');
+  stopped();
   let capabilities = { userData: false };
   try {
     if (jellyfin.migrationCapabilities) capabilities = await jellyfin.migrationCapabilities();
@@ -244,25 +283,62 @@ export async function migrateItemState(
       'Jellyfin capabilities could not be verified. Only legacy watched and favorite updates will be attempted.',
     );
   }
+  if (scope === 'watched_only' && !capabilities.userData)
+    migrationWarning(
+      details,
+      'This older Jellyfin version uses its watched-item endpoint, which may update playback dates, counts or resume state. Jellyfin 10.9 or newer is required to preserve those fields precisely.',
+    );
   let applied = 0;
-  for (const match of plan.matches) {
-    stopped();
+  let processed = 0;
+  let reportedUpdated = 0;
+  let fatal = false;
+  let fatalError: unknown;
+  const latchFailure = (error: unknown) => {
+    if (fatal) return;
+    fatal = true;
+    fatalError = error;
+  };
+  const guard = () => {
+    if (fatal) throw fatalError;
+    try {
+      stopped();
+    } catch (error) {
+      latchFailure(error);
+      throw error;
+    }
+  };
+  guard();
+  const missingDate = (source: MediaItem, target: MediaItem) => {
+    if (
+      source.Type === 'Episode' &&
+      source.UserData?.Played === true &&
+      !playedDate(source.UserData.LastPlayedDate) &&
+      !playedDate(target.UserData?.LastPlayedDate)
+    )
+      details.history_dates_missing++;
+  };
+  const apply = async (match: MatchPlan['matches'][number]): Promise<boolean> => {
+    guard();
     try {
       const target = { ...match.target };
+      // Already merged snapshots need no remote reads or writes. Potential changes still use
+      // a fresh destination read, so later Jellyfin activity wins immediately before a write.
+      if (!Object.keys(mergeUserData(match.source, target, scope)).length) {
+        missingDate(match.source, target);
+        return false;
+      }
       if (capabilities.userData && jellyfin.userData)
         target.UserData = await jellyfin.userData(userId, target.Id);
-      stopped();
-      const patch = mergeUserData(match.source, target);
-      if (
-        match.source.Type === 'Episode' &&
-        match.source.UserData?.Played === true &&
-        !playedDate(match.source.UserData.LastPlayedDate) &&
-        !playedDate(target.UserData?.LastPlayedDate)
-      )
-        details.history_dates_missing++;
-      if (!Object.keys(patch).length) continue;
+      guard();
+      const patch = mergeUserData(match.source, target, scope);
+      missingDate(match.source, target);
+      if (!Object.keys(patch).length) return false;
       if (capabilities.userData && jellyfin.updateUserData) {
-        stopped();
+        if (!jellyfin.userData)
+          throw new ServiceError(
+            'Fresh Jellyfin user data is required before detailed migration updates.',
+          );
+        guard();
         await jellyfin.updateUserData(userId, target.Id, patch);
         if (patch.Played) applied++;
         if (patch.IsFavorite) details.favorites++;
@@ -274,7 +350,7 @@ export async function migrateItemState(
         let changed = false;
         if (patch.Played) {
           const date = playedDate(match.source.UserData?.LastPlayedDate);
-          stopped();
+          guard();
           await jellyfin.markPlayed(userId, target.Id, date);
           applied++;
           changed = true;
@@ -285,25 +361,30 @@ export async function migrateItemState(
             );
         }
         if (patch.IsFavorite && jellyfin.markFavorite) {
-          stopped();
+          guard();
           await jellyfin.markFavorite(userId, target.Id);
           details.favorites++;
           changed = true;
         }
         if (
-          Object.keys(patch).some((key) => !['Played', 'IsFavorite'].includes(key)) ||
+          Object.keys(patch).some(
+            (key) =>
+              !['Played', 'IsFavorite'].includes(key) &&
+              !(key === 'LastPlayedDate' && patch.Played === true),
+          ) ||
           (patch.IsFavorite && !jellyfin.markFavorite)
         )
           migrationWarning(
             details,
             'This Jellyfin version/client supports limited user data. Upgrade to Jellyfin 10.9 or newer for resume positions, counts, dates and ratings.',
           );
-        if (!changed) continue;
+        if (!changed) return false;
       }
       details.items_updated++;
       saved();
+      return true;
     } catch (error) {
-      stopped();
+      guard();
       details.failed_items++;
       migrationWarning(
         details,
@@ -311,8 +392,41 @@ export async function migrateItemState(
           ? error.message
           : 'An item could not be updated. Review the migration and retry.',
       );
+      return false;
     }
+  };
+  // Different Emby versions/editions can resolve to one Jellyfin item. Their reads and
+  // mutations must remain ordered even while unrelated target items run concurrently.
+  const byTarget = new Map<string, MatchPlan['matches']>();
+  for (const match of plan.matches) {
+    const group = byTarget.get(match.target.Id) ?? [];
+    group.push(match);
+    byTarget.set(match.target.Id, group);
   }
+  const groups = [...byTarget.values()];
+  let next = 0;
+  const worker = async () => {
+    try {
+      while (!fatal) {
+        const group = groups[next++];
+        if (!group) return;
+        for (const match of group) {
+          if (fatal) return;
+          const changed = await apply(match);
+          processed++;
+          if (changed) reportedUpdated++;
+          options.progress?.(processed, plan.matches.length, reportedUpdated);
+        }
+      }
+    } catch (error) {
+      latchFailure(error);
+      throw error;
+    }
+  };
+  // Drain every worker before propagating a fatal guard/stop. Callers can then release
+  // their account mutation lock without leaving remote writes running behind it.
+  await Promise.allSettled(Array.from({ length: Math.min(concurrency, groups.length) }, worker));
+  if (fatal) throw fatalError;
   if (details.history_dates_missing)
     migrationWarning(
       details,
@@ -351,6 +465,7 @@ export async function migratePlaylists(
     );
     return;
   }
+  const matchPlaylist = createMatcher(targetItems, settings.path_mappings);
   for (const entry of source) {
     stopped();
     if (entry.error) {
@@ -358,7 +473,7 @@ export async function migratePlaylists(
       continue;
     }
     try {
-      const plan = matchItems(entry.items, targetItems, settings.path_mappings);
+      const plan = matchPlaylist(entry.items);
       const mapped = new Map(plan.matches.map((match) => [match.source.Id, match.target.Id]));
       let ids = entry.items.flatMap((item) => (mapped.has(item.Id) ? [mapped.get(item.Id)!] : []));
       details.playlist_items_skipped += entry.items.length - ids.length;

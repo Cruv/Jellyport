@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { matchItems, MIGRATABLE_ITEM_TYPES } from '../server/matching.js';
+import { createMatcher, matchItems, MIGRATABLE_ITEM_TYPES } from '../server/matching.js';
 import type { MediaItem } from '../server/media.js';
 
 const item = (Id: string, fields: Partial<MediaItem> = {}): MediaItem => ({
@@ -8,6 +8,82 @@ const item = (Id: string, fields: Partial<MediaItem> = {}): MediaItem => ({
   ...fields,
 });
 describe('conservative media matching', () => {
+  it('reuses destination indexes while keeping independent plans and conservative matches', () => {
+    const targets = [
+      item('movie', { ProviderIds: { Imdb: 'tt42' }, Path: '/media/film.mkv' }),
+      item('movie-4k', { ProviderIds: { Imdb: 'tt42' }, Path: '/media/film-4k.mkv' }),
+      item('episode', {
+        Type: 'Episode',
+        SeriesProviderIds: { Tvdb: '100' },
+        ParentIndexNumber: 1,
+        IndexNumber: 2,
+      }),
+      item('photo', { Type: 'Photo', Path: '/media/photo.jpg' }),
+    ];
+    const mappings = [{ source: '/emby', target: '/media' }];
+    const sources = [
+      item('exact', { ProviderIds: { Imdb: 'tt42' }, Path: '/emby/film.mkv' }),
+      item('ambiguous', { ProviderIds: { Imdb: 'tt42' } }),
+      item('episode-source', {
+        Type: 'Episode',
+        SeriesProviderIds: { TheTvdb: '100' },
+        ParentIndexNumber: 1,
+        IndexNumber: 2,
+      }),
+      item('photo-source', { Type: 'Photo', Path: '/emby/photo.jpg' }),
+      item('unmatched', { Name: 'Same title', ProviderIds: { Imdb: 'missing' } }),
+      item('wrong-type', { Type: 'Audio', ProviderIds: { Imdb: 'tt42' } }),
+      item('unsupported', { Type: 'Folder', Path: '/media/photo.jpg' }),
+    ];
+    const before = structuredClone({ targets, sources, mappings });
+    const match = createMatcher(targets, mappings);
+    const result = match(sources);
+    expect(result).toEqual(matchItems(sources, targets, mappings));
+    expect(result.matches.map((entry) => [entry.source.Id, entry.target.Id, entry.method])).toEqual(
+      [
+        ['exact', 'movie', 'provider_id+path'],
+        ['episode-source', 'episode', 'series_episode'],
+        ['photo-source', 'photo', 'path'],
+      ],
+    );
+    expect(result.ambiguous[0]?.candidates).toEqual(targets.slice(0, 2));
+    expect(result.unmatched.map((entry) => entry.Id)).toEqual([
+      'unmatched',
+      'wrong-type',
+      'unsupported',
+    ]);
+    expect(match([sources[1]!])).toEqual(matchItems([sources[1]!], targets, mappings));
+    result.matches.length = 0;
+    result.ambiguous[0]!.candidates.length = 0;
+    expect(match(sources).matches).toHaveLength(3);
+    expect(match(sources).ambiguous[0]!.candidates).toHaveLength(2);
+    expect({ targets, sources, mappings }).toEqual(before);
+  });
+  it('keeps prepared matchers scoped to their own destination catalog', () => {
+    const source = item('source', { ProviderIds: { Imdb: 'tt42' } });
+    const firstTarget = item('first-target', {
+      ProviderIds: source.ProviderIds,
+      UserData: { Played: true },
+    });
+    const secondTarget = item('second-target', {
+      ProviderIds: source.ProviderIds,
+      UserData: { Played: false },
+    });
+    const first = createMatcher([firstTarget]);
+    const second = createMatcher([secondTarget]);
+    expect(first([source]).matches[0]!.target).toBe(firstTarget);
+    expect(second([source]).matches[0]!.target).toBe(secondTarget);
+    expect(first([source]).matches[0]!.target.UserData).toEqual({ Played: true });
+    expect(second([source]).matches[0]!.target.UserData).toEqual({ Played: false });
+  });
+  it('retains a prepared catalog order when the caller changes its array', () => {
+    const source = item('source', { Path: '/media/film.mkv' });
+    const target = item('target', { Path: source.Path });
+    const targets = [target];
+    const match = createMatcher(targets);
+    targets.length = 0;
+    expect(match([source]).matches).toEqual([{ source, target, method: 'path' }]);
+  });
   it('matches provider identity despite title and server ID differences', () => {
     const source = item('s', { Name: 'Old title', ProviderIds: { IMDb: 'tt42', Tmdb: '17' } });
     const target = item('t', {

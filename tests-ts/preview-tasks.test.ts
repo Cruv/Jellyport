@@ -48,6 +48,30 @@ it('rejects invalid migration scopes before starting any work', async () => {
   }
 });
 
+it.each([undefined, false, true])(
+  'forwards snapshot selection %s without changing session ownership',
+  async (useSnapshots) => {
+    const run = vi.fn(async (_ids: string[], controls: { use_snapshots: boolean }) => ({
+      use_snapshots: controls.use_snapshots,
+    }));
+    const tasks = new PreviewTasks(run);
+    try {
+      const task = tasks.start('owner', 'config', ['source'], 'complete', useSnapshots);
+      await flush();
+      expect(run).toHaveBeenCalledWith(
+        ['source'],
+        expect.objectContaining({ use_snapshots: useSnapshots ?? false }),
+      );
+      expect(tasks.get('owner', 'config', task.id)?.preview).toEqual({
+        use_snapshots: useSnapshots ?? false,
+      });
+      expect(tasks.get('other', 'config', task.id)).toBeUndefined();
+    } finally {
+      tasks.close();
+    }
+  },
+);
+
 it('returns before scanning, keeps progress and results private to the requesting session, and returns copies', async () => {
   let release!: (value: { users: string[] }) => void;
   let report!: (processed: number, total: number) => void;

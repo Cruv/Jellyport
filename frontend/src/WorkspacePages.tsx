@@ -219,6 +219,8 @@ export function MigratePage({
   preview,
   migrationScope,
   setMigrationScope,
+  useSnapshots,
+  setUseSnapshots,
   busy,
   navigate,
 }: {
@@ -231,6 +233,8 @@ export function MigratePage({
   preview: () => void;
   migrationScope: MigrationScope;
   setMigrationScope: (scope: MigrationScope) => void;
+  useSnapshots: boolean;
+  setUseSnapshots: (value: boolean) => void;
   busy: boolean;
   navigate: (page: Page) => void;
 }) {
@@ -283,6 +287,23 @@ export function MigratePage({
           {migrationScope === 'watched_only'
             ? 'Copies watched flags and original playback dates when safe. Other imported personal data is skipped; new accounts still use your account role or template defaults.'
             : 'Copies watch history, favorites, playlists, and supported personal data while preserving newer Jellyfin activity.'}
+        </small>
+      </div>
+      <div className="field mb-17">
+        <label className="check-label">
+          <input
+            type="checkbox"
+            checked={useSnapshots}
+            onChange={(event) => setUseSnapshots(event.target.checked)}
+            disabled={busy}
+            aria-describedby="migration-snapshot-help"
+          />
+          Use saved Emby snapshot
+        </label>
+        <small id="migration-snapshot-help">
+          Live Emby reads are the default. Saved snapshots must cover every selected account and be
+          current enough for the chosen scope. Missing or expired snapshots stop the preview;
+          refresh them in Settings or choose live reads.
         </small>
       </div>
       <div className="steps">

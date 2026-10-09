@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { Callout, Heading, Icon } from './components';
 import AdminAlertsPanel from './AdminAlertsPanel';
+import SourceSnapshotsPanel from './SourceSnapshotsPanel';
 import {
   safeUrl,
   defaultMembershipTiers,
@@ -853,6 +854,7 @@ export default function SettingsPage({
           </div>
         </div>
       </form>
+      <SourceSnapshotsPanel api={api} notify={notify} demo={demo} />
       {tested && (
         <div className="connection-test-results">
           <section className="panel">

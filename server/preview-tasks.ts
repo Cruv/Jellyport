@@ -22,6 +22,7 @@ interface Controls {
   signal: AbortSignal;
   progress: (processed: number, total: number) => void;
   migration_scope: MigrationScope;
+  use_snapshots: boolean;
 }
 
 /** Ephemeral, session-owned reads; never persisted or shared between administrator sessions. */
@@ -42,6 +43,7 @@ export class PreviewTasks<T> {
     context: string,
     ids: string[],
     migrationScope: MigrationScope = 'complete',
+    useSnapshots = false,
   ): PreviewTask<T> {
     if (!['complete', 'watched_only'].includes(migrationScope))
       throw new ServiceError('Choose a valid migration scope.');
@@ -93,6 +95,7 @@ export class PreviewTasks<T> {
         entry.controller.signal.throwIfAborted();
         return this.run([...ids], {
           migration_scope: migrationScope,
+          use_snapshots: useSnapshots,
           signal: entry.controller.signal,
           progress: (processed, total) => {
             if (entry.controller.signal.aborted || entry.value.status !== 'running') return;

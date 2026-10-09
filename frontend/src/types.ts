@@ -129,6 +129,7 @@ export interface ItemIssue {
   candidate_ids?: string[];
 }
 export interface JobResult {
+  source_snapshot?: SourceSnapshotMetadata;
   username?: string;
   source_username?: string;
   mapping_id?: string;
@@ -186,6 +187,49 @@ export interface JobProgress {
   items_updated?: number;
 }
 export type MigrationScope = 'complete' | 'watched_only';
+export interface SourceSnapshotMetadata {
+  source_type?: 'sqlite_online_backup';
+  schema?: string;
+  id: string;
+  source_server_url: string;
+  source_server_id: string;
+  source_server_version: string;
+  source_user_id: string;
+  source_username: string;
+  scope: MigrationScope;
+  started_at: string;
+  finished_at: string;
+  expires_at: string;
+  items: number;
+  playlists: number;
+  playlist_entries: number;
+  bytes: number;
+  avatar: boolean;
+}
+export interface SourceSnapshotConfig {
+  enabled: boolean;
+  hour: number;
+  minute: number;
+  time_zone: string;
+  scope: MigrationScope;
+  revision: string;
+}
+export interface SourceSnapshotStatus {
+  available?: boolean;
+  capture_method?: 'sqlite_online_backup';
+  config: SourceSnapshotConfig;
+  running: boolean;
+  last_attempt_at: string | null;
+  last_finished_at: string | null;
+  last_error: string | null;
+  users_total: number;
+  users_processed: number;
+  users_succeeded: number;
+  users_failed: number;
+  snapshots: number;
+  encrypted_bytes: number;
+  records: SourceSnapshotMetadata[];
+}
 export interface Job {
   id: string;
   kind: string;
@@ -206,6 +250,7 @@ export interface Overview {
   pending_subscriptions?: number;
 }
 export interface PreviewUser {
+  source_snapshot?: SourceSnapshotMetadata;
   source_user_id: string;
   username: string;
   source_username?: string;
@@ -232,6 +277,7 @@ export interface PreviewUser {
 export interface Preview {
   users: PreviewUser[];
   migration_scope?: MigrationScope;
+  source_snapshot_ids?: Record<string, string>;
 }
 export interface PreviewTask {
   id: string;

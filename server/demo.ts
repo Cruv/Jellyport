@@ -160,6 +160,19 @@ export class DemoClient implements MediaAPI {
   async migrationItems(userId?: string): Promise<MediaItem[]> {
     return this.items(userId);
   }
+  async catalogItems(): Promise<MediaItem[]> {
+    return (await this.migrationItems()).map(({ UserData: _state, ...item }) => item as MediaItem);
+  }
+  async migrationState(
+    userId: string,
+    catalog: MediaItem[],
+    scope: 'complete' | 'watched_only',
+  ): Promise<MediaItem[]> {
+    const ids = new Set(catalog.map((item) => item.Id));
+    return (await this.migrationItems(userId)).filter(
+      (item) => ids.has(item.Id) && (scope !== 'watched_only' || item.UserData?.Played === true),
+    );
+  }
   async migrationCapabilities() {
     return { userData: true, privatePlaylists: true, playlistDuplicates: true, version: '12.2.0' };
   }

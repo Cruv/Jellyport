@@ -48,6 +48,8 @@ import { AccountProfiles, type AccountProfileInput } from './account-profiles.js
 import { AdminAlerts } from './admin-alerts.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { SourceSnapshots, type SnapshotMetadata } from './source-snapshots.js';
+import { MediaWorkload, type MediaWorkloadEvent } from './media-workload.js';
+import { MigrationCatalogCache, type MigrationCatalog } from './migration-catalog.js';
 
 export { ServiceError } from './errors.js';
 export interface JobRequest {
@@ -81,6 +83,7 @@ export interface JobStats {
   source_playlists: number;
 }
 export interface JobResult extends Partial<JobStats> {
+  source_catalog?: { captured_at: string; items: number };
   source_snapshot?: SnapshotMetadata;
   username: string;
   status: string;
@@ -101,6 +104,7 @@ export interface JobResult extends Partial<JobStats> {
   ambiguous_items?: Array<{ name: string; id: string; candidate_ids: string[] }>;
 }
 export interface Job {
+  cancel_requested?: boolean;
   source_snapshot_ids?: Record<string, string>;
   id: string;
   kind: string;
@@ -181,9 +185,16 @@ export interface BotAdapter {
 export interface ServiceOptions {
   clientFactory?: ClientFactory;
   demo?: boolean;
+  observeMedia?: (event: MediaWorkloadEvent) => void;
 }
 interface ProvisioningDefaults extends MediaUser {
   accountRole?: AccountRole;
+}
+interface MigrationPreviewOptions {
+  signal?: AbortSignal;
+  progress?: (processed: number, total: number) => void;
+  migration_scope?: MigrationScope;
+  use_snapshots?: boolean;
 }
 interface PreviewUser {
   source_snapshot?: SnapshotMetadata;
@@ -192,7 +203,8 @@ interface PreviewUser {
   username: string;
   target_user_id: string | null;
   target_exists: boolean;
-  stats: JobStats;
+  history_deferred?: boolean;
+  stats: JobStats | null;
   unmatched: MediaItem[];
   ambiguous: MatchPlan['ambiguous'];
   mapping_id: string | null;
@@ -204,14 +216,30 @@ interface PreviewUser {
 
 class Mutex {
   private tail: Promise<void> = Promise.resolve();
-  async run<T>(action: () => Promise<T>): Promise<T> {
+  async run<T>(action: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const previous = this.tail;
     let release!: () => void;
     this.tail = new Promise<void>((resolve) => {
       release = resolve;
     });
-    await previous;
     try {
+      if (signal) {
+        await new Promise<void>((resolve, reject) => {
+          const abort = () => reject(signal.reason ?? new CanceledError());
+          if (signal.aborted) {
+            abort();
+            return;
+          }
+          signal.addEventListener('abort', abort, { once: true });
+          previous.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+        });
+      } else await previous;
+    } catch (error) {
+      void previous.then(release);
+      throw error;
+    }
+    try {
+      signal?.throwIfAborted();
       return await action();
     } finally {
       release();
@@ -219,6 +247,8 @@ class Mutex {
   }
 }
 class StoppedError extends Error {}
+class CanceledError extends StoppedError {}
+class SourcePreparationError extends ServiceError {}
 export function now(): string {
   return new Date().toISOString();
 }
@@ -280,6 +310,12 @@ export class Service {
   clientFactory: ClientFactory;
   readonly jobTasks = new Map<string, Promise<void>>();
   private readonly mutationMutex = new Mutex();
+  private readonly migrationMutex = new Mutex();
+  private readonly historyMutex = new Mutex();
+  private readonly jobControllers = new Map<string, AbortController>();
+  private readonly activeJobs = new Map<string, Job>();
+  private readonly sourceWorkload: MediaWorkload;
+  private readonly sourceCatalogs: MigrationCatalogCache;
   private readonly subscriptionMutex = new Mutex();
   private readonly clients = new Set<MediaAPI>();
   private stopping = false;
@@ -295,8 +331,18 @@ export class Service {
     readonly store: Store,
     options: ServiceOptions = {},
   ) {
+    this.sourceWorkload = new MediaWorkload({
+      observe: options.observeMedia ?? ((event) => console.info(JSON.stringify(event))),
+    });
+    this.sourceCatalogs = new MigrationCatalogCache({
+      hit: (items) => this.sourceWorkload.cacheHit('catalog', items),
+    });
     this.clientFactory =
-      options.clientFactory ?? ((url, key, kind) => new MediaClient(url, key, kind));
+      options.clientFactory ??
+      ((url, key, kind) =>
+        new MediaClient(url, key, kind, {
+          ...(kind === 'emby' ? { workload: this.sourceWorkload } : {}),
+        }));
     this.demo = options.demo ?? false;
     this.mappings = new UserMappings(store);
     this.roles = new AccountRoles(store, this.demo);
@@ -329,12 +375,19 @@ export class Service {
     settings: Settings,
     kind: MediaKind,
     action: (client: MediaAPI) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
     const client = this.client(settings, kind);
     this.clients.add(client);
+    const cancel = () => {
+      void client.close().catch(() => {});
+    };
+    signal?.addEventListener('abort', cancel, { once: true });
     try {
+      signal?.throwIfAborted();
       return await action(client);
     } finally {
+      signal?.removeEventListener('abort', cancel);
       this.clients.delete(client);
       await client.close();
     }
@@ -599,14 +652,13 @@ export class Service {
       };
     }
   }
-  async preview(
+  async preview(sourceUserIds: string[], options: MigrationPreviewOptions = {}) {
+    if (!options.use_snapshots) return this.previewRead(sourceUserIds, options);
+    return this.historyMutex.run(() => this.previewRead(sourceUserIds, options), options.signal);
+  }
+  private async previewRead(
     sourceUserIds: string[],
-    options: {
-      signal?: AbortSignal;
-      progress?: (processed: number, total: number) => void;
-      migration_scope?: MigrationScope;
-      use_snapshots?: boolean;
-    } = {},
+    options: MigrationPreviewOptions = {},
   ): Promise<{
     users: PreviewUser[];
     mode: 'merge';
@@ -686,29 +738,52 @@ export class Service {
               throw new ServiceError(
                 'A disabled Jellyfin account cannot be a migration destination.',
               );
+            if (!options.use_snapshots) {
+              this.assertMapping(mapping, sourceId, settings);
+              users.push({
+                source_user_id: sourceId,
+                source_username: sourceUser.Name,
+                username,
+                target_user_id: target?.Id ?? null,
+                target_exists: Boolean(target),
+                history_deferred: true,
+                stats: null,
+                unmatched: [],
+                ambiguous: [],
+                mapping_id: mapping?.id ?? null,
+                mapping_revision: mapping?.revision ?? null,
+                discord_user_id: mapping?.discord_user_id ?? null,
+                discord_username: mapping?.discord_username ?? null,
+                warnings: [
+                  'Live preview checks account identity only. Complete history, favorites, resume positions, playlists and matching details are read after approval; results report unmatched and ambiguous items. A shared matching catalog is reused during the job, so library changes after collection require another migration. Saved snapshots provide history details before approval.',
+                  ...(!target && template.accountRole
+                    ? [
+                        'The new account’s role may limit library access; final matches are checked using that account.',
+                      ]
+                    : []),
+                ],
+              });
+              options.progress?.(users.length, sourceUserIds.length);
+              checkCanceled();
+              continue;
+            }
             // Validate account identity first, then overlap independent catalog reads. Preview
             // needs only playlist metadata; entries are fetched during the actual migration.
-            const saved = snapshotInfo
-              ? await this.sourceSnapshots.select(
-                  sourceId,
-                  settings,
-                  snapshotInfo.Id as string,
-                  captureId,
-                )
-              : null;
-            if (saved) {
-              captureId = saved.id;
-              snapshotIds[sourceId] = saved.id;
-              saved.metadata.source_username = sourceUser.Name;
-            }
+            if (!snapshotInfo)
+              throw new ServiceError(
+                'Saved snapshot identity is unavailable. Review a new preview.',
+              );
+            const saved = await this.sourceSnapshots.select(
+              sourceId,
+              settings,
+              snapshotInfo.Id as string,
+              captureId,
+            );
+            captureId = saved.id;
+            snapshotIds[sourceId] = saved.id;
+            saved.metadata.source_username = sourceUser.Name;
             const [sourceItems, targetCatalog, playlists] = await Promise.all([
-              saved
-                ? this.sourceSnapshots.items(saved, sourceId, scope, options.signal)
-                : scope === 'watched_only' && emby.watchedItems
-                  ? emby.watchedItems(sourceId)
-                  : emby.migrationItems
-                    ? emby.migrationItems(sourceId)
-                    : emby.items(sourceId),
+              this.sourceSnapshots.items(saved, sourceId, scope, options.signal),
               targetCatalogFor(target),
               scope === 'watched_only'
                 ? Promise.resolve({ count: 0, warnings: [] })
@@ -741,7 +816,7 @@ export class Service {
               );
             this.assertMapping(mapping, sourceId, settings);
             users.push({
-              ...(saved ? { source_snapshot: saved.metadata } : {}),
+              source_snapshot: saved.metadata,
               source_user_id: sourceId,
               source_username: sourceUser.Name,
               username,
@@ -1675,8 +1750,13 @@ export class Service {
     };
     job.results.push(result);
     this.save(job);
+    const check = () => {
+      this.checkJobStopped(job);
+      this.assertConnections(settings);
+      return this.assertRoleUpdate(request, settings);
+    };
     try {
-      const { role } = this.assertRoleUpdate(request, settings);
+      const { role } = check();
       result.role_name = role.name;
       if (
         !request.role_sections?.length ||
@@ -1689,9 +1769,9 @@ export class Service {
         throw new ServiceError('The queued role update is invalid. Review a new update.');
       for (const section of request.role_sections) {
         await this.requireRoleServer(client, role);
-        this.assertRoleUpdate(request, settings);
+        check();
         const user = await client.user(request.target_user_id!);
-        this.assertRoleUpdate(request, settings);
+        check();
         this.assertRoleTarget(user, request.target_user_id!, request.username!, settings);
         if (section === 'display') {
           if (
@@ -1704,7 +1784,7 @@ export class Service {
             );
           const current = await client.displayPreferences(user.Id);
           const confirmed = await client.user(user.Id);
-          this.assertRoleUpdate(request, settings);
+          check();
           this.assertRoleTarget(confirmed, user.Id, user.Name, settings);
           await client.setDisplayPreferences(
             user.Id,
@@ -1722,7 +1802,7 @@ export class Service {
         // edit prevents us from stamping the assignment as current afterwards.
         result.role_sections!.push(section);
         this.save(job);
-        const { assignment } = this.assertRoleUpdate(request, settings);
+        const { assignment } = check();
         this.roles.markApplied(user.Id, role.id, role.revision, assignment.revision, settings, [
           section,
         ]);
@@ -1782,14 +1862,49 @@ export class Service {
   }
   private schedule(job: Job, requests: JobRequest[], settings: Settings): void {
     if (this.jobTasks.has(job.id)) return;
-    const task = Promise.resolve().then(() => this.run(job, requests, settings));
+    this.jobControllers.set(job.id, new AbortController());
+    const controller = this.jobControllers.get(job.id)!;
+    const task = Promise.resolve()
+      .then(() =>
+        requests.some((request) => request.source_user_id)
+          ? this.migrationMutex.run(() => this.run(job, requests, settings), controller.signal)
+          : this.run(job, requests, settings),
+      )
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) throw error;
+      });
     this.jobTasks.set(job.id, task);
-    void task.finally(() => this.jobTasks.delete(job.id)).catch(() => {});
+    void task
+      .finally(() => {
+        this.jobTasks.delete(job.id);
+        this.jobControllers.delete(job.id);
+        this.activeJobs.delete(job.id);
+      })
+      .catch(() => {});
   }
   getJob(id: string): Job {
     const job = this.store.job(id);
     if (!job) throw new ServiceError('Job not found.');
     return job;
+  }
+  cancelJob(id: string): Job {
+    const job = this.getJob(id);
+    if (!['queued', 'running'].includes(job.status)) return job;
+    const queued = this.store.cancelQueuedJob(id);
+    if (queued) {
+      this.jobControllers.get(id)?.abort(new CanceledError('Job canceled.'));
+      return queued;
+    }
+    const active = this.activeJobs.get(id) ?? job;
+    active.cancel_requested = true;
+    if (active.status === 'queued') {
+      active.status = 'canceled';
+      active.finished_at = now();
+      active.error = 'Canceled before account work began.';
+    }
+    this.save(active);
+    this.jobControllers.get(id)?.abort(new CanceledError('Job canceled.'));
+    return structuredClone(active);
   }
   private save(job: Job): void {
     job.updated_at = now();
@@ -1923,6 +2038,7 @@ export class Service {
     settings: Settings,
     jellyfin: MediaAPI,
     template: ProvisioningDefaults,
+    catalogContext: { key?: string; value?: MigrationCatalog },
   ): Promise<void> {
     const scope = migrationScope(request.migration_scope);
     let source: SourceSnapshot | null = null;
@@ -1937,7 +2053,8 @@ export class Service {
     };
     job.progress.current_user = mapping?.target_username ?? request.username;
     const guard = () => {
-      this.checkStopped();
+      this.checkJobStopped(job);
+      this.assertConnections(settings);
       this.assertMembershipRequest(request, settings);
       this.assertDefaultRole(template, request, settings);
       this.assertMapping(mapping, request.source_user_id, settings);
@@ -1945,26 +2062,94 @@ export class Service {
     };
     if (request.source_user_id) {
       phase('reading_source');
-      source = await this.withClient(settings, 'emby', async (emby) => {
-        if (!request.source_snapshot_id)
-          return readMigrationSource(emby, request.source_user_id!, scope);
-        const info = await emby.systemInfo();
-        if (info.Version !== '4.10.1.0' || typeof info.Id !== 'string')
-          throw new ServiceError('Emby version or identity changed. Review a new preview.');
-        const selected = await this.sourceSnapshots.select(
-          request.source_user_id!,
+      try {
+        source = await this.withClient(
           settings,
-          info.Id,
-          request.source_snapshot_id,
+          'emby',
+          async (emby) => {
+            if (!request.source_snapshot_id) {
+              if (!emby.catalogItems || !emby.migrationState)
+                throw new ServiceError(
+                  'This source client cannot perform bounded history reads. Use a saved snapshot or update the source integration.',
+                );
+              const info = await emby.systemInfo();
+              this.checkJobStopped(job);
+              if (typeof info.Id !== 'string' || !info.Id || typeof info.Version !== 'string')
+                throw new ServiceError('The Emby source identity could not be verified.');
+              const key = MigrationCatalogCache.key(
+                settings.emby_url,
+                settings.emby_api_key,
+                info.Id,
+                info.Version,
+              );
+              if (catalogContext.key && catalogContext.key !== key)
+                throw new ServiceError(
+                  'The Emby source changed during this job. Review before retrying.',
+                );
+              if (catalogContext.value)
+                this.sourceWorkload.cacheHit('catalog', catalogContext.value.items.length);
+              else
+                catalogContext.value = await this.sourceCatalogs.get(key, () =>
+                  emby.catalogItems!(),
+                );
+              catalogContext.key = key;
+              this.checkJobStopped(job);
+              const items = await emby.migrationState(
+                request.source_user_id!,
+                catalogContext.value.items,
+                scope,
+              );
+              this.checkJobStopped(job);
+              const source = await readMigrationSource(
+                emby,
+                request.source_user_id!,
+                scope,
+                items,
+                this.jobControllers.get(job.id)?.signal,
+              );
+              source.catalog = {
+                captured_at: new Date(catalogContext.value.capturedAt).toISOString(),
+                items: catalogContext.value.items.length,
+              };
+              return source;
+            }
+            const info = await emby.systemInfo();
+            if (info.Version !== '4.10.1.0' || typeof info.Id !== 'string')
+              throw new ServiceError('Emby version or identity changed. Review a new preview.');
+            const selected = await this.sourceSnapshots.select(
+              request.source_user_id!,
+              settings,
+              info.Id,
+              request.source_snapshot_id,
+            );
+            savedMetadata = selected.metadata;
+            return readMigrationSource(
+              emby,
+              request.source_user_id!,
+              scope,
+              await this.sourceSnapshots.items(
+                selected,
+                request.source_user_id!,
+                scope,
+                this.jobControllers.get(job.id)?.signal,
+              ),
+              this.jobControllers.get(job.id)?.signal,
+            );
+          },
+          this.jobControllers.get(job.id)?.signal,
         );
-        savedMetadata = selected.metadata;
-        return readMigrationSource(
-          emby,
-          request.source_user_id!,
-          scope,
-          await this.sourceSnapshots.items(selected, request.source_user_id!, scope),
+        if (this.sourceWorkload.snapshot().cooldown_remaining_ms > 0)
+          throw new MediaError(
+            'Emby source preparation stopped after a slow or rejected read. No destination changes were started for this account.',
+          );
+      } catch (error) {
+        this.checkJobStopped(job);
+        throw new SourcePreparationError(
+          error instanceof MediaError || error instanceof ServiceError
+            ? error.message
+            : 'The source data could not be prepared. Remaining accounts were not started.',
         );
-      });
+      }
       if (source.user.Id !== request.source_user_id)
         throw new ServiceError('Emby returned a different source account. Reload the user list.');
       if (savedMetadata) savedMetadata.source_username = source.user.Name;
@@ -2042,6 +2227,7 @@ export class Service {
     const result: JobResult = {
       username,
       ...(source ? { source_username: source.user.Name } : {}),
+      ...(source?.catalog ? { source_catalog: source.catalog } : {}),
       ...(savedMetadata ? { source_snapshot: savedMetadata } : {}),
       ...(mapping ? { mapping_id: mapping.id } : {}),
       status: 'running',
@@ -2061,17 +2247,23 @@ export class Service {
         scope === 'complete' &&
         (!currentTarget || this.store.account(username)?.status === 'provisioning')
       )
-        await this.withClient(settings, 'emby', async (emby) => {
-          if (!emby.userImage) return;
-          try {
-            avatar = await emby.userImage(source!.user.Id);
-          } catch {
-            migrationWarning(
-              result.data!,
-              'The source profile picture could not be read. Other account data can still migrate.',
-            );
-          }
-        });
+        await this.withClient(
+          settings,
+          'emby',
+          async (emby) => {
+            this.checkJobStopped(job);
+            if (!emby.userImage) return;
+            try {
+              avatar = await emby.userImage(source!.user.Id);
+            } catch {
+              migrationWarning(
+                result.data!,
+                'The source profile picture could not be read. Other account data can still migrate.',
+              );
+            }
+          },
+          this.jobControllers.get(job.id)?.signal,
+        );
     }
     guard();
     job.results.push(result);
@@ -2376,90 +2568,130 @@ export class Service {
   private checkStopped(): void {
     if (this.stopping) throw new StoppedError();
   }
+  private checkJobStopped(job: Job): void {
+    this.checkStopped();
+    if (job.cancel_requested || this.jobControllers.get(job.id)?.signal.aborted)
+      throw new CanceledError('Job canceled.');
+  }
+  private assertConnections(settings: Settings): void {
+    const live = this.store.settings();
+    if (
+      ['emby_url', 'emby_api_key', 'jellyfin_url', 'jellyfin_api_key'].some(
+        (key) => live[key as keyof Settings] !== settings[key as keyof Settings],
+      )
+    ) {
+      this.sourceCatalogs.clear();
+      throw new ServiceError('A media server connection changed. Review and start a new job.');
+    }
+  }
   private async run(job: Job, requests: JobRequest[], settings: Settings): Promise<void> {
     if (this.stopping || !this.store.claimQueuedJob(job.id)) return;
+    this.activeJobs.set(job.id, job);
+    const catalogContext: { key?: string; value?: MigrationCatalog } = {};
     job.status = 'running';
     job.started_at = new Date().toISOString();
     this.save(job);
     try {
-      await this.withClient(settings, 'jellyfin', async (jellyfin) => {
-        const template =
-          job.kind === 'role_update' ||
-          requests.every((request) => request.access_disabled !== undefined)
-            ? null
-            : await this.template(jellyfin, settings);
-        for (const request of requests) {
-          await this.mutationMutex.run(async () => {
-            this.checkStopped();
-            try {
-              if (request.access_disabled !== undefined) {
-                const member = this.assertMembershipRequest(request, settings);
-                if (!member || !request.discord_user_id || !request.target_user_id)
-                  throw new ServiceError('Invalid queued membership action.');
-                const link = this.store.link(request.discord_user_id, request.membership_slot);
+      this.checkJobStopped(job);
+      this.assertConnections(settings);
+      await this.withClient(
+        settings,
+        'jellyfin',
+        async (jellyfin) => {
+          const template =
+            job.kind === 'role_update' ||
+            requests.every((request) => request.access_disabled !== undefined)
+              ? null
+              : await this.template(jellyfin, settings);
+          for (const request of requests) {
+            const work = () =>
+              this.mutationMutex.run(async () => {
+                this.checkJobStopped(job);
+                try {
+                  if (request.access_disabled !== undefined) {
+                    const member = this.assertMembershipRequest(request, settings);
+                    if (!member || !request.discord_user_id || !request.target_user_id)
+                      throw new ServiceError('Invalid queued membership action.');
+                    const link = this.store.link(request.discord_user_id, request.membership_slot);
+                    if (
+                      !link ||
+                      link.remote_id !== request.target_user_id ||
+                      link.username !== request.username
+                    )
+                      throw new ServiceError(
+                        'The linked membership account changed. Review it first.',
+                      );
+                    const family =
+                      this.profiles.get('jellyfin', request.target_user_id, this.store.settings())
+                        ?.family === true;
+                    if (!family) await this.recipientIdentity(request.discord_user_id);
+                    const available = await this.updateLinkedAccess(
+                      jellyfin,
+                      settings,
+                      request.discord_user_id,
+                      request.membership_slot!,
+                      request.access_disabled,
+                      () => {
+                        this.checkJobStopped(job);
+                        this.assertMembershipRequest(request, settings);
+                      },
+                    );
+                    job.results.push({
+                      username: request.username!,
+                      target_user_id: request.target_user_id,
+                      status: available ? 'completed' : 'partial',
+                      created: false,
+                      ...(!available
+                        ? {
+                            warnings: [
+                              this.profiles.get(
+                                'jellyfin',
+                                request.target_user_id,
+                                this.store.settings(),
+                              )?.family
+                                ? 'Family account access is managed manually. The membership access change was skipped.'
+                                : 'This account was disabled outside Jellyport and remains disabled. Review it in Jellyfin.',
+                            ],
+                          }
+                        : {}),
+                    });
+                  } else if (job.kind === 'role_update')
+                    await this.oneRoleUpdate(job, request, settings, jellyfin);
+                  else await this.one(job, request, settings, jellyfin, template!, catalogContext);
+                } catch (error) {
+                  if (error instanceof StoppedError) throw error;
+                  if (!(error instanceof MediaError || error instanceof ServiceError)) throw error;
+                  job.results.push({
+                    username: request.username ?? request.source_user_id ?? '',
+                    status: 'failed',
+                    error: error.message,
+                  });
+                  if (error instanceof SourcePreparationError) throw error;
+                }
+                this.checkJobStopped(job);
                 if (
-                  !link ||
-                  link.remote_id !== request.target_user_id ||
-                  link.username !== request.username
+                  request.source_user_id &&
+                  this.sourceWorkload.snapshot().cooldown_remaining_ms > 0
                 )
-                  throw new ServiceError('The linked membership account changed. Review it first.');
-                const family =
-                  this.profiles.get('jellyfin', request.target_user_id, this.store.settings())
-                    ?.family === true;
-                if (!family) await this.recipientIdentity(request.discord_user_id);
-                const available = await this.updateLinkedAccess(
-                  jellyfin,
-                  settings,
-                  request.discord_user_id,
-                  request.membership_slot!,
-                  request.access_disabled,
-                  () => {
-                    this.checkStopped();
-                    this.assertMembershipRequest(request, settings);
-                  },
-                );
-                job.results.push({
-                  username: request.username!,
-                  target_user_id: request.target_user_id,
-                  status: available ? 'completed' : 'partial',
-                  created: false,
-                  ...(!available
-                    ? {
-                        warnings: [
-                          this.profiles.get(
-                            'jellyfin',
-                            request.target_user_id,
-                            this.store.settings(),
-                          )?.family
-                            ? 'Family account access is managed manually. The membership access change was skipped.'
-                            : 'This account was disabled outside Jellyport and remains disabled. Review it in Jellyfin.',
-                        ],
-                      }
-                    : {}),
-                });
-              } else if (job.kind === 'role_update')
-                await this.oneRoleUpdate(job, request, settings, jellyfin);
-              else await this.one(job, request, settings, jellyfin, template!);
-            } catch (error) {
-              if (error instanceof StoppedError) throw error;
-              if (!(error instanceof MediaError || error instanceof ServiceError)) throw error;
-              job.results.push({
-                username: request.username ?? request.source_user_id ?? '',
-                status: 'failed',
-                error: error.message,
+                  throw new ServiceError(
+                    'Emby migration reads stopped after a slow or rejected request. Review results and wait before retrying; remaining accounts were not started.',
+                  );
+                job.progress.processed++;
+                delete job.progress.current_user;
+                delete job.progress.phase;
+                delete job.progress.items_processed;
+                delete job.progress.items_total;
+                delete job.progress.items_updated;
+                this.save(job);
               });
-            }
-            job.progress.processed++;
-            delete job.progress.current_user;
-            delete job.progress.phase;
-            delete job.progress.items_processed;
-            delete job.progress.items_total;
-            delete job.progress.items_updated;
-            this.save(job);
-          });
-        }
-      });
-      this.checkStopped();
+            if (request.source_user_id)
+              await this.historyMutex.run(work, this.jobControllers.get(job.id)?.signal);
+            else await work();
+          }
+        },
+        this.jobControllers.get(job.id)?.signal,
+      );
+      this.checkJobStopped(job);
       const statuses = job.results.map((result) => result.status);
       job.status = statuses.every((status) => status === 'completed')
         ? 'completed'
@@ -2467,7 +2699,13 @@ export class Service {
           ? 'failed'
           : 'partial';
     } catch (error) {
-      if (error instanceof StoppedError || this.stopping) {
+      if (job.cancel_requested || error instanceof CanceledError) {
+        job.status = 'canceled';
+        job.error =
+          'Canceled. Already-applied changes were preserved; review results before rerunning.';
+        for (const result of job.results)
+          if (result.status === 'running') result.status = 'interrupted';
+      } else if (error instanceof StoppedError || this.stopping) {
         job.status = 'interrupted';
         job.error = 'App stopped during this job. Review results before starting another update.';
       } else {
@@ -2484,6 +2722,8 @@ export class Service {
   }
   async stop(): Promise<void> {
     this.stopping = true;
+    this.sourceWorkload.close();
+    this.sourceCatalogs.clear();
     await this.sourceSnapshots.stop();
     await Promise.allSettled([...this.clients].map((client) => client.close()));
     await Promise.allSettled([...this.jobTasks.values()]);

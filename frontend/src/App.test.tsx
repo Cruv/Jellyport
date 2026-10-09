@@ -182,7 +182,7 @@ async function selectAndPreview() {
   fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
   fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
-  await screen.findByText('Reading libraries and matching history… 0 of 2 users complete.');
+  await screen.findByText('Preparing migration review… 0 of 2 users complete.');
 }
 describe('React account safeguards', () => {
   it('loads editable tier defaults and only saves their definitions without provisioning accounts', async () => {
@@ -711,6 +711,52 @@ describe('React account safeguards', () => {
       discord_recipients: { 'e-river': '123456789012345678' },
     });
   });
+  it('shows deferred live history without invented zero counts and retains complete migration approval', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview'] = {
+      ...readyPreviewTask,
+      preview: {
+        migration_scope: 'complete',
+        users: readyPreviewTask.preview.users.map((user) => ({
+          ...user,
+          stats: null,
+          history_deferred: true,
+          unmatched: [],
+          ambiguous: [],
+        })),
+      },
+    };
+    responses['/api/migrations'] = { ...job, kind: 'migrate' };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    expect(
+      await screen.findByText(/Live previews check accounts without reading history/),
+    ).toBeTruthy();
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getAllByText('History details deferred')).toHaveLength(2);
+    expect(
+      within(dialog).getAllByText(
+        /Matching, history, favorites, resume positions and playlist details are read after approval/,
+      ),
+    ).toHaveLength(2);
+    expect(within(dialog).getByText(/Newer Jellyfin progress stays intact/)).toBeTruthy();
+    expect(within(dialog).queryByText('Played in Emby')).toBeNull();
+    expect(within(dialog).queryByText('Matched to Jellyfin')).toBeNull();
+    expect(within(dialog).queryByText('Unmatched')).toBeNull();
+    expect(within(dialog).queryByText('Ambiguous')).toBeNull();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
+    );
+    expect(
+      JSON.parse(
+        String(requests.find((request) => request.path === '/api/migrations')!.options?.body),
+      ).migration_scope,
+    ).toBe('complete');
+  });
+
   it('polls preview progress and only offers migration approval after the preview is ready', async () => {
     prepareRunningPreview();
     responses['/api/migrations/preview/preview-task-1'] = {
@@ -737,12 +783,12 @@ describe('React account safeguards', () => {
       ).migration_scope,
     ).toBe('complete');
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(screen.getByRole('button', { name: 'Matching history…' })).toHaveProperty(
+    expect(screen.getByRole('button', { name: 'Preparing review…' })).toHaveProperty(
       'disabled',
       true,
     );
     await screen.findByText(
-      'Reading libraries and matching history… 1 of 2 users complete.',
+      'Preparing migration review… 1 of 2 users complete.',
       {},
       { timeout: 3000 },
     );
@@ -750,7 +796,7 @@ describe('React account safeguards', () => {
     responses['/api/migrations/preview/preview-task-1'] = readyPreviewTask;
     const dialog = await screen.findByRole('dialog', {}, { timeout: 3000 });
     expect(within(dialog).getByRole('button', { name: 'Start migration' })).toBeTruthy();
-    expect(screen.queryByText(/Reading libraries and matching history/)).toBeNull();
+    expect(screen.queryByText(/Preparing migration review/)).toBeNull();
     expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
     const polls = requests.filter(
       (request) => request.path === '/api/migrations/preview/preview-task-1',
@@ -1006,7 +1052,7 @@ describe('React account safeguards', () => {
       release({ ok: true, status: 200, json: async () => readyPreviewTask } as Response);
     });
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(screen.queryByText(/Reading libraries and matching history/)).toBeNull();
+    expect(screen.queryByText(/Preparing migration review/)).toBeNull();
     expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
   });
 
@@ -1052,7 +1098,7 @@ describe('React account safeguards', () => {
       ),
     ).toBe(false);
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(screen.queryByText(/Reading libraries and matching history/)).toBeNull();
+    expect(screen.queryByText(/Preparing migration review/)).toBeNull();
   });
 
   it('cancels a known preview after a polling network error so another attempt can start', async () => {
@@ -1091,8 +1137,8 @@ describe('React account safeguards', () => {
     prepareRunningPreview();
     render(<App />);
     await selectAndPreview();
-    fireEvent.click(screen.getByRole('button', { name: 'Cancel matching' }));
-    expect(screen.queryByText(/Reading libraries and matching history/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel preview' }));
+    expect(screen.queryByText(/Preparing migration review/)).toBeNull();
     expect(screen.getByRole('button', { name: 'Preview migration (2)' })).toHaveProperty(
       'disabled',
       false,
@@ -1224,6 +1270,63 @@ describe('React account safeguards', () => {
       mapping_revisions: { complex: 'approved-revision' },
     });
   });
+  it('cancels queued jobs, updates their displayed status and keeps completed-change guidance explicit', async () => {
+    responses['/api/jobs/job-1'] = { ...job, status: 'queued', results: [] };
+    responses['/api/jobs/job-1/cancel'] = { ...job, status: 'canceled', results: [] };
+    const dialog = await openJob();
+    expect(
+      within(dialog).getByText(
+        /Changes already applied to media accounts are kept and are not rolled back/,
+      ),
+    ).toBeTruthy();
+    expect(within(dialog).getByText(/Review the results before rerunning/)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel job' }));
+    expect(await within(dialog).findByText('Canceled')).toBeTruthy();
+    expect(within(dialog).queryByRole('button', { name: 'Cancel job' })).toBeNull();
+    const cancellation = requests.find((request) => request.path === '/api/jobs/job-1/cancel')!;
+    expect(cancellation.options?.method).toBe('POST');
+    expect((cancellation.options?.headers as Record<string, string>)['X-CSRF-Token']).toBe(
+      'test-csrf',
+    );
+    expect(JSON.parse(String(cancellation.options?.body))).toEqual({});
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close' }));
+    expect(screen.getByText('Canceled')).toBeTruthy();
+  });
+  it('shows cancellation draining for running jobs and prevents duplicate requests', async () => {
+    responses['/api/jobs/job-1'] = { ...job, status: 'running', results: [] };
+    responses['/api/jobs/job-1/cancel'] = {
+      ...job,
+      status: 'running',
+      cancel_requested: true,
+      results: [],
+    };
+    const dialog = await openJob();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel job' }));
+    const canceling = await within(dialog).findByRole('button', { name: 'Canceling…' });
+    await waitFor(() => expect(canceling).toHaveProperty('disabled', true));
+    fireEvent.click(canceling);
+    expect(requests.filter((request) => request.path === '/api/jobs/job-1/cancel')).toHaveLength(1);
+    expect(within(dialog).getByText('In progress')).toBeTruthy();
+    expect(
+      await screen.findByText(
+        'Cancellation requested. Completed changes are kept; review results before rerunning.',
+      ),
+    ).toBeTruthy();
+  });
+  it('leaves the active job available for retry if its cancellation fails', async () => {
+    responses['/api/jobs/job-1'] = { ...job, status: 'running', results: [] };
+    responses['/api/jobs/job-1/cancel'] = { detail: 'Cancellation could not be confirmed.' };
+    statuses['/api/jobs/job-1/cancel'] = 503;
+    const dialog = await openJob();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel job' }));
+    await screen.findByText('Cancellation could not be confirmed.');
+    expect(within(dialog).getByRole('button', { name: 'Cancel job' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(within(dialog).getByText('In progress')).toBeTruthy();
+  });
+
   it('reports detailed migration results and escapes source names and warnings', async () => {
     responses['/api/jobs/job-1'] = {
       ...job,

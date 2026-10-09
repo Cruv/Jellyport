@@ -59,7 +59,7 @@ export function adminAlertReceiptId(generation: string, source: AdminAlertSource
 }
 const ADMIN_ALERT_SOURCES = `
   SELECT 'job' AS kind,id,json_extract(payload,'$.status') AS status FROM jobs
-  WHERE json_extract(payload,'$.status') IN ('completed','partial','failed','interrupted','cancelled')
+  WHERE json_extract(payload,'$.status') IN ('completed','partial','failed','interrupted','cancelled','canceled')
   UNION ALL
   SELECT 'subscription' AS kind,id,json_extract(payload,'$.status') AS status FROM subscriptions
   WHERE json_extract(payload,'$.status') IN ('pending','failed')`;
@@ -424,6 +424,20 @@ export class Store {
           row.encrypted as Uint8Array,
         ),
       }));
+  }
+  cancelQueuedJob(id: string): Job | null {
+    return this.transaction(() => {
+      const job = this.job(id);
+      if (!job || job.status !== 'queued') return null;
+      job.status = 'canceled';
+      job.cancel_requested = true;
+      job.updated_at = new Date().toISOString();
+      job.finished_at = job.updated_at;
+      job.error = 'Canceled before account work began.';
+      this.saveJob(job);
+      this.db.prepare('DELETE FROM job_queue WHERE job_id=?').run(id);
+      return job;
+    });
   }
   claimQueuedJob(id: string): boolean {
     return this.transaction(() => {

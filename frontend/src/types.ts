@@ -129,6 +129,7 @@ export interface ItemIssue {
   candidate_ids?: string[];
 }
 export interface JobResult {
+  source_catalog?: { captured_at: string; items: number };
   source_snapshot?: SourceSnapshotMetadata;
   username?: string;
   source_username?: string;
@@ -188,7 +189,7 @@ export interface JobProgress {
 }
 export type MigrationScope = 'complete' | 'watched_only';
 export interface SourceSnapshotMetadata {
-  source_type?: 'sqlite_online_backup';
+  source_type?: 'sqlite_online_backup' | 'file_copy';
   schema?: string;
   id: string;
   source_server_url: string;
@@ -216,7 +217,7 @@ export interface SourceSnapshotConfig {
 }
 export interface SourceSnapshotStatus {
   available?: boolean;
-  capture_method?: 'sqlite_online_backup';
+  capture_method?: 'sqlite_online_backup' | 'file_copy';
   config: SourceSnapshotConfig;
   running: boolean;
   last_attempt_at: string | null;
@@ -242,6 +243,7 @@ export interface Job {
   error?: string;
   progress?: number | JobProgress;
   migration_scope?: MigrationScope;
+  cancel_requested?: boolean;
 }
 export interface Overview {
   counts: { emby_users?: number; jellyfin_users?: number; jobs?: number };
@@ -260,6 +262,7 @@ export interface PreviewUser {
   discord_username?: string | null;
   warnings?: string[];
   target_exists: boolean;
+  history_deferred?: boolean;
   stats: {
     source_played?: number;
     matched?: number;
@@ -270,7 +273,7 @@ export interface PreviewUser {
     source_favorites?: number;
     source_resume?: number;
     source_playlists?: number;
-  };
+  } | null;
   unmatched?: ItemIssue[];
   ambiguous?: ItemIssue[];
 }

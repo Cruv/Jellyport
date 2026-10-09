@@ -8,6 +8,12 @@ export const snapshotId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{
 export const SNAPSHOT_VERSION = '4.10.1.0';
 export const MAX_SNAPSHOT_BYTES = 8 * 1024 ** 3;
 export const CAPTURE_DEADLINE = 5 * 60_000;
+export type SnapshotCaptureMethod = 'sqlite_online_backup' | 'file_copy';
+export function snapshotCaptureMethod(value: unknown): SnapshotCaptureMethod {
+  if (value === undefined || value === 'sqlite_online_backup') return 'sqlite_online_backup';
+  if (value === 'file_copy') return 'file_copy';
+  throw new Error('Unsupported snapshot capture method.');
+}
 const aad = Buffer.from('Jellyport SQLite snapshot v1');
 
 export async function regular(path: string): Promise<void> {
@@ -123,6 +129,7 @@ export interface CaptureRequest {
   requested_at: string;
   binding: SnapshotBinding;
   user_ids?: string[];
+  capture_method?: SnapshotCaptureMethod;
 }
 export interface CaptureResult extends CaptureRequest {
   ok: boolean;
@@ -160,6 +167,9 @@ function recoveredRequest(value: CaptureRequest, id: string): CaptureRequest {
       server_id: value.binding.server_id,
       version: SNAPSHOT_VERSION,
     },
+    ...(value.capture_method === undefined
+      ? {}
+      : { capture_method: snapshotCaptureMethod(value.capture_method) }),
     ...(value.user_ids === undefined ? {} : { user_ids: value.user_ids }),
   };
 }
@@ -176,6 +186,8 @@ async function completedCapture(
       value.requested_at !== request.requested_at ||
       value.binding.url !== request.binding.url ||
       value.binding.server_id !== request.binding.server_id ||
+      snapshotCaptureMethod(value.capture_method) !==
+        snapshotCaptureMethod(request.capture_method) ||
       typeof value.ok !== 'boolean' ||
       !Number.isFinite(Date.parse(value.started_at)) ||
       !Number.isFinite(Date.parse(value.finished_at)) ||

@@ -161,6 +161,7 @@ export interface SourcePlaylist {
   error?: string;
 }
 export interface SourceSnapshot {
+  catalog?: { captured_at: string; items: number };
   user: MediaUser;
   items: MediaItem[];
   playlists: SourcePlaylist[];
@@ -212,15 +213,17 @@ export async function readMigrationSource(
   sourceId: string,
   scope: MigrationScope = 'complete',
   savedItems?: MediaItem[],
+  signal?: AbortSignal,
 ): Promise<SourceSnapshot> {
+  if (!Array.isArray(savedItems))
+    throw new ServiceError(
+      'Prepared source history is required. Read bounded user state or a saved snapshot before migration.',
+    );
+  const check = () => signal?.throwIfAborted();
+  check();
   const user = await emby.user(sourceId);
-  const items =
-    savedItems ??
-    (await (scope === 'watched_only' && emby.watchedItems
-      ? emby.watchedItems(sourceId)
-      : emby.migrationItems
-        ? emby.migrationItems(sourceId)
-        : emby.items(sourceId)));
+  check();
+  const items = savedItems;
   const result: SourceSnapshot = { user, items, playlists: [], warnings: [] };
   if (scope === 'watched_only') return result;
   if (!emby.playlists || !emby.playlistItems) {
@@ -228,15 +231,28 @@ export async function readMigrationSource(
     return result;
   }
   try {
+    check();
     const playlists = await emby.playlists(sourceId);
+    check();
     if (playlists.length > 500)
       result.warnings.push(
         'Only the first 500 source playlists were read. Remaining playlists were skipped.',
       );
     let total = 0;
+    let retainedBytes = 0;
     for (const playlist of playlists.slice(0, 500)) {
+      check();
       try {
         const entries = await emby.playlistItems(playlist.Id, sourceId);
+        check();
+        retainedBytes += Buffer.byteLength(JSON.stringify(playlist));
+        for (const item of entries) {
+          retainedBytes += Buffer.byteLength(JSON.stringify(item));
+          if (retainedBytes > 32 * 1024 * 1024)
+            throw new ServiceError(
+              'The source playlists exceed the supported memory budget. No destination changes were started.',
+            );
+        }
         if (entries.length > 100_000 - total) {
           result.warnings.push(
             'The total source playlist limit of 100,000 entries was reached. Remaining playlists were skipped.',
@@ -245,7 +261,9 @@ export async function readMigrationSource(
         }
         total += entries.length;
         result.playlists.push({ playlist, items: entries });
-      } catch {
+      } catch (error) {
+        check();
+        if (error instanceof ServiceError) throw error;
         result.playlists.push({
           playlist,
           items: [],
@@ -253,7 +271,9 @@ export async function readMigrationSource(
         });
       }
     }
-  } catch {
+  } catch (error) {
+    check();
+    if (error instanceof ServiceError) throw error;
     result.warnings.push('Source playlists could not be read; library data can still migrate.');
   }
   return result;

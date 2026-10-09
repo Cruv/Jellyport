@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, writeFile, utimes } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Store, DEFAULT_SETTINGS } from '../server/store.js';
@@ -186,6 +186,21 @@ it('requests an encrypted capture bound to verified source identity and its publ
   expect(await f.manager.status()).toMatchObject({ available: true, running: true, snapshots: 0 });
   await expect(f.manager.refresh()).rejects.toThrow('already running');
   expect(f.factory).toHaveBeenCalledOnce();
+});
+
+it('collects stale unfinished ciphertext while preserving recent work and the last completed capture', async () => {
+  const f = await fixture();
+  const completed = await f.complete();
+  const stale = join(f.shared, `${randomUUID()}.db.enc.pending`);
+  const recent = join(f.shared, `${randomUUID()}.db.enc.pending`);
+  await writeFile(stale, 'unfinished-stale-ciphertext');
+  await writeFile(recent, 'unfinished-recent-ciphertext');
+  const past = new Date(Date.now() - 21 * 60_000);
+  await utimes(stale, past, past);
+  await f.manager.refresh();
+  await expect(stat(stale)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(await readFile(recent, 'utf8')).toBe('unfinished-recent-ciphertext');
+  expect((await stat(join(f.shared, `${completed.id}.db.enc`))).isFile()).toBe(true);
 });
 
 it('fails closed for stale helpers, unsupported server versions and unsupported public user IDs', async () => {

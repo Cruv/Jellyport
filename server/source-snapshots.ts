@@ -534,7 +534,7 @@ export class SourceSnapshots {
     this.save();
     // Failed/interrupted helper output is not an unbounded archive. Never touch current work.
     for (const name of await readdir(this.directory)) {
-      const match = /^([a-f0-9-]{36})\.(db\.enc|result|request|working)$/.exec(name);
+      const match = /^([a-f0-9-]{36})\.(db\.enc(?:\.pending)?|result|request|working)$/.exec(name);
       if (
         !match ||
         !snapshotId.test(match[1]!) ||

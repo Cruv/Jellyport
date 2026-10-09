@@ -1268,9 +1268,12 @@ describe('React account safeguards', () => {
     expect(dialog.querySelector('script,img')).toBeNull();
   });
   it('closes mobile navigation when moving to a page and dismisses private dialogs with Escape', async () => {
-    await openJob();
-    fireEvent.keyDown(document, { key: 'Escape' });
-    expect(screen.queryByRole('dialog')).toBeNull();
+    const dialog = await openJob();
+    // The DOM can be visible before the modal's focus and keyboard effects have run.
+    const close = within(dialog).getByRole('button', { name: 'Close dialog' });
+    await waitFor(() => expect(document.activeElement).toBe(close));
+    fireEvent.keyDown(close, { key: 'Escape' });
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     const toggle = screen.getByRole('button', { name: 'Toggle navigation' });
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');

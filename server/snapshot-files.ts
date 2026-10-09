@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { lstat, mkdir, readFile, rename, writeFile, rm } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, rename, writeFile, rm } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { join } from 'node:path';
 
@@ -133,4 +133,120 @@ export interface CaptureResult extends CaptureRequest {
   schema?: string;
   identities?: Record<string, number>;
   error?: string;
+}
+
+function recoveredRequest(value: CaptureRequest, id: string): CaptureRequest {
+  if (
+    !value ||
+    value.id !== id ||
+    typeof value.requested_at !== 'string' ||
+    !Number.isFinite(Date.parse(value.requested_at)) ||
+    typeof value.binding?.url !== 'string' ||
+    !value.binding.url ||
+    typeof value.binding.server_id !== 'string' ||
+    !value.binding.server_id ||
+    value.binding.version !== SNAPSHOT_VERSION ||
+    (value.user_ids !== undefined &&
+      (!Array.isArray(value.user_ids) ||
+        value.user_ids.length > 1000 ||
+        value.user_ids.some((user) => typeof user !== 'string' || !/^[a-f0-9]{32}$/.test(user))))
+  )
+    throw new Error('Invalid interrupted capture request.');
+  return {
+    id,
+    requested_at: value.requested_at,
+    binding: {
+      url: value.binding.url,
+      server_id: value.binding.server_id,
+      version: SNAPSHOT_VERSION,
+    },
+    ...(value.user_ids === undefined ? {} : { user_ids: value.user_ids }),
+  };
+}
+
+async function completedCapture(
+  directory: string,
+  request: CaptureRequest,
+  key: Buffer,
+): Promise<boolean> {
+  try {
+    const value = await readEnvelope<CaptureResult>(join(directory, `${request.id}.result`), key);
+    recoveredRequest(value, request.id);
+    if (
+      value.requested_at !== request.requested_at ||
+      value.binding.url !== request.binding.url ||
+      value.binding.server_id !== request.binding.server_id ||
+      typeof value.ok !== 'boolean' ||
+      !Number.isFinite(Date.parse(value.started_at)) ||
+      !Number.isFinite(Date.parse(value.finished_at)) ||
+      Date.parse(value.finished_at) < Date.parse(value.started_at)
+    )
+      return false;
+    if (!value.ok) return typeof value.error === 'string';
+    if (
+      value.schema !== 'emby-4.10.1.0' ||
+      !Number.isSafeInteger(value.bytes) ||
+      value.bytes! < 1 ||
+      value.bytes! > MAX_SNAPSHOT_BYTES ||
+      !value.identities ||
+      Array.isArray(value.identities) ||
+      typeof value.identities !== 'object' ||
+      Object.entries(value.identities).some(
+        ([user, local]) =>
+          !/^[a-f0-9]{32}$/.test(user) || !Number.isSafeInteger(local) || local < 1,
+      ) ||
+      request.user_ids?.some((user) => !Object.hasOwn(value.identities!, user))
+    )
+      return false;
+    const path = join(directory, `${request.id}.db.enc`);
+    await regular(path);
+    return (await lstat(path)).size === value.bytes! + 28;
+  } catch {
+    return false;
+  }
+}
+
+/** Recover only artifacts owned by the previous helper; queued requests remain untouched. */
+export async function recoverSnapshotHelper(directory: string, key: Buffer): Promise<void> {
+  for (const name of await readdir(directory)) {
+    const match = /^([a-f0-9-]{36})\.(db\.enc\.pending|working)$/.exec(name);
+    if (!match || !snapshotId.test(match[1]!)) continue;
+    const path = join(directory, name);
+    let info;
+    try {
+      info = await lstat(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    // Unlinking a symlink is safe; never follow it or recursively remove directories.
+    if (!info.isFile() && !info.isSymbolicLink()) continue;
+    if (match[2] === 'db.enc.pending') {
+      await rm(path, { force: true });
+      continue;
+    }
+    let request: CaptureRequest;
+    try {
+      request = recoveredRequest(await readEnvelope<CaptureRequest>(path, key), match[1]!);
+    } catch {
+      await rm(path, { force: true });
+      continue;
+    }
+    if (!(await completedCapture(directory, request, key))) {
+      const now = new Date().toISOString();
+      await writeEnvelope(
+        join(directory, `${request.id}.result`),
+        {
+          ...request,
+          ok: false,
+          started_at: now,
+          finished_at: now,
+          error:
+            'Database capture was interrupted. The last good capture is preserved. Capture Emby again.',
+        } satisfies CaptureResult,
+        key,
+      );
+    }
+    await rm(path, { force: true });
+  }
 }

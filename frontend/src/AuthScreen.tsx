@@ -4,6 +4,8 @@ import { type Api, type Session, type SetupConnection } from './types';
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : 'The operation could not be completed.';
+const requiresHttpsSignIn = (session: Session | null) =>
+  !!session?.secure_cookie && !session.setup_required && globalThis.location.protocol === 'http:';
 
 export default function AuthScreen({
   session,
@@ -25,6 +27,7 @@ export default function AuthScreen({
   const requestVersion = useRef(0);
   const secretField = useRef<HTMLInputElement | null>(null);
   const setup = !!session?.setup_required;
+  const httpsRequired = requiresHttpsSignIn(session);
   const templates = (connection?.templates || []).filter(
     (user) => !user.Policy?.IsAdministrator && !user.Policy?.IsDisabled,
   );
@@ -41,7 +44,12 @@ export default function AuthScreen({
     return () => {
       if (field) field.value = '';
     };
-  }, [session?.csrf_token, session?.setup_required, session?.authenticated]);
+  }, [
+    session?.csrf_token,
+    session?.setup_required,
+    session?.authenticated,
+    session?.secure_cookie,
+  ]);
   useEffect(() => {
     if (session) return;
     const controller = new AbortController();
@@ -99,7 +107,7 @@ export default function AuthScreen({
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (busyRef.current) return;
+    if (busyRef.current || httpsRequired) return;
     const form = event.currentTarget;
     const data = new FormData(form);
     const body = setup
@@ -135,7 +143,7 @@ export default function AuthScreen({
         if (requestVersion.current !== version) return;
         // A retained cookie after failed sign-out supplies CSRF, not renewed console access.
         onSession({ ...anonymous, authenticated: false, user: undefined });
-        if (anonymous.setup_required) return;
+        if (anonymous.setup_required || requiresHttpsSignIn(anonymous)) return;
         const value = await api<Session>('/api/login', { method: 'POST', body });
         if (requestVersion.current !== version) return;
         if (!value.authenticated)
@@ -243,14 +251,18 @@ export default function AuthScreen({
             ? connection
               ? 'Choose account permissions'
               : 'Connect your Jellyfin server'
-            : 'Welcome back'}
+            : httpsRequired
+              ? 'HTTPS is required for sign-in'
+              : 'Welcome back'}
         </h1>
         <p>
           {setup
             ? connection
               ? 'New accounts will copy the permissions of your template user.'
               : 'Create an API key in Jellyfin, then paste it here to link your server.'
-            : 'Sign in with your Jellyfin administrator account to manage your community.'}
+            : httpsRequired
+              ? 'Jellyport uses secure sign-in cookies. Open your HTTPS reverse-proxy address to continue.'
+              : 'Sign in with your Jellyfin administrator account to manage your community.'}
         </p>
         {setup && (
           <div className="setup-progress" aria-label="Setup progress">
@@ -265,7 +277,9 @@ export default function AuthScreen({
         )}
         {setupComplete && !setup && (
           <div className="setup-server mb-17" role="status">
-            Setup complete. Sign in with your Jellyfin administrator account to continue.
+            {httpsRequired
+              ? 'Setup complete. Your server connection has been saved.'
+              : 'Setup complete. Sign in with your Jellyfin administrator account to continue.'}
           </div>
         )}
         {busy === 'resume' || busy === 'session' ? (
@@ -282,7 +296,7 @@ export default function AuthScreen({
               Retry connection
             </button>
           </div>
-        ) : connection ? (
+        ) : httpsRequired ? null : connection ? (
           <form key="permissions" className="form-stack" onSubmit={complete}>
             <div className="setup-server">
               <Icon name="jellyfin" />

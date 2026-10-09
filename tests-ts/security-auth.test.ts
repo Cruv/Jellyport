@@ -14,7 +14,7 @@ afterEach(async () => {
   }
 });
 
-async function fixture(demo = false, allowedHosts: string[] = []) {
+async function fixture(demo = false, allowedHosts: string[] = [], secureCookie = false) {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-security-'));
   const identity = {
     serverId: 'server',
@@ -23,25 +23,30 @@ async function fixture(demo = false, allowedHosts: string[] = []) {
     accessToken: 'private-interactive-token',
   };
   let authentications = 0;
+  let signOuts = 0;
   const authClient: JellyfinAuthentication = {
     authenticate: async () => {
       authentications++;
       return identity;
     },
     validateSession: async () => identity,
-    signOut: async () => {},
+    signOut: async () => {
+      signOuts++;
+    },
     validateApiKey: async () => {
       authentications++;
       return { serverId: identity.serverId, apiKeyName: 'test API key' };
     },
   };
-  const app = await createApp({ dataDir: directory, demo, allowedHosts, authClient });
+  const app = await createApp({ dataDir: directory, demo, allowedHosts, secureCookie, authClient });
   resources.push({ app, directory });
-  return { app, authentications: () => authentications };
+  return { app, authentications: () => authentications, signOuts: () => signOuts };
 }
 
 function browser(response: Awaited<ReturnType<JellyportApp['inject']>>) {
-  const cookie = response.cookies.find((item) => item.name === 'jellyport_session')!;
+  const cookie =
+    response.cookies.find((item) => item.name === 'jellyport_setup_session' && item.value) ??
+    response.cookies.find((item) => item.name === 'jellyport_session' && item.value)!;
   return {
     cookie: `${cookie.name}=${cookie.value}`,
     'x-csrf-token': response.json().csrf_token as string,
@@ -122,41 +127,112 @@ describe('request boundaries', () => {
     expect(authentications()).toBe(0);
   });
 
-  it('requires a private connection and local Host for first pairing, including behind a proxy', async () => {
-    const { app, authentications } = await fixture(false, ['portal.example.com']);
+  it.each([false, true])(
+    'requires a private connection and local Host for first pairing with secureCookie=%s, including behind a proxy',
+    async (secureCookie) => {
+      const { app, authentications, signOuts } = await fixture(
+        false,
+        ['portal.example.com'],
+        secureCookie,
+      );
+      const initial = await app.inject('/api/session');
+      const headers = browser(initial);
+      for (const connection of [
+        { remoteAddress: '203.0.113.7', headers },
+        { remoteAddress: '203.0.113.7', headers: { ...headers, 'x-forwarded-for': '127.0.0.1' } },
+        { remoteAddress: '192.168.1.2', headers: { ...headers, host: 'portal.example.com' } },
+        {
+          remoteAddress: '192.168.1.2',
+          headers: { ...headers, host: 'portal.example.com', 'x-forwarded-host': 'localhost' },
+        },
+        {
+          remoteAddress: '203.0.113.7',
+          headers: {
+            ...headers,
+            'x-forwarded-for': '127.0.0.1',
+            'x-forwarded-host': 'localhost',
+            'x-forwarded-proto': 'http',
+          },
+        },
+      ]) {
+        const session = await app.inject({ url: '/api/session', ...connection });
+        expect(session.statusCode).toBe(403);
+        expect(session.cookies).toHaveLength(0);
+        const connect = await app.inject({
+          method: 'POST',
+          url: '/api/setup/connect',
+          ...connection,
+          payload: {
+            jellyfin_url: 'http://192.168.1.3:8096',
+            api_key: 'private-supplied-key',
+          },
+        });
+        expect(connect.statusCode).toBe(403);
+        expect(connect.cookies).toHaveLength(0);
+        expect(connect.body).not.toContain('private-supplied-key');
+        const logout = await app.inject({ method: 'POST', url: '/api/logout', ...connection });
+        expect(logout.statusCode).toBe(403);
+        expect(logout.cookies).toHaveLength(0);
+      }
+      expect(authentications()).toBe(0);
+      expect(signOuts()).toBe(0);
+      expect(app.jellyport.store.authState()?.kind).toBe('pending');
+      expect(
+        (
+          await app.inject({
+            url: '/api/session',
+            remoteAddress: '192.168.1.2',
+            headers: { host: '192.168.1.3:8057' },
+          })
+        ).statusCode,
+      ).toBe(200);
+    },
+  );
+
+  it('keeps local bootstrap cookies subject to CSRF and browser origin checks', async () => {
+    const { app, authentications } = await fixture(false, [], true);
     const initial = await app.inject('/api/session');
-    const headers = browser(initial);
-    for (const connection of [
-      { remoteAddress: '203.0.113.7', headers },
-      { remoteAddress: '203.0.113.7', headers: { ...headers, 'x-forwarded-for': '127.0.0.1' } },
-      { remoteAddress: '192.168.1.2', headers: { ...headers, host: 'portal.example.com' } },
+    expect(initial.json().secure_cookie).toBe(true);
+    const setupCookie = initial.cookies.find((cookie) => cookie.name === 'jellyport_setup_session');
+    expect(setupCookie).toMatchObject({ path: '/api', httpOnly: true, sameSite: 'Strict' });
+    expect(setupCookie?.secure).not.toBe(true);
+    const requestHeaders = browser(initial);
+    for (const headers of [
+      { cookie: requestHeaders.cookie },
+      { ...requestHeaders, 'x-csrf-token': 'incorrect' },
+      { ...requestHeaders, origin: 'https://other.example' },
+      { ...requestHeaders, origin: 'null' },
+      { ...requestHeaders, 'sec-fetch-site': 'cross-site' },
     ]) {
-      const session = await app.inject({ url: '/api/session', ...connection });
-      expect(session.statusCode).toBe(403);
-      expect(session.cookies).toHaveLength(0);
-      const connect = await app.inject({
+      const response = await app.inject({
         method: 'POST',
         url: '/api/setup/connect',
-        ...connection,
-        payload: {
-          jellyfin_url: 'http://192.168.1.3:8096',
-          api_key: 'private-supplied-key',
-        },
+        headers,
+        payload: { jellyfin_url: 'http://jellyfin:8096', api_key: 'private-supplied-key' },
       });
-      expect(connect.statusCode).toBe(403);
-      expect(connect.body).not.toContain('private-supplied-key');
+      expect(response.statusCode).toBe(403);
+      expect(response.cookies).toHaveLength(0);
+      expect(response.body).not.toContain('private-supplied-key');
     }
     expect(authentications()).toBe(0);
-    expect(app.jellyport.store.authState()?.kind).toBe('pending');
-    expect(
-      (
-        await app.inject({
-          url: '/api/session',
-          remoteAddress: '192.168.1.2',
-          headers: { host: '192.168.1.3:8057' },
-        })
-      ).statusCode,
-    ).toBe(200);
+  });
+
+  it('does not issue an HTTP bootstrap cookie for demo administrator sessions', async () => {
+    const { app } = await fixture(true, [], true);
+    const response = await app.inject('/api/session');
+    expect(response.json()).toMatchObject({
+      demo: true,
+      setup_required: false,
+      secure_cookie: true,
+    });
+    expect(response.cookies.find((cookie) => cookie.name === 'jellyport_session')).toMatchObject({
+      secure: true,
+      httpOnly: true,
+      sameSite: 'Strict',
+    });
+    expect(response.cookies.some((cookie) => cookie.name === 'jellyport_setup_session')).toBe(
+      false,
+    );
   });
 
   it('rejects different origins and cross-site requests even with a valid cookie and CSRF token', async () => {
@@ -201,51 +277,64 @@ describe('request boundaries', () => {
     ).toBe(200);
   });
 
-  it('allows a configured installation to sign in through an explicitly allowed HTTPS proxy', async () => {
-    const { app } = await fixture(false, ['portal.example.com']);
-    const state = app.jellyport.store.authState();
-    if (state?.kind !== 'pending') throw new Error('Expected fresh state');
-    app.jellyport.store.completeAuth(
-      state.generation,
-      {
-        kind: 'configured',
-        serverId: 'server',
-        serverUrl: 'https://jellyfin.example.com',
-        apiKeyName: 'Jellyport',
-      },
-      (settings) => ({
-        ...settings,
-        jellyfin_url: 'https://jellyfin.example.com',
-        jellyfin_api_key: 'private-service-key',
-      }),
-    );
-    const host = { host: 'portal.example.com', origin: 'https://portal.example.com' };
-    const initial = await app.inject({
-      url: '/api/session',
-      headers: host,
-      remoteAddress: '203.0.113.7',
-    });
-    expect(initial.statusCode).toBe(200);
-    const signedIn = await app.inject({
-      method: 'POST',
-      url: '/api/login',
-      headers: { ...host, ...browser(initial) },
-      payload: { username: 'Administrator', password: 'private-password' },
-    });
-    expect(signedIn.statusCode).toBe(200);
-    const dto = signedIn.json();
-    expect(dto.user).toEqual({ id: 'admin', name: 'Administrator' });
-    for (const secret of [
-      'private-interactive-token',
-      'private-service-key',
-      'private-password',
-      signedIn.cookies[0]!.value,
-    ])
-      expect(signedIn.body).not.toContain(secret);
-    expect(signedIn.headers['cache-control']).toBe('no-store');
-    expect(signedIn.headers['set-cookie']).toContain('HttpOnly');
-    expect(signedIn.headers['set-cookie']).toContain('SameSite=Strict');
-  });
+  it.each([false, true])(
+    'allows a configured installation to sign in through an explicitly allowed HTTPS proxy with secureCookie=%s',
+    async (secureCookie) => {
+      const { app } = await fixture(false, ['portal.example.com'], secureCookie);
+      const state = app.jellyport.store.authState();
+      if (state?.kind !== 'pending') throw new Error('Expected fresh state');
+      app.jellyport.store.completeAuth(
+        state.generation,
+        {
+          kind: 'configured',
+          serverId: 'server',
+          serverUrl: 'https://jellyfin.example.com',
+          apiKeyName: 'Jellyport',
+        },
+        (settings) => ({
+          ...settings,
+          jellyfin_url: 'https://jellyfin.example.com',
+          jellyfin_api_key: 'private-service-key',
+        }),
+      );
+      const host = { host: 'portal.example.com', origin: 'https://portal.example.com' };
+      const initial = await app.inject({
+        url: '/api/session',
+        headers: host,
+        remoteAddress: '203.0.113.7',
+      });
+      expect(initial.statusCode).toBe(200);
+      expect(initial.json().secure_cookie).toBe(secureCookie);
+      expect(initial.cookies.some((cookie) => cookie.name === 'jellyport_setup_session')).toBe(
+        false,
+      );
+      const signedIn = await app.inject({
+        method: 'POST',
+        url: '/api/login',
+        headers: { ...host, ...browser(initial) },
+        payload: { username: 'Administrator', password: 'private-password' },
+      });
+      expect(signedIn.statusCode).toBe(200);
+      const dto = signedIn.json();
+      expect(dto.user).toEqual({ id: 'admin', name: 'Administrator' });
+      for (const secret of [
+        'private-interactive-token',
+        'private-service-key',
+        'private-password',
+        signedIn.cookies[0]!.value,
+      ])
+        expect(signedIn.body).not.toContain(secret);
+      expect(signedIn.headers['cache-control']).toBe('no-store');
+      expect(signedIn.headers['set-cookie']).toContain('HttpOnly');
+      expect(signedIn.headers['set-cookie']).toContain('SameSite=Strict');
+      expect(signedIn.cookies.find((cookie) => cookie.name === 'jellyport_session')?.secure).toBe(
+        secureCookie || undefined,
+      );
+      expect(signedIn.cookies.some((cookie) => cookie.name === 'jellyport_setup_session')).toBe(
+        false,
+      );
+    },
+  );
 });
 
 describe('session capacity and private data', () => {

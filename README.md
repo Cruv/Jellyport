@@ -25,7 +25,7 @@ services:
     user: "1000:1000" # Host UID:GID.
     environment:
       - JELLYPORT_DATA_DIR=/data
-      - JELLYPORT_SECURE_COOKIE=false # Set true for HTTPS.
+      - JELLYPORT_SECURE_COOKIE=false # Set true for browser HTTPS; local setup still works.
       - JELLYPORT_ALLOWED_HOSTS=${JELLYPORT_ALLOWED_HOSTS:-} # Optional proxy/custom DNS hostnames.
       - TZ=Etc/UTC # Optional.
     volumes:
@@ -52,9 +52,11 @@ sudo install -d -m 700 -o 1000 -g 1000 /path/to/jellyport
 
 `user: "1000:1000"` sets the real process UID and GID; change it and the directory owner together if your host uses different IDs. Jellyport does not use `PUID` or `PGID` environment variables.
 
-Create a dedicated API key in Jellyfin's **Dashboard → Advanced → API Keys** first, then open `http://YOUR_LAN_IP:8000` or `http://localhost:8000` and complete the setup wizard with your Jellyfin server URL and that key. Set the public Jellyfin URL; selecting a legacy template user is optional. After setup, sign in with an enabled Jellyfin administrator account, then choose a saved default account role or a template before creating or migrating accounts. Initial pairing requires both a private connection source and a local hostname or private IP address; complete it before exposing any reverse proxy. The first qualifying visitor can pair the installation.
+Create a dedicated API key in Jellyfin's **Dashboard → Advanced → API Keys** first, then open `http://YOUR_LAN_IP:8000` or `http://localhost:8000` and complete the setup wizard with your Jellyfin server URL and that key. Set the public Jellyfin URL; selecting a legacy template user is optional. Initial pairing requires both a private connection source and a local hostname or private IP address; complete it before exposing any reverse proxy. The first qualifying visitor can pair the installation.
 
-For HTTPS through a reverse proxy, set `JELLYPORT_SECURE_COOKIE=true` and add its hostname to `JELLYPORT_ALLOWED_HOSTS`, for example `jellyport.example.com` (comma-separated hostnames, without schemes or ports). Preserve the browser's Host header. IP literals, single-label local names, and `.local`, `.localhost`, or `.home.arpa` names work by default. A public hostname cannot perform initial pairing. Use [examples/compose.shared-network.yaml](examples/compose.shared-network.yaml) when joining an existing media-server network from a separate stack; set `JELLYPORT_MEDIA_NETWORK` to the actual Docker network name. Jellyport connects through server APIs and only needs its own `/data` mount. It does not need access to media files or the Jellyfin configuration directory.
+For browser access through HTTPS, set `JELLYPORT_SECURE_COOKIE=true` and add the reverse-proxy hostname to `JELLYPORT_ALLOWED_HOSTS`, for example `jellyport.example.com` (comma-separated hostnames, without schemes or ports). You can set these before first deployment: the local wizard uses a separate setup-only cookie that works over HTTP and is cleared when pairing finishes. Then open the HTTPS address and sign in with an enabled Jellyfin administrator account. The administrator session still requires HTTPS when secure cookies are enabled. For an HTTP-only installation, leave the setting `false`. Choose a saved default account role or a template before creating or migrating accounts.
+
+Preserve the browser's Host header. IP literals, single-label local names, and `.local`, `.localhost`, or `.home.arpa` names work by default. A public hostname cannot perform initial pairing. Use [examples/compose.shared-network.yaml](examples/compose.shared-network.yaml) when joining an existing media-server network from a separate stack; set `JELLYPORT_MEDIA_NETWORK` to the actual Docker network name. Jellyport connects through server APIs and only needs its own `/data` mount. It does not need access to media files or the Jellyfin configuration directory.
 
 Use HTTPS or an encrypted VPN to protect API keys, administrator passwords, and session cookies in transit. Review [the security assessment and deployment assumptions](docs/security-review.md) before exposing the administration interface.
 
@@ -69,7 +71,7 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and complete setup with your Jellyfin server URL and a pre-created API key, then sign in with your Jellyfin administrator account. Compose binds to `127.0.0.1:8000` by default; an SSH tunnel can provide localhost access from another machine during setup. After pairing, configure your HTTPS reverse proxy, set `JELLYPORT_SECURE_COOKIE=true` and `JELLYPORT_ALLOWED_HOSTS` in `.env`, then recreate the container. A proxy in another container needs a route to the host or an explicitly configured shared Docker network.
+For an HTTPS deployment, set `JELLYPORT_SECURE_COOKIE=true` and `JELLYPORT_ALLOWED_HOSTS` in `.env` before starting the container. Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and complete setup with your Jellyfin server URL and a pre-created API key, then open the HTTPS reverse-proxy address to sign in with your Jellyfin administrator account. The local wizard works with secure cookies already enabled; changing the variable or restarting solely for setup is unnecessary. Compose binds to `127.0.0.1:8000` by default; an SSH tunnel can provide localhost access from another machine during setup. A proxy in another container needs a route to the host or an explicitly configured shared Docker network. For HTTP-only access, leave `JELLYPORT_SECURE_COOKIE=false`.
 
 The container must be able to reach both media servers. A server URL containing `localhost` refers to the Jellyport container itself. Use reachable hostnames or addresses; reverse proxy base paths are supported.
 
@@ -318,7 +320,7 @@ For development with hot reload, run `npm run dev` for the API and `npm run dev:
 
 ## API
 
-The browser uses authenticated session cookies. Mutating API requests require the session's `X-CSRF-Token`; get an anonymous session from `GET /api/session` before calling `POST /api/login` with a Jellyfin `username` and `password`. First-run setup uses the same CSRF protection and validates a pre-created Jellyfin API key and the server identity before pairing. Setup does not establish an administrator session; a separate Jellyfin administrator sign-in is required. Jellyfin access tokens and API keys are not returned to the browser. `/health` is unauthenticated. There is no public subscription webhook endpoint.
+The browser uses authenticated session cookies. Mutating API requests require the session's `X-CSRF-Token`; get an anonymous session from `GET /api/session` before calling `POST /api/login` with a Jellyfin `username` and `password`. First-run setup uses the same CSRF protection and validates a pre-created Jellyfin API key and the server identity before pairing. With secure cookies enabled on an unpaired installation, qualifying local setup requests use a separate HttpOnly, SameSite Strict cookie scoped to `/api`, without the Secure attribute. It is accepted only for setup and is cleared when pairing finishes. Setup does not establish an administrator session; a separate Jellyfin administrator sign-in is required. Ordinary session cookies retain the configured Secure setting. Jellyfin access tokens and API keys are not returned to the browser. `/health` is unauthenticated. There is no public subscription webhook endpoint.
 
 | Operation | Endpoint |
 | --- | --- |

@@ -6,7 +6,7 @@ services:
     user: "1000:1000" # Host UID:GID; prepare the data directory with this owner.
     environment:
       - JELLYPORT_DATA_DIR=/data
-      - JELLYPORT_SECURE_COOKIE=false # Set true when accessing through HTTPS.
+      - JELLYPORT_SECURE_COOKIE=false # Set true for browser HTTPS; local setup still works.
       - JELLYPORT_ALLOWED_HOSTS=${JELLYPORT_ALLOWED_HOSTS:-} # Optional proxy/custom DNS hostnames.
       - TZ=Etc/UTC # Optional; use your timezone.
     volumes:

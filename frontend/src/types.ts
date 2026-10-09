@@ -15,6 +15,7 @@ export interface Session {
   demo: boolean;
   setup_required: boolean;
   setup_connected: boolean;
+  secure_cookie?: boolean;
   setup_server_url?: string;
   user?: { id: string; name: string };
 }

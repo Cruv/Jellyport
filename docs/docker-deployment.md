@@ -7,6 +7,7 @@ Jellyport runs its web interface, API, and optional Discord bot in one container
 - [Standalone Portainer stack](../examples/compose.portainer.yaml): use reachable hostnames or server addresses in the setup wizard and Settings.
 - [Stack on an existing Docker network](../examples/compose.shared-network.yaml): connect Jellyport to the network used by your media servers or reverse proxy.
 - [Optional Emby snapshot helper](../examples/compose.snapshots.yaml): run beside Emby on the same Linux Docker host, using a read-only local database mount in a network-isolated helper.
+- [Emby Backup & Restore plugin setup](emby-plugin-backups.md): prepare scheduled Emby backups; importing them into Jellyport is pending format and completion verification, and has no supported Compose mode yet.
 - [Repository Compose file](../compose.yaml): build from source and retain the original `jellyport-data` named volume. This uses the image's default UID/GID `10001:10001` and publishes the web port on the host's loopback address.
 
 The Portainer examples use a published image, list-style environment variables, and a dedicated host bind mount. Replace their generic paths and settings before deploying. These examples target Docker Standalone; run one Jellyport container against each data directory.

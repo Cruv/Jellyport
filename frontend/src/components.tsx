@@ -223,6 +223,7 @@ export function Status({ value, label }: { value?: string; label?: string }) {
     running: 'In progress',
     queued: 'Queued',
     interrupted: 'Interrupted',
+    canceled: 'Canceled',
     pending: 'Awaiting review',
     applied: 'Applied',
     ignored: 'Ignored',

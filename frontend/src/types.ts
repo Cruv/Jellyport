@@ -129,6 +129,7 @@ export interface ItemIssue {
   candidate_ids?: string[];
 }
 export interface JobResult {
+  source_catalog?: { captured_at: string; items: number };
   source_snapshot?: SourceSnapshotMetadata;
   username?: string;
   source_username?: string;
@@ -242,6 +243,7 @@ export interface Job {
   error?: string;
   progress?: number | JobProgress;
   migration_scope?: MigrationScope;
+  cancel_requested?: boolean;
 }
 export interface Overview {
   counts: { emby_users?: number; jellyfin_users?: number; jobs?: number };
@@ -260,6 +262,7 @@ export interface PreviewUser {
   discord_username?: string | null;
   warnings?: string[];
   target_exists: boolean;
+  history_deferred?: boolean;
   stats: {
     source_played?: number;
     matched?: number;
@@ -270,7 +273,7 @@ export interface PreviewUser {
     source_favorites?: number;
     source_resume?: number;
     source_playlists?: number;
-  };
+  } | null;
   unmatched?: ItemIssue[];
   ambiguous?: ItemIssue[];
 }

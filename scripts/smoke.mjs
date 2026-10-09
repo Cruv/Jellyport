@@ -165,7 +165,10 @@ const preview = previewTask.preview;
 assert.equal(preview.mode, 'merge');
 assert.equal(preview.migration_scope, 'complete');
 assert.equal(preview.users.length, 3);
-assert(preview.users.every((user) => Number.isInteger(user.stats.source_items)));
+assert(
+  preview.users.every((user) => user.history_deferred === true && user.stats === null),
+  'Live preview must defer history reads without invented zero counts.',
+);
 assert(preview.users.every((user) => user.mapping_revision === null));
 assert.equal(
   (
@@ -219,7 +222,8 @@ for (let attempt = 0; attempt < 100 && quickPreview.status === 'running'; attemp
 }
 assert.equal(quickPreview.status, 'ready');
 assert.equal(quickPreview.preview.migration_scope, 'watched_only');
-assert.equal(quickPreview.preview.users[0].stats.source_playlists, 0);
+assert.equal(quickPreview.preview.users[0].stats, null);
+assert.equal(quickPreview.preview.users[0].history_deferred, true);
 const quick = await request('/api/migrations', 'POST', {
   source_user_ids: ['e-river'],
   migration_scope: 'watched_only',

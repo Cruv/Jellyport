@@ -1051,6 +1051,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   app.get<{ Params: { job_id: string } }>('/api/jobs/:job_id', async (request) =>
     service.getJob(request.params.job_id),
   );
+  app.post<{ Params: { job_id: string } }>('/api/jobs/:job_id/cancel', async (request) =>
+    service.cancelJob(request.params.job_id),
+  );
   app.post<{ Params: { job_id: string } }>('/api/jobs/:job_id/credentials', async (request) => {
     const job = service.getJob(request.params.job_id);
     if (['queued', 'running'].includes(job.status))

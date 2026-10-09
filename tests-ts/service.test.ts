@@ -69,6 +69,62 @@ describe('account migration and subscription safety', () => {
     return service.getJob(job.id);
   }
 
+  function savedPreview() {
+    const factory = service.clientFactory;
+    const snapshotId = '7d1a6301-8c1c-4c1c-a1b1-b2139d712b80';
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      if (args[2] === 'emby')
+        client.systemInfo = async () => ({ Version: '4.10.1.0', Id: 'fixture-source-server' });
+      return client;
+    };
+    vi.spyOn(service.sourceSnapshots, 'select').mockImplementation(async (userId) => {
+      const timestamp = new Date().toISOString();
+      return {
+        id: snapshotId,
+        metadata: {
+          id: snapshotId,
+          source_server_url: 'http://emby',
+          source_server_id: 'fixture-source-server',
+          source_server_version: '4.10.1.0',
+          source_user_id: userId,
+          source_username: 'fixture user',
+          scope: 'complete',
+          started_at: timestamp,
+          finished_at: timestamp,
+          expires_at: new Date(Date.now() + 48 * 60 * 60_000).toISOString(),
+          items: 0,
+          playlists: 0,
+          playlist_entries: 0,
+          bytes: 4096,
+          avatar: false,
+          source_type: 'sqlite_online_backup',
+          schema: 'emby-4.10.1.0',
+        },
+        result: {
+          id: snapshotId,
+          requested_at: timestamp,
+          binding: { url: 'http://emby', server_id: 'fixture-source-server', version: '4.10.1.0' },
+          ok: true,
+          started_at: timestamp,
+          finished_at: timestamp,
+          identities: { [userId]: 1 },
+          schema: 'emby-4.10.1.0',
+          bytes: 4096,
+        },
+      };
+    });
+    // These are isolated fixture arrays standing in for the already saved database projection.
+    vi.spyOn(service.sourceSnapshots, 'items').mockImplementation(async (_saved, id) => {
+      const fixture = factory('http://emby', 'fixture', 'emby');
+      try {
+        return await (fixture.migrationItems ? fixture.migrationItems(id) : fixture.items(id));
+      } finally {
+        await fixture.close();
+      }
+    });
+  }
+
   it.each(['template', 'administrator', 'disabled'])(
     'rejects a %s destination before scanning catalogs or playlists',
     async (protection) => {
@@ -122,7 +178,7 @@ describe('account migration and subscription safety', () => {
     },
   );
 
-  it('counts source playlists without reading entries in preview, while migration reads their contents', async () => {
+  it('defers source playlist reads until the approved migration reads their contents', async () => {
     servers.playlists['e-river'] = [
       {
         Id: 'source-list',
@@ -133,9 +189,15 @@ describe('account migration and subscription safety', () => {
       },
     ];
     const entries = vi.fn();
+    const playlists = vi.fn();
     service.clientFactory = (...args) => {
       const client = servers.factory(...args);
       if (args[2] === 'emby') {
+        const list = client.playlists!.bind(client);
+        client.playlists = async (...parameters) => {
+          playlists(...parameters);
+          return list(...parameters);
+        };
         const original = client.playlistItems!.bind(client);
         client.playlistItems = async (...parameters) => {
           entries(...parameters);
@@ -145,7 +207,9 @@ describe('account migration and subscription safety', () => {
       return client;
     };
     const preview = await service.preview(['e-river']);
-    expect(preview.users[0]?.stats.source_playlists).toBe(1);
+    expect(preview.users[0]?.stats).toBeNull();
+    expect(preview.users[0]?.history_deferred).toBe(true);
+    expect(playlists).not.toHaveBeenCalled();
     expect(entries).not.toHaveBeenCalled();
     const job = await finish(await service.migrateUsers(['e-river']));
     expect(entries).toHaveBeenCalledWith('source-list', 'e-river');
@@ -154,7 +218,7 @@ describe('account migration and subscription safety', () => {
   });
 
   it.each(['unavailable', 'unsupported', 'over limit'])(
-    'reports safe playlist metadata warnings when source playlists are %s',
+    'defers playlist warnings until approved migration when source playlists are %s',
     async (condition) => {
       const entries = vi.fn(async () => []);
       service.clientFactory = (...args) => {
@@ -175,53 +239,51 @@ describe('account migration and subscription safety', () => {
         return client;
       };
       const preview = await service.preview(['e-river']);
-      expect(preview.users[0]?.stats.source_playlists).toBe(condition === 'over limit' ? 500 : 0);
-      expect(preview.users[0]?.warnings).toEqual([
+      expect(preview.users[0]?.stats).toBeNull();
+      expect(preview.users[0]?.history_deferred).toBe(true);
+      expect(JSON.stringify(preview)).not.toContain('private upstream credential');
+      expect(entries).not.toHaveBeenCalled();
+      const job = await finish(await service.migrateUsers(['e-river']));
+      expect(job.results[0]?.source_playlists).toBe(condition === 'over limit' ? 500 : 0);
+      expect(job.results[0]?.data?.warnings).toContain(
         condition === 'unsupported'
           ? 'This source client cannot read playlists.'
           : condition === 'over limit'
             ? 'Only the first 500 source playlists were read. Remaining playlists were skipped.'
             : 'Source playlists could not be read; library data can still migrate.',
-      ]);
-      expect(JSON.stringify(preview)).not.toContain('private upstream credential');
-      expect(entries).not.toHaveBeenCalled();
+      );
+      expect(JSON.stringify(job)).not.toContain('private upstream credential');
     },
   );
 
-  it('overlaps independent catalog scans and reports progress after each completed user', async () => {
-    let sourceStarted!: () => void;
-    let targetStarted!: () => void;
-    const sourceReady = new Promise<void>((resolve) => {
-      sourceStarted = resolve;
-    });
-    const targetReady = new Promise<void>((resolve) => {
-      targetStarted = resolve;
+  it('checks identities without catalog or playlist scans and reports progress for each reviewed user', async () => {
+    const catalogReads = vi.fn(async () => {
+      throw new Error('Live preview must not scan catalogs.');
     });
     service.clientFactory = (...args) => {
       const client = servers.factory(...args);
-      const original = client.migrationItems!.bind(client);
-      client.migrationItems = async (...parameters) => {
-        if (args[2] === 'emby') {
-          sourceStarted();
-          await targetReady;
-        } else {
-          targetStarted();
-          await sourceReady;
-        }
-        return original(...parameters);
-      };
+      client.items = catalogReads;
+      client.migrationItems = catalogReads;
+      client.watchedItems = catalogReads;
+      client.playlists = catalogReads;
+      client.playlistItems = catalogReads;
       return client;
     };
     const progress = vi.fn();
     const preview = await service.preview(['e-river', 'e-sam'], { progress });
     expect(preview.users.map((user) => user.source_user_id)).toEqual(['e-river', 'e-sam']);
+    expect(preview.users.every((user) => user.stats === null && user.history_deferred)).toBe(true);
+    expect(
+      preview.users.every((user) => user.unmatched.length === 0 && user.ambiguous.length === 0),
+    ).toBe(true);
+    expect(catalogReads).not.toHaveBeenCalled();
     expect(progress.mock.calls).toEqual([
       [1, 2],
       [2, 2],
     ]);
-  }, 1000);
+  });
 
-  it('reuses only sanitized new-destination catalogs within a preview and never across previews', async () => {
+  it('does not read destination histories or reuse template personal data across lightweight previews', async () => {
     const targetReads = vi.fn();
     servers.userData.template = {
       '1': { Played: true, IsFavorite: true, PlaybackPositionTicks: 5000 },
@@ -238,11 +300,12 @@ describe('account migration and subscription safety', () => {
       return client;
     };
     const preview = await service.preview(['e-alex', 'e-sam', 'e-river']);
-    expect(targetReads.mock.calls).toEqual([['template'], ['j-river']]);
-    expect(preview.users.map((user) => user.stats.already_played)).toEqual([0, 0, 1]);
+    expect(targetReads).not.toHaveBeenCalled();
+    expect(preview.users.map((user) => user.stats)).toEqual([null, null, null]);
+    expect(preview.users.every((user) => user.history_deferred)).toBe(true);
     expect(JSON.stringify(preview)).not.toContain('PlaybackPositionTicks');
     await service.preview(['e-alex', 'e-sam']);
-    expect(targetReads.mock.calls).toEqual([['template'], ['j-river'], ['template']]);
+    expect(targetReads).not.toHaveBeenCalled();
   });
 
   it('bounds preview detail arrays while retaining full unmatched and ambiguous counts', async () => {
@@ -274,7 +337,8 @@ describe('account migration and subscription safety', () => {
             }));
       return client;
     };
-    const preview = await service.preview(['e-river']);
+    savedPreview();
+    const preview = await service.preview(['e-river'], { use_snapshots: true });
     expect(preview.users[0]?.stats).toMatchObject({
       source_items: 402,
       unmatched: 201,
@@ -343,7 +407,8 @@ describe('account migration and subscription safety', () => {
             ];
       return client;
     };
-    const preview = await service.preview(['e-river']);
+    savedPreview();
+    const preview = await service.preview(['e-river'], { use_snapshots: true });
     const details = preview.users[0]!;
     expect(details.unmatched[0]).toEqual({ Id: 'nested-source', Type: 'Movie' });
     expect(details.unmatched[1]?.Id).toHaveLength(128);
@@ -392,7 +457,7 @@ describe('account migration and subscription safety', () => {
     expect(sourceUsers.mock.calls).toEqual([['e-river']]);
   });
 
-  it('closes both preview clients when canceled during catalog reads and returns a safe error', async () => {
+  it('closes both preview clients when canceled during an identity read and returns a safe error', async () => {
     const controller = new AbortController();
     const started = new Set<string>();
     const closed = new Set<string>();
@@ -404,12 +469,13 @@ describe('account migration and subscription safety', () => {
       const client = servers.factory(...args);
       const kind = args[2]!;
       let reject!: (reason: Error) => void;
-      client.migrationItems = async () =>
-        new Promise((_, fail) => {
-          reject = fail;
-          started.add(kind);
-          if (started.size === 2) ready();
-        });
+      if (kind === 'emby')
+        client.user = async () =>
+          new Promise((_, fail) => {
+            reject = fail;
+            started.add(kind);
+            ready();
+          });
       client.close = async () => {
         closed.add(kind);
         reject?.(new MediaError('private upstream cancellation details'));
@@ -444,7 +510,10 @@ describe('account migration and subscription safety', () => {
 
   it('migrates played items, reveals new credentials once and preserves them on repeated merging', async () => {
     const preview = await service.preview(['e-alex']);
-    expect(preview.users[0]?.stats).toEqual({
+    expect(preview.users[0]?.stats).toBeNull();
+    expect(preview.users[0]?.history_deferred).toBe(true);
+    const job = await finish(await service.migrateUsers(['e-alex']));
+    expect(job.results[0]).toMatchObject({
       source_played: 4,
       matched: 3,
       unmatched: 1,
@@ -455,7 +524,6 @@ describe('account migration and subscription safety', () => {
       source_resume: 0,
       source_playlists: 0,
     });
-    const job = await finish(await service.migrateUsers(['e-alex']));
     expect(job.status).toBe('partial');
     expect(job.results[0]?.applied).toBe(3);
     const alex = servers.users.jellyfin.find((user) => user.Name === 'alex')!;
@@ -510,10 +578,13 @@ describe('account migration and subscription safety', () => {
       const client = servers.factory(...args);
       if (args[2] === 'emby') {
         const original = client.migrationItems!.bind(client);
-        client.watchedItems = async (id) => {
-          watchedReads(id);
+        client.catalogItems = async () =>
+          (await original()).map(({ UserData: _state, ...item }) => item as MediaItem);
+        client.migrationState = async (id, _catalog, scope) => {
+          watchedReads(id, scope);
           return (await original(id)).filter((item) => item.UserData?.Played === true);
         };
+        client.watchedItems = excluded;
         client.migrationItems = excluded;
         client.playlists = excluded;
         client.playlistItems = excluded;
@@ -532,20 +603,16 @@ describe('account migration and subscription safety', () => {
     };
     const preview = await service.preview(['e-river'], { migration_scope: 'watched_only' });
     expect(preview.migration_scope).toBe('watched_only');
-    expect(preview.users[0]?.stats).toMatchObject({
-      source_items: 2,
-      matched: 2,
-      source_favorites: 0,
-      source_resume: 0,
-      source_playlists: 0,
-    });
+    expect(preview.users[0]?.stats).toBeNull();
+    expect(preview.users[0]?.history_deferred).toBe(true);
+    expect(watchedReads).not.toHaveBeenCalled();
     const job = await finish(
       await service.migrateUsers(['e-river'], {}, undefined, 'watched_only'),
     );
     expect(job.status).toBe('completed');
     expect(job.migration_scope).toBe('watched_only');
     expect(job.results[0]?.applied).toBe(1);
-    expect(watchedReads.mock.calls).toEqual([['e-river'], ['e-river']]);
+    expect(watchedReads.mock.calls).toEqual([['e-river', 'watched_only']]);
     expect(excluded).not.toHaveBeenCalled();
     expect(patches).toEqual([{ Played: true }]);
     expect(servers.userData['j-river']?.['2']).toEqual({
@@ -1066,7 +1133,10 @@ describe('account migration and subscription safety', () => {
   });
   it('never uses template watch history as a new account baseline', async () => {
     servers.played.template = new Set(['1', '2', '3']);
-    expect((await service.preview(['e-alex'])).users[0]?.stats.already_played).toBe(0);
+    expect((await service.preview(['e-alex'])).users[0]?.stats).toBeNull();
+    const job = await finish(await service.migrateUsers(['e-alex']));
+    expect(job.results[0]?.already_played).toBe(0);
+    expect(job.results[0]?.applied).toBe(3);
   });
   it('keeps Jellyfin template users visible when Emby is unavailable', async () => {
     service.clientFactory = (...args) => {
@@ -1217,13 +1287,15 @@ describe('account migration and subscription safety', () => {
       season: { IsFavorite: true },
     };
     const preview = await service.preview(['e-sam']);
-    expect(preview.users[0]?.stats).toMatchObject({
+    expect(preview.users[0]?.stats).toBeNull();
+    expect(preview.users[0]?.history_deferred).toBe(true);
+    const job = await finish(await service.migrateUsers(['e-sam']));
+    expect(job.results[0]).toMatchObject({
       source_items: 4,
       source_played: 1,
       source_favorites: 3,
       source_resume: 1,
     });
-    const job = await finish(await service.migrateUsers(['e-sam']));
     expect(job.status).toBe('completed');
     const target = servers.users.jellyfin.find((user) => user.Name === 'sam')!;
     expect(servers.userData[target.Id]?.['1']).toMatchObject({
@@ -1526,7 +1598,8 @@ describe('account migration and subscription safety', () => {
       }
       return client;
     };
-    const preview = await service.preview(['e-alex']);
+    savedPreview();
+    const preview = await service.preview(['e-alex'], { use_snapshots: true });
     expect(JSON.stringify(preview)).not.toContain('private-library-token');
     expect(preview.users[0]?.unmatched[0]).toEqual({
       Id: 'missing',

@@ -49,7 +49,7 @@ Cookie behavior follows the [Secure, HttpOnly, SameSite and Path definitions](ht
 
 Create a dedicated key in Jellyfin's **Dashboard → Advanced → API Keys** before pairing. `Jellyport` is a recommended label for administration; no particular name is required. The app validates the supplied key against the selected server without creating or revoking keys. The local pairing boundary, Host/Origin checks, CSRF protection, server identity binding, response bounds, and sanitized upstream errors continue to apply. A valid integration key enables background work; it does not establish a browser administrator session.
 
-An authenticated administrator can replace the background key by submitting a pre-created key to `POST /api/auth/service-key`. The replacement is validated against the bound server before saving. Existing queued jobs retain their encrypted settings snapshots and previous key. Manually revoke the old key in Jellyfin after those jobs finish; revoking it earlier can interrupt them. Existing paired installations keep working with their saved key without a data reset. Local authentication recovery retains data and the original server identity, and requires pairing again with a valid key for that server. Neither replacement nor local reset deletes or revokes keys at Jellyfin.
+An authenticated administrator can replace the background key by submitting a pre-created key to `POST /api/auth/service-key`. The replacement is validated against the bound server before saving. A changed source/destination URL or API key invalidates queued settings before remote work; review and queue a new job after replacement. Running work checks the current connections at its guards, while an already accepted remote operation can still finish. Manually revoke obsolete keys in Jellyfin. Existing paired installations keep working with their saved key without a data reset. Local authentication recovery retains data and the original server identity, and requires pairing again with a valid key for that server. Neither replacement nor local reset deletes or revokes keys at Jellyfin.
 
 ## Passive check results and residual findings
 
@@ -101,7 +101,7 @@ Detailed writes allow only portable user-data fields and refresh destination act
 
 ## Background history-review follow-up — 0.11.2
 
-History previews run as bounded, read-only tasks instead of holding a reverse-proxy request open during catalog reads. Starting, polling, and cancelling a review require the current administrator authorization; mutations also require the session's CSRF token. Each task belongs to the exact browser session, and unknown, expired, or differently owned task IDs return 404. Tasks are memory-only, cleared on sign-out, restart, or a configuration change, with a 15-minute scan deadline and 10-minute completed-result retention. The installation allows at most two running scans and sixteen retained tasks. Cancelled work closes its dedicated upstream clients. The preview reads playlist metadata rather than entries; complete entry reads and private-copy verification remain in migration execution.
+History previews run as bounded, read-only tasks instead of holding a reverse-proxy request open. Starting, polling and canceling a review require the current administrator authorization; mutations also require the session's CSRF token. Each task belongs to the exact browser session, and unknown, expired or differently owned task IDs return 404. Tasks are memory-only, cleared on sign-out, restart or a configuration change, with a 15-minute deadline and 10-minute completed-result retention. The installation allows at most two running tasks and sixteen retained tasks. Canceled work closes its dedicated upstream clients. Since 0.13.0, live preview checks identities without catalog or playlist reads and explicitly defers history details. Saved-snapshot preview reads playlist metadata and serializes its expensive matching with actual source migrations. Complete playlist-entry reads and private-copy verification remain in execution.
 
 Preview responses retain projected account and matching fields rather than arbitrary upstream objects, and errors remain sanitized. Matching progress reports completed users, not sensitive upstream response contents. Existing Host/Origin checks, no-store headers, session revocation, and protected template/administrator/disabled-destination checks still apply. The selected template is rejected as a destination before expensive catalog matching begins. A preview does not grant permission to bypass the migration job's fresh account, ownership, server, and mapping checks.
 
@@ -111,9 +111,9 @@ Retained preview details are bounded to 200 unmatched and 200 ambiguous items pe
 
 Within one account, item-state transfer uses at most four workers, grouping all matches for the same destination item into one ordered sequence. Potential detailed updates still require a fresh, user-scoped destination read before the merge and write. Snapshot no-ops avoid additional user-data requests, and no personal-state or permission cache is shared between users. Guard failures stop new work and all workers drain before releasing the account operation, so concurrent writes cannot escape the mutation lock. Mutations still have no automatic transport retry after an uncertain response.
 
-Library pagination requests the total on the first page only. Later count-disabled responses can contain a page count or zero; those values cannot truncate the catalog. A missing or invalid first total falls back to reading until an empty page, preserving repeated-page detection and the supported size bound. Playlist matching reuses identity indexes scoped to that account's already validated catalog. It does not substitute an unrestricted catalog for the user's accessible items. Complete mode does not filter away supported personal state.
+Destination library pagination requests the total on the first page only. Later count-disabled responses can contain a page count or zero; those values cannot truncate the catalog. A missing or invalid first total falls back to reading until an empty page, preserving repeated-page detection and the supported size bound. Since 0.13.0, the live source uses one user-neutral matching catalog without total counts and reads fresh per-user state in explicit-ID batches. Playlist matching reuses identity indexes scoped to that account's already validated destination catalog. It does not substitute an unrestricted destination catalog for the user's accessible items. Complete mode does not filter away supported personal state.
 
-Only fresh destinations within one preview share a sanitized default template or server catalog, after removing personal state. Existing-user catalog reads and actual migrations remain independently user-scoped. The cache does not cross preview or settings boundaries. Saved job diagnostics use the same per-user 200 unmatched, 200 ambiguous, and 20-candidate bounds as preview details, while summary counts and actual migration work remain complete.
+Within a saved-snapshot preview, only fresh destinations share a sanitized default template or server catalog after removing personal state. Existing destination reads and actual migrations remain user-scoped. That destination cache does not cross preview or settings boundaries. The separate 0.13.0 source metadata cache excludes personal state, binds credentials and source identity, and is reused across users with bounded retention. Saved job diagnostics use the same per-user 200 unmatched, 200 ambiguous, and 20-candidate bounds as saved-snapshot preview details, while summary counts and actual migration work remain complete. Live preview returns deferred statistics instead of incomplete counts.
 
 The optional `migration_scope` accepts only `complete` or `watched_only`, defaulting to Complete. The scope is passed to the session-owned preview runner and persisted with queued migration requests. Watched-only mode deliberately narrows source data and writes to played status plus a safe original date when marking an item played; it does not import resume positions, counts, favorites, ratings, playlists, images, or source preferences. It retains account identity, mapping, ownership, authorization, CSRF, template/administrator protection, and fresh detailed-write checks. Destination catalog access stays user-scoped in both modes, and changing scope does not authorize cross-session preview access.
 
@@ -152,6 +152,50 @@ Membership allowances are encrypted and scoped to the paired Jellyfin URL and se
 Queued membership work checks the current entitlement revision before remote writes and credential delivery. Creation, downgrade, and cancellation mutations serialize to prevent an in-flight account from escaping an approved suspension. Cancellation holds survive ordinary role reconciliation, and renewals restore only entitled accounts disabled by Jellyport. Reviewed account counts and names are checked again before accepting a web update. Protected, renamed, mismatched, and independently disabled accounts require review. Explicit secondary-account recovery retains the ownership and entitlement checks.
 
 Validation passed: 832 tests, production typecheck/build, an npm audit reporting zero known dependency vulnerabilities, and a hardened local Docker smoke check. New HTTP tests verify administrator authorization/revocation, CSRF, cross-site rejection, no-store responses, strict request bounds, stale reviews, and exclusion of passwords, tokens, and arbitrary metadata from membership responses. Lifecycle tests cover migration, separate histories/passwords, collisions, upgrade/downgrade/renewal, uncertain writes, cancellation races and holds, and server scope changes. The new interface was inspected with synthetic local accounts; no production server, Discord, or billing account was contacted.
+
+## Playback workload follow-up — 0.13.0 patch candidate
+
+The October 8 production evidence supports catalog-read contention as a strong
+suspect, not a proven Emby lock or query-plan diagnosis. The replacement live path
+avoids recursive user-scoped catalog enumeration during preview and migration.
+Only one user-neutral matching catalog is collected and pinned during a job;
+source state is read fresh through bounded explicit-ID requests. Credentials,
+server URL, server identity and version scope cache reuse, and personal state is
+excluded from the cache. Source preparation failure stops the remaining batch
+instead of repeating a failed catalog build for each user. Complete mode retains
+state that played/favorite/resumable filters would omit.
+
+One source governor admits one heavy read, bounds its waiting queue, leaves
+500 ms idle after completion, and uses a five-second deadline. A two-second
+response, network/server rejection, timeout or active-request cancellation opens
+a five-minute cooldown, extended by a longer sanitized Retry-After duration up to
+24 hours. Queued callers fail promptly instead of producing an automatic retry
+storm. In-flight client cancellation does not prove Emby has stopped an accepted
+query, which is why active cancellation also opens the circuit. Failed work is
+not automatically resumed when the cooldown ends.
+
+Retained catalog, personal state and playlist data have incremental item and byte
+limits. Playlist entries have 32 MiB per-read and aggregate retained-payload
+budgets in addition to count limits. These measure serialized payloads, not exact
+JavaScript heap or RSS. Queued cancellation removes encrypted requests/settings
+transactionally; active cancellation preserves applied changes and drains item
+workers before releasing the account mutation lock. The authenticated cancel
+route retains the existing current-administrator, CSRF and origin boundaries.
+
+Workload logs contain fixed operation/outcome labels and aggregate counters and
+durations. They exclude URLs, query strings, credentials, account/item IDs,
+names, paths and personal playback values. Logs never receive arbitrary upstream
+errors or DTOs. The existing browser session and response-minimization boundaries
+remain in place.
+
+The source contract was verified using an isolated Emby 4.10.1.0 container and
+synthetic media. Mocked large-catalog, failure, memory-budget, cancellation,
+cache-scope and preservation tests cover the patch. This is a reviewable candidate;
+no production deployment or load test was performed. The live cold catalog still
+uses documented name ordering and OFFSET pagination, and database snapshots
+still consume I/O and can delay WAL checkpoints. Neither path guarantees zero
+playback impact. See [performance safety](performance-safety.md) for evidence,
+limits, tradeoffs and the separately approved production-verification plan.
 
 ## Deployment boundaries that remain important
 

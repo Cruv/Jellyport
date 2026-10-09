@@ -64,6 +64,7 @@ function summary(sources: AdminAlertSource[]): string {
     ['failed', 'failed'],
     ['interrupted', 'interrupted'],
     ['cancelled', 'cancelled'],
+    ['canceled', 'canceled'],
   ];
   const jobs = labels
     .map(([status, label]) => [count('job', status!), label] as const)

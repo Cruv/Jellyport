@@ -266,7 +266,7 @@ export function MigratePage({
           >
             {busy ? <span className="spinner" /> : <Icon name="migrate" />}
             {busy
-              ? 'Matching history…'
+              ? 'Preparing review…'
               : `Preview migration${selected.size ? ` (${selected.size})` : ''}`}
           </button>
         }
@@ -301,9 +301,10 @@ export function MigratePage({
           Use saved Emby snapshot
         </label>
         <small id="migration-snapshot-help">
-          Live Emby reads are the default. Saved snapshots must cover every selected account and be
-          current enough for the chosen scope. Missing or expired snapshots stop the preview;
-          refresh them in Settings or choose live reads.
+          Live previews check accounts without reading history; matching and selected personal data
+          are read only after approval. Migrations pause between source requests to protect
+          playback. Saved snapshots must cover every selected account and be current enough; missing
+          or expired snapshots stop the preview.
         </small>
       </div>
       <div className="steps">
@@ -312,7 +313,7 @@ export function MigratePage({
         </span>
         <span className="step-separator" />
         <span className="step">
-          <span className="step-number">2</span>Preview matches
+          <span className="step-number">2</span>Review accounts
         </span>
         <span className="step-separator" />
         <span className="step">

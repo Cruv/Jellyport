@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +13,7 @@ import {
   type Job,
 } from '../server/service.js';
 import { DEFAULT_SETTINGS, Store } from '../server/store.js';
+import type { MediaItem } from '../server/media.js';
 
 class FakeBot implements BotAdapter {
   delivered: string[][] = [];
@@ -67,6 +68,355 @@ describe('account migration and subscription safety', () => {
     await service.jobTasks.get(job.id);
     return service.getJob(job.id);
   }
+
+  it.each(['template', 'administrator', 'disabled'])(
+    'rejects a %s destination before scanning catalogs or playlists',
+    async (protection) => {
+      if (protection === 'template') servers.users.emby[0]!.Name = 'Member template';
+      else {
+        servers.users.emby[0]!.Name = 'river';
+        servers.users.jellyfin[1]!.Policy![
+          protection === 'administrator' ? 'IsAdministrator' : 'IsDisabled'
+        ] = true;
+      }
+      const reads = vi.fn(async () => {
+        throw new Error('Catalog reads must not start for a protected destination.');
+      });
+      service.clientFactory = (...args) => {
+        const client = servers.factory(...args);
+        client.items = reads;
+        client.migrationItems = reads;
+        client.playlists = reads;
+        return client;
+      };
+      await expect(service.preview(['e-alex'])).rejects.toThrow(protection);
+      expect(reads).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['different account', 'renamed mapping'])(
+    'rejects a source with %s before scanning catalogs or playlists',
+    async (mismatch) => {
+      if (mismatch === 'renamed mapping') {
+        approveMapping('e-alex', 'alex');
+        servers.users.emby[0]!.Name = 'changed-source-name';
+      }
+      const reads = vi.fn(async () => {
+        throw new Error('Catalog reads must not start before source identity is checked.');
+      });
+      service.clientFactory = (...args) => {
+        const client = servers.factory(...args);
+        if (args[2] === 'emby' && mismatch === 'different account') {
+          const original = client.user.bind(client);
+          client.user = async (id) => ({ ...(await original(id)), Id: 'different-source-id' });
+        }
+        client.items = reads;
+        client.migrationItems = reads;
+        client.playlists = reads;
+        return client;
+      };
+      await expect(service.preview(['e-alex'])).rejects.toThrow(
+        mismatch === 'different account' ? 'different source account' : 'renamed',
+      );
+      expect(reads).not.toHaveBeenCalled();
+    },
+  );
+
+  it('counts source playlists without reading entries in preview, while migration reads their contents', async () => {
+    servers.playlists['e-river'] = [
+      {
+        Id: 'source-list',
+        Name: 'Favorites',
+        Type: 'Playlist',
+        MediaType: 'Video',
+        items: ['2', '1'],
+      },
+    ];
+    const entries = vi.fn();
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      if (args[2] === 'emby') {
+        const original = client.playlistItems!.bind(client);
+        client.playlistItems = async (...parameters) => {
+          entries(...parameters);
+          return original(...parameters);
+        };
+      }
+      return client;
+    };
+    const preview = await service.preview(['e-river']);
+    expect(preview.users[0]?.stats.source_playlists).toBe(1);
+    expect(entries).not.toHaveBeenCalled();
+    const job = await finish(await service.migrateUsers(['e-river']));
+    expect(entries).toHaveBeenCalledWith('source-list', 'e-river');
+    expect(job.results[0]?.data?.playlists_created).toBe(1);
+    expect(servers.playlists['j-river']?.[0]?.items).toEqual(['2', '1']);
+  });
+
+  it.each(['unavailable', 'unsupported', 'over limit'])(
+    'reports safe playlist metadata warnings when source playlists are %s',
+    async (condition) => {
+      const entries = vi.fn(async () => []);
+      service.clientFactory = (...args) => {
+        const client = servers.factory(...args);
+        if (args[2] === 'emby') {
+          client.playlistItems = entries;
+          if (condition === 'unsupported') client.playlists = undefined;
+          else
+            client.playlists = async () => {
+              if (condition === 'unavailable') throw new Error('private upstream credential');
+              return Array.from({ length: 501 }, (_, index) => ({
+                Id: `playlist-${index}`,
+                Name: 'Playlist',
+                Type: 'Playlist',
+              }));
+            };
+        }
+        return client;
+      };
+      const preview = await service.preview(['e-river']);
+      expect(preview.users[0]?.stats.source_playlists).toBe(condition === 'over limit' ? 500 : 0);
+      expect(preview.users[0]?.warnings).toEqual([
+        condition === 'unsupported'
+          ? 'This source client cannot read playlists.'
+          : condition === 'over limit'
+            ? 'Only the first 500 source playlists were read. Remaining playlists were skipped.'
+            : 'Source playlists could not be read; library data can still migrate.',
+      ]);
+      expect(JSON.stringify(preview)).not.toContain('private upstream credential');
+      expect(entries).not.toHaveBeenCalled();
+    },
+  );
+
+  it('overlaps independent catalog scans and reports progress after each completed user', async () => {
+    let sourceStarted!: () => void;
+    let targetStarted!: () => void;
+    const sourceReady = new Promise<void>((resolve) => {
+      sourceStarted = resolve;
+    });
+    const targetReady = new Promise<void>((resolve) => {
+      targetStarted = resolve;
+    });
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      const original = client.migrationItems!.bind(client);
+      client.migrationItems = async (...parameters) => {
+        if (args[2] === 'emby') {
+          sourceStarted();
+          await targetReady;
+        } else {
+          targetStarted();
+          await sourceReady;
+        }
+        return original(...parameters);
+      };
+      return client;
+    };
+    const progress = vi.fn();
+    const preview = await service.preview(['e-river', 'e-sam'], { progress });
+    expect(preview.users.map((user) => user.source_user_id)).toEqual(['e-river', 'e-sam']);
+    expect(progress.mock.calls).toEqual([
+      [1, 2],
+      [2, 2],
+    ]);
+  }, 1000);
+
+  it('bounds preview detail arrays while retaining full unmatched and ambiguous counts', async () => {
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      client.migrationItems = async () =>
+        args[2] === 'emby'
+          ? [
+              ...Array.from({ length: 201 }, (_, index) => ({
+                Id: `unmatched-${index}`,
+                Name: 'Unmatched movie',
+                Type: 'Movie',
+                ProviderIds: { Tmdb: `missing-${index}` },
+                UserData: { Played: true },
+              })),
+              ...Array.from({ length: 201 }, (_, index) => ({
+                Id: `ambiguous-${index}`,
+                Name: 'Ambiguous movie',
+                Type: 'Movie',
+                ProviderIds: { Tmdb: 'multiple-editions' },
+                UserData: { Played: true },
+              })),
+            ]
+          : Array.from({ length: 21 }, (_, index) => ({
+              Id: `candidate-${index}`,
+              Name: 'Candidate movie',
+              Type: 'Movie',
+              ProviderIds: { Tmdb: 'multiple-editions' },
+            }));
+      return client;
+    };
+    const preview = await service.preview(['e-river']);
+    expect(preview.users[0]?.stats).toMatchObject({
+      source_items: 402,
+      unmatched: 201,
+      ambiguous: 201,
+    });
+    expect(preview.users[0]?.unmatched).toHaveLength(200);
+    expect(preview.users[0]?.ambiguous).toHaveLength(200);
+    expect(preview.users[0]?.ambiguous.every((entry) => entry.candidates.length === 20)).toBe(true);
+    expect(preview.users[0]?.warnings).toContain(
+      'Preview details are limited to 200 unmatched items, 200 ambiguous items, and 20 candidates per item. Full counts are shown; migration checks every item.',
+    );
+  });
+
+  it('projects preview details to bounded primitive strings without retaining nested upstream data', async () => {
+    const privateObject = { private_plugin_token: 'private-plugin-value' };
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      client.migrationItems = async () =>
+        args[2] === 'emby'
+          ? [
+              {
+                Id: 'nested-source',
+                Name: privateObject,
+                Type: 'Movie',
+                UserData: { Played: true },
+              } as unknown as MediaItem,
+              {
+                Id: 'oversize-id'.repeat(100),
+                Name: 'oversize-name'.repeat(100),
+                Type: 'Movie',
+                UserData: { Played: true },
+              },
+              {
+                Id: 'ambiguous-source',
+                Name: privateObject,
+                Type: 'Movie',
+                ProviderIds: { Tmdb: 'multiple-editions' },
+                UserData: { Played: true },
+              } as unknown as MediaItem,
+              {
+                Id: 'nested-type',
+                Name: 'Nested type',
+                Type: privateObject,
+                UserData: { IsFavorite: true },
+              } as unknown as MediaItem,
+              {
+                Id: 'oversize-type',
+                Name: 'Oversize type',
+                Type: 'unsupported-type'.repeat(100),
+                UserData: { IsFavorite: true },
+              },
+            ]
+          : [
+              {
+                Id: 'nested-candidate',
+                Name: privateObject,
+                Type: 'Movie',
+                ProviderIds: { Tmdb: 'multiple-editions' },
+              } as unknown as MediaItem,
+              {
+                Id: 'oversize-candidate-id'.repeat(100),
+                Name: 'oversize-candidate-name'.repeat(100),
+                Type: 'Movie',
+                ProviderIds: { Tmdb: 'multiple-editions' },
+              },
+            ];
+      return client;
+    };
+    const preview = await service.preview(['e-river']);
+    const details = preview.users[0]!;
+    expect(details.unmatched[0]).toEqual({ Id: 'nested-source', Type: 'Movie' });
+    expect(details.unmatched[1]?.Id).toHaveLength(128);
+    expect(details.unmatched[1]?.Name).toHaveLength(512);
+    expect(details.unmatched[2]).toEqual({ Id: 'nested-type', Name: 'Nested type' });
+    expect(details.unmatched[3]?.Type).toHaveLength(64);
+    expect(details.ambiguous[0]?.source).toEqual({ Id: 'ambiguous-source', Type: 'Movie' });
+    expect(details.ambiguous[0]?.candidates[0]).toEqual({ Id: 'nested-candidate', Type: 'Movie' });
+    expect(details.ambiguous[0]?.candidates[1]?.Id).toHaveLength(128);
+    expect(details.ambiguous[0]?.candidates[1]?.Name).toHaveLength(512);
+    expect(JSON.stringify(preview)).not.toContain('private-plugin-value');
+    expect(JSON.stringify(preview)).not.toContain('private_plugin_token');
+    expect(details.stats).toMatchObject({ source_items: 5, unmatched: 4, ambiguous: 1 });
+  });
+
+  it('rejects an already canceled preview without opening media clients', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('private cancellation reason'));
+    const factory = vi.fn(servers.factory);
+    service.clientFactory = factory;
+    await expect(service.preview(['e-river'], { signal: controller.signal })).rejects.toThrow(
+      'History matching was canceled.',
+    );
+    expect(factory).not.toHaveBeenCalled();
+  });
+
+  it('stops before the next user when canceled after a progress update', async () => {
+    const controller = new AbortController();
+    const sourceUsers = vi.fn();
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      if (args[2] === 'emby') {
+        const original = client.user.bind(client);
+        client.user = async (id) => {
+          sourceUsers(id);
+          return original(id);
+        };
+      }
+      return client;
+    };
+    const progress = vi.fn(() => controller.abort());
+    await expect(
+      service.preview(['e-river', 'e-sam'], { signal: controller.signal, progress }),
+    ).rejects.toThrow('History matching was canceled.');
+    expect(progress.mock.calls).toEqual([[1, 2]]);
+    expect(sourceUsers.mock.calls).toEqual([['e-river']]);
+  });
+
+  it('closes both preview clients when canceled during catalog reads and returns a safe error', async () => {
+    const controller = new AbortController();
+    const started = new Set<string>();
+    const closed = new Set<string>();
+    let ready!: () => void;
+    const reading = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      const kind = args[2]!;
+      let reject!: (reason: Error) => void;
+      client.migrationItems = async () =>
+        new Promise((_, fail) => {
+          reject = fail;
+          started.add(kind);
+          if (started.size === 2) ready();
+        });
+      client.close = async () => {
+        closed.add(kind);
+        reject?.(new MediaError('private upstream cancellation details'));
+      };
+      return client;
+    };
+    const progress = vi.fn();
+    const pending = service.preview(['e-river'], { signal: controller.signal, progress });
+    const rejected = expect(pending).rejects.toThrow('History matching was canceled.');
+    await reading;
+    controller.abort(new Error('private cancellation reason'));
+    await rejected;
+    expect(closed).toEqual(new Set(['emby', 'jellyfin']));
+    expect(progress).not.toHaveBeenCalled();
+    expect(store.jobs()).toEqual([]);
+  });
+
+  it('removes its cancellation listener after preview clients are closed normally', async () => {
+    const controller = new AbortController();
+    const close = vi.fn(async () => {});
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      client.close = close;
+      return client;
+    };
+    await service.preview(['e-river'], { signal: controller.signal });
+    expect(close).toHaveBeenCalledTimes(2);
+    controller.abort();
+    await Promise.resolve();
+    expect(close).toHaveBeenCalledTimes(2);
+  });
 
   it('migrates played items, reveals new credentials once and preserves them on repeated merging', async () => {
     const preview = await service.preview(['e-alex']);

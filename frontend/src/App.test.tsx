@@ -108,6 +108,40 @@ async function openJob() {
   fireEvent.click(screen.getByRole('button', { name: 'View operation details' }));
   return screen.findByRole('dialog');
 }
+const runningPreviewTask = {
+  id: 'preview-task-1',
+  status: 'running',
+  progress: { processed: 0, total: 2 },
+};
+const readyPreviewTask = {
+  ...runningPreviewTask,
+  status: 'ready',
+  progress: { processed: 2, total: 2 },
+  preview: {
+    users: [
+      { source_user_id: 'e-alex', username: 'alex', target_exists: false, stats: {} },
+      { source_user_id: 'e-river', username: 'river', target_exists: false, stats: {} },
+    ],
+  },
+};
+function prepareRunningPreview() {
+  responses['/api/users'] = {
+    emby: [
+      { Id: 'e-alex', Name: 'alex' },
+      { Id: 'e-river', Name: 'river' },
+    ],
+    jellyfin: [],
+  };
+  responses['/api/migrations/preview'] = runningPreviewTask;
+  statuses['/api/migrations/preview'] = 202;
+  responses['/api/migrations/preview/preview-task-1'] = runningPreviewTask;
+}
+async function selectAndPreview() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+  await screen.findByText('Reading libraries and matching history… 0 of 2 users complete.');
+}
 describe('React account safeguards', () => {
   it('loads editable tier defaults and only saves their definitions without provisioning accounts', async () => {
     render(<App />);
@@ -573,20 +607,25 @@ describe('React account safeguards', () => {
       jellyfin: [{ Id: 'j-river', Name: 'river' }],
     };
     responses['/api/migrations/preview'] = {
-      users: [
-        {
-          source_user_id: 'e-alex',
-          username: 'alex',
-          target_exists: false,
-          stats: { source_played: 2, matched: 2 },
-        },
-        {
-          source_user_id: 'e-river',
-          username: 'river',
-          target_exists: true,
-          stats: { source_played: 1, matched: 1 },
-        },
-      ],
+      id: 'preview-bulk',
+      status: 'ready',
+      progress: { processed: 2, total: 2 },
+      preview: {
+        users: [
+          {
+            source_user_id: 'e-alex',
+            username: 'alex',
+            target_exists: false,
+            stats: { source_played: 2, matched: 2 },
+          },
+          {
+            source_user_id: 'e-river',
+            username: 'river',
+            target_exists: true,
+            stats: { source_played: 1, matched: 1 },
+          },
+        ],
+      },
     };
     responses['/api/migrations'] = { ...job, kind: 'migrate' };
     responses['/api/discord/members?query=river'] = {
@@ -629,29 +668,280 @@ describe('React account safeguards', () => {
       discord_recipients: { 'e-river': '123456789012345678' },
     });
   });
+  it('polls preview progress and only offers migration approval after the preview is ready', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview/preview-task-1'] = {
+      ...runningPreviewTask,
+      progress: { processed: 1, total: 2 },
+    };
+    render(<App />);
+    await selectAndPreview();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Matching history…' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    await screen.findByText(
+      'Reading libraries and matching history… 1 of 2 users complete.',
+      {},
+      { timeout: 3000 },
+    );
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+    responses['/api/migrations/preview/preview-task-1'] = readyPreviewTask;
+    const dialog = await screen.findByRole('dialog', {}, { timeout: 3000 });
+    expect(within(dialog).getByRole('button', { name: 'Start migration' })).toBeTruthy();
+    expect(screen.queryByText(/Reading libraries and matching history/)).toBeNull();
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+    const polls = requests.filter(
+      (request) => request.path === '/api/migrations/preview/preview-task-1',
+    );
+    expect(polls.length).toBeGreaterThanOrEqual(2);
+    expect(polls.every((request) => !!request.options?.signal)).toBe(true);
+  });
+
+  it('shows a failed preview error and releases the preview button without starting a migration', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview/preview-task-1'] = {
+      ...runningPreviewTask,
+      status: 'failed',
+      error: 'The Emby library could not be read. Check the server connection and retry.',
+    };
+    render(<App />);
+    await selectAndPreview();
+    await screen.findByText(
+      'The Emby library could not be read. Check the server connection and retry.',
+      {},
+      { timeout: 3000 },
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Preview migration (2)' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+  });
+
+  it('cancels a preview when leaving the migration page and ignores an already pending late result', async () => {
+    prepareRunningPreview();
+    const normalFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    let release!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    vi.mocked(globalThis.fetch).mockImplementation(async (path, options) => {
+      if (path === '/api/migrations/preview/preview-task-1' && options?.method !== 'DELETE') {
+        requests.push({ path: String(path), options });
+        return pending;
+      }
+      return normalFetch(path, options);
+    });
+    render(<App />);
+    await selectAndPreview();
+    await waitFor(
+      () =>
+        expect(
+          requests.some((request) => request.path === '/api/migrations/preview/preview-task-1'),
+        ).toBe(true),
+      { timeout: 3000 },
+    );
+    const poll = requests.find(
+      (request) => request.path === '/api/migrations/preview/preview-task-1',
+    )!;
+    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    await screen.findByText('Every move, recorded.');
+    expect(poll.options?.signal?.aborted).toBe(true);
+    const cancelled = requests.find(
+      (request) =>
+        request.path === '/api/migrations/preview/preview-task-1' &&
+        request.options?.method === 'DELETE',
+    )!;
+    expect(cancelled).toBeTruthy();
+    expect((cancelled.options?.headers as Record<string, string>)['X-CSRF-Token']).toBe(
+      'test-csrf',
+    );
+    await act(async () => {
+      release({ ok: true, status: 200, json: async () => readyPreviewTask } as Response);
+    });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByText(/Reading libraries and matching history/)).toBeNull();
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+  });
+
+  it('receives and cancels a delayed preview task after navigating away during its initial request', async () => {
+    prepareRunningPreview();
+    const normalFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    let release!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => {
+      release = resolve;
+    });
+    vi.mocked(globalThis.fetch).mockImplementation(async (path, options) => {
+      if (path === '/api/migrations/preview') {
+        requests.push({ path: String(path), options });
+        return pending;
+      }
+      return normalFetch(path, options);
+    });
+    render(<App />);
+    await selectAndPreview();
+    expect(
+      requests.find((request) => request.path === '/api/migrations/preview')?.options?.signal,
+    ).toBeUndefined();
+    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    await screen.findByText('Every move, recorded.');
+    expect(requests.some((request) => request.options?.method === 'DELETE')).toBe(false);
+    await act(async () => {
+      release({ ok: true, status: 202, json: async () => runningPreviewTask } as Response);
+    });
+    await waitFor(() =>
+      expect(
+        requests.filter(
+          (request) =>
+            request.path === '/api/migrations/preview/preview-task-1' &&
+            request.options?.method === 'DELETE',
+        ),
+      ).toHaveLength(1),
+    );
+    expect(
+      requests.some(
+        (request) =>
+          request.path === '/api/migrations/preview/preview-task-1' &&
+          request.options?.method !== 'DELETE',
+      ),
+    ).toBe(false);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByText(/Reading libraries and matching history/)).toBeNull();
+  });
+
+  it('cancels a known preview after a polling network error so another attempt can start', async () => {
+    prepareRunningPreview();
+    const normalFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    vi.mocked(globalThis.fetch).mockImplementation(async (path, options) => {
+      if (path === '/api/migrations/preview/preview-task-1' && options?.method !== 'DELETE') {
+        requests.push({ path: String(path), options });
+        throw new TypeError('Failed to fetch');
+      }
+      return normalFetch(path, options);
+    });
+    render(<App />);
+    await selectAndPreview();
+    await screen.findByText(
+      'Could not reach Jellyport. Check that the application is running and try again.',
+      {},
+      { timeout: 3000 },
+    );
+    expect(
+      requests.filter(
+        (request) =>
+          request.path === '/api/migrations/preview/preview-task-1' &&
+          request.options?.method === 'DELETE',
+      ),
+    ).toHaveLength(1);
+    expect(screen.getByRole('button', { name: 'Preview migration (2)' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+  });
+
+  it('lets the administrator cancel matching and return to selecting users', async () => {
+    prepareRunningPreview();
+    render(<App />);
+    await selectAndPreview();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel matching' }));
+    expect(screen.queryByText(/Reading libraries and matching history/)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Preview migration (2)' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    await waitFor(() =>
+      expect(
+        requests.filter(
+          (request) =>
+            request.path === '/api/migrations/preview/preview-task-1' &&
+            request.options?.method === 'DELETE',
+        ),
+      ).toHaveLength(1),
+    );
+    expect(screen.getByRole('checkbox', { name: 'Select all visible Emby users' })).toHaveProperty(
+      'checked',
+      true,
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('aborts and cancels an active preview before signing out', async () => {
+    prepareRunningPreview();
+    responses['/api/logout'] = anonymous;
+    render(<App />);
+    await selectAndPreview();
+    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await screen.findByText('Welcome back');
+    const cancelIndex = requests.findIndex(
+      (request) =>
+        request.path === '/api/migrations/preview/preview-task-1' &&
+        request.options?.method === 'DELETE',
+    );
+    const logoutIndex = requests.findIndex((request) => request.path === '/api/logout');
+    expect(cancelIndex).toBeGreaterThanOrEqual(0);
+    expect(cancelIndex).toBeLessThan(logoutIndex);
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('cancels an authenticated preview on unmount and stops its polling', async () => {
+    prepareRunningPreview();
+    const view = render(<App />);
+    await selectAndPreview();
+    view.unmount();
+    expect(
+      requests.filter(
+        (request) =>
+          request.path === '/api/migrations/preview/preview-task-1' &&
+          request.options?.method === 'DELETE',
+      ),
+    ).toHaveLength(1);
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+  });
+
+  it('clears rejected preview sessions without sending cancellation under an invalid session', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview/preview-task-1'] = { detail: 'Sign in to Jellyport.' };
+    statuses['/api/migrations/preview/preview-task-1'] = 401;
+    render(<App />);
+    await selectAndPreview();
+    await screen.findByText('Welcome back', {}, { timeout: 3000 });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(requests.some((request) => request.options?.method === 'DELETE')).toBe(false);
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+  });
   it('shows approved identity exceptions and submits the preview mapping revision with its verified recipient', async () => {
     responses['/api/users'] = { emby: [{ Id: 'complex', Name: 'Mr. Complex !' }], jellyfin: [] };
     responses['/api/migrations/preview'] = {
-      users: [
-        {
-          source_user_id: 'complex',
-          source_username: 'Mr. Complex !',
-          username: 'simple',
-          target_exists: true,
-          mapping_id: 'map-1',
-          mapping_revision: 'approved-revision',
-          discord_user_id: '123456789012345678',
-          discord_username: 'discord.original',
-          stats: {
-            source_played: 2,
-            source_favorites: 3,
-            source_resume: 1,
-            source_playlists: 2,
-            matched: 5,
+      id: 'preview-mapped',
+      status: 'ready',
+      progress: { processed: 1, total: 1 },
+      preview: {
+        users: [
+          {
+            source_user_id: 'complex',
+            source_username: 'Mr. Complex !',
+            username: 'simple',
+            target_exists: true,
+            mapping_id: 'map-1',
+            mapping_revision: 'approved-revision',
+            discord_user_id: '123456789012345678',
+            discord_username: 'discord.original',
+            stats: {
+              source_played: 2,
+              source_favorites: 3,
+              source_resume: 1,
+              source_playlists: 2,
+              matched: 5,
+            },
+            warnings: ['Some source playlists could not be read.'],
           },
-          warnings: ['Some source playlists could not be read.'],
-        },
-      ],
+        ],
+      },
     };
     responses['/api/migrations'] = { ...job, kind: 'migrate' };
     render(<App />);

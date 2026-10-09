@@ -210,6 +210,13 @@ export interface PreviewUser {
 export interface Preview {
   users: PreviewUser[];
 }
+export interface PreviewTask {
+  id: string;
+  status: 'running' | 'ready' | 'failed';
+  progress: { processed: number; total: number };
+  preview?: Preview;
+  error?: string;
+}
 export interface SubscriptionEvent {
   id: string;
   username?: string;

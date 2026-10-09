@@ -190,8 +190,13 @@ hr {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-height: 0;
+  overflow-y: auto;
+  margin-left: -20px;
+  padding-left: 20px;
 }
 .nav-button {
+  flex-shrink: 0;
   padding: 12px 13px;
   display: flex;
   gap: 12px;
@@ -232,6 +237,7 @@ hr {
 .sidebar-bottom {
   margin-top: auto;
   padding-top: 30px;
+  flex-shrink: 0;
 }
 .operator-card {
   display: flex;
@@ -1533,6 +1539,10 @@ textarea::placeholder {
   .nav-button.active::before {
     left: -16px;
   }
+  .nav {
+    margin-left: -16px;
+    padding-left: 16px;
+  }
   .content {
     padding: 28px 26px;
   }
@@ -1989,6 +1999,13 @@ progress.progress-track::-moz-progress-bar {
 .setup-server strong {
   color: var(--text);
   font-weight: 500;
+}
+.preview-progress {
+  flex-wrap: wrap;
+}
+.preview-cancel {
+  margin-left: auto;
+  flex-shrink: 0;
 }
 .setup-refresh {
   align-self: flex-start;

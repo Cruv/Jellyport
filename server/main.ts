@@ -9,12 +9,13 @@ import staticFiles from '@fastify/static';
 import { registerUserMappingRoutes } from './user-mappings.js';
 import { registerDiscordMemberRoutes } from './discord-members.js';
 import { registerAccountRoleRoutes } from './account-roles.js';
-import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Store } from './store.js';
 import { Service } from './service.js';
+import { PreviewTasks } from './preview-tasks.js';
 import { BotManager, BotError } from './bot.js';
 import { UserOrganization } from './user-organization.js';
 import { DemoServers } from './demo.js';
@@ -142,6 +143,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     clientFactory = servers.factory;
   }
   const service = new Service(store, { demo, clientFactory });
+  const previews = new PreviewTasks((ids, controls) => service.preview(ids, controls));
+  const previewContext = () =>
+    createHash('sha256').update(JSON.stringify(store.settings())).digest('hex');
   const bot = new BotManager(service);
   service.bot = bot;
   const app = Fastify({
@@ -168,6 +172,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     const value = sessions.get(sid);
     if (!value) return undefined;
     sessions.delete(sid);
+    previews.cancelOwner(sid);
     authenticatedSessions.delete(sid);
     anonymousSessions.delete(sid);
     const owned = addresses.get(value.address);
@@ -760,6 +765,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       for (const key of ['emby_url', 'jellyfin_url', 'jellyfin_public_url'] as const)
         settings[key] = settings[key].replace(/\/+$/, '');
       store.saveSettings(settings);
+      previews.close();
       await bot.restart(settings);
       return publicSettings();
     },
@@ -810,6 +816,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           !store.updateServiceKey(state.serverId, request.body.api_key, key.apiKeyName)
         )
           throw new JellyfinAuthError('Server configuration changed. Reload the page.', 403);
+        previews.close();
         await bot.restart(store.settings());
         return publicSettings();
       } finally {
@@ -860,7 +867,37 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   app.post<{ Body: MigrationRequest }>(
     '/api/migrations/preview',
     { schema: { body: migrationSchema } },
-    async (request) => service.preview(request.body.source_user_ids),
+    async (request, reply) =>
+      reply
+        .code(202)
+        .send(
+          previews.start(request.cookies[COOKIE]!, previewContext(), request.body.source_user_ids),
+        ),
+  );
+  const previewParams = {
+    type: 'object',
+    required: ['id'],
+    properties: { id: { type: 'string', pattern: '^[a-f0-9-]{36}$' } },
+  };
+  const unavailablePreview = (reply: FastifyReply) =>
+    reply
+      .code(404)
+      .send({ detail: 'This history preview expired or is unavailable. Start a new preview.' });
+  app.get<{ Params: { id: string } }>(
+    '/api/migrations/preview/:id',
+    { schema: { params: previewParams } },
+    async (request, reply) => {
+      const value = previews.get(request.cookies[COOKIE]!, previewContext(), request.params.id);
+      return value ?? unavailablePreview(reply);
+    },
+  );
+  app.delete<{ Params: { id: string } }>(
+    '/api/migrations/preview/:id',
+    { schema: { params: previewParams } },
+    async (request, reply) =>
+      previews.cancel(request.cookies[COOKIE]!, request.params.id)
+        ? { canceled: true }
+        : unavailablePreview(reply),
   );
   app.post<{ Body: MigrationRequest }>(
     '/api/migrations',
@@ -1185,6 +1222,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   maintenance.unref();
   app.addHook('onClose', async () => {
     clearInterval(maintenance);
+    previews.close();
     await Promise.all([bot.stop(), service.stop()]);
     await upkeep;
     await Promise.all([...sessions.values()].map((value) => revoke(value)));

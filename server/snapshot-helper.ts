@@ -11,6 +11,7 @@ import {
   regular,
   snapshotId,
   snapshotKey,
+  snapshotCaptureMethod,
   writeEnvelope,
   type CaptureRequest,
   type CaptureResult,
@@ -19,6 +20,7 @@ import {
 const directory = process.env.JELLYPORT_SNAPSHOT_DIR;
 const source = process.env.JELLYPORT_EMBY_DATA_DIR;
 const workDirectory = process.env.JELLYPORT_SNAPSHOT_WORK_DIR;
+const captureMethod = snapshotCaptureMethod(process.env.JELLYPORT_SNAPSHOT_METHOD);
 if (
   !directory ||
   !source ||
@@ -56,6 +58,7 @@ const heartbeat = setInterval(() => {
         {
           version: 1,
           emby_version: SNAPSHOT_VERSION,
+          capture_method: captureMethod,
           updated_at: new Date().toISOString(),
         },
         key,
@@ -88,6 +91,7 @@ while (!stopping) {
       {
         version: 1,
         emby_version: SNAPSHOT_VERSION,
+        capture_method: captureMethod,
         updated_at: new Date().toISOString(),
       },
       key,
@@ -116,6 +120,8 @@ while (!stopping) {
       let temporary: string | undefined;
       let result: CaptureResult;
       try {
+        if (snapshotCaptureMethod(request.capture_method) !== captureMethod)
+          throw new Error('The helper capture method changed. Request a new capture.');
         await sourceIdentity(request.binding.server_id);
         temporary = await mkdtemp(join(workDirectory, `capture-${id}-`));
         const output = join(temporary, 'library.db');
@@ -123,7 +129,10 @@ while (!stopping) {
           identities: Record<string, number>;
           schema: string;
           bytes: number;
-        }>({ operation: 'capture', directory: source, output }, controller.signal);
+        }>(
+          { operation: 'capture', directory: source, output, capture_method: captureMethod },
+          controller.signal,
+        );
         if (
           !request.user_ids?.length ||
           request.user_ids.length > 1000 ||
@@ -143,6 +152,7 @@ while (!stopping) {
         await rename(join(directory, `${id}.db.enc.pending`), join(directory, `${id}.db.enc`));
         result = {
           ...request,
+          capture_method: captureMethod,
           ok: true,
           started_at,
           finished_at: new Date().toISOString(),

@@ -156,8 +156,45 @@ The defaults favor playback protection over migration speed. A 100,000-item
 catalog needs at least 1,000 state batches per account, so the idle intervals alone
 take about eight minutes per account. Request processing and destination writes
 add time. For large bulk moves, saved snapshots avoid repeated live source-state
-API reads, while still carrying disk-I/O and WAL-retention costs during capture.
+API reads, while still carrying disk-I/O costs during capture. The legacy Online
+Backup method can also delay WAL checkpoints while its source transaction stays
+open.
 No approach here guarantees zero impact on an actively used media server.
+
+## Scheduled best-effort file copies
+
+`JELLYPORT_SNAPSHOT_METHOD=file_copy` on the optional helper selects ordinary
+scheduled file copying. The same daily schedule and timezone are reused. It needs
+no ZFS, downtime, backup plugin or special storage. The helper opens source files
+read-only and streams only `library.db`, `users.db` and their available WAL files
+into private work space; it does not query SQLite on the live source or copy
+`-shm`, authentication databases or unrelated configuration. A single capture
+supplies library history for all users.
+
+SQLite performs normal WAL recovery on the private copies, followed by integrity
+and supported-schema validation. Only the allowlisted encrypted migration
+projection is published. Raw library/users/WAL copies remain in helper-only work
+space until cleanup; the raw user database can contain private account data.
+Damaged, incompatible or unresolvable captures retain the last good projection.
+There is no `.recover` salvage, adoption of repaired data, or automatic fallback
+to live history reads. Capture metadata labels this method `file_copy`; old
+records without a method retain the `sqlite_online_backup` meaning.
+
+This is explicitly best effort. File copies taken during writes do not provide
+an atomic database view, and structural integrity cannot prove complete or current
+history. Normal WAL recovery can disregard incomplete or uncommitted tail data.
+Copies can fail or miss activity even while the source server is healthy. Avoiding
+a source SQLite read transaction removes that capture's read-lock/checkpoint hold;
+it does not remove disk traffic, private-copy recovery/projection CPU cost or all
+possibility of playback impact. The existing Online Backup method remains the
+default when the helper method is omitted. Both have the capture deadline and
+retention/size limits documented in [deployment](docker-deployment.md#optional-local-emby-snapshots--0120).
+
+Saved history does not make the entire migration offline. Current source identity
+still comes through the API; Complete mode also obtains supported account
+configuration, profile images and playlist metadata/entries live. Jellyfin access
+and destination state remain live. Neither capture method makes these separate
+databases and API responses one consistent transaction.
 
 ## Observability and verification
 

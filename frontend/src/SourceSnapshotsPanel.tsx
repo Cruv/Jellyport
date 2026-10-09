@@ -151,6 +151,9 @@ export default function SourceSnapshotsPanel({
     setCaptureTime(clock(status.config));
     setError('');
   }
+  const fileCopy = status?.capture_method === 'file_copy';
+  const hasFileCopies =
+    fileCopy || status?.records.some((record) => record.source_type === 'file_copy');
   return (
     <section className="panel mt-18" aria-label="Saved Emby database snapshots">
       <div className="panel-header">
@@ -161,11 +164,19 @@ export default function SourceSnapshotsPanel({
       </div>
       <div className="panel-body form-stack">
         <p className="muted text-small">
-          A network-isolated helper uses a read-only Emby database mount on the same Docker host.
-          Emby can keep running while the consistent database copy is captured. This avoids a full
-          library scan through Emby’s API. Database captures support both complete and watched-only
-          migrations.
+          A network-isolated helper uses a read-only Emby database mount on the same Docker host.{' '}
+          {fileCopy
+            ? 'File copies run while Emby stays online; no filesystem snapshot or downtime is needed.'
+            : 'Emby can keep running while a consistent SQLite online backup is captured.'}{' '}
+          This avoids a full library scan through Emby’s API. Database captures support both
+          complete and watched-only migrations.
         </p>
+        {hasFileCopies && (
+          <Callout icon="info" title="File copies use best-effort history.">
+            Live file copies are not transactional. Some history may be missing or inconsistent even
+            when validation passes. Failed captures keep the last good copy.
+          </Callout>
+        )}
         {status?.available === false && (
           <Callout warning title="Emby database source is unavailable.">
             Configure the read-only source mount using the{' '}
@@ -186,6 +197,10 @@ export default function SourceSnapshotsPanel({
         )}
         {status && (
           <div aria-live="polite">
+            <p className="muted text-small">
+              Capture method:{' '}
+              <strong>{fileCopy ? 'Scheduled file copy' : 'SQLite online backup'}</strong>
+            </p>
             <strong>
               {status.running
                 ? 'Capturing Emby database…'
@@ -337,12 +352,21 @@ export default function SourceSnapshotsPanel({
                     </td>
                     <td>
                       <strong>
-                        {record.source_type === 'sqlite_online_backup'
-                          ? 'Complete database'
-                          : record.scope === 'watched_only'
-                            ? 'Watched-only data'
-                            : 'Complete data'}
+                        {record.source_type === 'file_copy'
+                          ? 'File copy'
+                          : record.source_type === 'sqlite_online_backup'
+                            ? 'SQLite online backup'
+                            : record.scope === 'watched_only'
+                              ? 'Watched-only data'
+                              : 'Complete data'}
                       </strong>
+                      {record.source_type && (
+                        <small>
+                          {record.scope === 'watched_only'
+                            ? 'Watched-only migration data'
+                            : 'Complete migration data'}
+                        </small>
+                      )}
                       <small>{Math.ceil(record.bytes / 1024).toLocaleString()} KiB</small>
                     </td>
                     <td>

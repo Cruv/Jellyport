@@ -189,7 +189,7 @@ export interface JobProgress {
 }
 export type MigrationScope = 'complete' | 'watched_only';
 export interface SourceSnapshotMetadata {
-  source_type?: 'sqlite_online_backup';
+  source_type?: 'sqlite_online_backup' | 'file_copy';
   schema?: string;
   id: string;
   source_server_url: string;
@@ -217,7 +217,7 @@ export interface SourceSnapshotConfig {
 }
 export interface SourceSnapshotStatus {
   available?: boolean;
-  capture_method?: 'sqlite_online_backup';
+  capture_method?: 'sqlite_online_backup' | 'file_copy';
   config: SourceSnapshotConfig;
   running: boolean;
   last_attempt_at: string | null;

@@ -8,11 +8,22 @@ import {
   readSnapshotItems,
   readUserIdentities,
 } from './emby-snapshot-reader.js';
-import { MAX_SNAPSHOT_BYTES, regular } from './snapshot-files.js';
+import {
+  MAX_SNAPSHOT_BYTES,
+  regular,
+  snapshotCaptureMethod,
+  type SnapshotCaptureMethod,
+} from './snapshot-files.js';
+import { captureFileCopy } from './snapshot-copy.js';
 import type { MigrationScope } from './migration.js';
 
 type Request =
-  | { operation: 'capture'; directory: string; output: string }
+  | {
+      operation: 'capture';
+      directory: string;
+      output: string;
+      capture_method?: SnapshotCaptureMethod;
+    }
   | {
       operation: 'read';
       path: string;
@@ -50,6 +61,8 @@ async function run(request: Request): Promise<unknown> {
     return items;
   }
   if (request.operation !== 'capture') throw new Error('Unknown operation.');
+  if (snapshotCaptureMethod(request.capture_method) === 'file_copy')
+    return captureFileCopy(request.directory, request.output);
   const path = join(request.directory, 'library.db');
   await regular(path);
   const fs = await statfs(path);

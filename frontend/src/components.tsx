@@ -484,13 +484,16 @@ export function JobProgressDetails({ job }: { job: Job }) {
   );
 }
 export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetadata }) {
+  const fileCopy = snapshot.source_type === 'file_copy';
   return (
     <p className="subtle text-small">
-      Saved Emby snapshot · Emby {snapshot.source_server_version} ·{' '}
+      Saved Emby snapshot{fileCopy ? ' · File copy' : ''} · Emby {snapshot.source_server_version} ·{' '}
       {snapshot.scope === 'watched_only' ? 'watched-only' : 'complete'} · captured{' '}
-      {new Date(snapshot.finished_at).toLocaleString()}. Read window:{' '}
+      {new Date(snapshot.finished_at).toLocaleString()}. {fileCopy ? 'Copy' : 'Read'} window:{' '}
       {new Date(snapshot.started_at).toLocaleString()} –{' '}
       {new Date(snapshot.finished_at).toLocaleString()}. Activity after this window is not included.
+      {fileCopy &&
+        ' Live file copies are not transactional; some history may be missing or inconsistent even when validation passes.'}
     </p>
   );
 }

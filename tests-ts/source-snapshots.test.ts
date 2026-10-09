@@ -67,13 +67,18 @@ async function fixture(demo = false) {
   // Keep scheduling deterministic: these tests explicitly tick the file protocol.
   clearInterval((manager as unknown as { timer?: ReturnType<typeof setInterval> }).timer);
   const key = demo ? undefined : await snapshotKey(shared);
-  async function heartbeat(updatedAt = new Date().toISOString(), version = SNAPSHOT_VERSION) {
+  async function heartbeat(
+    updatedAt = new Date().toISOString(),
+    version = SNAPSHOT_VERSION,
+    captureMethod?: unknown,
+  ) {
     await writeEnvelope(
       join(shared, 'helper.status'),
       {
         version: 1,
         emby_version: version,
         updated_at: updatedAt,
+        ...(captureMethod === undefined ? {} : { capture_method: captureMethod }),
       },
       key!,
     );
@@ -201,6 +206,58 @@ it('collects stale unfinished ciphertext while preserving recent work and the la
   await expect(stat(stale)).rejects.toMatchObject({ code: 'ENOENT' });
   expect(await readFile(recent, 'utf8')).toBe('unfinished-recent-ciphertext');
   expect((await stat(join(f.shared, `${completed.id}.db.enc`))).isFile()).toBe(true);
+});
+
+it('pins a file-copy helper method and preserves its provenance across restart and helper changes', async () => {
+  const f = await fixture();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  expect(await f.manager.status()).toMatchObject({ available: true, capture_method: 'file_copy' });
+  await f.manager.refresh();
+  const request = await f.pendingRequest();
+  expect(request.capture_method).toBe('file_copy');
+  const capture = await f.finish(request);
+  expect(
+    (await f.manager.select(userId, f.settings, 'fixture-emby-server')).metadata.source_type,
+  ).toBe('file_copy');
+  await f.restart();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'sqlite_online_backup');
+  expect(await f.manager.status()).toMatchObject({
+    capture_method: 'sqlite_online_backup',
+    records: [{ id: capture.id, source_type: 'file_copy' }],
+  });
+  await f.heartbeat(new Date(Date.now() - 30_000).toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  expect(await f.manager.status()).toMatchObject({ available: false, capture_method: 'file_copy' });
+});
+
+it('rejects an authenticated result that silently changes file-copy capture to online backup', async () => {
+  const f = await fixture();
+  const good = await f.complete();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  await f.manager.refresh();
+  const request = await f.pendingRequest();
+  await f.finish(request, { capture_method: 'sqlite_online_backup' });
+  expect(await f.manager.status()).toMatchObject({
+    running: false,
+    records: [{ id: good.id }],
+    last_error: 'Database capture could not be validated. The last good copy is preserved.',
+  });
+});
+
+it('rejects unknown helper capture methods before making any Emby API request', async () => {
+  const f = await fixture();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'unrecognized-capture-method');
+  await expect(f.manager.refresh()).rejects.toThrow('helper is unavailable');
+  expect(f.factory).not.toHaveBeenCalled();
+});
+
+it('reads legacy capture manifests without a method as SQLite online backups', async () => {
+  const f = await fixture();
+  const capture = await f.complete({ capture_method: undefined });
+  await f.restart();
+  expect(
+    (await f.manager.select(userId, f.settings, 'fixture-emby-server', capture.id)).metadata
+      .source_type,
+  ).toBe('sqlite_online_backup');
 });
 
 it('fails closed for stale helpers, unsupported server versions and unsupported public user IDs', async () => {
@@ -570,6 +627,24 @@ it('restores the named-zone schedule and last daily attempt across a manager res
   await f.tick();
   expect(f.factory).toHaveBeenCalledTimes(2);
   expect(await f.pendingRequest()).toMatchObject({ requested_at: '2026-01-16T08:15:00.000Z' });
+});
+
+it('uses the file-copy method for daily scheduled captures without repeating the daily attempt', async () => {
+  vi.setSystemTime(new Date('2026-10-09T03:30:00Z'));
+  const f = await fixture();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  const config = (await f.manager.status()).config;
+  await f.manager.configure({ ...config, enabled: true, expected_revision: config.revision });
+  await f.tick();
+  const request = await f.pendingRequest();
+  expect(request.capture_method).toBe('file_copy');
+  await f.finish(request);
+  await f.tick();
+  expect(f.factory).toHaveBeenCalledOnce();
+  expect(await f.manager.status()).toMatchObject({
+    capture_method: 'file_copy',
+    records: [{ source_type: 'file_copy' }],
+  });
 });
 
 it('does not capture twice when daylight saving repeats the scheduled local wall-clock time', async () => {

@@ -34,6 +34,7 @@ services:
     environment:
       - JELLYPORT_SNAPSHOT_DIR=/snapshots
       - JELLYPORT_SNAPSHOT_WORK_DIR=/work
+      - JELLYPORT_SNAPSHOT_METHOD=file_copy # Best effort live-file copies; omit for legacy SQLite Online Backup.
       - JELLYPORT_EMBY_DATA_DIR=/emby-data
       - JELLYPORT_EMBY_VERSION=4.10.1.0 # Must match the supported Emby version.
       - TZ=Etc/UTC

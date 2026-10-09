@@ -11,7 +11,7 @@ The work consists of ordinary code review, defensive regression tests with synth
 - After pairing, the authentication server's URL and identity are bound separately from editable integration settings. Interactive sessions are checked against the bound Jellyfin server and its current administrator policy. Background work uses the separately supplied privileged API key, which remains valid until manually revoked on Jellyfin. Jellyport does not create, delete, or revoke API keys.
 - Jellyfin passwords are used only for ordinary administrator sign-in and are not persisted by Jellyport. First-run pairing uses a pre-created API key instead of an administrator password. The pending key remains in server memory until setup completion, when it is saved encrypted. Interactive access tokens remain on the server. The browser receives an opaque session cookie and a CSRF token; Jellyfin access tokens and API keys are never returned in responses or saved in browser storage.
 - Saved API keys, bot tokens, queued settings snapshots, and retained generated passwords are encrypted. The encryption key, `secret.key`, resides beside `jellyport.db`. Anyone who can read both files or their backups can decrypt those secrets. Restrict access to the host, data mount, and backups; encryption does not protect against a compromised host or a compromised Jellyport administrator session.
-- Optional Emby migration snapshots are retained encrypted in a private exchange directory containing their encryption material. Anyone able to read both can recover the allowlisted media metadata and personal history. A full native `library.db` can contain unrelated tables and sensitive integration data, so its raw backup and temporary projection remain exclusively in the network-isolated helper's private `/work` mount. The helper builds a new database from allowlisted `MediaItems` and `UserDatas` columns and supported metadata fields; sync jobs/targets, other native tables, unused columns, and arbitrary payloads are excluded before encryption and publication. The web/API container receives only that projection, never the raw database or the source/work mounts. Authenticated reads temporarily decrypt the projection; completed decrypted projections can remain for up to a minute between reads. Temporary-file cleanup does not guarantee forensic erasure or remove copies from host backups. The helper reads allowlisted user ID/GUID fields from `users.db` for version-specific identity mapping, without copying authentication or user databases. Read-only mounting prevents source writes, but the helper can read other source-directory files allowed by its UID/GID, so keep that mount confined to the smallest actual database directory.
+- Optional Emby migration snapshots are retained encrypted in a private exchange directory containing their encryption material. Anyone able to read both can recover the allowlisted media metadata and personal history. Raw library/users databases, WAL copies and temporary projections remain exclusively in the network-isolated helper's private `/work` mount. A raw `library.db` can contain unrelated integration data, and the file-copy method's raw `users.db` can contain sensitive account configuration or credential material. Only required user ID/GUID mappings are derived from the user database. The helper builds a new database from allowlisted `MediaItems` and `UserDatas` columns and supported metadata fields; sync jobs/targets, other native tables, unused columns and arbitrary payloads are excluded before encryption/publication. The web/API container receives only that projection, never raw databases or source/work mounts. `authentication.db`, `-shm` and unrelated configuration are not copied. Authenticated reads temporarily decrypt the projection; completed decrypted projections can remain for up to a minute between reads. Cleanup does not guarantee forensic erasure or remove copies from host backups. Read-only mounting prevents source writes, but the helper can read other source-directory files allowed by its UID/GID, so keep that mount confined to the smallest actual database directory.
 - The database is not fully encrypted. Account names, Discord account links, subscription events, and job metadata are readable to a database reader. Watch-history-derived results and watched-media titles in job metadata are also readable; secret-field encryption does not protect the watch history stored on the linked media servers. Deleting an expired credential does not erase earlier backups or guarantee forensic removal from SQLite storage.
 - Plain HTTP exposes API keys, passwords, session cookies, and user data to parties able to observe the network path. Use HTTPS or a trusted encrypted network for browser access and protect Jellyport's connections to Jellyfin and Emby as well. Set `JELLYPORT_SECURE_COOKIE=true` when browser access uses HTTPS. A Secure cookie alone does not encrypt an HTTP connection.
 - Local pairing has a separate setup-only cookie so `JELLYPORT_SECURE_COOKIE=true` can be configured before deployment. It is HttpOnly, SameSite Strict, host-only, scoped to `/api`, and intentionally lacks Secure so the private HTTP wizard can use it. Server-side checks accept it only while unpaired, for qualifying local setup requests; it never authorizes login or protected administration. Pairing completion clears the setup cookie and returns an anonymous session. Ordinary session cookies retain the configured Secure attribute, so an HTTPS deployment signs in through its HTTPS address. The path limits where browsers send the cookie; authorization comes from the server-side scope and pairing checks.
@@ -192,10 +192,33 @@ The source contract was verified using an isolated Emby 4.10.1.0 container and
 synthetic media. Mocked large-catalog, failure, memory-budget, cancellation,
 cache-scope and preservation tests cover the patch. This is a reviewable candidate;
 no production deployment or load test was performed. The live cold catalog still
-uses documented name ordering and OFFSET pagination, and database snapshots
-still consume I/O and can delay WAL checkpoints. Neither path guarantees zero
+uses documented name ordering and OFFSET pagination, and database captures
+still consume I/O; the legacy Online Backup method can delay WAL checkpoints.
+Neither path guarantees zero
 playback impact. See [performance safety](performance-safety.md) for evidence,
 limits, tradeoffs and the separately approved production-verification plan.
+
+## Best-effort file-copy capture
+
+Opt-in `JELLYPORT_SNAPSHOT_METHOD=file_copy` performs ordinary read-only copies of
+`library.db`, `users.db` and available WAL files into helper-private work space,
+without opening/querying SQLite on the source. Normal WAL recovery, integrity and
+schema validation operate only on those private copies. There is no source
+checkpoint, source journal change, `.recover` salvage or publication of repaired
+data. The encrypted allowlisted projection remains the only output accepted by
+the web service; failures retain the last good capture with no automatic live
+history fallback. Capture metadata identifies `source_type: file_copy`; legacy
+records with the method omitted retain Online Backup semantics.
+
+This method needs no ZFS, downtime or special storage and reuses the existing
+daily schedule. It avoids a source SQLite read transaction but continues to use
+disk bandwidth and CPU. Copies taken during writes are not atomic, and successful
+integrity checks cannot establish semantic completeness or recent-history
+coverage. Private raw user data increases the importance of helper work-directory
+isolation and cleanup. Complete migrations still read current identity,
+preferences, profile images and playlists through the API; destination state is
+also live. Neither file-copy nor Online Backup makes the whole migration offline
+or guarantees zero production impact.
 
 ## Deployment boundaries that remain important
 

@@ -12,12 +12,14 @@ import {
   readEnvelope,
   snapshotId,
   snapshotKey,
+  snapshotCaptureMethod,
   writeEnvelope,
   SNAPSHOT_VERSION,
   MAX_SNAPSHOT_BYTES,
   type CaptureRequest,
   type CaptureResult,
   type SnapshotBinding,
+  type SnapshotCaptureMethod,
 } from './snapshot-files.js';
 
 const MAX_AGE = 48 * 60 * 60_000;
@@ -45,7 +47,7 @@ export interface SnapshotMetadata {
   playlist_entries: number;
   bytes: number;
   avatar: boolean;
-  source_type: 'sqlite_online_backup';
+  source_type: SnapshotCaptureMethod;
   schema: string;
 }
 interface State {
@@ -114,21 +116,24 @@ export class SourceSnapshots {
     this.timer.unref();
     await this.tick();
   }
-  private async available(): Promise<boolean> {
-    if (!this.key || this.options.demo) return false;
+  private async helperStatus(): Promise<{ capture_method: SnapshotCaptureMethod } | null> {
+    if (!this.key || this.options.demo) return null;
     try {
       const status = await readEnvelope<{
         version: number;
         emby_version: string;
         updated_at: string;
+        capture_method?: unknown;
       }>(join(this.directory, 'helper.status'), this.key);
-      return (
+      if (!(
         status.version === 1 &&
         status.emby_version === SNAPSHOT_VERSION &&
         Math.abs(Date.now() - Date.parse(status.updated_at)) < 20_000
-      );
+      ))
+        return null;
+      return { capture_method: snapshotCaptureMethod(status.capture_method) };
     } catch {
-      return false;
+      return null;
     }
   }
   private async result(id: string): Promise<CaptureResult> {
@@ -154,6 +159,7 @@ export class SourceSnapshots {
         Date.parse(value.finished_at) < Date.parse(value.started_at)
       )
         throw new Error('Invalid capture.');
+      snapshotCaptureMethod(value.capture_method);
       const database = await lstat(join(this.directory, `${id}.db.enc`));
       if (!database.isFile() || database.isSymbolicLink() || database.size !== value.bytes + 28)
         throw new Error('Missing or changed capture.');
@@ -185,7 +191,7 @@ export class SourceSnapshots {
       playlist_entries: 0,
       bytes: value.bytes!,
       avatar: false,
-      source_type: 'sqlite_online_backup',
+      source_type: snapshotCaptureMethod(value.capture_method),
       schema: value.schema!,
     };
   }
@@ -198,10 +204,13 @@ export class SourceSnapshots {
         } catch {
           /* Retained error is reported separately. */
         }
+    const helper = await this.helperStatus();
     return {
       config: this.state.config,
-      available: await this.available(),
-      capture_method: 'sqlite_online_backup',
+      available: helper !== null,
+      capture_method:
+        helper?.capture_method ??
+        snapshotCaptureMethod(this.state.active?.capture_method ?? records[0]?.source_type),
       running: !!this.state.active,
       last_attempt_at: this.state.last_attempt_at,
       last_finished_at: this.state.last_finished_at,
@@ -250,7 +259,8 @@ export class SourceSnapshots {
   async refresh() {
     if (this.clearing || this.stopping)
       throw new ServiceError('Snapshot changes are in progress. Retry shortly.');
-    if (this.options.demo || !this.key || !(await this.available()))
+    const helper = await this.helperStatus();
+    if (this.options.demo || !this.key || !helper)
       throw new ServiceError(
         'The snapshot helper is unavailable. Check its same-host read-only mount and shared directory.',
       );
@@ -296,6 +306,7 @@ export class SourceSnapshots {
       requested_at: new Date().toISOString(),
       binding,
       user_ids: userIds,
+      capture_method: helper.capture_method,
     };
     this.state.active = request;
     this.state.last_attempt_at = request.requested_at;
@@ -329,6 +340,11 @@ export class SourceSnapshots {
           result.id === active.id &&
           JSON.stringify(result.binding) === JSON.stringify(active.binding)
         ) {
+          if (
+            snapshotCaptureMethod(result.capture_method) !==
+            snapshotCaptureMethod(active.capture_method)
+          )
+            throw new Error('The capture method changed during the request.');
           if (result.ok) {
             await this.result(active.id);
             if (active.user_ids?.some((id) => !Object.hasOwn(result!.identities!, id)))

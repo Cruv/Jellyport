@@ -136,6 +136,10 @@ For roles saved before 0.6.1, copy settings from the source account again and re
 
 Select 1–100 distinct Emby users, review the preview, and start the migration. Usernames match exactly by default. Use **User mappings** for simplified usernames, different existing Jellyfin usernames, or other identity exceptions; case-only conflicts are never guessed.
 
+History matching runs in the background while the interface checks progress, so a large catalog does not hold one reverse-proxy request open. Cancel a review you no longer need. Reviews are private to the administrator session and are cleared on sign-out, server restart, or a configuration change. Matching has a 15-minute deadline; completed results remain available for 10 minutes. A preview counts source playlists without reading their entries; the migration reads and transfers their contents. For a failed review, see [migration troubleshooting](docs/migration-capabilities.md#troubleshooting-a-migration-review).
+
+Preview details are bounded to the first 200 unmatched and 200 ambiguous items per user, with up to 20 candidates for each ambiguous match. Summary counts still cover the full scan; these display limits do not limit actual migration matching.
+
 Migration combines watched flags and favorites, preserves the larger play count and later playback date, and transfers resume positions when the source is demonstrably newer or Jellyfin has no competing progress. Existing Jellyfin progress wins when chronology is unknown or tied. Personal ratings and likes fill empty fields. Movies, episodes, music, books, photos, and identifiable containers are supported; aggregate season/series completion is derived from episode history instead of copied.
 
 Matching uses provider IDs, series identity with season/episode numbers, and exact file paths with optional prefix mappings. It does not guess from titles. Conflicting metadata and duplicate editions are reported as ambiguous; missing matches are reported as unmatched. Those items are skipped and the job is marked partial so you can review them, correct metadata or mappings, and rerun the merge.
@@ -339,7 +343,9 @@ The browser uses authenticated session cookies. Mutating API requests require th
 | Explicitly link an existing Jellyfin account to a Discord owner | `POST /api/accounts/link` |
 | Search Discord server members | `GET /api/discord/members?query=USERNAME_OR_NICKNAME_PREFIX` |
 | Read or stop private administrator alerts | `GET /api/discord/admin-alerts`, `POST /api/discord/admin-alerts/disable` |
-| Preview or queue migrations | `POST /api/migrations/preview`, `POST /api/migrations` |
+| Start background migration history review | `POST /api/migrations/preview` (202 Accepted) |
+| Poll or cancel an owned history review | `GET` / `DELETE /api/migrations/preview/{id}` |
+| Queue a reviewed migration | `POST /api/migrations` |
 | Create a new account | `POST /api/accounts` |
 | Read managed memberships or provision a member's account allowance | `GET /api/memberships`, `POST /api/memberships/provision` |
 | Save a paid or complimentary access policy without media account changes | `POST /api/memberships/access` |
@@ -349,5 +355,7 @@ The browser uses authenticated session cookies. Mutating API requests require th
 | List or inspect jobs | `GET /api/jobs`, `GET /api/jobs/{job_id}` |
 | Consume retained credentials | `POST /api/jobs/{job_id}/credentials` |
 | Review, apply, or ignore membership events | `GET /api/subscriptions`, `POST /api/subscriptions/{event_id}/apply`, `POST /api/subscriptions/{event_id}/ignore` |
+
+`POST /api/migrations/preview` returns `{id, status, progress}` immediately. Poll its ID for `status: "running"`, `"ready"`, or `"failed"`; `progress` contains completed user count `processed` and selected user count `total`. A ready response includes `preview: {users, mode}`, and a failed response includes a sanitized `error`. The browser polls once per second. Polling requires the same currently authorized administrator session; cancelling also requires its CSRF token. Expired, cleared, or another session's IDs return 404. Tasks remain in memory, with at most two scans running and sixteen retained tasks across the installation. These read-only reviews are separate from persistent migration jobs.
 
 API contracts were checked against [Emby API-key authentication](https://dev.emby.media/doc/restapi/API-Key-Authentication.html), [Emby user items](https://dev.emby.media/reference/RestAPI/ItemsService/getUsersByUseridItems.html), and Jellyfin's [user controller](https://github.com/jellyfin/jellyfin/blob/master/Jellyfin.Api/Controllers/UserController.cs) and [playstate controller](https://github.com/jellyfin/jellyfin/blob/master/Jellyfin.Api/Controllers/PlaystateController.cs). Run a migration preview and test one account on your server versions before a bulk migration.

@@ -284,6 +284,69 @@ it('validates account and migration request shapes without coercion', async () =
     ).statusCode,
   ).toBe(422);
 });
+it('runs history preview outside the HTTP request and isolates polling and cancellation by session', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const other = await login(app);
+  let signal!: AbortSignal;
+  const preview = vi
+    .spyOn(app.jellyport.service, 'preview')
+    .mockImplementation(async (_ids, controls) => {
+      signal = controls!.signal!;
+      await new Promise<void>((_resolve, reject) =>
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
+      );
+      return { users: [], mode: 'merge' };
+    });
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/migrations/preview',
+    headers,
+    payload: { source_user_ids: ['e-alex'] },
+  });
+  expect(response.statusCode).toBe(202);
+  const task = response.json();
+  expect(task.status).toBe('running');
+  expect(task.preview).toBeUndefined();
+  expect(preview).toHaveBeenCalledOnce();
+  const url = `/api/migrations/preview/${task.id}`;
+  expect((await app.inject({ url, headers })).json().status).toBe('running');
+  expect((await app.inject({ url })).statusCode).toBe(401);
+  expect((await app.inject({ url, headers: other })).statusCode).toBe(404);
+  expect((await app.inject({ method: 'DELETE', url, headers: other })).statusCode).toBe(404);
+  expect(
+    (await app.inject({ method: 'DELETE', url, headers: { cookie: headers.cookie } })).statusCode,
+  ).toBe(403);
+  expect(signal.aborted).toBe(false);
+  expect((await app.inject({ method: 'POST', url: '/api/logout', headers })).statusCode).toBe(200);
+  expect(signal.aborted).toBe(true);
+  const next = await login(app);
+  expect((await app.inject({ url, headers: next })).statusCode).toBe(404);
+  expect(app.jellyport.store.jobs()).toHaveLength(0);
+});
+it('discards ready history previews when integration settings change', async () => {
+  const app = await setup(false);
+  const headers = await login(app);
+  vi.spyOn(app.jellyport.service, 'preview').mockResolvedValue({ users: [], mode: 'merge' });
+  const started = await app.inject({
+    method: 'POST',
+    url: '/api/migrations/preview',
+    headers,
+    payload: { source_user_ids: ['source'] },
+  });
+  const url = `/api/migrations/preview/${started.json().id}`;
+  await vi.waitFor(async () =>
+    expect((await app.inject({ url, headers })).json().status).toBe('ready'),
+  );
+  const updated = await app.inject({
+    method: 'PUT',
+    url: '/api/settings',
+    headers,
+    payload: { emby_url: 'https://emby.example' },
+  });
+  expect(updated.statusCode).toBe(200);
+  expect((await app.inject({ url, headers })).statusCode).toBe(404);
+});
 it('starts production setup without a local administrator password or bootstrap code', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-api-'));
   const app = await createApp({ demo: false, dataDir: directory });

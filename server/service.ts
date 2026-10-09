@@ -236,6 +236,15 @@ export function templatePolicy(template: MediaUser | { Policy?: JsonObject }): J
   return policy;
 }
 
+/** Display-only preview diagnostics; these shortened IDs never identify migration writes. */
+function previewItemSummary(item: MediaItem): Pick<MediaItem, 'Id' | 'Name' | 'Type'> {
+  return {
+    Id: typeof item.Id === 'string' ? item.Id.slice(0, 128) : '',
+    ...(typeof item.Name === 'string' ? { Name: item.Name.slice(0, 512) } : {}),
+    ...(typeof item.Type === 'string' ? { Type: item.Type.slice(0, 64) } : {}),
+  };
+}
+
 /** Account jobs and subscription actions share a mutation lock released between users. */
 export class Service {
   bot: BotAdapter | null = null;
@@ -526,88 +535,141 @@ export class Service {
     )
       throw new ServiceError('The user mapping changed. Review a new preview before migrating.');
   }
-  async preview(sourceUserIds: string[]): Promise<{ users: PreviewUser[]; mode: 'merge' }> {
+  private async previewPlaylists(
+    emby: MediaAPI,
+    sourceId: string,
+  ): Promise<{ count: number; warnings: string[] }> {
+    if (!emby.playlists || !emby.playlistItems)
+      return { count: 0, warnings: ['This source client cannot read playlists.'] };
+    try {
+      const playlists = await emby.playlists(sourceId);
+      return {
+        count: Math.min(playlists.length, 500),
+        warnings:
+          playlists.length > 500
+            ? ['Only the first 500 source playlists were read. Remaining playlists were skipped.']
+            : [],
+      };
+    } catch {
+      return {
+        count: 0,
+        warnings: ['Source playlists could not be read; library data can still migrate.'],
+      };
+    }
+  }
+  async preview(
+    sourceUserIds: string[],
+    options: { signal?: AbortSignal; progress?: (processed: number, total: number) => void } = {},
+  ): Promise<{ users: PreviewUser[]; mode: 'merge' }> {
+    const checkCanceled = () => {
+      if (options.signal?.aborted) throw new ServiceError('History matching was canceled.');
+    };
+    checkCanceled();
     const settings = this.store.settings();
     return this.withClient(settings, 'emby', (emby) =>
       this.withClient(settings, 'jellyfin', async (jellyfin) => {
-        const template = await this.template(jellyfin, settings),
-          targets = await jellyfin.users();
-        const users: PreviewUser[] = [];
-        for (const sourceId of sourceUserIds) {
-          const source = await readMigrationSource(emby, sourceId);
-          if (source.user.Id !== sourceId)
-            throw new ServiceError(
-              'Emby returned a different source account. Reload the user list.',
-            );
-          const mapping = this.mappings.getForSource(sourceId, settings);
-          if (mapping && source.user.Name !== mapping.source_username)
-            throw new ServiceError('The mapped Emby account was renamed. Review its mapping.');
-          const username = mapping?.target_user_id
-              ? validateExistingMappingUsername(mapping.target_username)
-              : validateUsername(mapping?.target_username ?? source.user.Name),
-            target = this.mappedTarget(targets, mapping, username, settings);
-          if (
-            target &&
-            (target.Id === template.Id ||
-              target.Id === settings.template_user_id ||
-              target.Policy?.IsAdministrator)
-          )
-            throw new ServiceError(
-              'A migration cannot target your template user or a Jellyfin administrator.',
-            );
-          if (target?.Policy?.IsDisabled)
-            throw new ServiceError(
-              'A disabled Jellyfin account cannot be a migration destination.',
-            );
-          let targetItems = await (jellyfin.migrationItems
-            ? jellyfin.migrationItems(target?.Id || template.Id || undefined)
-            : jellyfin.items(target?.Id || template.Id || undefined));
-          if (!target)
-            targetItems = targetItems.map((item) => ({ ...item, UserData: { Played: false } }));
-          const [plan, stats] = this.plan(
-            source.items,
-            targetItems,
-            settings,
-            source.playlists.length,
-          );
-          const warnings = [
-            ...source.warnings,
-            ...source.playlists.flatMap((entry) => (entry.error ? [entry.error] : [])),
-            ...(!target && template.accountRole
-              ? [
-                  'This preview uses the server catalog. The new account’s role may limit library access; final matches are checked using that account.',
-                ]
-              : []),
-          ];
-          this.assertMapping(mapping, sourceId, settings);
-          users.push({
-            source_user_id: sourceId,
-            source_username: source.user.Name,
-            username,
-            target_user_id: target?.Id ?? null,
-            target_exists: Boolean(target),
-            stats,
-            unmatched: plan.unmatched.map((item) => ({
-              Id: item.Id,
-              Name: item.Name,
-              Type: item.Type,
-            })),
-            ambiguous: plan.ambiguous.map((entry) => ({
-              source: { Id: entry.source.Id, Name: entry.source.Name, Type: entry.source.Type },
-              candidates: entry.candidates.map((item) => ({
-                Id: item.Id,
-                Name: item.Name,
-                Type: item.Type,
+        const cancel = () => {
+          // These clients belong only to this preview; closing them aborts in-flight reads.
+          void Promise.allSettled([
+            Promise.resolve().then(() => emby.close()),
+            Promise.resolve().then(() => jellyfin.close()),
+          ]);
+        };
+        options.signal?.addEventListener('abort', cancel, { once: true });
+        try {
+          checkCanceled();
+          const template = await this.template(jellyfin, settings);
+          checkCanceled();
+          const targets = await jellyfin.users();
+          checkCanceled();
+          const users: PreviewUser[] = [];
+          for (const sourceId of sourceUserIds) {
+            checkCanceled();
+            const sourceUser = await emby.user(sourceId);
+            checkCanceled();
+            if (sourceUser.Id !== sourceId)
+              throw new ServiceError(
+                'Emby returned a different source account. Reload the user list.',
+              );
+            const mapping = this.mappings.getForSource(sourceId, settings);
+            if (mapping && sourceUser.Name !== mapping.source_username)
+              throw new ServiceError('The mapped Emby account was renamed. Review its mapping.');
+            const username = mapping?.target_user_id
+                ? validateExistingMappingUsername(mapping.target_username)
+                : validateUsername(mapping?.target_username ?? sourceUser.Name),
+              target = this.mappedTarget(targets, mapping, username, settings);
+            if (
+              target &&
+              (target.Id === template.Id ||
+                target.Id === settings.template_user_id ||
+                target.Policy?.IsAdministrator)
+            )
+              throw new ServiceError(
+                'A migration cannot target your template user or a Jellyfin administrator.',
+              );
+            if (target?.Policy?.IsDisabled)
+              throw new ServiceError(
+                'A disabled Jellyfin account cannot be a migration destination.',
+              );
+            // Validate account identity first, then overlap independent catalog reads. Preview
+            // needs only playlist metadata; entries are fetched during the actual migration.
+            const [sourceItems, targetCatalog, playlists] = await Promise.all([
+              emby.migrationItems ? emby.migrationItems(sourceId) : emby.items(sourceId),
+              jellyfin.migrationItems
+                ? jellyfin.migrationItems(target?.Id || template.Id || undefined)
+                : jellyfin.items(target?.Id || template.Id || undefined),
+              this.previewPlaylists(emby, sourceId),
+            ]);
+            checkCanceled();
+            let targetItems = targetCatalog;
+            if (!target)
+              targetItems = targetItems.map((item) => ({ ...item, UserData: { Played: false } }));
+            const [plan, stats] = this.plan(sourceItems, targetItems, settings, playlists.count);
+            const warnings = [
+              ...playlists.warnings,
+              ...(!target && template.accountRole
+                ? [
+                    'This preview uses the server catalog. The new account’s role may limit library access; final matches are checked using that account.',
+                  ]
+                : []),
+            ];
+            if (
+              plan.unmatched.length > 200 ||
+              plan.ambiguous.length > 200 ||
+              plan.ambiguous.some((entry) => entry.candidates.length > 20)
+            )
+              warnings.push(
+                'Preview details are limited to 200 unmatched items, 200 ambiguous items, and 20 candidates per item. Full counts are shown; migration checks every item.',
+              );
+            this.assertMapping(mapping, sourceId, settings);
+            users.push({
+              source_user_id: sourceId,
+              source_username: sourceUser.Name,
+              username,
+              target_user_id: target?.Id ?? null,
+              target_exists: Boolean(target),
+              stats,
+              unmatched: plan.unmatched.slice(0, 200).map(previewItemSummary),
+              ambiguous: plan.ambiguous.slice(0, 200).map((entry) => ({
+                source: previewItemSummary(entry.source),
+                candidates: entry.candidates.slice(0, 20).map(previewItemSummary),
               })),
-            })),
-            mapping_id: mapping?.id ?? null,
-            mapping_revision: mapping?.revision ?? null,
-            discord_user_id: mapping?.discord_user_id ?? null,
-            discord_username: mapping?.discord_username ?? null,
-            warnings,
-          });
+              mapping_id: mapping?.id ?? null,
+              mapping_revision: mapping?.revision ?? null,
+              discord_user_id: mapping?.discord_user_id ?? null,
+              discord_username: mapping?.discord_username ?? null,
+              warnings,
+            });
+            options.progress?.(users.length, sourceUserIds.length);
+            checkCanceled();
+          }
+          return { users, mode: 'merge' };
+        } catch (error) {
+          checkCanceled();
+          throw error;
+        } finally {
+          options.signal?.removeEventListener('abort', cancel);
         }
-        return { users, mode: 'merge' };
       }),
     );
   }

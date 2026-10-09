@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { version as appVersion } from '../../package.json';
 import {
   Callout,
   Empty,
@@ -36,6 +37,7 @@ import {
   type Overview,
   type Page,
   type Preview,
+  type PreviewTask,
   type Session,
   type Settings,
   type SubscriptionEvent,
@@ -71,6 +73,19 @@ interface Toast {
 const message = (error: unknown) =>
   error instanceof Error ? error.message : 'The operation could not be completed.';
 const emptyUsers: Users = { emby: [], jellyfin: [] };
+const nextPreviewPoll = (signal: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    const abort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('Preview cancelled.', 'AbortError'));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', abort);
+      resolve();
+    }, 1000);
+    signal.addEventListener('abort', abort, { once: true });
+    if (signal.aborted) abort();
+  });
 
 export default function App() {
   const [session, setSession] = useState<Session | null>(null);
@@ -102,6 +117,8 @@ export default function App() {
   const dialogVersion = useRef(0);
   const [busy, setBusy] = useState(new Set<string>());
   const busyRef = useRef(new Set<string>());
+  const [previewProgress, setPreviewProgress] = useState<PreviewTask['progress'] | null>(null);
+  const previewRun = useRef<{ controller: AbortController; cancel: () => void } | null>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastId = useRef(0);
@@ -134,10 +151,22 @@ export default function App() {
     dialogVersion.current++;
     setDialog(next);
   }, []);
+  const cancelPreview = useCallback(() => {
+    const run = previewRun.current;
+    if (!run) return;
+    previewRun.current = null;
+    run.controller.abort();
+    run.cancel();
+    setPreviewProgress(null);
+    busyRef.current.delete('preview');
+    setBusy(new Set(busyRef.current));
+  }, []);
+  useEffect(() => () => cancelPreview(), [cancelPreview]);
   const clearSession = useCallback(() => {
     authGeneration.current++;
     loadVersion.current++;
     sessionRef.current = null;
+    cancelPreview();
     setSession(null);
     setOverview(null);
     setUsers(emptyUsers);
@@ -150,7 +179,7 @@ export default function App() {
     setToasts([]);
     setMobileOpen(false);
     closeDialog();
-  }, [closeDialog]);
+  }, [cancelPreview, closeDialog]);
   const acceptSession = useCallback((value: Session) => {
     sessionRef.current = value;
     setSession(value);
@@ -333,6 +362,7 @@ export default function App() {
     if (session?.authenticated) void load(page);
   }, [session?.authenticated, page, load]);
   function navigate(target: Page) {
+    if (target !== 'migrate') cancelPreview();
     closeDialog();
     setMobileOpen(false);
     if (target === page) void load(target);
@@ -409,19 +439,90 @@ export default function App() {
       showDialog({ kind: 'job', job: value });
       setPollPaused(false);
     });
-  const preview = () =>
-    void work('preview', async () => {
-      if (selected.size > 100) throw new Error('Select up to 100 users for one migration.');
-      const value = await api<Preview>('/api/migrations/preview', {
-        method: 'POST',
-        body: { source_user_ids: [...selected] },
-      });
-      if (!value.users?.length)
-        throw new Error(
-          'No users were returned for this preview. Reload the Emby user list and try again.',
-        );
-      showDialog({ kind: 'preview', preview: value });
-    });
+  function preview() {
+    if (busyRef.current.has('preview')) return;
+    if (selected.size > 100) {
+      notify('Select up to 100 users for one migration.', true);
+      return;
+    }
+    const generation = authGeneration.current;
+    const controller = new AbortController();
+    let taskId = '';
+    let cancellationSent = false;
+    const run = {
+      controller,
+      cancel: () => {
+        const current = sessionRef.current;
+        if (
+          !taskId ||
+          cancellationSent ||
+          !current?.authenticated ||
+          generation !== authGeneration.current
+        )
+          return;
+        cancellationSent = true;
+        // Cancellation must not restore UI or clear a newer session if this component has gone away.
+        void fetch(`/api/migrations/preview/${encodeURIComponent(taskId)}`, {
+          method: 'DELETE',
+          headers: { Accept: 'application/json', 'X-CSRF-Token': current.csrf_token },
+          credentials: 'same-origin',
+          signal: AbortSignal.timeout(5000),
+        }).catch(() => {});
+      },
+    };
+    const active = () =>
+      previewRun.current === run &&
+      !controller.signal.aborted &&
+      generation === authGeneration.current &&
+      !!sessionRef.current?.authenticated &&
+      pageRef.current === 'migrate';
+    previewRun.current = run;
+    busyRef.current.add('preview');
+    setBusy(new Set(busyRef.current));
+    setPreviewProgress({ processed: 0, total: selected.size });
+    void (async () => {
+      try {
+        let task = await api<PreviewTask>('/api/migrations/preview', {
+          method: 'POST',
+          body: { source_user_ids: [...selected] },
+          // Receive the task ID even if the user leaves while this short request is in flight.
+          // Polling is independently abortable, and an abandoned task is cancelled below.
+        });
+        taskId = task.id;
+        if (!active()) {
+          run.cancel();
+          return;
+        }
+        while (task.status === 'running') {
+          setPreviewProgress(task.progress);
+          await nextPreviewPoll(controller.signal);
+          if (!active()) return;
+          task = await api<PreviewTask>(`/api/migrations/preview/${encodeURIComponent(taskId)}`, {
+            signal: controller.signal,
+          });
+          if (!active()) return;
+        }
+        if (task.status === 'failed')
+          throw new Error(task.error || 'The migration preview could not be completed. Try again.');
+        if (task.status !== 'ready' || !task.preview?.users?.length)
+          throw new Error(
+            'No users were returned for this preview. Reload the Emby user list and try again.',
+          );
+        showDialog({ kind: 'preview', preview: task.preview });
+      } catch (error) {
+        if (active()) notify(message(error), true);
+      } finally {
+        // The reviewed preview is now copied locally; failed or abandoned scans also release capacity.
+        run.cancel();
+        if (previewRun.current === run) {
+          previewRun.current = null;
+          setPreviewProgress(null);
+          busyRef.current.delete('preview');
+          setBusy(new Set(busyRef.current));
+        }
+      }
+    })();
+  }
   function startMigration(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (dialog?.kind !== 'preview') return;
@@ -463,6 +564,7 @@ export default function App() {
     });
   }
   function logout() {
+    cancelPreview();
     void work('logout', async () => {
       let anonymous: Session = {
         authenticated: false,
@@ -698,6 +800,9 @@ export default function App() {
                 </button>
               </div>
               <div className="sidebar-note">A smoother way to move forward.</div>
+              <div className="sidebar-note" aria-label="Jellyport version">
+                v{appVersion}
+              </div>
             </div>
           </aside>
           <main className="main">
@@ -726,6 +831,22 @@ export default function App() {
                   <Icon name="info" />
                   Demo mode is active. Accounts, watch history, and Discord messages use sample
                   data. Settings are read-only.
+                </div>
+              )}
+              {page === 'migrate' && previewProgress && (
+                <div className="setup-server preview-progress mb-17" role="status">
+                  <span>
+                    Reading libraries and matching history… {previewProgress.processed} of{' '}
+                    {previewProgress.total} {previewProgress.total === 1 ? 'user' : 'users'}{' '}
+                    complete.
+                  </span>
+                  <button
+                    className="text-button preview-cancel"
+                    type="button"
+                    onClick={cancelPreview}
+                  >
+                    Cancel matching
+                  </button>
                 </div>
               )}
               {content}

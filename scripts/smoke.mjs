@@ -18,7 +18,7 @@ for (let attempt = 0; ; attempt++) {
 }
 let cookie = '',
   csrf = '';
-async function request(path, method = 'GET', payload) {
+async function request(path, method = 'GET', payload, expectedStatus) {
   const response = await fetch(new URL(path, base), {
     method,
     signal: AbortSignal.timeout(5000),
@@ -32,6 +32,7 @@ async function request(path, method = 'GET', payload) {
   const setCookie = response.headers.get('set-cookie');
   if (setCookie) cookie = setCookie.split(';')[0];
   assert(response.ok, `${method} ${path} failed with HTTP ${response.status}`);
+  if (expectedStatus !== undefined) assert.equal(response.status, expectedStatus);
   return response.json();
 }
 const index = await fetch(base);
@@ -146,12 +147,47 @@ const users = await request('/api/users');
 assert.equal(users.emby.length, 3);
 assert.deepEqual(await request('/api/user-mappings'), { mappings: [] });
 assert.deepEqual(await request('/api/account-roles'), { roles: [], assignments: [] });
-const preview = await request('/api/migrations/preview', 'POST', {
-  source_user_ids: users.emby.map((user) => user.Id),
-});
+let previewTask = await request(
+  '/api/migrations/preview',
+  'POST',
+  { source_user_ids: users.emby.map((user) => user.Id) },
+  202,
+);
+assert.equal(typeof previewTask.id, 'string');
+assert(['running', 'ready'].includes(previewTask.status));
+for (let attempt = 0; attempt < 100 && previewTask.status === 'running'; attempt++) {
+  await delay(100);
+  previewTask = await request(`/api/migrations/preview/${previewTask.id}`);
+}
+assert.equal(previewTask.status, 'ready', 'Background history matching must finish.');
+assert.deepEqual(previewTask.progress, { processed: 3, total: 3 });
+const preview = previewTask.preview;
+assert.equal(preview.mode, 'merge');
 assert.equal(preview.users.length, 3);
 assert(preview.users.every((user) => Number.isInteger(user.stats.source_items)));
 assert(preview.users.every((user) => user.mapping_revision === null));
+assert.equal(
+  (
+    await fetch(new URL(`/api/migrations/preview/${previewTask.id}`, base), {
+      method: 'DELETE',
+      headers: { Cookie: cookie },
+    })
+  ).status,
+  403,
+  'Cancelling a history review must require CSRF protection.',
+);
+assert.deepEqual(await request(`/api/migrations/preview/${previewTask.id}`, 'DELETE'), {
+  canceled: true,
+});
+assert.equal(
+  (
+    await fetch(new URL(`/api/migrations/preview/${previewTask.id}`, base), {
+      headers: { Cookie: cookie },
+    })
+  ).status,
+  404,
+  'A cancelled history review must no longer be available.',
+);
 const job = await request('/api/migrations', 'POST', {
   source_user_ids: users.emby.map((user) => user.Id),
 });
@@ -171,6 +207,15 @@ assert.equal(credentials.credentials.length, 2);
 assert((await request(`/api/jobs/${job.id}/credentials`, 'POST')).credentials.length === 0);
 await request('/api/logout', 'POST');
 assert.equal(
+  (
+    await fetch(new URL(`/api/migrations/preview/${previewTask.id}`, base), {
+      headers: { Cookie: cookie },
+    })
+  ).status,
+  401,
+  'History previews must remain private after logout.',
+);
+assert.equal(
   (await fetch(new URL('/api/discord/members?query=alex', base), { headers: { Cookie: cookie } }))
     .status,
   401,
@@ -180,5 +225,5 @@ assert.equal(
   401,
 );
 console.log(
-  'Container smoke passed: React assets, authentication/CSRF, safe user directory and family review, read-only demo organization/access, bulk migration, preserved existing accounts, and one-time credentials.',
+  'Container smoke passed: React assets, authentication/CSRF, safe user directory and family review, read-only demo organization/access, background history review, bulk migration, preserved existing accounts, and one-time credentials.',
 );

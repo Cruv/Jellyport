@@ -89,6 +89,8 @@ For a permission-denied startup message, check that the mounted directory and it
 
 Bind-mount source paths refer to the Docker host. A directory reached through a mounted NAS share on a laptop can have a different path and displayed owner from that same directory on the server. Check the server-side path and permissions. If moving Jellyport into another stack, verify that its volume entry still points to the intended data directory.
 
+For **502 Bad Gateway** while opening a migration review, large-catalog matching now runs in the background with short progress polls. A generic gateway page points to a different layer than a sanitized Jellyport JSON error. Check container health and proxy connectivity, then follow [migration review troubleshooting](migration-capabilities.md#troubleshooting-a-migration-review). The preview is read-only; a failed or cancelled review does not change media accounts.
+
 ## Reset Jellyfin pairing
 
 For local recovery, stop Jellyport and run the reset command against the same data mount and image. Recovery retains the linked Jellyfin server's address and verifies its identity. To link a different Jellyfin server, start a fresh Jellyport installation with a new data directory; existing account links and jobs belong to the original server.

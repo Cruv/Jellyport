@@ -293,7 +293,12 @@ export function JobsTable({
           {jobs.map((job) => (
             <tr key={job.id}>
               <td>
-                <strong>{names[job.kind] || job.kind || 'Account operation'}</strong>
+                <strong>
+                  {job.migration_scope === 'watched_only' &&
+                  ['migrate', 'migration'].includes(job.kind)
+                    ? 'Watched-only migration'
+                    : names[job.kind] || job.kind || 'Account operation'}
+                </strong>
                 <small>
                   {job.results
                     ?.map((result) => result.username)
@@ -306,7 +311,15 @@ export function JobsTable({
               <td>
                 <Status value={job.status} />
               </td>
-              {!compact && <td>{num(job.results?.length)}</td>}
+              {!compact && (
+                <td>
+                  {typeof job.progress === 'object' &&
+                  job.progress.processed !== undefined &&
+                  job.progress.total !== undefined
+                    ? `${num(job.progress.processed)} / ${num(job.progress.total)}`
+                    : num(job.results?.length)}
+                </td>
+              )}
               <td className="nowrap">{date(job.created_at)}</td>
               <td className="right">
                 <button
@@ -376,6 +389,91 @@ export function progressPercent(job: Job) {
     return total ? Math.min(100, Math.round((completed / total) * 100)) : 0;
   }
   return ['completed', 'partial', 'failed'].includes(job.status) ? 100 : 0;
+}
+function jobElapsed(job: Job): string | null {
+  const end = job.finished_at || job.updated_at;
+  if (!job.started_at || (!activeJob(job) && !end)) return null;
+  const milliseconds =
+    (activeJob(job) ? Date.now() : new Date(end!).getTime()) - new Date(job.started_at).getTime();
+  if (!Number.isFinite(milliseconds)) return null;
+  const seconds = Math.floor(Math.max(0, milliseconds) / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  return hours
+    ? `${hours}h ${minutes % 60}m ${seconds % 60}s`
+    : minutes
+      ? `${minutes}m ${seconds % 60}s`
+      : `${seconds}s`;
+}
+export function JobProgressDetails({ job }: { job: Job }) {
+  const progress = typeof job.progress === 'object' ? job.progress : undefined;
+  const running = activeJob(job);
+  const elapsed = jobElapsed(job);
+  const phases = {
+    reading_source: 'Reading Emby library',
+    preparing_account: 'Preparing Jellyfin account',
+    reading_target: 'Reading Jellyfin library',
+    transferring_history:
+      job.migration_scope === 'watched_only'
+        ? 'Migrating watched status'
+        : 'Migrating watch history and favorites',
+    transferring_playlists: 'Migrating playlists',
+    delivering_credentials: 'Delivering account credentials',
+  };
+  const phase = progress?.phase ? phases[progress.phase] : undefined;
+  return (
+    <div aria-live={running ? 'polite' : undefined}>
+      {running && (
+        <progress
+          className="progress-track"
+          aria-label="Operation progress"
+          value={progressPercent(job)}
+          max={100}
+        />
+      )}
+      {((progress?.processed !== undefined && progress.total !== undefined) || elapsed) && (
+        <div className="job-meta">
+          {progress?.processed !== undefined && progress.total !== undefined && (
+            <span>
+              {num(progress.processed)} of {num(progress.total)}{' '}
+              {progress.total === 1 ? 'account' : 'accounts'} processed
+            </span>
+          )}
+          {elapsed && <span>Elapsed {elapsed}</span>}
+        </div>
+      )}
+      {running && (
+        <>
+          <p className="muted text-small">
+            {job.status === 'queued' ? (
+              'Waiting for the operation to begin…'
+            ) : (
+              <>
+                {progress?.current_user && <strong>{progress.current_user} · </strong>}
+                {phase || 'The operation is running. Progress updates automatically.'}
+              </>
+            )}
+          </p>
+          {progress?.items_processed !== undefined && (
+            <p className="muted text-small">
+              {num(progress.items_processed)}
+              {progress.items_total !== undefined && ` of ${num(progress.items_total)}`} matched
+              items checked
+              {progress.items_updated !== undefined && ` · ${num(progress.items_updated)} updated`}
+            </p>
+          )}
+          {progress?.phase === 'transferring_history' && !!progress.items_total && (
+            <progress
+              className="progress-track"
+              aria-label="History item progress"
+              value={progress.items_processed || 0}
+              max={progress.items_total}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
 }
 export function Modal({
   title,

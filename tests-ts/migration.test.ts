@@ -144,6 +144,77 @@ const migrate = (
   );
 
 describe('conservative migration merge policy', () => {
+  it('limits watched-only matching to played playable items without changing complete mode', () => {
+    const source = [
+      media('watched-movie', { Played: true }),
+      media('watched-episode', { Played: true }, 'Episode'),
+      media('watched-audio', { Played: true }, 'Audio'),
+      media('favorite', { IsFavorite: true }),
+      media('resume', { PlaybackPositionTicks: 20 }),
+      media('container', { Played: true, IsFavorite: true }, 'Series'),
+      media('playlist', { Played: true, IsFavorite: true }, 'Playlist'),
+    ];
+    const target = source.map((item) => ({ ...item, Id: `target-${item.Id}`, UserData: {} }));
+    expect(
+      statePlan(source, target, settings, 'watched_only').matches.map((match) => match.source.Id),
+    ).toEqual(['watched-movie', 'watched-episode', 'watched-audio']);
+    expect(statePlan(source, target, settings).matches.map((match) => match.source.Id)).toEqual([
+      'watched-movie',
+      'watched-episode',
+      'watched-audio',
+      'favorite',
+      'resume',
+      'container',
+    ]);
+  });
+
+  it('merges only newly watched flags and safe original dates in watched-only mode', () => {
+    const source = media('source', {
+      Played: true,
+      IsFavorite: true,
+      Likes: true,
+      Rating: 8,
+      PlayCount: 7,
+      PlaybackPositionTicks: 20,
+      LastPlayedDate: newDate,
+    });
+    const target = media('target', {
+      Played: false,
+      IsFavorite: false,
+      Likes: false,
+      Rating: 4,
+      PlayCount: 2,
+      PlaybackPositionTicks: 50,
+      LastPlayedDate: oldDate,
+    });
+    expect(mergeUserData(source, target, 'watched_only')).toEqual({
+      Played: true,
+      LastPlayedDate: newDate,
+    });
+    expect(
+      mergeUserData(
+        source,
+        { ...target, UserData: { LastPlayedDate: '2027-01-01T00:00:00.000Z' } },
+        'watched_only',
+      ),
+    ).toEqual({ Played: true });
+    expect(
+      mergeUserData(
+        source,
+        { ...target, UserData: { Played: true, LastPlayedDate: oldDate } },
+        'watched_only',
+      ),
+    ).toEqual({});
+    expect(
+      mergeUserData(
+        { ...source, UserData: { ...source.UserData, Played: false } },
+        target,
+        'watched_only',
+      ),
+    ).toEqual({});
+    expect(mergeUserData({ ...source, Type: 'Series' }, target, 'watched_only')).toEqual({});
+  });
+
   it('handles playlist personal state through its imported copy instead of guessing a library identity', async () => {
     const fixture = playlistFixture();
     fixture.sourcePlaylists[0]!.playlist.UserData = { IsFavorite: true, Likes: true, Rating: 8 };
@@ -418,6 +489,396 @@ describe('conservative migration merge policy', () => {
 });
 
 describe('user-state application and reporting', () => {
+  const modernCapabilities = async () => ({
+    userData: true,
+    privatePlaylists: false,
+    playlistDuplicates: false,
+  });
+  const matchedPlan = (count: number) => ({
+    matches: Array.from({ length: count }, (_, index) => ({
+      source: media(`source-${index}`, { Played: true }),
+      target: media(`target-${index}`),
+      method: 'path',
+    })),
+    unmatched: [],
+    ambiguous: [],
+  });
+  const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  it('uses fresh data for watched-only writes without importing excluded fields or altering already-watched items', async () => {
+    const source = [
+      media('change', {
+        Played: true,
+        IsFavorite: true,
+        PlaybackPositionTicks: 20,
+        PlayCount: 6,
+        Likes: true,
+        Rating: 8,
+        LastPlayedDate: newDate,
+      }),
+      media('already', { Played: true, LastPlayedDate: newDate }),
+      media('raced', { Played: true, LastPlayedDate: newDate }),
+      media('excluded', { IsFavorite: true, PlaybackPositionTicks: 30 }),
+    ];
+    const target = source.map((item) => ({
+      ...item,
+      Id: `target-${item.Id}`,
+      UserData: item.Id === 'already' ? { Played: true, LastPlayedDate: oldDate } : {},
+    }));
+    const userData = vi.fn(async (_user: string, id: string) =>
+      id === 'target-raced'
+        ? { Played: true, LastPlayedDate: oldDate }
+        : {
+            Played: false,
+            LastPlayedDate: '2027-01-01T00:00:00.000Z',
+            PlaybackPositionTicks: 77,
+            PlayCount: 9,
+            IsFavorite: false,
+            Likes: false,
+            Rating: 4,
+          },
+    );
+    const updateUserData = vi.fn(async () => {});
+    const details = migrationDetails();
+    const progress = vi.fn();
+    expect(
+      await migrateItemState(
+        client({ migrationCapabilities: modernCapabilities, userData, updateUserData }),
+        'user',
+        statePlan(source, target, settings, 'watched_only'),
+        details,
+        () => {},
+        () => {},
+        { migration_scope: 'watched_only', progress },
+      ),
+    ).toBe(1);
+    expect(userData.mock.calls.map((call) => call[1]).sort()).toEqual([
+      'target-change',
+      'target-raced',
+    ]);
+    expect(updateUserData).toHaveBeenCalledExactlyOnceWith('user', 'target-change', {
+      Played: true,
+    });
+    expect(details).toMatchObject({
+      items_updated: 1,
+      favorites: 0,
+      resume_positions: 0,
+      play_counts: 0,
+      last_played_dates: 0,
+      ratings: 0,
+      failed_items: 0,
+    });
+    expect(progress).toHaveBeenLastCalledWith(3, 3, 1);
+  });
+
+  it('bounds independent item work to four concurrent requests and reports every completed item', async () => {
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const reading = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let reads = 0;
+    let active = 0;
+    let maximum = 0;
+    const enter = () => {
+      active++;
+      maximum = Math.max(maximum, active);
+    };
+    const api = client({
+      migrationCapabilities: modernCapabilities,
+      userData: async () => {
+        enter();
+        if (++reads === 4) started();
+        await gate;
+        active--;
+        return {};
+      },
+      updateUserData: async () => {
+        enter();
+        await tick();
+        active--;
+      },
+    });
+    const details = migrationDetails();
+    const saved = vi.fn();
+    const progress = vi.fn();
+    const operation = migrateItemState(api, 'user', matchedPlan(8), details, () => {}, saved, {
+      progress,
+    });
+    await reading;
+    expect(reads).toBe(4);
+    expect(active).toBe(4);
+    release();
+    expect(await operation).toBe(8);
+    expect(maximum).toBe(4);
+    expect(active).toBe(0);
+    expect(saved).toHaveBeenCalledTimes(8);
+    expect(progress.mock.calls.map(([processed, total]) => [processed, total])).toEqual(
+      Array.from({ length: 8 }, (_, index) => [index + 1, 8]),
+    );
+    expect(progress).toHaveBeenLastCalledWith(8, 8, 8);
+  });
+
+  it('keeps updated progress within processed counts when a concurrent batch resolves together', async () => {
+    const details = migrationDetails();
+    const progress = vi.fn();
+    await migrateItemState(
+      client({
+        migrationCapabilities: modernCapabilities,
+        userData: async () => ({}),
+        updateUserData: async () => {},
+      }),
+      'user',
+      matchedPlan(4),
+      details,
+      () => {},
+      () => {},
+      { progress },
+    );
+    expect(progress.mock.calls).toEqual([
+      [1, 4, 1],
+      [2, 4, 2],
+      [3, 4, 3],
+      [4, 4, 4],
+    ]);
+    expect(details.items_updated).toBe(4);
+  });
+
+  it('serializes sources sharing a destination item while preserving their order and fresh merge state', async () => {
+    const values = new Map<string, MediaUserDataPatch>();
+    const active = new Set<string>();
+    const order: string[] = [];
+    const request = async (id: string, operation: string) => {
+      expect(active.has(id)).toBe(false);
+      active.add(id);
+      order.push(`${id}:${operation}`);
+      await tick();
+      active.delete(id);
+    };
+    const api = client({
+      migrationCapabilities: modernCapabilities,
+      userData: async (_user, id) => {
+        await request(id, 'read');
+        return structuredClone(values.get(id) ?? {});
+      },
+      updateUserData: async (_user, id, patch) => {
+        await request(id, 'write');
+        values.set(id, { ...values.get(id), ...patch });
+      },
+    });
+    const plan = matchedPlan(3);
+    plan.matches[0]!.source.UserData = {
+      Played: true,
+      PlaybackPositionTicks: 10,
+      LastPlayedDate: oldDate,
+    };
+    plan.matches[1]!.target.Id = 'target-0';
+    plan.matches[1]!.source.UserData = { PlaybackPositionTicks: 20, LastPlayedDate: newDate };
+    await migrateItemState(
+      api,
+      'user',
+      plan,
+      migrationDetails(),
+      () => {},
+      () => {},
+    );
+    expect(order.filter((entry) => entry.startsWith('target-0:'))).toEqual([
+      'target-0:read',
+      'target-0:write',
+      'target-0:read',
+      'target-0:write',
+    ]);
+    expect(values.get('target-0')).toMatchObject({
+      Played: true,
+      PlaybackPositionTicks: 20,
+      LastPlayedDate: newDate,
+    });
+  });
+
+  it('drains already-issued writes before rejecting a fatal guard and never starts queued items afterward', async () => {
+    let releaseWrite!: () => void;
+    let startWrite!: () => void;
+    let failGuard!: () => void;
+    const writeGate = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    const writing = new Promise<void>((resolve) => {
+      startWrite = resolve;
+    });
+    const failedGuard = new Promise<void>((resolve) => {
+      failGuard = resolve;
+    });
+    let changed = false;
+    const failure = new ServiceError('The account mapping changed.');
+    const reads = vi.fn(async (_user: string, id: string) => {
+      if (id === 'target-0') {
+        await writing;
+        changed = true;
+      }
+      return {};
+    });
+    const write = vi.fn(async () => {
+      startWrite();
+      await writeGate;
+    });
+    const details = migrationDetails();
+    let settled = false;
+    const operation = migrateItemState(
+      client({ migrationCapabilities: modernCapabilities, userData: reads, updateUserData: write }),
+      'user',
+      matchedPlan(3),
+      details,
+      () => {
+        if (changed) {
+          failGuard();
+          throw failure;
+        }
+      },
+      () => {},
+      { concurrency: 2 },
+    ).finally(() => {
+      settled = true;
+    });
+    const rejected = expect(operation).rejects.toBe(failure);
+    await failedGuard;
+    await tick();
+    expect(settled).toBe(false);
+    expect(reads.mock.calls.map((call) => call[1])).toEqual(['target-0', 'target-1']);
+    expect(write).toHaveBeenCalledOnce();
+    releaseWrite();
+    await rejected;
+    expect(settled).toBe(true);
+    expect(details).toMatchObject({ items_updated: 1, failed_items: 0 });
+  });
+
+  it('isolates ordinary item failures while preserving progress and successful updates', async () => {
+    const api = client({
+      migrationCapabilities: modernCapabilities,
+      userData: async (_user, id) => {
+        if (id === 'target-1') throw new MediaError('Jellyfin request timed out.');
+        return {};
+      },
+      updateUserData: async () => {},
+    });
+    const details = migrationDetails();
+    const progress = vi.fn();
+    const saved = vi.fn();
+    expect(
+      await migrateItemState(api, 'user', matchedPlan(4), details, () => {}, saved, { progress }),
+    ).toBe(3);
+    expect(details).toMatchObject({ items_updated: 3, failed_items: 1 });
+    expect(details.warnings).toEqual(['Jellyfin request timed out.']);
+    expect(saved).toHaveBeenCalledTimes(3);
+    expect(progress).toHaveBeenCalledTimes(4);
+    expect(progress).toHaveBeenLastCalledWith(4, 4, 3);
+  });
+
+  it('skips fresh reads for unchanged snapshots while preserving missing-date warnings and progress', async () => {
+    const from = media('source', { Played: true }, 'Episode');
+    const target = media('target', { Played: true }, 'Episode');
+    target.Path = from.Path;
+    const userData = vi.fn(async () => ({ Played: true }));
+    const updateUserData = vi.fn(async () => {});
+    const saved = vi.fn();
+    const progress = vi.fn();
+    const details = migrationDetails();
+    expect(
+      await migrateItemState(
+        client({ migrationCapabilities: modernCapabilities, userData, updateUserData }),
+        'user',
+        statePlan([from], [target], settings),
+        details,
+        () => {},
+        saved,
+        { progress },
+      ),
+    ).toBe(0);
+    expect(userData).not.toHaveBeenCalled();
+    expect(updateUserData).not.toHaveBeenCalled();
+    expect(saved).not.toHaveBeenCalled();
+    expect(details).toMatchObject({ history_dates_missing: 1, items_updated: 0 });
+    expect(details.warnings.join(' ')).toContain('no original playback date');
+    expect(progress).toHaveBeenCalledWith(1, 1, 0);
+  });
+
+  it('avoids destination reads and repeated writes when an explicitly rerun migration is already merged', async () => {
+    const state = new Map<string, MediaUserDataPatch>();
+    const userData = vi.fn(async (_user: string, id: string) => state.get(id) ?? {});
+    const updateUserData = vi.fn(async (_user: string, id: string, patch: MediaUserDataPatch) => {
+      state.set(id, { ...state.get(id), ...patch });
+    });
+    const api = client({ migrationCapabilities: modernCapabilities, userData, updateUserData });
+    const plan = matchedPlan(5);
+    expect(
+      await migrateItemState(
+        api,
+        'user',
+        plan,
+        migrationDetails(),
+        () => {},
+        () => {},
+      ),
+    ).toBe(5);
+    for (const match of plan.matches) match.target.UserData = state.get(match.target.Id);
+    userData.mockClear();
+    updateUserData.mockClear();
+    const details = migrationDetails();
+    const progress = vi.fn();
+    expect(
+      await migrateItemState(
+        api,
+        'user',
+        plan,
+        details,
+        () => {},
+        () => {},
+        { progress },
+      ),
+    ).toBe(0);
+    expect(userData).not.toHaveBeenCalled();
+    expect(updateUserData).not.toHaveBeenCalled();
+    expect(details.items_updated).toBe(0);
+    expect(progress).toHaveBeenLastCalledWith(5, 5, 0);
+  });
+
+  it('refuses detailed writes when the client cannot read fresh user data', async () => {
+    const updateUserData = vi.fn(async () => {});
+    const details = migrationDetails();
+    await migrateItemState(
+      client({ migrationCapabilities: modernCapabilities, updateUserData }),
+      'user',
+      matchedPlan(1),
+      details,
+      () => {},
+      () => {},
+    );
+    expect(updateUserData).not.toHaveBeenCalled();
+    expect(details.failed_items).toBe(1);
+    expect(details.warnings.join(' ')).toContain('Fresh Jellyfin user data is required');
+  });
+
+  it.each([0, 5, Number.NaN])(
+    'rejects invalid worker concurrency %s before contacting Jellyfin',
+    async (concurrency) => {
+      const capabilities = vi.fn(modernCapabilities);
+      await expect(
+        migrateItemState(
+          client({ migrationCapabilities: capabilities }),
+          'user',
+          matchedPlan(1),
+          migrationDetails(),
+          () => {},
+          () => {},
+          { concurrency },
+        ),
+      ).rejects.toThrow('between 1 and 4');
+      expect(capabilities).not.toHaveBeenCalled();
+    },
+  );
+
   it('re-reads target user data so later Jellyfin progress wins over the preview snapshot', async () => {
     const from = media('a', {
       IsFavorite: true,
@@ -557,6 +1018,53 @@ describe('user-state application and reporting', () => {
   it('does not report unsupported-only state as updated on legacy servers', async () => {
     const from = media('a', { PlaybackPositionTicks: 20 }),
       target = { ...media('b'), Path: from.Path };
+    const markPlayed = vi.fn(async () => {});
+    const details = migrationDetails();
+    await migrateItemState(
+      client({ markPlayed }),
+      'target-user',
+      statePlan([from], [target], settings),
+      details,
+      () => {},
+      () => {},
+    );
+    expect(markPlayed).not.toHaveBeenCalled();
+    expect(details.items_updated).toBe(0);
+    expect(details.warnings.join(' ')).toMatch(/limited|10\.9/);
+  });
+
+  it.each(['complete', 'watched_only'] as const)(
+    'does not warn about a historical date sent with a legacy watched update in %s mode',
+    async (scope) => {
+      const from = media('a', { Played: true, LastPlayedDate: oldDate });
+      const target = { ...media('b'), Path: from.Path };
+      const markPlayed = vi.fn(async () => {});
+      const details = migrationDetails();
+      await migrateItemState(
+        client({ markPlayed }),
+        'target-user',
+        statePlan([from], [target], settings, scope),
+        details,
+        () => {},
+        () => {},
+        { migration_scope: scope },
+      );
+      expect(markPlayed).toHaveBeenCalledWith('target-user', 'b', oldDate);
+      expect(details.items_updated).toBe(1);
+      expect(details.warnings).toEqual(
+        scope === 'watched_only'
+          ? [
+              'This older Jellyfin version uses its watched-item endpoint, which may update playback dates, counts or resume state. Jellyfin 10.9 or newer is required to preserve those fields precisely.',
+            ]
+          : [],
+      );
+      expect(details.warnings.join(' ')).not.toMatch(/supports limited user data/);
+    },
+  );
+
+  it('still warns when a legacy client cannot copy a date without a watched update', async () => {
+    const from = media('a', { Played: true, LastPlayedDate: newDate });
+    const target = { ...media('b', { Played: true, LastPlayedDate: oldDate }), Path: from.Path };
     const markPlayed = vi.fn(async () => {});
     const details = migrationDetails();
     await migrateItemState(
@@ -830,6 +1338,46 @@ describe('private playlist migration and durable retries', () => {
 });
 
 describe('source snapshot scope, bounds and safe errors', () => {
+  it('uses the watched-only source query when supported and keeps complete reads broad', async () => {
+    const watchedItems = vi.fn(async () => [media('watched', { Played: true })]);
+    const migrationItems = vi.fn(async () => [media('favorite', { IsFavorite: true })]);
+    const api = client({ watchedItems, migrationItems });
+    const quick = await readMigrationSource(api, 'selected-user', 'watched_only');
+    expect(watchedItems).toHaveBeenCalledWith('selected-user');
+    expect(migrationItems).not.toHaveBeenCalled();
+    expect(quick.items.map((item) => item.Id)).toEqual(['watched']);
+    watchedItems.mockClear();
+    const complete = await readMigrationSource(api, 'selected-user');
+    expect(migrationItems).toHaveBeenCalledWith('selected-user');
+    expect(watchedItems).not.toHaveBeenCalled();
+    expect(complete.items.map((item) => item.Id)).toEqual(['favorite']);
+  });
+
+  it('does not request playlist metadata or entries for a watched-only source snapshot', async () => {
+    const items = [media('watched', { Played: true, IsFavorite: true })];
+    const playlists = vi.fn(async () => {
+      throw new Error('Excluded playlist metadata must not be requested.');
+    });
+    const playlistItems = vi.fn(async () => {
+      throw new Error('Excluded playlist contents must not be requested.');
+    });
+    const migrationItems = vi.fn(async () => items);
+    const source = await readMigrationSource(
+      client({ migrationItems, playlists, playlistItems }),
+      'selected-user',
+      'watched_only',
+    );
+    expect(migrationItems).toHaveBeenCalledWith('selected-user');
+    expect(source).toMatchObject({
+      user: { Id: 'selected-user' },
+      items,
+      playlists: [],
+      warnings: [],
+    });
+    expect(playlists).not.toHaveBeenCalled();
+    expect(playlistItems).not.toHaveBeenCalled();
+  });
+
   it('uses broad reads for the selected user and keeps playlist failures separate from library data', async () => {
     const migrationItems = vi.fn(async () => [media('one', { IsFavorite: true })]);
     const items = vi.fn(async () => []);

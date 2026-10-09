@@ -163,6 +163,7 @@ assert.equal(previewTask.status, 'ready', 'Background history matching must fini
 assert.deepEqual(previewTask.progress, { processed: 3, total: 3 });
 const preview = previewTask.preview;
 assert.equal(preview.mode, 'merge');
+assert.equal(preview.migration_scope, 'complete');
 assert.equal(preview.users.length, 3);
 assert(preview.users.every((user) => Number.isInteger(user.stats.source_items)));
 assert(preview.users.every((user) => user.mapping_revision === null));
@@ -205,6 +206,37 @@ assert(finished.results.some((result) => result.data.last_played_dates > 0));
 const credentials = await request(`/api/jobs/${job.id}/credentials`, 'POST');
 assert.equal(credentials.credentials.length, 2);
 assert((await request(`/api/jobs/${job.id}/credentials`, 'POST')).credentials.length === 0);
+assert.equal(finished.migration_scope, 'complete');
+assert(Number.isFinite(Date.parse(finished.started_at)));
+assert(Number.isFinite(Date.parse(finished.finished_at)));
+let quickPreview = await request('/api/migrations/preview', 'POST', {
+  source_user_ids: ['e-river'],
+  migration_scope: 'watched_only',
+});
+for (let attempt = 0; attempt < 100 && quickPreview.status === 'running'; attempt++) {
+  await delay(100);
+  quickPreview = await request(`/api/migrations/preview/${quickPreview.id}`);
+}
+assert.equal(quickPreview.status, 'ready');
+assert.equal(quickPreview.preview.migration_scope, 'watched_only');
+assert.equal(quickPreview.preview.users[0].stats.source_playlists, 0);
+const quick = await request('/api/migrations', 'POST', {
+  source_user_ids: ['e-river'],
+  migration_scope: 'watched_only',
+});
+let quickFinished;
+for (let attempt = 0; attempt < 100; attempt++) {
+  quickFinished = await request(`/api/jobs/${quick.id}`);
+  if (!['queued', 'running'].includes(quickFinished.status)) break;
+  await delay(100);
+}
+assert.equal(quickFinished.status, 'completed');
+assert.equal(quickFinished.migration_scope, 'watched_only');
+assert.equal(quickFinished.results[0].applied, 0, 'Watched-only reruns must skip merged flags.');
+assert.equal(quickFinished.results[0].data.items_updated, 0);
+assert.equal(quickFinished.results[0].data.resume_positions, 0);
+assert.equal(quickFinished.results[0].data.playlists_created, 0);
+assert.equal((await request(`/api/jobs/${quick.id}/credentials`, 'POST')).credentials.length, 0);
 await request('/api/logout', 'POST');
 assert.equal(
   (
@@ -225,5 +257,5 @@ assert.equal(
   401,
 );
 console.log(
-  'Container smoke passed: React assets, authentication/CSRF, safe user directory and family review, read-only demo organization/access, background history review, bulk migration, preserved existing accounts, and one-time credentials.',
+  'Container smoke passed: React assets, authentication/CSRF, private history review, complete bulk migration, watched-only scope and no-op reruns, preserved accounts, timestamps, and one-time credentials.',
 );

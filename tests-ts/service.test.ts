@@ -221,6 +221,30 @@ describe('account migration and subscription safety', () => {
     ]);
   }, 1000);
 
+  it('reuses only sanitized new-destination catalogs within a preview and never across previews', async () => {
+    const targetReads = vi.fn();
+    servers.userData.template = {
+      '1': { Played: true, IsFavorite: true, PlaybackPositionTicks: 5000 },
+    };
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      if (args[2] === 'jellyfin') {
+        const original = client.migrationItems!.bind(client);
+        client.migrationItems = async (id) => {
+          targetReads(id);
+          return original(id);
+        };
+      }
+      return client;
+    };
+    const preview = await service.preview(['e-alex', 'e-sam', 'e-river']);
+    expect(targetReads.mock.calls).toEqual([['template'], ['j-river']]);
+    expect(preview.users.map((user) => user.stats.already_played)).toEqual([0, 0, 1]);
+    expect(JSON.stringify(preview)).not.toContain('PlaybackPositionTicks');
+    await service.preview(['e-alex', 'e-sam']);
+    expect(targetReads.mock.calls).toEqual([['template'], ['j-river'], ['template']]);
+  });
+
   it('bounds preview detail arrays while retaining full unmatched and ambiguous counts', async () => {
     service.clientFactory = (...args) => {
       const client = servers.factory(...args);
@@ -457,6 +481,152 @@ describe('account migration and subscription safety', () => {
     expect(servers.played['j-river']).toEqual(new Set(['1', '2', '3']));
     expect(store.takeCredentials(job.id)).toEqual([]);
   });
+  it('quick migration reads only watched source items and preserves all unrelated destination data', async () => {
+    servers.userData['e-river'] = {
+      '2': {
+        IsFavorite: true,
+        PlayCount: 8,
+        PlaybackPositionTicks: 700,
+        Rating: 9,
+        Likes: false,
+        LastPlayedDate: '2026-10-06T12:00:00.000Z',
+      },
+      '3': { IsFavorite: true, PlaybackPositionTicks: 1000 },
+    };
+    servers.userData['j-river'] = {
+      '2': {
+        PlaybackPositionTicks: 800,
+        PlayCount: 2,
+        Rating: 4,
+        LastPlayedDate: '2026-10-07T12:00:00.000Z',
+      },
+    };
+    const watchedReads = vi.fn();
+    const excluded = vi.fn(async () => {
+      throw new Error('Quick migration must not import this data.');
+    });
+    const patches: unknown[] = [];
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      if (args[2] === 'emby') {
+        const original = client.migrationItems!.bind(client);
+        client.watchedItems = async (id) => {
+          watchedReads(id);
+          return (await original(id)).filter((item) => item.UserData?.Played === true);
+        };
+        client.migrationItems = excluded;
+        client.playlists = excluded;
+        client.playlistItems = excluded;
+        client.userImage = excluded;
+      } else {
+        const update = client.updateUserData!.bind(client);
+        client.updateUserData = async (...parameters) => {
+          patches.push(parameters[2]);
+          await update(...parameters);
+        };
+        client.createPlaylist = excluded;
+        client.setConfiguration = excluded;
+        client.setUserImage = excluded;
+      }
+      return client;
+    };
+    const preview = await service.preview(['e-river'], { migration_scope: 'watched_only' });
+    expect(preview.migration_scope).toBe('watched_only');
+    expect(preview.users[0]?.stats).toMatchObject({
+      source_items: 2,
+      matched: 2,
+      source_favorites: 0,
+      source_resume: 0,
+      source_playlists: 0,
+    });
+    const job = await finish(
+      await service.migrateUsers(['e-river'], {}, undefined, 'watched_only'),
+    );
+    expect(job.status).toBe('completed');
+    expect(job.migration_scope).toBe('watched_only');
+    expect(job.results[0]?.applied).toBe(1);
+    expect(watchedReads.mock.calls).toEqual([['e-river'], ['e-river']]);
+    expect(excluded).not.toHaveBeenCalled();
+    expect(patches).toEqual([{ Played: true }]);
+    expect(servers.userData['j-river']?.['2']).toEqual({
+      Played: true,
+      PlaybackPositionTicks: 800,
+      PlayCount: 2,
+      Rating: 4,
+      LastPlayedDate: '2026-10-07T12:00:00.000Z',
+    });
+    expect(servers.userData['j-river']?.['3']).toBeUndefined();
+  });
+
+  it('quick new accounts keep normal defaults and can import the remaining data in a later complete migration', async () => {
+    servers.users.emby[2]!.Configuration = { AudioLanguagePreference: 'spa' };
+    servers.images['e-sam'] = { contentType: 'image/png', data: new Uint8Array([137, 80]) };
+    servers.userData['e-sam'] = { '1': { IsFavorite: true, PlaybackPositionTicks: 500 } };
+    const quick = await finish(
+      await service.migrateUsers(['e-sam'], {}, undefined, 'watched_only'),
+    );
+    expect(quick.status).toBe('completed');
+    const target = servers.users.jellyfin.find((user) => user.Name === 'sam')!;
+    expect(target.Configuration).toEqual(servers.users.jellyfin[0]!.Configuration);
+    expect(target.Policy).toEqual(servers.users.jellyfin[0]!.Policy);
+    expect(servers.images[target.Id]).toBeUndefined();
+    expect(servers.userData[target.Id]?.['1']).toBeUndefined();
+    expect(store.takeCredentials(quick.id)).toHaveLength(1);
+    const complete = await finish(await service.migrateUsers(['e-sam']));
+    expect(complete.migration_scope).toBe('complete');
+    expect(complete.results[0]?.created).toBe(false);
+    expect(servers.userData[target.Id]?.['1']).toMatchObject({
+      IsFavorite: true,
+      PlaybackPositionTicks: 500,
+    });
+    expect(store.takeCredentials(complete.id)).toEqual([]);
+  });
+
+  it('retains watched-only scope in a durable unstarted job across a store restart', async () => {
+    await service.stop();
+    const timestamp = new Date().toISOString();
+    const queued: Job = {
+      id: 'durable-quick-job',
+      kind: 'migrate',
+      status: 'queued',
+      created_at: timestamp,
+      updated_at: timestamp,
+      migration_scope: 'watched_only',
+      progress: { processed: 0, total: 1 },
+      results: [],
+    };
+    servers.userData['e-river'] = { '3': { IsFavorite: true } };
+    store.saveQueuedJob(
+      queued,
+      [{ source_user_id: 'e-river', migration_scope: 'watched_only' }],
+      store.settings(),
+    );
+    store.close();
+    store = new Store(directory);
+    service = new Service(store, { clientFactory: servers.factory });
+    await service.start();
+    const job = await finish(queued);
+    expect(job.status).toBe('completed');
+    expect(job.migration_scope).toBe('watched_only');
+    expect(job.results[0]?.data?.favorites).toBe(0);
+    expect(servers.userData['j-river']?.['3']).toBeUndefined();
+  });
+
+  it('rejects unknown migration scopes before any reads or queued mutations', async () => {
+    const reads = vi.fn();
+    service.clientFactory = (...args) => {
+      reads();
+      return servers.factory(...args);
+    };
+    await expect(
+      service.preview(['e-river'], { migration_scope: 'unknown' as never }),
+    ).rejects.toThrow('Choose complete or watched-only');
+    await expect(
+      service.migrateUsers(['e-river'], {}, undefined, 'unknown' as never),
+    ).rejects.toThrow('Choose complete or watched-only');
+    expect(reads).not.toHaveBeenCalled();
+    expect(store.jobs()).toEqual([]);
+  });
   it('does not reset a duplicate fresh account', async () => {
     const before = structuredClone(servers.users.jellyfin[1]);
     const job = await finish(await service.createAccount('river'));
@@ -496,6 +666,121 @@ describe('account migration and subscription safety', () => {
     expect((await finish(await service.createAccount('casey'))).status).toBe('failed');
     expect(calls).toEqual(['casey']);
     expect(store.account('casey')?.status).toBe('uncertain');
+  });
+  it('journals uncertain account creation before sending the request, then confirms its identity', async () => {
+    const sent = vi.fn();
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      const original = client.createUser.bind(client);
+      client.createUser = async (username, password) => {
+        const pending = store.account(username)!;
+        expect(pending.status).toBe('uncertain');
+        expect(pending.remote_id).toBeNull();
+        expect(store.accountPassword(pending)).toBe(password);
+        sent();
+        return original(username, password);
+      };
+      return client;
+    };
+    const job = await finish(await service.createAccount('casey'));
+    expect(job.status).toBe('completed');
+    expect(sent).toHaveBeenCalledOnce();
+    expect(store.account('casey')?.status).toBe('ready');
+    expect(store.account('casey')?.remote_id).toBe(job.results[0]?.target_user_id);
+  });
+
+  it('checkpoints live history counts in batches and flushes them before completing a user', async () => {
+    const catalog = Array.from({ length: 64 }, (_, index) => ({
+      Id: `bulk-${index}`,
+      Name: `Movie ${index}`,
+      Type: 'Movie',
+      ProviderIds: { Tmdb: `bulk-${index}` },
+    }));
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      client.migrationItems = async () =>
+        catalog.map((item) => ({ ...item, UserData: { Played: args[2] === 'emby' } }));
+      return client;
+    };
+    const snapshots: Job[] = [];
+    const originalSave = store.saveJob.bind(store);
+    vi.spyOn(store, 'saveJob').mockImplementation((job) => {
+      snapshots.push(structuredClone(job));
+      originalSave(job);
+    });
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now());
+    try {
+      const job = await finish(await service.migrateUsers(['e-river']));
+      expect(job.status).toBe('completed');
+      expect(job.results[0]?.applied).toBe(64);
+      const history = snapshots.filter((entry) => entry.progress.phase === 'transferring_history');
+      expect(history.length).toBeGreaterThanOrEqual(4);
+      expect(history.length).toBeLessThan(10);
+      expect(history.at(-1)?.progress).toMatchObject({
+        processed: 0,
+        total: 1,
+        current_user: 'river',
+        items_processed: 64,
+        items_total: 64,
+        items_updated: 64,
+      });
+      expect(snapshots.map((entry) => entry.progress.phase)).toEqual(
+        expect.arrayContaining([
+          'reading_source',
+          'preparing_account',
+          'reading_target',
+          'transferring_history',
+          'transferring_playlists',
+        ]),
+      );
+      expect(job.progress).toEqual({ processed: 1, total: 1 });
+      expect(Date.parse(job.started_at!)).toBeGreaterThan(0);
+      expect(Date.parse(job.finished_at!)).toBeGreaterThanOrEqual(Date.parse(job.started_at!));
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('bounds persisted migration diagnostics and never serializes arbitrary upstream name objects', async () => {
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      client.migrationItems = async () =>
+        args[2] === 'emby'
+          ? ([
+              ...Array.from({ length: 201 }, (_, index) => ({
+                Id: `unmatched-${index}`,
+                Name: { credential: 'upstream-private-diagnostic' },
+                Type: 'Movie',
+                ProviderIds: { Tmdb: `missing-${index}` },
+                UserData: { Played: true },
+              })),
+              ...Array.from({ length: 201 }, (_, index) => ({
+                Id: `ambiguous-${index}`,
+                Name: 'A'.repeat(700),
+                Type: 'Movie',
+                ProviderIds: { Tmdb: 'duplicate' },
+                UserData: { Played: true },
+              })),
+            ] as unknown as MediaItem[])
+          : Array.from({ length: 21 }, (_, index) => ({
+              Id: `candidate-${index}`,
+              Type: 'Movie',
+              ProviderIds: { Tmdb: 'duplicate' },
+            }));
+      return client;
+    };
+    const job = await finish(await service.migrateUsers(['e-river']));
+    expect(job.status).toBe('partial');
+    expect(job.results[0]).toMatchObject({ unmatched: 201, ambiguous: 201 });
+    expect(job.results[0]?.unmatched_items).toHaveLength(200);
+    expect(job.results[0]?.unmatched_items?.[0]?.name).toBe('');
+    expect(job.results[0]?.ambiguous_items).toHaveLength(200);
+    expect(job.results[0]?.ambiguous_items?.[0]?.name).toHaveLength(512);
+    expect(job.results[0]?.ambiguous_items?.[0]?.candidate_ids).toHaveLength(20);
+    expect(JSON.stringify(job)).not.toContain('upstream-private-diagnostic');
+    expect(job.results[0]?.data?.warnings).toContain(
+      'Result details are limited to 200 unmatched items, 200 ambiguous items, and 20 candidates per item. Full counts are shown; migration checks every item.',
+    );
   });
   it('reads source history successfully before creating any target account', async () => {
     service.clientFactory = (...args) => {

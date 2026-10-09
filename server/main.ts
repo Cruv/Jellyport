@@ -16,6 +16,7 @@ import { resolve } from 'node:path';
 import { Store } from './store.js';
 import { Service } from './service.js';
 import { PreviewTasks } from './preview-tasks.js';
+import type { MigrationScope } from './migration.js';
 import { BotManager, BotError } from './bot.js';
 import { UserOrganization } from './user-organization.js';
 import { DemoServers } from './demo.js';
@@ -69,6 +70,7 @@ interface MigrationRequest {
   source_user_ids: string[];
   discord_recipients?: Record<string, string>;
   mapping_revisions?: Record<string, string | null>;
+  migration_scope?: MigrationScope;
 }
 export interface CreateAppOptions {
   demoPassword?: string;
@@ -107,6 +109,7 @@ const migrationSchema = {
   required: ['source_user_ids'],
   properties: {
     source_user_ids: { type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: id },
+    migration_scope: { type: 'string', enum: ['complete', 'watched_only'] },
     discord_recipients: {
       type: 'object',
       maxProperties: 100,
@@ -871,7 +874,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       reply
         .code(202)
         .send(
-          previews.start(request.cookies[COOKIE]!, previewContext(), request.body.source_user_ids),
+          previews.start(
+            request.cookies[COOKIE]!,
+            previewContext(),
+            request.body.source_user_ids,
+            request.body.migration_scope ?? 'complete',
+          ),
         ),
   );
   const previewParams = {
@@ -910,6 +918,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             request.body.source_user_ids,
             request.body.discord_recipients,
             request.body.mapping_revisions,
+            request.body.migration_scope ?? 'complete',
           ),
         ),
   );

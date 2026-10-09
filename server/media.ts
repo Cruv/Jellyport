@@ -57,6 +57,7 @@ export interface MediaAPI {
   setDisplayPreferences?(userId: string, preferences: JsonObject): Promise<void>;
   markPlayed(userId: string, itemId: string, datePlayed?: string): Promise<void>;
   migrationItems?(userId?: string): Promise<MediaItem[]>;
+  watchedItems?(userId: string): Promise<MediaItem[]>;
   migrationCapabilities?(): Promise<MigrationCapabilities>;
   updateUserData?(userId: string, itemId: string, patch: MediaUserDataPatch): Promise<void>;
   userData?(userId: string, itemId: string): Promise<MediaUserDataPatch>;
@@ -474,11 +475,13 @@ export class MediaClient implements MediaAPI {
     userId: string | undefined,
     itemTypes: string,
     expanded = false,
+    watchedOnly = false,
   ): Promise<MediaItem[]> {
     const path = userId !== undefined ? `Users/${this.id(userId)}/Items` : 'Items';
     const items: MediaItem[] = [];
     const seenIds = new Set<string>();
     let start = 0;
+    let total: number | undefined;
     while (true) {
       const data = this.object(
         await this.request('GET', path, {
@@ -494,7 +497,8 @@ export class MediaClient implements MediaAPI {
           SortOrder: 'Ascending',
           StartIndex: start,
           Limit: this.pageSize,
-          EnableTotalRecordCount: 'true',
+          EnableTotalRecordCount: start === 0 ? 'true' : 'false',
+          ...(watchedOnly ? { IsPlayed: 'true' } : {}),
         }),
       );
       if (!Array.isArray(data.Items) || data.Items.some((item) => !isObject(item)))
@@ -503,6 +507,15 @@ export class MediaClient implements MediaAPI {
       if (data.Items.some((item) => typeof item.Id !== 'string' || !item.Id))
         throw new MediaError(`${this.label} returned library items without identifiers.`);
       const page = data.Items as MediaItem[];
+      // With counting disabled, some servers report only this page's size (or zero).
+      // Keep the first requested total instead of treating those later values as an end.
+      if (
+        start === 0 &&
+        typeof data.TotalRecordCount === 'number' &&
+        Number.isSafeInteger(data.TotalRecordCount) &&
+        data.TotalRecordCount >= page.length
+      )
+        total = data.TotalRecordCount;
       if (page.every((item) => seenIds.has(item.Id)))
         throw new MediaError(
           `${this.label} repeated a library page; refresh the library and retry.`,
@@ -512,15 +525,11 @@ export class MediaClient implements MediaAPI {
         seenIds.add(item.Id);
       }
       start += page.length;
-      if (
-        typeof data.TotalRecordCount === 'number' &&
-        Number.isInteger(data.TotalRecordCount) &&
-        data.TotalRecordCount >= 0
-      ) {
-        if (start >= data.TotalRecordCount) break;
-      } else if (page.length < this.pageSize) break;
       if (start > 2_000_000)
         throw new MediaError(`${this.label} library exceeds the supported migration size.`);
+      if (total !== undefined && start >= total) break;
+      // Without a valid first total, continue to an empty page. A server may return
+      // fewer than Limit before the end, so a short page alone is not sufficient.
     }
     return items;
   }
@@ -558,6 +567,35 @@ export class MediaClient implements MediaAPI {
     for (const item of items) {
       const values = item.SeriesId ? providers.get(item.SeriesId) : undefined;
       if (values && !item.SeriesProviderIds) item.SeriesProviderIds = structuredClone(values);
+    }
+    return items;
+  }
+
+  /** Quick migrations need only watched playable items, while series IDs remain unfiltered. */
+  async watchedItems(userId: string): Promise<MediaItem[]> {
+    this.id(userId);
+    const items = await this.itemsByType(
+      userId,
+      'Movie,Episode,Audio,MusicVideo,Video,Book,AudioBook,Trailer',
+      true,
+      true,
+    );
+    const needsSeries = new Set(
+      items
+        .filter((item) => item.Type === 'Episode' && item.SeriesId && !item.SeriesProviderIds)
+        .map((item) => item.SeriesId),
+    );
+    if (needsSeries.size) {
+      const series = await this.itemsByType(userId, 'Series');
+      const providers = new Map(
+        series
+          .filter((item) => needsSeries.has(item.Id) && isObject(item.ProviderIds))
+          .map((item) => [item.Id, item.ProviderIds!]),
+      );
+      for (const item of items) {
+        const values = item.SeriesId ? providers.get(item.SeriesId) : undefined;
+        if (values && !item.SeriesProviderIds) item.SeriesProviderIds = structuredClone(values);
+      }
     }
     return items;
   }

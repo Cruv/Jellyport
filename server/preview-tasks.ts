@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { MediaError, ServiceError } from './errors.js';
+import type { MigrationScope } from './migration.js';
 
 const MAX_RESULT_BYTES = 8 * 1024 * 1024;
 
@@ -20,6 +21,7 @@ interface Entry<T> {
 interface Controls {
   signal: AbortSignal;
   progress: (processed: number, total: number) => void;
+  migration_scope: MigrationScope;
 }
 
 /** Ephemeral, session-owned reads; never persisted or shared between administrator sessions. */
@@ -35,7 +37,14 @@ export class PreviewTasks<T> {
     } = {},
   ) {}
 
-  start(owner: string, context: string, ids: string[]): PreviewTask<T> {
+  start(
+    owner: string,
+    context: string,
+    ids: string[],
+    migrationScope: MigrationScope = 'complete',
+  ): PreviewTask<T> {
+    if (!['complete', 'watched_only'].includes(migrationScope))
+      throw new ServiceError('Choose a valid migration scope.');
     if (
       [...this.entries.values()].some(
         (entry) => entry.owner === owner && entry.value.status === 'running',
@@ -83,6 +92,7 @@ export class PreviewTasks<T> {
       .then(() => {
         entry.controller.signal.throwIfAborted();
         return this.run([...ids], {
+          migration_scope: migrationScope,
           signal: entry.controller.signal,
           progress: (processed, total) => {
             if (entry.controller.signal.aborted || entry.value.status !== 'running') return;

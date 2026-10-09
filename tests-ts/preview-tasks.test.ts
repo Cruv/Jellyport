@@ -1,11 +1,52 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { PreviewTasks } from '../server/preview-tasks.js';
 import { MediaError } from '../server/errors.js';
+import type { MigrationScope } from '../server/migration.js';
 
 const flush = async () => {
   for (let i = 0; i < 8; i++) await Promise.resolve();
 };
 afterEach(() => vi.useRealTimers());
+
+it.each([undefined, 'complete', 'watched_only'] as const)(
+  'passes the selected migration scope (%s) to its isolated asynchronous runner',
+  async (scope) => {
+    const run = vi.fn(async (_ids: string[], controls: { migration_scope: MigrationScope }) => ({
+      scope: controls.migration_scope,
+    }));
+    const tasks = new PreviewTasks(run);
+    try {
+      const task = tasks.start('owner', 'config', ['source'], scope);
+      expect(run).not.toHaveBeenCalled();
+      await flush();
+      expect(run).toHaveBeenCalledWith(
+        ['source'],
+        expect.objectContaining({ migration_scope: scope ?? 'complete' }),
+      );
+      expect(tasks.get('owner', 'config', task.id)?.preview).toEqual({
+        scope: scope ?? 'complete',
+      });
+      expect(tasks.get('other-owner', 'config', task.id)).toBeUndefined();
+      expect(tasks.cancel('other-owner', task.id)).toBe(false);
+    } finally {
+      tasks.close();
+    }
+  },
+);
+
+it('rejects invalid migration scopes before starting any work', async () => {
+  const run = vi.fn(async () => 'unreachable');
+  const tasks = new PreviewTasks(run);
+  try {
+    expect(() => tasks.start('owner', 'config', ['source'], 'invalid' as never)).toThrow(
+      'Choose a valid migration scope.',
+    );
+    await flush();
+    expect(run).not.toHaveBeenCalled();
+  } finally {
+    tasks.close();
+  }
+});
 
 it('returns before scanning, keeps progress and results private to the requesting session, and returns copies', async () => {
   let release!: (value: { users: string[] }) => void;

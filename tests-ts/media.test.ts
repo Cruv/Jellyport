@@ -5,6 +5,46 @@ import { MediaError } from '../server/errors.js';
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 describe('media API boundary', () => {
+  it('filters quick source reads to watched playable items and enriches episodes from unfiltered series', async () => {
+    const requests: URL[] = [];
+    const movies = [
+      { Id: 'e1', Type: 'Episode', SeriesId: 's1', UserData: { Played: true } },
+      { Id: 'm1', Type: 'Movie', UserData: { Played: true } },
+      { Id: 'e2', Type: 'Episode', SeriesId: 's1', UserData: { Played: true } },
+    ];
+    const client = new MediaClient('http://emby.test', 'synthetic-key', 'emby', {
+      transport: async (address) => {
+        const url = new URL(address);
+        requests.push(url);
+        expect(url.pathname).toBe('/Users/alice/Items');
+        expect(url.searchParams.get('EnableUserData')).toBe('true');
+        if (url.searchParams.get('IncludeItemTypes') === 'Series') {
+          expect(url.searchParams.has('IsPlayed')).toBe(false);
+          return json({ Items: [{ Id: 's1', ProviderIds: { Tvdb: '42' } }], TotalRecordCount: 1 });
+        }
+        expect(url.searchParams.get('IsPlayed')).toBe('true');
+        expect(url.searchParams.get('IncludeItemTypes')).toBe(
+          'Movie,Episode,Audio,MusicVideo,Video,Book,AudioBook,Trailer',
+        );
+        expect(url.searchParams.get('Fields')).toContain('UserDataLastPlayedDate');
+        const start = Number(url.searchParams.get('StartIndex'));
+        return json({
+          Items: movies.slice(start, start + 2),
+          TotalRecordCount: start === 0 ? 3 : 0,
+        });
+      },
+    });
+    client.pageSize = 2;
+    try {
+      const items = await client.watchedItems('alice');
+      expect(items.map((item) => item.Id)).toEqual(['e1', 'm1', 'e2']);
+      expect(items[0]?.SeriesProviderIds).toEqual({ Tvdb: '42' });
+      expect(items[2]?.SeriesProviderIds).toEqual({ Tvdb: '42' });
+      expect(requests).toHaveLength(3);
+    } finally {
+      await client.close();
+    }
+  });
   it('uses user-scoped pagination and enriches episode series identity', async () => {
     const requests: URL[] = [];
     const transport: FetchTransport = async (address, init) => {
@@ -36,6 +76,80 @@ describe('media API boundary', () => {
     expect(items[1]?.UserData?.Played).toBe(false);
     expect(requests).toHaveLength(3);
   });
+  it.each([
+    ['jellyfin', 'page-size'],
+    ['jellyfin', 'zero'],
+    ['emby', 'page-size'],
+    ['emby', 'zero'],
+  ] as const)(
+    'counts only the first %s page and ignores later %s totals',
+    async (kind, totalMode) => {
+      const values = Array.from({ length: 53 }, (_, index) => ({
+        Id: `item-${index}`,
+        Type: 'Movie',
+        UserData: { PlayCount: index, LastPlayedDate: '2026-10-01T12:00:00.000Z' },
+      }));
+      const seen: URL[] = [];
+      const client = new MediaClient(`http://${kind}.test`, 'synthetic-key', kind, {
+        transport: async (address) => {
+          const url = new URL(address);
+          seen.push(url);
+          const start = Number(url.searchParams.get('StartIndex'));
+          const page = values.slice(start, start + 3);
+          return json({
+            Items: page,
+            TotalRecordCount: start === 0 ? values.length : totalMode === 'zero' ? 0 : page.length,
+          });
+        },
+      });
+      client.pageSize = 3;
+      try {
+        expect(await client.migrationItems('alice')).toEqual(values);
+        expect(seen).toHaveLength(18);
+        expect(seen.map((url) => url.searchParams.get('EnableTotalRecordCount'))).toEqual([
+          'true',
+          ...Array(17).fill('false'),
+        ]);
+        expect(seen.every((url) => url.pathname === '/Users/alice/Items')).toBe(true);
+        expect(seen.every((url) => url.searchParams.get('EnableUserData') === 'true')).toBe(true);
+      } finally {
+        await client.close();
+      }
+    },
+  );
+  it.each([undefined, 0, -1, '9'])(
+    'reads until an empty page when the initial total is unusable (%j)',
+    async (initialTotal) => {
+      const values = Array.from({ length: 9 }, (_, index) => ({
+        Id: `item-${index}`,
+        Type: 'Movie',
+      }));
+      const starts: number[] = [];
+      const client = new MediaClient('http://jellyfin.test', 'synthetic-key', 'jellyfin', {
+        transport: async (address) => {
+          const url = new URL(address);
+          const start = Number(url.searchParams.get('StartIndex'));
+          starts.push(start);
+          // A server may clamp Limit below our request even before the final page.
+          return json({
+            Items: values.slice(start, start + 2),
+            ...(start === 0 && initialTotal !== undefined
+              ? { TotalRecordCount: initialTotal }
+              : start === 0
+                ? {}
+                : { TotalRecordCount: 0 }),
+          });
+        },
+      });
+      client.pageSize = 5;
+      try {
+        expect(await client.migrationItems('alice')).toEqual(values);
+        expect(starts).toEqual([0, 2, 4, 6, 8, 9]);
+      } finally {
+        await client.close();
+      }
+    },
+  );
   it('preserves creation, template, configuration, password and played endpoint contracts', async () => {
     const seen: unknown[] = [];
     const client = new MediaClient('http://jellyfin.test/base', 'key', 'jellyfin', {

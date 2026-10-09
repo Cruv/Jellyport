@@ -195,12 +195,12 @@ function lookup(index: Map<string, Set<number>>, key: unknown[]): Set<number> {
   return index.get(JSON.stringify(key)) ?? new Set();
 }
 
-/** Type-scoped provider identity, complete series numbering, then exact mapped path; never titles. */
-export function matchItems(
-  source: MediaItem[],
-  target: MediaItem[],
+/** Build once for one destination catalog; its identity metadata must remain unchanged. */
+export function createMatcher(
+  targetItems: MediaItem[],
   pathMappings: PathMapping[] = [],
-): MatchPlan {
+): (source: MediaItem[]) => MatchPlan {
+  const target = targetItems.slice();
   const providerIndex = new Map<string, Set<number>>(),
     seriesIndex = new Map<string, Set<number>>(),
     pathIndex = new Map<string, Set<number>>();
@@ -226,49 +226,60 @@ export function matchItems(
       return sourcePath && targetPath ? [[sourcePath, targetPath] as [string, string]] : [];
     })
     .sort((a, b) => b[0].length - a[0].length);
-  const result: MatchPlan = { matches: [], unmatched: [], ambiguous: [] };
-  for (const item of source) {
-    const type = kind(item);
-    if (!supportedTypes.has(type)) {
-      result.unmatched.push(item);
-      continue;
-    }
-    const value = mappedPath(item, mappings);
-    const pathCandidates = value ? lookup(pathIndex, [type, value]) : new Set<number>();
-    let candidates = new Set<number>(),
-      method = 'provider_id';
-    if (type !== 'season')
-      for (const [provider, id] of providerEntries(item, 'ProviderIds'))
-        for (const index of lookup(providerIndex, [type, provider, id])) candidates.add(index);
-    if (!candidates.size && ['episode', 'season'].includes(type)) {
-      const numbers = seriesNumbers(item);
-      if (numbers) {
-        method = type === 'episode' ? 'series_episode' : 'series_season';
-        for (const [provider, id] of providerEntries(item, 'SeriesProviderIds'))
-          for (const index of lookup(seriesIndex, [type, provider, id, ...numbers]))
-            candidates.add(index);
+  return (source) => {
+    const result: MatchPlan = { matches: [], unmatched: [], ambiguous: [] };
+    for (const item of source) {
+      const type = kind(item);
+      if (!supportedTypes.has(type)) {
+        result.unmatched.push(item);
+        continue;
       }
-    }
-    if (!candidates.size) {
-      candidates = new Set(pathCandidates);
-      method = 'path';
-    }
-    const values = () => [...candidates].sort((a, b) => a - b).map((index) => target[index]!);
-    if ([...candidates].some((index) => !compatible(item, target[index]!))) {
-      result.ambiguous.push({ source: item, candidates: values() });
-      continue;
-    }
-    if (candidates.size > 1) {
-      const narrowed = new Set([...candidates].filter((index) => pathCandidates.has(index)));
-      if (narrowed.size === 1) {
-        candidates = narrowed;
-        method += '+path';
+      const value = mappedPath(item, mappings);
+      const pathCandidates = value ? lookup(pathIndex, [type, value]) : new Set<number>();
+      let candidates = new Set<number>(),
+        method = 'provider_id';
+      if (type !== 'season')
+        for (const [provider, id] of providerEntries(item, 'ProviderIds'))
+          for (const index of lookup(providerIndex, [type, provider, id])) candidates.add(index);
+      if (!candidates.size && ['episode', 'season'].includes(type)) {
+        const numbers = seriesNumbers(item);
+        if (numbers) {
+          method = type === 'episode' ? 'series_episode' : 'series_season';
+          for (const [provider, id] of providerEntries(item, 'SeriesProviderIds'))
+            for (const index of lookup(seriesIndex, [type, provider, id, ...numbers]))
+              candidates.add(index);
+        }
       }
+      if (!candidates.size) {
+        candidates = new Set(pathCandidates);
+        method = 'path';
+      }
+      const values = () => [...candidates].sort((a, b) => a - b).map((index) => target[index]!);
+      if ([...candidates].some((index) => !compatible(item, target[index]!))) {
+        result.ambiguous.push({ source: item, candidates: values() });
+        continue;
+      }
+      if (candidates.size > 1) {
+        const narrowed = new Set([...candidates].filter((index) => pathCandidates.has(index)));
+        if (narrowed.size === 1) {
+          candidates = narrowed;
+          method += '+path';
+        }
+      }
+      if (candidates.size === 1)
+        result.matches.push({ source: item, target: target[[...candidates][0]!]!, method });
+      else if (candidates.size) result.ambiguous.push({ source: item, candidates: values() });
+      else result.unmatched.push(item);
     }
-    if (candidates.size === 1)
-      result.matches.push({ source: item, target: target[[...candidates][0]!]!, method });
-    else if (candidates.size) result.ambiguous.push({ source: item, candidates: values() });
-    else result.unmatched.push(item);
-  }
-  return result;
+    return result;
+  };
+}
+
+/** Type-scoped provider identity, complete series numbering, then exact mapped path; never titles. */
+export function matchItems(
+  source: MediaItem[],
+  target: MediaItem[],
+  pathMappings: PathMapping[] = [],
+): MatchPlan {
+  return createMatcher(target, pathMappings)(source);
 }

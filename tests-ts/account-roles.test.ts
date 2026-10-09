@@ -75,8 +75,7 @@ async function apiFixture(demo = false) {
     authenticate: async () => identity,
     validateSession: async () => identity,
     signOut: async () => {},
-    createApiKey: async () => 'managed-key',
-    deleteApiKey: async () => {},
+    validateApiKey: async () => ({ serverId: identity.serverId, apiKeyName: 'test API key' }),
   };
   const close = vi.fn(async () => {});
   let currentServerId = 'bound-server';
@@ -517,13 +516,15 @@ describe('authenticated role routes', () => {
       username: 'admin',
       accessToken: 'private-setup-token',
     };
-    const createKey = vi.fn(async () => 'private-managed-key');
+    const validateKey = vi.fn(async () => ({
+      serverId: identity.serverId,
+      apiKeyName: 'Jellyport',
+    }));
     const authClient: JellyfinAuthentication = {
       authenticate: async () => identity,
       validateSession: async () => identity,
       signOut: async () => {},
-      createApiKey: createKey,
-      deleteApiKey: async () => {},
+      validateApiKey: validateKey,
     };
     const userReads = vi.fn();
     const app = await createApp({
@@ -550,8 +551,7 @@ describe('authenticated role routes', () => {
       },
       payload: {
         jellyfin_url: 'http://jellyfin:8096',
-        username: 'admin',
-        password: 'private-admin-password',
+        api_key: 'private-managed-key',
       },
     });
     expect(connected.statusCode).toBe(200);
@@ -565,8 +565,8 @@ describe('authenticated role routes', () => {
       payload: { template_user_id: '', jellyfin_public_url: 'https://watch.example/' },
     });
     expect(complete.statusCode).toBe(200);
-    expect(complete.json().authenticated).toBe(true);
-    expect(createKey).toHaveBeenCalledOnce();
+    expect(complete.json().authenticated).toBe(false);
+    expect(validateKey).toHaveBeenCalled();
     expect(userReads).not.toHaveBeenCalled();
     expect(app.jellyport.store.settings()).toMatchObject({
       template_user_id: '',
@@ -576,9 +576,19 @@ describe('authenticated role routes', () => {
     expect(complete.body).not.toMatch(
       /private-setup-token|private-managed-key|private-admin-password/,
     );
+    const signedIn = await app.inject({
+      method: 'POST',
+      url: '/api/login',
+      headers: {
+        cookie: `jellyport_session=${complete.cookies[0]!.value}`,
+        'x-csrf-token': complete.json().csrf_token,
+      },
+      payload: { username: 'admin', password: 'private-admin-password' },
+    });
+    expect(signedIn.statusCode).toBe(200);
     const headers = {
-      cookie: `jellyport_session=${complete.cookies[0]!.value}`,
-      'x-csrf-token': complete.json().csrf_token,
+      cookie: `jellyport_session=${signedIn.cookies[0]!.value}`,
+      'x-csrf-token': signedIn.json().csrf_token,
     };
     const saved = await app.inject({
       method: 'POST',

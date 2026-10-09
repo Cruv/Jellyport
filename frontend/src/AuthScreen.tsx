@@ -20,8 +20,10 @@ export default function AuthScreen({
   const [error, setError] = useState(initialError);
   const [busy, setBusy] = useState('');
   const [sessionRetry, setSessionRetry] = useState(0);
+  const [setupComplete, setSetupComplete] = useState(false);
   const busyRef = useRef(false);
   const requestVersion = useRef(0);
+  const secretField = useRef<HTMLInputElement | null>(null);
   const setup = !!session?.setup_required;
   const templates = (connection?.templates || []).filter(
     (user) => !user.Policy?.IsAdministrator && !user.Policy?.IsDisabled,
@@ -33,6 +35,13 @@ export default function AuthScreen({
   useEffect(() => {
     if (!session?.setup_required) setConnection(null);
   }, [session?.setup_required]);
+  useEffect(() => {
+    const field = secretField.current;
+    if (field) field.value = '';
+    return () => {
+      if (field) field.value = '';
+    };
+  }, [session?.csrf_token, session?.setup_required, session?.authenticated]);
   useEffect(() => {
     if (session) return;
     const controller = new AbortController();
@@ -83,6 +92,7 @@ export default function AuthScreen({
   useEffect(
     () => () => {
       requestVersion.current++;
+      if (secretField.current) secretField.current.value = '';
     },
     [],
   );
@@ -95,16 +105,14 @@ export default function AuthScreen({
     const body = setup
       ? {
           jellyfin_url: String(data.get('jellyfin_url') || '').trim(),
-          username: String(data.get('username') || '').trim(),
-          password: String(data.get('password') || ''),
+          api_key: String(data.get('api_key') || '').trim(),
         }
       : {
           username: String(data.get('username') || '').trim(),
           password: String(data.get('password') || ''),
         };
     // Remove secrets from the visible form even when the server rejects the request.
-    const passwordField = form.elements.namedItem('password');
-    if (passwordField instanceof HTMLInputElement) passwordField.value = '';
+    if (secretField.current) secretField.current.value = '';
     busyRef.current = true;
     setBusy(setup ? 'connect' : 'login');
     setError('');
@@ -168,7 +176,10 @@ export default function AuthScreen({
         },
       });
       if (requestVersion.current !== version) return;
-      if (!value.authenticated) throw new Error('Setup was not completed. Try again.');
+      if (value.authenticated || value.setup_required || value.setup_connected)
+        throw new Error('Setup was not completed. Try again.');
+      setConnection(null);
+      setSetupComplete(true);
       onSession(value);
     } catch (reason) {
       if (requestVersion.current === version) setError(errorMessage(reason));
@@ -238,7 +249,7 @@ export default function AuthScreen({
           {setup
             ? connection
               ? 'New accounts will copy the permissions of your template user.'
-              : 'Link Jellyfin once, then sign in with your Jellyfin administrator account.'
+              : 'Create an API key in Jellyfin, then paste it here to link your server.'
             : 'Sign in with your Jellyfin administrator account to manage your community.'}
         </p>
         {setup && (
@@ -250,6 +261,11 @@ export default function AuthScreen({
         {error && (
           <div className="error-block mb-17" role="alert">
             {error}
+          </div>
+        )}
+        {setupComplete && !setup && (
+          <div className="setup-server mb-17" role="status">
+            Setup complete. Sign in with your Jellyfin administrator account to continue.
           </div>
         )}
         {busy === 'resume' || busy === 'session' ? (
@@ -337,7 +353,11 @@ export default function AuthScreen({
             </button>
           </form>
         ) : (
-          <form key="credentials" className="form-stack" onSubmit={submit}>
+          <form
+            key={setup ? 'setup-key' : 'login-credentials'}
+            className="form-stack"
+            onSubmit={submit}
+          >
             {setup && (
               <div className="field">
                 <label htmlFor="setup-server-url">Jellyfin server URL</label>
@@ -355,36 +375,60 @@ export default function AuthScreen({
                 />
                 <small>
                   {session.setup_server_url
-                    ? 'Sign in to the Jellyfin server already connected to this workspace.'
+                    ? 'Use a key from the Jellyfin server already connected to this workspace.'
                     : 'Use a URL reachable from the Jellyport container.'}
                 </small>
               </div>
             )}
-            <div className="field">
-              <label htmlFor="jellyfin-username">Jellyfin username</label>
-              <input
-                id="jellyfin-username"
-                name="username"
-                type="text"
-                autoComplete="username"
-                defaultValue={session?.demo ? 'admin' : ''}
-                required
-                autoFocus={!setup || !!session.setup_server_url}
-                disabled={!!busy}
-              />
-              <small>Use a Jellyfin administrator account with a password.</small>
-            </div>
-            <div className="field">
-              <label htmlFor="jellyfin-password">Jellyfin password</label>
-              <input
-                id="jellyfin-password"
-                name="password"
-                type="password"
-                autoComplete="current-password"
-                required
-                disabled={!!busy}
-              />
-            </div>
+            {setup ? (
+              <div className="field">
+                <label htmlFor="setup-api-key">Jellyfin API key</label>
+                <input
+                  ref={secretField}
+                  id="setup-api-key"
+                  name="api_key"
+                  type="password"
+                  autoComplete="new-password"
+                  spellCheck={false}
+                  required
+                  autoFocus={!!session.setup_server_url}
+                  disabled={!!busy}
+                />
+                <small>
+                  In Jellyfin, open Dashboard → Advanced → API Keys and create a key. We recommend
+                  naming it Jellyport; any name works.
+                </small>
+              </div>
+            ) : (
+              <>
+                <div className="field">
+                  <label htmlFor="jellyfin-username">Jellyfin username</label>
+                  <input
+                    id="jellyfin-username"
+                    name="username"
+                    type="text"
+                    autoComplete="username"
+                    defaultValue={session?.demo ? 'admin' : ''}
+                    required
+                    autoFocus={!setup || !!session.setup_server_url}
+                    disabled={!!busy}
+                  />
+                  <small>Use a Jellyfin administrator account with a password.</small>
+                </div>
+                <div className="field">
+                  <label htmlFor="jellyfin-password">Jellyfin password</label>
+                  <input
+                    ref={secretField}
+                    id="jellyfin-password"
+                    name="password"
+                    type="password"
+                    autoComplete="current-password"
+                    required
+                    disabled={!!busy}
+                  />
+                </div>
+              </>
+            )}
             <button className="btn btn-primary" type="submit" disabled={!!busy}>
               {busy ? <span className="spinner" /> : <Icon name="lock" />}
               {busy

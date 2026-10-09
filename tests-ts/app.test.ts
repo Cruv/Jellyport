@@ -27,8 +27,7 @@ async function setup(demo = true) {
     },
     validateSession: async () => identity,
     signOut: async () => {},
-    createApiKey: async () => 'service-key',
-    deleteApiKey: async () => {},
+    validateApiKey: async () => ({ serverId: identity.serverId, apiKeyName: 'test API key' }),
   };
   const app = await createApp({
     demoPassword: 'testing-password-long',
@@ -415,8 +414,7 @@ it('supports a fresh isolated demo and repeat startup without consulting product
     authenticate: rejectAuthentication,
     validateSession: rejectAuthentication,
     signOut: rejectAuthentication,
-    createApiKey: rejectAuthentication,
-    deleteApiKey: rejectAuthentication,
+    validateApiKey: rejectAuthentication,
   };
   let app = await createApp({
     dataDir: directory,

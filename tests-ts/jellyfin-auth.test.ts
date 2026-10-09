@@ -606,51 +606,46 @@ describe('Jellyfin authentication client', () => {
   });
 });
 
-describe('dedicated Jellyport service API keys', () => {
-  it.each([
-    { status: 200, isActive: false },
-    { status: 204, isActive: false },
-    { status: 200, isActive: true },
-    { status: 204, isActive: true },
-    { status: 200, isActive: undefined },
-    { status: 204, isActive: undefined },
-  ])(
-    'supports Jellyfin key creation with POST status $status and IsActive $isActive',
-    async ({ status, isActive }) => {
+describe('user-provided Jellyfin API keys', () => {
+  it.each([false, true, undefined])(
+    'validates an existing key with IsActive %s, without requiring a particular or unique name',
+    async (isActive) => {
       const requests: Array<{ address: string; init: RequestInit }> = [];
       const client = new JellyfinAuthClient({
         transport: async (address, init) => {
           requests.push({ address, init });
-          if (init.method === 'POST')
-            return status === 204
-              ? new Response(null, { status })
-              : json({ AppName: 'Jellyport setup one', AccessToken: 'dedicated-key' });
+          if (!address.endsWith('/Auth/Keys')) return json({ Id: 'linked-server' });
           return json({
             Items: [
-              { AppName: 'Jellyport setup another', AccessToken: 'unrelated-key' },
+              { AppName: 'Any chosen label', AccessToken: 'unrelated-key' },
               {
-                AppName: 'Jellyport setup one',
+                AppName: 'Any chosen label',
                 AccessToken: 'dedicated-key',
                 IsActive: isActive,
+                DateRevoked: null,
               },
             ],
           });
         },
       });
       await expect(
-        client.createApiKey('http://jellyfin/base', 'admin-token', 'Jellyport setup one'),
-      ).resolves.toBe('dedicated-key');
-      expect(requests).toHaveLength(2);
-      expect(requests[0]?.init.method).toBe('POST');
-      expect(new URL(requests[0]!.address).pathname).toBe('/base/Auth/Keys');
-      expect(new URL(requests[0]!.address).searchParams.get('app')).toBe('Jellyport setup one');
-      expect(requests[1]?.init.method).toBe('GET');
-      expect(new URL(requests[1]!.address).search).toBe('');
-      for (const { address, init } of requests) {
+        client.validateApiKey('http://jellyfin/base', 'dedicated-key', 'linked-server'),
+      ).resolves.toEqual({ serverId: 'linked-server', apiKeyName: 'Any chosen label' });
+      expect(requests.map(({ address }) => new URL(address).pathname)).toEqual([
+        '/base/System/Info/Public',
+        '/base/System/Info',
+        '/base/Auth/Keys',
+      ]);
+      expect(new Headers(requests[0]!.init.headers).has('Authorization')).toBe(false);
+      for (const { init } of requests.slice(1)) {
         expect(new Headers(init.headers).get('Authorization')).toBe(
-          'MediaBrowser Token="admin-token"',
+          'MediaBrowser Token="dedicated-key"',
         );
-        expect(address).not.toContain('admin-token');
+      }
+      for (const { address, init } of requests) {
+        expect(init.method).toBe('GET');
+        expect(init.body).toBeUndefined();
+        expect(new URL(address).search).toBe('');
         expect(address).not.toContain('dedicated-key');
       }
     },
@@ -658,14 +653,13 @@ describe('dedicated Jellyport service API keys', () => {
 
   it.each([
     { Items: [] },
-    { Items: [{ AppName: 'wrong-name', AccessToken: 'unrelated-key' }] },
-    { Items: [{ AppName: 'unique-name', AccessToken: '' }] },
-    { Items: [{ AppName: 'unique-name', AccessToken: 'secret\nheader' }] },
+    { Items: [{ AppName: 'Same label', AccessToken: 'unrelated-key' }] },
+    { Items: [{ AccessToken: '' }] },
     {
       Items: [
         {
-          AppName: 'unique-name',
-          AccessToken: 'revoked-key',
+          AppName: 'Any name',
+          AccessToken: 'dedicated-key',
           IsActive: false,
           DateRevoked: '2026-10-07',
         },
@@ -673,64 +667,111 @@ describe('dedicated Jellyport service API keys', () => {
     },
     {
       Items: [
-        { AppName: 'unique-name', AccessToken: 'first' },
-        { AppName: 'unique-name', AccessToken: 'second', IsActive: false },
+        { AppName: 'First label', AccessToken: 'dedicated-key' },
+        { AppName: 'Second label', AccessToken: 'dedicated-key', IsActive: false },
       ],
     },
-  ])('refuses absent, ambiguous, revoked, or malformed setup-key matches: %j', async (value) => {
+  ])('rejects unlisted, revoked, or ambiguous supplied keys: %j', async (value) => {
     const client = new JellyfinAuthClient({
-      transport: async (_address, init) =>
-        init.method === 'POST' ? new Response(null, { status: 204 }) : json(value),
+      transport: async (address) =>
+        json(address.endsWith('/Auth/Keys') ? value : { Id: 'linked-server' }),
     });
-    await expect(
-      client.createApiKey('http://jellyfin', 'admin-token', 'unique-name'),
-    ).rejects.toMatchObject({
-      statusCode: 502,
-      message: 'Unable to identify the Jellyport API key created by this setup.',
+    await expect(client.validateApiKey('http://jellyfin', 'dedicated-key')).rejects.toMatchObject({
+      statusCode: 403,
+      message:
+        'Enter an API key created in the Jellyfin dashboard, rather than a user session token.',
     });
   });
 
-  it('never retries an uncertain API key creation', async () => {
+  it('does not retry or expose connection errors and never mutates keys', async () => {
     const transport = vi.fn<FetchTransport>(async () => {
-      throw new Error('secret creation timeout');
+      throw new Error('secret key validation timeout dedicated-key');
     });
     const client = new JellyfinAuthClient({ transport });
+    await expect(client.validateApiKey('http://jellyfin', 'dedicated-key')).rejects.toMatchObject({
+      statusCode: 502,
+      message: 'Unable to connect to Jellyfin. Check the server address and availability.',
+    });
+    expect(transport).toHaveBeenCalledOnce();
+  });
+
+  it('refuses a different pinned server before submitting the key', async () => {
+    const transport = vi.fn<FetchTransport>(async (_address, init) => {
+      expect(new Headers(init.headers).has('Authorization')).toBe(false);
+      return json({ Id: 'different-server' });
+    });
     await expect(
-      client.createApiKey('http://jellyfin', 'admin-token', 'unique-name'),
+      new JellyfinAuthClient({ transport }).validateApiKey(
+        'http://jellyfin',
+        'dedicated-key',
+        'linked-server',
+      ),
     ).rejects.toMatchObject({ statusCode: 502 });
     expect(transport).toHaveBeenCalledOnce();
   });
 
-  it('revokes only the supplied key using the administrator token', async () => {
-    const transport = vi.fn<FetchTransport>(async (address, init) => {
-      expect(address).toBe('http://jellyfin/base/Auth/Keys/dedicated-key');
-      expect(init.method).toBe('DELETE');
-      expect(init.body).toBeUndefined();
-      expect(new Headers(init.headers).get('Authorization')).toBe(
-        'MediaBrowser Token="admin-token"',
-      );
-      return new Response(null, { status: 204 });
-    });
-    await new JellyfinAuthClient({ transport }).deleteApiKey(
-      'http://jellyfin/base',
-      'admin-token',
-      'dedicated-key',
-    );
-    expect(transport).toHaveBeenCalledOnce();
-  });
-
-  it.each(['', ' name ', 'unsafe\nname'])(
-    'rejects invalid setup-key names before making requests: %j',
-    async (appName) => {
+  it.each(['', ' key ', 'unsafe\nkey', 'unsafe"key', 'x'.repeat(4097), '.', '..'])(
+    'rejects invalid keys before making requests',
+    async (apiKey) => {
       const transport = vi.fn<FetchTransport>();
       await expect(
-        new JellyfinAuthClient({ transport }).createApiKey(
-          'http://jellyfin',
-          'admin-token',
-          appName,
-        ),
+        new JellyfinAuthClient({ transport }).validateApiKey('http://jellyfin', apiKey),
       ).rejects.toMatchObject({ statusCode: 400 });
       expect(transport).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([401, 403])('sanitizes rejected key responses with status %i', async (status) => {
+    const client = new JellyfinAuthClient({
+      transport: async (address) =>
+        address.endsWith('/Public')
+          ? json({ Id: 'linked-server' })
+          : json({ detail: 'dedicated-key unrelated-key http://internal' }, status),
+    });
+    await expect(client.validateApiKey('http://jellyfin', 'dedicated-key')).rejects.toMatchObject({
+      statusCode: 400,
+      message: 'Jellyfin rejected the API key. Create an API key in the Jellyfin dashboard.',
+    });
+  });
+
+  it('rejects an authenticated server identity mismatch before reading keys', async () => {
+    const transport = vi.fn<FetchTransport>(async (address) =>
+      json({ Id: address.endsWith('/Public') ? 'linked-server' : 'different-server' }),
+    );
+    await expect(
+      new JellyfinAuthClient({ transport }).validateApiKey('http://jellyfin', 'dedicated-key'),
+    ).rejects.toMatchObject({ statusCode: 502 });
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([null, {}, { Items: 'dedicated-key' }])(
+    'rejects malformed key listings',
+    async (value) => {
+      const client = new JellyfinAuthClient({
+        transport: async (address) =>
+          json(address.endsWith('/Auth/Keys') ? value : { Id: 'linked-server' }),
+      });
+      await expect(client.validateApiKey('http://jellyfin', 'dedicated-key')).rejects.toMatchObject(
+        { statusCode: 502 },
+      );
+    },
+  );
+
+  it.each([undefined, '', 'unsafe\nlabel'])(
+    'allows keys without a usable display name',
+    async (appName) => {
+      const client = new JellyfinAuthClient({
+        transport: async (address) =>
+          json(
+            address.endsWith('/Auth/Keys')
+              ? { Items: [{ AccessToken: 'dedicated-key', AppName: appName }] }
+              : { Id: 'linked-server' },
+          ),
+      });
+      await expect(client.validateApiKey('http://jellyfin', 'dedicated-key')).resolves.toEqual({
+        serverId: 'linked-server',
+        apiKeyName: 'User-provided API key',
+      });
     },
   );
 });

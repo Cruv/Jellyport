@@ -22,6 +22,11 @@ export interface JellyfinIdentity {
   accessToken: string;
 }
 
+export interface JellyfinApiKey {
+  serverId: string;
+  apiKeyName: string;
+}
+
 export interface JellyfinAuthentication {
   authenticate(
     baseUrl: string,
@@ -36,8 +41,11 @@ export interface JellyfinAuthentication {
     expectedUserId: string,
   ): Promise<JellyfinIdentity>;
   signOut(baseUrl: string, accessToken: string): Promise<void>;
-  createApiKey(baseUrl: string, adminToken: string, appName: string): Promise<string>;
-  deleteApiKey(baseUrl: string, adminToken: string, apiKey: string): Promise<void>;
+  validateApiKey(
+    baseUrl: string,
+    apiKey: string,
+    expectedServerId?: string,
+  ): Promise<JellyfinApiKey>;
 }
 
 export interface JellyfinAuthClientOptions {
@@ -152,19 +160,16 @@ export class JellyfinAuthClient implements JellyfinAuthentication {
 
   private async request(
     baseUrl: string,
-    method: 'GET' | 'POST' | 'DELETE',
+    method: 'GET' | 'POST',
     path: string,
     options: {
       accessToken?: string;
       body?: unknown;
       deviceId?: string;
-      params?: Record<string, string>;
       decode?: boolean;
     } = {},
   ): Promise<unknown> {
     const address = new URL(`${normalizeJellyfinUrl(baseUrl)}/${path}`);
-    for (const [name, value] of Object.entries(options.params ?? {}))
-      address.searchParams.set(name, value);
     if (options.accessToken !== undefined && !token(options.accessToken))
       throw new JellyfinAuthError('The Jellyfin session is invalid. Sign in again.', 401);
     const controller = new AbortController();
@@ -354,39 +359,59 @@ export class JellyfinAuthClient implements JellyfinAuthentication {
     await this.request(baseUrl, 'POST', 'Sessions/Logout', { accessToken, decode: false });
   }
 
-  async createApiKey(baseUrl: string, adminToken: string, appName: string): Promise<string> {
-    if (!identifier(appName) || appName !== appName.trim())
-      throw new JellyfinAuthError('A valid Jellyport API key name is required.', 400);
-    await this.request(baseUrl, 'POST', 'Auth/Keys', {
-      accessToken: adminToken,
-      params: { app: appName },
-      decode: false,
-    });
-    // Jellyfin 10.11 returns 204; newer versions return the created key. Reading by a unique
-    // setup-attempt name supports both, without guessing or accidentally adopting another key.
-    const result = await this.request(baseUrl, 'GET', 'Auth/Keys', { accessToken: adminToken });
+  async validateApiKey(
+    baseUrl: string,
+    apiKey: string,
+    expectedServerId?: string,
+  ): Promise<JellyfinApiKey> {
+    if (!token(apiKey)) throw new JellyfinAuthError('Enter a valid Jellyfin API key.', 400);
+    if (expectedServerId !== undefined && !identifier(expectedServerId))
+      throw new JellyfinAuthError('The linked Jellyfin server identifier is invalid.', 400);
+    // Pin the server before sending a secret, including during reset or key replacement.
+    const info = await this.request(baseUrl, 'GET', 'System/Info/Public');
+    if (!isObject(info) || !identifier(info.Id)) throw invalidResponse();
+    if (expectedServerId !== undefined && info.Id !== expectedServerId)
+      throw new JellyfinAuthError(
+        'The connected Jellyfin server does not match this installation.',
+        502,
+      );
+    let authenticatedInfo: unknown;
+    let result: unknown;
+    try {
+      authenticatedInfo = await this.request(baseUrl, 'GET', 'System/Info', {
+        accessToken: apiKey,
+      });
+      if (!isObject(authenticatedInfo) || authenticatedInfo.Id !== info.Id) throw invalidResponse();
+      // This endpoint requires elevated access. Matching the supplied key also rules out
+      // interactive user tokens, even when they belong to an administrator.
+      result = await this.request(baseUrl, 'GET', 'Auth/Keys', { accessToken: apiKey });
+    } catch (error) {
+      if (error instanceof JellyfinAuthError && [401, 403].includes(error.statusCode))
+        throw new JellyfinAuthError(
+          'Jellyfin rejected the API key. Create an API key in the Jellyfin dashboard.',
+          400,
+        );
+      throw error;
+    }
     if (!isObject(result) || !Array.isArray(result.Items)) throw invalidResponse();
     // Jellyfin's API-key DTO leaves IsActive at its default false, even for usable keys.
-    // Identify our key by its exact unique name; DateRevoked still rules out revoked keys.
+    // Validate the exact supplied token, regardless of its name, and reject revoked keys.
     const matches = result.Items.filter(
       (item: unknown) =>
         isObject(item) &&
-        item.AppName === appName &&
+        item.AccessToken === apiKey &&
         (item.DateRevoked === undefined || item.DateRevoked === null),
     );
-    if (matches.length !== 1 || !isObject(matches[0]) || !token(matches[0].AccessToken))
+    if (matches.length !== 1 || !isObject(matches[0]))
       throw new JellyfinAuthError(
-        'Unable to identify the Jellyport API key created by this setup.',
-        502,
+        'Enter an API key created in the Jellyfin dashboard, rather than a user session token.',
+        403,
       );
-    return matches[0].AccessToken;
-  }
-
-  async deleteApiKey(baseUrl: string, adminToken: string, apiKey: string): Promise<void> {
-    if (!token(apiKey)) throw new JellyfinAuthError('The Jellyport API key is invalid.', 400);
-    await this.request(baseUrl, 'DELETE', `Auth/Keys/${encodeURIComponent(apiKey)}`, {
-      accessToken: adminToken,
-      decode: false,
-    });
+    return {
+      serverId: info.Id,
+      apiKeyName: identifier(matches[0].AppName)
+        ? matches[0].AppName.trim()
+        : 'User-provided API key',
+    };
   }
 }

@@ -32,8 +32,7 @@ const setupWithoutCsrf = await fetch(new URL('/api/setup/connect', base), {
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
     jellyfin_url: 'http://jellyfin:8096',
-    username: 'admin',
-    password: 'fixture-password',
+    api_key: 'fixture-pre-created-api-key',
   }),
 });
 assert.equal(setupWithoutCsrf.status, 403, 'Direct Jellyfin setup must retain CSRF protection.');
@@ -52,5 +51,5 @@ assert.equal(
   'Fresh production instances must require setup, without demo login.',
 );
 console.log(
-  'Fresh-container smoke passed: direct Jellyfin setup, no local password or code, CSRF protection, and no demo sign-in.',
+  'Fresh-container smoke passed: manual Jellyfin API-key setup, no local password or code, CSRF protection, and no demo sign-in.',
 );

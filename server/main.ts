@@ -9,7 +9,7 @@ import staticFiles from '@fastify/static';
 import { registerUserMappingRoutes } from './user-mappings.js';
 import { registerDiscordMemberRoutes } from './discord-members.js';
 import { registerAccountRoleRoutes } from './account-roles.js';
-import { randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
+import { randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -47,7 +47,13 @@ interface Session {
   csrf_token: string;
   expires: number;
   identity?: JellyfinIdentity;
-  connection?: { identity: JellyfinIdentity; serverUrl: string; generation: string };
+  connection?: {
+    apiKey: string;
+    serverId: string;
+    apiKeyName: string;
+    serverUrl: string;
+    generation: string;
+  };
 }
 interface AccountRequest {
   username: string;
@@ -173,10 +179,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   }
   async function revoke(value?: Session): Promise<void> {
     if (demo || !value) return;
-    const identity = value.identity ?? value.connection?.identity;
+    const identity = value.identity;
     const state = store.authState();
-    const url =
-      value.connection?.serverUrl ?? (state?.kind === 'configured' ? state.serverUrl : '');
+    const url = state?.kind === 'configured' ? state.serverUrl : '';
     if (identity && url) await authClient.signOut(url, identity.accessToken).catch(() => {});
   }
   function session(request: FastifyRequest): Session | undefined {
@@ -469,17 +474,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   }
   async function setupView(request: FastifyRequest) {
     const connection = pendingConnection(request);
-    await authClient.validateSession(
-      connection.serverUrl,
-      connection.identity.accessToken,
-      connection.identity.serverId,
-      connection.identity.userId,
-    );
-    const client = service.clientFactory(
-      connection.serverUrl,
-      connection.identity.accessToken,
-      'jellyfin',
-    );
+    await authClient.validateApiKey(connection.serverUrl, connection.apiKey, connection.serverId);
+    const client = service.clientFactory(connection.serverUrl, connection.apiKey, 'jellyfin');
     let templates: MediaUser[];
     try {
       templates = (await client.users())
@@ -505,7 +501,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   }
   app.get('/api/setup', async (request) => setupView(request));
   app.post<{
-    Body: { jellyfin_url: string; username: string; password: string };
+    Body: { jellyfin_url: string; api_key: string };
   }>(
     '/api/setup/connect',
     {
@@ -513,10 +509,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         body: {
           type: 'object',
           additionalProperties: false,
-          required: ['jellyfin_url', 'username', 'password'],
+          required: ['jellyfin_url', 'api_key'],
           properties: {
-            ...credentialsSchema,
             jellyfin_url: { type: 'string', minLength: 1, maxLength: 2048 },
+            api_key: { type: 'string', minLength: 1, maxLength: 4096 },
           },
         },
       },
@@ -534,53 +530,52 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           'Complete setup using the Jellyfin server already linked to this installation.',
           403,
         );
-      const identity = await authClient.authenticate(
+      const key = await authClient.validateApiKey(
         serverUrl,
-        request.body.username,
-        request.body.password,
+        request.body.api_key,
         state.previousServerId,
       );
+      const client = service.clientFactory(serverUrl, request.body.api_key, 'jellyfin');
+      let templates: MediaUser[];
       try {
-        const client = service.clientFactory(serverUrl, identity.accessToken, 'jellyfin');
-        let templates: MediaUser[];
-        try {
-          templates = (await client.users())
-            .filter(
-              (user) => user.Policy?.IsAdministrator === false && user.Policy?.IsDisabled === false,
-            )
-            .map((user) => ({ Id: user.Id, Name: user.Name }));
-        } finally {
-          await client.close();
-        }
-        const current = store.authState();
-        if (
-          session(request) !== originalSession ||
-          current?.kind !== 'pending' ||
-          current.generation !== state.generation
-        )
-          throw new JellyfinAuthError(
-            'Setup was completed in another session. Reload the page.',
-            403,
-          );
-        void revoke(forget(request));
-        const view = newSession(request, reply, {
-          connection: { identity, serverUrl, generation: state.generation },
-        });
-        const settings = store.settings();
-        attempts.delete(request.ip);
-        return {
-          session: view,
-          server: { url: serverUrl },
-          templates,
-          defaults: {
-            template_user_id: settings.template_user_id,
-            jellyfin_public_url: settings.jellyfin_public_url,
-          },
-        };
-      } catch (error) {
-        await authClient.signOut(serverUrl, identity.accessToken).catch(() => {});
-        throw error;
+        templates = (await client.users())
+          .filter(
+            (user) => user.Policy?.IsAdministrator === false && user.Policy?.IsDisabled === false,
+          )
+          .map((user) => ({ Id: user.Id, Name: user.Name }));
+      } finally {
+        await client.close();
       }
+      const current = store.authState();
+      if (
+        session(request) !== originalSession ||
+        current?.kind !== 'pending' ||
+        current.generation !== state.generation
+      )
+        throw new JellyfinAuthError(
+          'Setup was completed in another session. Reload the page.',
+          403,
+        );
+      void revoke(forget(request));
+      const view = newSession(request, reply, {
+        connection: {
+          ...key,
+          apiKey: request.body.api_key,
+          serverUrl,
+          generation: state.generation,
+        },
+      });
+      const settings = store.settings();
+      attempts.delete(request.ip);
+      return {
+        session: view,
+        server: { url: serverUrl },
+        templates,
+        defaults: {
+          template_user_id: settings.template_user_id,
+          jellyfin_public_url: settings.jellyfin_public_url,
+        },
+      };
     },
   );
   app.post<{ Body: { template_user_id: string; jellyfin_public_url: string } }>(
@@ -600,11 +595,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     },
     async (request, reply) => {
       const connection = pendingConnection(request);
-      await authClient.validateSession(
+      const key = await authClient.validateApiKey(
         connection.serverUrl,
-        connection.identity.accessToken,
-        connection.identity.serverId,
-        connection.identity.userId,
+        connection.apiKey,
+        connection.serverId,
       );
       const settings = {
         ...store.settings(),
@@ -613,11 +607,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         jellyfin_public_url: request.body.jellyfin_public_url,
       };
       validateSettings(settings);
-      const client = service.clientFactory(
-        connection.serverUrl,
-        connection.identity.accessToken,
-        'jellyfin',
-      );
+      const client = service.clientFactory(connection.serverUrl, connection.apiKey, 'jellyfin');
       try {
         if (request.body.template_user_id) {
           const template = await client.user(request.body.template_user_id);
@@ -627,47 +617,32 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       } finally {
         await client.close();
       }
-      const apiKeyName = `Jellyport ${randomUUID()}`;
-      const key = await authClient.createApiKey(
-        connection.serverUrl,
-        connection.identity.accessToken,
-        apiKeyName,
+      if (pendingConnection(request) !== connection)
+        throw new JellyfinAuthError('Setup session ended. Reload the page.', 403);
+      const claimed = store.completeAuth(
+        connection.generation,
+        {
+          kind: 'configured',
+          serverUrl: connection.serverUrl,
+          serverId: key.serverId,
+          apiKeyName: key.apiKeyName,
+        },
+        (current) => ({
+          ...current,
+          jellyfin_url: connection.serverUrl,
+          jellyfin_api_key: connection.apiKey,
+          template_user_id: request.body.template_user_id,
+          jellyfin_public_url: request.body.jellyfin_public_url.replace(/\/+$/, ''),
+        }),
       );
-      try {
-        if (pendingConnection(request) !== connection)
-          throw new JellyfinAuthError('Setup session ended. Reload the page.', 403);
-        const claimed = store.completeAuth(
-          connection.generation,
-          {
-            kind: 'configured',
-            serverUrl: connection.serverUrl,
-            serverId: connection.identity.serverId,
-            apiKeyName,
-          },
-          (current) => ({
-            ...current,
-            jellyfin_url: connection.serverUrl,
-            jellyfin_api_key: key,
-            template_user_id: request.body.template_user_id,
-            jellyfin_public_url: request.body.jellyfin_public_url.replace(/\/+$/, ''),
-          }),
+      if (!claimed)
+        throw new JellyfinAuthError(
+          'Setup was completed in another session. Reload the page.',
+          403,
         );
-        if (!claimed)
-          throw new JellyfinAuthError(
-            'Setup was completed in another session. Reload the page.',
-            403,
-          );
-      } catch (error) {
-        await authClient
-          .deleteApiKey(connection.serverUrl, connection.identity.accessToken, key)
-          .catch(() => {});
-        throw error;
-      }
-      forget(request); // Transfer the interactive token to the newly rotated authenticated cookie.
-      const result = newSession(request, reply, {
-        authenticated: true,
-        identity: connection.identity,
-      });
+      forget(request);
+      // Pairing proves possession of a service key, not a signed-in administrator identity.
+      const result = newSession(request, reply);
       await service.start();
       await bot.restart(store.settings());
       return result;
@@ -733,9 +708,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             'Jellyfin is managed by administrator sign-in. Use a separate data directory to link another server.',
           );
         if (incoming.jellyfin_api_key !== undefined)
-          throw new ServiceError(
-            'Use Refresh Jellyfin service key to replace the managed API key.',
-          );
+          throw new ServiceError('Use Replace Jellyfin API key to save a pre-created API key.');
         delete incoming.jellyfin_url;
       }
       const settings = { ...store.settings(), ...incoming };
@@ -749,33 +722,59 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       return publicSettings();
     },
   );
-  let refreshingKey = false;
-  app.post('/api/auth/service-key', async (request) => {
-    if (demo) throw new ServiceError('Demo settings are read-only.');
-    if (refreshingKey) throw new ServiceError('A service key refresh is already in progress.');
-    const state = store.authState();
-    const originalSession = session(request);
-    const identity = originalSession?.identity;
-    if (state?.kind !== 'configured' || !identity)
-      throw new JellyfinAuthError('Sign in to Jellyport.', 401);
-    refreshingKey = true;
-    try {
-      const apiKeyName = `Jellyport ${randomUUID()}`;
-      const key = await authClient.createApiKey(state.serverUrl, identity.accessToken, apiKeyName);
+  let replacingKey = false;
+  app.post<{ Body: { api_key: string } }>(
+    '/api/auth/service-key',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['api_key'],
+          properties: { api_key: { type: 'string', minLength: 1, maxLength: 4096 } },
+        },
+      },
+    },
+    async (request) => {
+      if (demo) throw new ServiceError('Demo settings are read-only.');
+      if (replacingKey) throw new ServiceError('An API key replacement is already in progress.');
+      const state = store.authState();
+      const originalSession = session(request);
+      const identity = originalSession?.identity;
+      if (state?.kind !== 'configured' || !identity)
+        throw new JellyfinAuthError('Sign in to Jellyport.', 401);
+      replacingKey = true;
       try {
+        const key = await authClient.validateApiKey(
+          state.serverUrl,
+          request.body.api_key,
+          state.serverId,
+        );
+        // A key validation can involve several upstream requests. Recheck administrator access
+        // before installing the replacement, and reject stale sessions or server bindings.
+        await authClient.validateSession(
+          state.serverUrl,
+          identity.accessToken,
+          state.serverId,
+          identity.userId,
+        );
+        const current = store.authState();
         if (session(request) !== originalSession)
           throw new JellyfinAuthError('Session ended. Sign in again.', 401);
-        if (!store.updateServiceKey(state.serverId, key, apiKeyName))
+        if (
+          current?.kind !== 'configured' ||
+          current.serverId !== state.serverId ||
+          current.serverUrl !== state.serverUrl ||
+          !store.updateServiceKey(state.serverId, request.body.api_key, key.apiKeyName)
+        )
           throw new JellyfinAuthError('Server configuration changed. Reload the page.', 403);
-      } catch (error) {
-        await authClient.deleteApiKey(state.serverUrl, identity.accessToken, key).catch(() => {});
-        throw error;
+        await bot.restart(store.settings());
+        return publicSettings();
+      } finally {
+        replacingKey = false;
       }
-      return publicSettings();
-    } finally {
-      refreshingKey = false;
-    }
-  });
+    },
+  );
   app.get('/api/users', async () => {
     const users = await service.users();
     // Only the fields used by the interface cross the browser boundary. Upstream user

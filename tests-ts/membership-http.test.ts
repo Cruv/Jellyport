@@ -33,8 +33,7 @@ async function fixture(demo = false) {
       return identity;
     }),
     signOut: vi.fn(async () => {}),
-    createApiKey: async () => 'private-managed-api-key',
-    deleteApiKey: async () => {},
+    validateApiKey: async () => ({ serverId: identity.serverId, apiKeyName: 'test API key' }),
   };
   const app = await createApp({
     demo,

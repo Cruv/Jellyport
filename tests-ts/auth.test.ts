@@ -10,6 +10,7 @@ import { Store } from '../server/store.js';
 
 const SERVER_URL = 'http://jellyfin:8096';
 const SERVER_ID = 'jellyfin-server-id';
+const API_KEY = 'user-owned-service-secret';
 const JELLYFIN_PASSWORD = 'actual-Jellyfin-administrator-password!42';
 const apps = new Set<JellyportApp>();
 const directories = new Set<string>();
@@ -19,8 +20,8 @@ type Response = Awaited<ReturnType<JellyportApp['inject']>>;
 function fakeAuthentication() {
   const behavior = {
     validationError: undefined as JellyfinAuthError | undefined,
-    createKeyError: undefined as JellyfinAuthError | undefined,
-    createKeyGate: undefined as ((key: string) => Promise<void>) | undefined,
+    keyValidationError: undefined as JellyfinAuthError | undefined,
+    keyValidationGate: undefined as ((key: string) => Promise<void>) | undefined,
     revoked: new Set<string>(),
     tokens: [] as string[],
     keys: [] as string[],
@@ -60,14 +61,19 @@ function fakeAuthentication() {
     signOut: vi.fn<JellyfinAuthentication['signOut']>(async (_url, accessToken) => {
       behavior.revoked.add(accessToken);
     }),
-    createApiKey: vi.fn<JellyfinAuthentication['createApiKey']>(async () => {
-      if (behavior.createKeyError) throw behavior.createKeyError;
-      const key = `service-secret-${behavior.keys.length + 1}`;
-      behavior.keys.push(key);
-      await behavior.createKeyGate?.(key);
-      return key;
-    }),
-    deleteApiKey: vi.fn<JellyfinAuthentication['deleteApiKey']>(async () => {}),
+    validateApiKey: vi.fn<JellyfinAuthentication['validateApiKey']>(
+      async (_baseUrl, apiKey, expectedServerId) => {
+        if (behavior.keyValidationError) throw behavior.keyValidationError;
+        if (expectedServerId !== undefined && expectedServerId !== SERVER_ID)
+          throw new JellyfinAuthError('The linked Jellyfin server does not match.', 502);
+        if (!behavior.keys.includes(apiKey)) behavior.keys.push(apiKey);
+        await behavior.keyValidationGate?.(apiKey);
+        return {
+          serverId: SERVER_ID,
+          apiKeyName: `Supplied key ${apiKey === API_KEY ? 'one' : 'two'}`,
+        };
+      },
+    ),
   } satisfies JellyfinAuthentication;
   return { auth, behavior };
 }
@@ -171,8 +177,7 @@ async function connect(value: Fixture, current?: Browser) {
     headers: headers(initial),
     payload: {
       jellyfin_url: `${SERVER_URL}/`,
-      username: 'administrator',
-      password: JELLYFIN_PASSWORD,
+      api_key: API_KEY,
     },
   });
   expect(response.statusCode).toBe(200);
@@ -191,7 +196,9 @@ async function configured(options: Parameters<typeof fixture>[0] = {}) {
   const connected = await connect(value);
   const response = await complete(value, connected.current);
   expect(response.statusCode).toBe(200);
-  return { ...value, current: browser(response), setupBrowser: connected.current };
+  expect(response.json().authenticated).toBe(false);
+  const signedIn = await signIn(value);
+  return { ...value, current: signedIn.current, setupBrowser: connected.current };
 }
 async function signIn(value: Fixture, username = 'administrator') {
   const initial = await anonymous(value.app);
@@ -205,8 +212,8 @@ async function signIn(value: Fixture, username = 'administrator') {
   return { current: browser(response), response };
 }
 
-describe('first-time Jellyfin administrator setup', () => {
-  it('offers direct Jellyfin setup without a local password or code while protecting private settings', async () => {
+describe('first-time Jellyfin API-key setup', () => {
+  it('offers direct setup while protecting private settings and rejects obsolete credentials', async () => {
     const value = await fixture();
     const initial = await anonymous(value.app);
     const view = (
@@ -229,16 +236,16 @@ describe('first-time Jellyfin administrator setup', () => {
       url: '/api/setup/connect',
       headers: headers(initial),
       payload: {
-        setup_code: 'obsolete-local-code',
-        jellyfin_url: 'https://untrusted.test',
+        jellyfin_url: SERVER_URL,
         username: 'administrator',
         password: JELLYFIN_PASSWORD,
+        api_key: API_KEY,
       },
     });
     expect(response.statusCode).toBe(422);
     expect(value.auth.authenticate).not.toHaveBeenCalled();
+    expect(value.auth.validateApiKey).not.toHaveBeenCalled();
     expect(value.mediaCalls).toEqual([]);
-    expect(value.auth.createApiKey).not.toHaveBeenCalled();
   });
 
   it('protects setup, login, and completion against CSRF, including encoded route aliases', async () => {
@@ -261,9 +268,10 @@ describe('first-time Jellyfin administrator setup', () => {
       expect(response.statusCode).toBe(403);
     }
     expect(value.auth.authenticate).not.toHaveBeenCalled();
+    expect(value.auth.validateApiKey).not.toHaveBeenCalled();
   });
 
-  it('rotates the setup cookie, lists only enabled ordinary templates, and resumes the connected wizard', async () => {
+  it('rotates the setup cookie, lists only enabled ordinary templates, and resumes without exposing the key', async () => {
     const value = await fixture();
     value.servers.users.jellyfin.push(
       {
@@ -290,12 +298,8 @@ describe('first-time Jellyfin administrator setup', () => {
       'template',
       'j-river',
     ]);
-    expect(value.auth.authenticate).toHaveBeenCalledWith(
-      SERVER_URL,
-      'administrator',
-      JELLYFIN_PASSWORD,
-      undefined,
-    );
+    expect(value.auth.validateApiKey).toHaveBeenCalledWith(SERVER_URL, API_KEY, undefined);
+    expect(value.auth.authenticate).not.toHaveBeenCalled();
     expect(
       (await value.app.inject({ url: '/api/settings', headers: headers(result.current) }))
         .statusCode,
@@ -303,40 +307,35 @@ describe('first-time Jellyfin administrator setup', () => {
     const resumed = await value.app.inject({ url: '/api/setup', headers: headers(result.current) });
     expect(resumed.statusCode).toBe(200);
     expect(resumed.json().session.setup_connected).toBe(true);
-    expect(value.auth.validateSession).toHaveBeenCalledWith(
-      SERVER_URL,
-      value.behavior.tokens[0],
-      SERVER_ID,
-      'administrator-id',
-    );
-    for (const secret of [JELLYFIN_PASSWORD, value.behavior.tokens[0]!])
-      expect(result.response.body + resumed.body).not.toContain(secret);
+    expect(value.auth.validateApiKey).toHaveBeenLastCalledWith(SERVER_URL, API_KEY, SERVER_ID);
+    expect(result.response.body + resumed.body).not.toContain(API_KEY);
     expect((await complete(value, result.initial)).statusCode).toBe(403);
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe('');
   });
 
-  it.each(['member', 'disabled-admin'])(
-    'refuses a Jellyfin account without enabled administrator access: %s',
-    async (username) => {
-      const value = await fixture();
-      const initial = await anonymous(value.app);
-      const response = await value.app.inject({
-        method: 'POST',
-        url: '/api/setup/connect',
-        headers: headers(initial),
-        payload: {
-          jellyfin_url: SERVER_URL,
-          username,
-          password: JELLYFIN_PASSWORD,
-        },
-      });
-      expect(response.statusCode).toBe(403);
-      expect(value.app.jellyport.store.authState()?.kind).toBe('pending');
-      expect(value.auth.createApiKey).not.toHaveBeenCalled();
-      expect(value.mediaCalls).toEqual([]);
-    },
-  );
+  it('refuses a supplied key rejected by Jellyfin', async () => {
+    const status = 400;
+    const value = await fixture();
+    value.behavior.keyValidationError = new JellyfinAuthError(
+      'Jellyfin rejected the API key.',
+      status,
+    );
+    const initial = await anonymous(value.app);
+    const response = await value.app.inject({
+      method: 'POST',
+      url: '/api/setup/connect',
+      headers: headers(initial),
+      payload: { jellyfin_url: SERVER_URL, api_key: API_KEY },
+    });
+    expect(response.statusCode).toBe(status);
+    expect(value.app.jellyport.store.authState()?.kind).toBe('pending');
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe('');
+    expect(value.auth.authenticate).not.toHaveBeenCalled();
+    expect(value.auth.signOut).not.toHaveBeenCalled();
+    expect(value.mediaCalls).toEqual([]);
+  });
 
-  it('validates the chosen template and public URL before creating an API key', async () => {
+  it('validates the selected template and public URL before saving the supplied key', async () => {
     const value = await fixture();
     value.servers.users.jellyfin.push({
       Id: 'administrator',
@@ -356,11 +355,12 @@ describe('first-time Jellyfin administrator setup', () => {
       });
       expect(response.statusCode).toBe(400);
     }
-    expect(value.auth.createApiKey).not.toHaveBeenCalled();
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe('');
     expect(value.app.jellyport.store.authState()?.kind).toBe('pending');
+    expect(value.auth.signOut).not.toHaveBeenCalled();
   });
 
-  it('commits the encrypted server binding and service key, then rotates into an authenticated session', async () => {
+  it('commits the encrypted server binding and supplied key, then requires an administrator sign-in', async () => {
     const value = await fixture();
     const pending = await connect(value);
     const response = await complete(value, pending.current);
@@ -369,123 +369,94 @@ describe('first-time Jellyfin administrator setup', () => {
     expect(current.cookie).not.toBe(pending.current.cookie);
     expect(current.csrf).not.toBe(pending.current.csrf);
     expect(response.json()).toMatchObject({
-      authenticated: true,
+      authenticated: false,
       setup_required: false,
       setup_connected: false,
-      user: { id: 'administrator-id', name: 'administrator' },
     });
-    expect(value.auth.createApiKey).toHaveBeenCalledWith(
-      SERVER_URL,
-      value.behavior.tokens[0],
-      expect.stringMatching(/^Jellyport [a-f0-9-]{36}$/),
-    );
+    expect(response.json().user).toBeUndefined();
+    expect(value.auth.authenticate).not.toHaveBeenCalled();
     expect(value.app.jellyport.store.authState()).toMatchObject({
       kind: 'configured',
       serverUrl: SERVER_URL,
       serverId: SERVER_ID,
+      apiKeyName: 'Supplied key one',
     });
     expect(value.app.jellyport.store.settings()).toMatchObject({
       jellyfin_url: SERVER_URL,
-      jellyfin_api_key: value.behavior.keys[0],
+      jellyfin_api_key: API_KEY,
       template_user_id: 'template',
       jellyfin_public_url: 'https://watch.example.test',
     });
     expect(
       (await value.app.inject({ url: '/api/settings', headers: headers(current) })).statusCode,
-    ).toBe(200);
+    ).toBe(401);
     expect(
       (await value.app.inject({ url: '/api/settings', headers: headers(pending.current) }))
         .statusCode,
     ).toBe(401);
     expect((await complete(value, pending.current)).statusCode).toBe(403);
-    expect(value.auth.deleteApiKey).not.toHaveBeenCalled();
-
-    const plaintextSettings = JSON.stringify(value.app.jellyport.store.settings());
-    const plaintextBinding = JSON.stringify(value.app.jellyport.store.authState());
-    expect(plaintextSettings + plaintextBinding).not.toContain(JELLYFIN_PASSWORD);
-    expect(plaintextSettings + plaintextBinding).not.toContain(value.behavior.tokens[0]!);
     const stored = Buffer.concat(
       readdirSync(value.directory)
         .filter((file) => file.startsWith('jellyport.db'))
         .map((file) => readFileSync(join(value.directory, file))),
     );
-    for (const secret of [
-      JELLYFIN_PASSWORD,
-      SERVER_URL,
-      value.behavior.tokens[0]!,
-      value.behavior.keys[0]!,
-    ]) {
+    for (const secret of [JELLYFIN_PASSWORD, SERVER_URL, API_KEY]) {
       expect(stored.includes(Buffer.from(secret))).toBe(false);
       expect(response.body).not.toContain(secret);
     }
+    expect(value.auth.signOut).not.toHaveBeenCalled();
+    expect((await signIn(value)).response.json().authenticated).toBe(true);
   });
 
-  it('leaves the wizard resumable if dedicated API-key creation fails', async () => {
+  it('leaves the wizard resumable if supplied-key validation temporarily fails', async () => {
     const value = await fixture();
     const { current } = await connect(value);
-    value.behavior.createKeyError = new JellyfinAuthError(
+    value.behavior.keyValidationError = new JellyfinAuthError(
       'Jellyfin is temporarily unavailable.',
       502,
     );
-    const response = await complete(value, current);
-    expect(response.statusCode).toBe(502);
+    expect((await complete(value, current)).statusCode).toBe(502);
     expect(value.app.jellyport.store.authState()?.kind).toBe('pending');
     expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe('');
-    expect(value.auth.deleteApiKey).not.toHaveBeenCalled();
-    value.behavior.createKeyError = undefined;
+    expect(value.auth.signOut).not.toHaveBeenCalled();
+    value.behavior.keyValidationError = undefined;
     expect((await complete(value, current)).statusCode).toBe(200);
   });
 
-  it('allows one concurrent setup completion and revokes the losing attempt’s newly created key', async () => {
+  it('allows only one concurrent setup completion without revoking user-owned keys', async () => {
     const value = await fixture();
     const first = await connect(value);
     const second = await connect(value);
-    let release!: () => void;
-    let bothEntered!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const entered = new Promise<void>((resolve) => {
-      bothEntered = resolve;
-    });
+    const pending = barrier();
     let arrivals = 0;
-    value.behavior.createKeyGate = async () => {
-      if (++arrivals === 2) bothEntered();
-      await gate;
+    value.behavior.keyValidationGate = async () => {
+      if (++arrivals === 2) pending.release();
+      await pending.wait();
     };
-    const completions = [complete(value, first.current), complete(value, second.current)];
-    await entered;
-    release();
-    const responses = await Promise.all(completions);
+    const responses = await Promise.all([
+      complete(value, first.current),
+      complete(value, second.current),
+    ]);
     expect(responses.map((response) => response.statusCode).sort()).toEqual([200, 403]);
-    expect(value.behavior.keys).toHaveLength(2);
-    expect(value.auth.deleteApiKey).toHaveBeenCalledOnce();
-    const deleted = value.auth.deleteApiKey.mock.calls[0]![2];
-    expect(value.behavior.keys).toContain(deleted);
-    expect(value.app.jellyport.store.settings().jellyfin_api_key).not.toBe(deleted);
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(API_KEY);
+    expect(value.auth.signOut).not.toHaveBeenCalled();
   });
 
   it.each(['short', 'replace-with-a-long-random-password', 'previous-Jellyport-password!42'])(
-    'ignores the obsolete admin environment password and accepts Jellyfin credentials directly: %s',
+    'ignores the obsolete local admin environment password: %s',
     async (legacyPassword) => {
       vi.stubEnv('JELLYPORT_ADMIN_PASSWORD', legacyPassword);
       const log = vi.spyOn(console, 'log').mockImplementation(() => {});
       const value = await fixture();
       const initial = await anonymous(value.app);
-      const view = (
-        await value.app.inject({ url: '/api/session', headers: headers(initial) })
-      ).json();
-      expect(view.setup_required).toBe(true);
-      expect(view).not.toHaveProperty('setup_protection');
+      expect(
+        (await value.app.inject({ url: '/api/session', headers: headers(initial) })).json()
+          .setup_required,
+      ).toBe(true);
       const connected = await connect(value, initial);
       const response = await complete(value, connected.current);
       expect(response.statusCode).toBe(200);
-      const loggedOut = await value.app.inject({
-        method: 'POST',
-        url: '/api/logout',
-        headers: headers(browser(response)),
-      });
-      const current = browser(loggedOut);
+      const current = browser(response);
       expect(
         (
           await value.app.inject({
@@ -506,13 +477,11 @@ describe('first-time Jellyfin administrator setup', () => {
           })
         ).statusCode,
       ).toBe(200);
-      const output = log.mock.calls.flat().join(' ');
-      expect(output).not.toContain(legacyPassword);
-      expect(output.toLowerCase()).not.toContain('setup code');
+      expect(log.mock.calls.flat().join(' ')).not.toContain(legacyPassword);
     },
   );
 
-  it('pins an existing installation to its saved Jellyfin URL before any remote authentication', async () => {
+  it('pins an existing installation to its saved URL before transmitting any key', async () => {
     const value = await fixture({ existingServerUrl: `${SERVER_URL}/` });
     const initial = await anonymous(value.app);
     expect(
@@ -523,20 +492,16 @@ describe('first-time Jellyfin administrator setup', () => {
       method: 'POST',
       url: '/api/setup/connect',
       headers: headers(initial),
-      payload: {
-        jellyfin_url: 'https://different-server.test',
-        username: 'administrator',
-        password: JELLYFIN_PASSWORD,
-      },
+      payload: { jellyfin_url: 'https://different-server.test', api_key: API_KEY },
     });
     expect([400, 403]).toContain(response.statusCode);
-    expect(value.auth.authenticate).not.toHaveBeenCalled();
+    expect(value.auth.validateApiKey).not.toHaveBeenCalled();
     expect(value.mediaCalls).toEqual([]);
     expect((await complete(value, (await connect(value, initial)).current)).statusCode).toBe(200);
   });
 
   it.each([undefined, SERVER_ID])(
-    'migrates old pending bootstrap state without retaining or requiring its setup code; existing pin: %s',
+    'migrates pending bootstrap state without its obsolete code; existing pin: %s',
     async (previousServerId) => {
       const legacyCode = 'obsolete-persisted-setup-code';
       const value = await fixture({
@@ -554,10 +519,9 @@ describe('first-time Jellyfin administrator setup', () => {
         previousServerId ? { previousServerId } : {},
       );
       const result = await connect(value);
-      expect(value.auth.authenticate).toHaveBeenLastCalledWith(
+      expect(value.auth.validateApiKey).toHaveBeenLastCalledWith(
         SERVER_URL,
-        'administrator',
-        JELLYFIN_PASSWORD,
+        API_KEY,
         previousServerId,
       );
       expect(result.response.body).not.toContain(legacyCode);
@@ -565,11 +529,11 @@ describe('first-time Jellyfin administrator setup', () => {
     },
   );
 
-  it('rejects a setup completion that returns after the connected session was logged out and revokes its new key', async () => {
+  it('rejects completion after logout without saving or revoking the supplied key', async () => {
     const value = await fixture();
     const { current } = await connect(value);
     const pending = barrier();
-    value.behavior.createKeyGate = () => pending.wait();
+    value.behavior.keyValidationGate = () => pending.wait();
     const finishing = complete(value, current);
     await pending.started;
     expect(
@@ -577,39 +541,25 @@ describe('first-time Jellyfin administrator setup', () => {
         .statusCode,
     ).toBe(200);
     pending.release();
-    const response = await finishing;
-    expect(response.statusCode).toBe(403);
+    expect((await finishing).statusCode).toBe(403);
     expect(value.app.jellyport.store.authState()?.kind).toBe('pending');
     expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe('');
-    expect(value.auth.deleteApiKey).toHaveBeenCalledWith(
-      SERVER_URL,
-      value.behavior.tokens[0],
-      value.behavior.keys[0],
-    );
+    expect(value.auth.signOut).not.toHaveBeenCalled();
     expect(
       (await value.app.inject({ url: '/api/settings', headers: headers(current) })).statusCode,
     ).toBe(401);
   });
 
-  it('does not restore a wizard session when connection authentication finishes after logout', async () => {
+  it('does not restore a setup connection when key validation finishes after logout', async () => {
     const value = await fixture();
     const initial = await anonymous(value.app);
     const pending = barrier();
-    const authenticate = value.auth.authenticate.getMockImplementation()!;
-    value.auth.authenticate.mockImplementationOnce(async (...args) => {
-      const identity = await authenticate(...args);
-      await pending.wait();
-      return identity;
-    });
+    value.behavior.keyValidationGate = () => pending.wait();
     const connecting = value.app.inject({
       method: 'POST',
       url: '/api/setup/connect',
       headers: headers(initial),
-      payload: {
-        jellyfin_url: SERVER_URL,
-        username: 'administrator',
-        password: JELLYFIN_PASSWORD,
-      },
+      payload: { jellyfin_url: SERVER_URL, api_key: API_KEY },
     });
     await pending.started;
     expect(
@@ -620,7 +570,7 @@ describe('first-time Jellyfin administrator setup', () => {
     const response = await connecting;
     expect([401, 403]).toContain(response.statusCode);
     expect(response.cookies).toEqual([]);
-    expect(value.auth.signOut).toHaveBeenCalledWith(SERVER_URL, value.behavior.tokens[0]);
+    expect(value.auth.signOut).not.toHaveBeenCalled();
     expect(
       (await value.app.inject({ url: '/api/setup', headers: headers(initial) })).statusCode,
     ).toBe(403);
@@ -793,7 +743,6 @@ describe('configured Jellyfin administrator sessions', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json().authenticated).toBe(false);
     expect(value.auth.signOut).toHaveBeenCalledWith(SERVER_URL, value.behavior.tokens[0]);
-    expect(value.auth.deleteApiKey).not.toHaveBeenCalled();
     expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(serviceKey);
     expect(
       (await value.app.inject({ url: '/api/settings', headers: headers(value.current) }))
@@ -805,42 +754,187 @@ describe('configured Jellyfin administrator sessions', () => {
     ).toBe(200);
   });
 
-  it('refreshes the dedicated service key through a verified admin session without exposing it', async () => {
+  it('replaces the service key through a verified admin session without exposing it', async () => {
     const value = await configured();
     const previousKey = value.app.jellyport.store.settings().jellyfin_api_key;
     const response = await value.app.inject({
       method: 'POST',
       url: '/api/auth/service-key',
       headers: headers(value.current),
+      payload: { api_key: 'replacement-service-secret' },
     });
     expect(response.statusCode).toBe(200);
-    expect(value.auth.createApiKey).toHaveBeenCalledTimes(2);
+    expect(value.auth.validateApiKey).toHaveBeenLastCalledWith(
+      SERVER_URL,
+      'replacement-service-secret',
+      SERVER_ID,
+    );
     expect(value.app.jellyport.store.settings().jellyfin_api_key).not.toBe(previousKey);
     expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(value.behavior.keys[1]);
     expect(value.app.jellyport.store.authState()).toMatchObject({
-      apiKeyName: value.auth.createApiKey.mock.calls[1]![2],
+      apiKeyName: 'Supplied key two',
     });
     for (const secret of [...value.behavior.keys, ...value.behavior.tokens])
       expect(response.body).not.toContain(secret);
     expect(value.auth.signOut).not.toHaveBeenCalled();
   });
 
-  it('retains the previous service key if refresh fails', async () => {
+  it.each([400, 502])(
+    'retains the previous service key if replacement validation fails with %i',
+    async (status) => {
+      const value = await configured();
+      const previousKey = value.app.jellyport.store.settings().jellyfin_api_key;
+      const previousState = value.app.jellyport.store.authState();
+      value.behavior.keyValidationError = new JellyfinAuthError('Key validation failed.', status);
+      expect(
+        (
+          await value.app.inject({
+            method: 'POST',
+            url: '/api/auth/service-key',
+            headers: headers(value.current),
+            payload: { api_key: 'replacement-service-secret' },
+          })
+        ).statusCode,
+      ).toBe(status);
+      expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(previousKey);
+      expect(value.app.jellyport.store.authState()).toEqual(previousState);
+    },
+  );
+
+  it('requires an explicit replacement API key and CSRF protection before validation', async () => {
     const value = await configured();
-    const previousKey = value.app.jellyport.store.settings().jellyfin_api_key;
-    const previousState = value.app.jellyport.store.authState();
-    value.behavior.createKeyError = new JellyfinAuthError('Key creation failed.', 502);
+    const validations = value.auth.validateApiKey.mock.calls.length;
+    for (const payload of [
+      {},
+      { api_key: '' },
+      { api_key: 12 },
+      { api_key: 'replacement-service-secret', unexpected: true },
+    ]) {
+      const response = await value.app.inject({
+        method: 'POST',
+        url: '/api/auth/service-key',
+        headers: headers(value.current),
+        payload,
+      });
+      expect(response.statusCode).toBe(422);
+    }
+    const noCsrf = await value.app.inject({
+      method: 'POST',
+      url: '/api/auth/service-key',
+      headers: { cookie: value.current.cookie },
+      payload: { api_key: 'replacement-service-secret' },
+    });
+    expect(noCsrf.statusCode).toBe(403);
+    expect(value.auth.validateApiKey).toHaveBeenCalledTimes(validations);
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(API_KEY);
+  });
+
+  it('requires administrator access rather than accepting the API key as a browser login', async () => {
+    const value = await configured();
+    const initial = await anonymous(value.app);
+    const validations = value.auth.validateApiKey.mock.calls.length;
+    const response = await value.app.inject({
+      method: 'POST',
+      url: '/api/auth/service-key',
+      headers: headers(initial),
+      payload: { api_key: 'replacement-service-secret' },
+    });
+    expect(response.statusCode).toBe(401);
+    expect(value.auth.validateApiKey).toHaveBeenCalledTimes(validations);
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(API_KEY);
+  });
+
+  it('rejects a replacement that finishes after logout without saving or revoking either key', async () => {
+    const value = await configured();
+    const pending = barrier();
+    value.behavior.keyValidationGate = () => pending.wait();
+    const replacing = value.app.inject({
+      method: 'POST',
+      url: '/api/auth/service-key',
+      headers: headers(value.current),
+      payload: { api_key: 'replacement-service-secret' },
+    });
+    await pending.started;
     expect(
       (
         await value.app.inject({
           method: 'POST',
-          url: '/api/auth/service-key',
+          url: '/api/logout',
           headers: headers(value.current),
         })
       ).statusCode,
-    ).toBe(502);
-    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(previousKey);
-    expect(value.app.jellyport.store.authState()).toEqual(previousState);
+    ).toBe(200);
+    pending.release();
+    const response = await replacing;
+    expect([401, 403]).toContain(response.statusCode);
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(API_KEY);
+    expect(value.auth.signOut.mock.calls).toEqual([[SERVER_URL, value.behavior.tokens[0]]]);
+    expect(response.body).not.toContain('replacement-service-secret');
+  });
+
+  it('rechecks administrator permission after validating a replacement key', async () => {
+    const value = await configured();
+    const pending = barrier();
+    value.behavior.keyValidationGate = () => pending.wait();
+    const replacing = value.app.inject({
+      method: 'POST',
+      url: '/api/auth/service-key',
+      headers: headers(value.current),
+      payload: { api_key: 'replacement-service-secret' },
+    });
+    await pending.started;
+    value.behavior.validationError = new JellyfinAuthError(
+      'Administrator permission was removed.',
+      403,
+    );
+    pending.release();
+    expect([401, 403]).toContain((await replacing).statusCode);
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(API_KEY);
+  });
+
+  it('rejects key replacement after a local authentication reset without changing the saved key', async () => {
+    const value = await configured();
+    const pending = barrier();
+    value.behavior.keyValidationGate = () => pending.wait();
+    const replacing = value.app.inject({
+      method: 'POST',
+      url: '/api/auth/service-key',
+      headers: headers(value.current),
+      payload: { api_key: 'replacement-service-secret' },
+    });
+    await pending.started;
+    const reset = value.app.jellyport.store.resetAuth();
+    pending.release();
+    expect([401, 403]).toContain((await replacing).statusCode);
+    expect(value.app.jellyport.store.authState()).toEqual(reset);
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(API_KEY);
+    expect(value.auth.signOut).not.toHaveBeenCalled();
+  });
+
+  it('serializes replacement attempts so an overlapping request cannot overwrite another key', async () => {
+    const value = await configured();
+    const pending = barrier();
+    value.behavior.keyValidationGate = () => pending.wait();
+    const replacing = value.app.inject({
+      method: 'POST',
+      url: '/api/auth/service-key',
+      headers: headers(value.current),
+      payload: { api_key: 'replacement-service-secret' },
+    });
+    await pending.started;
+    const overlapping = await value.app.inject({
+      method: 'POST',
+      url: '/api/auth/service-key',
+      headers: headers(value.current),
+      payload: { api_key: 'overlapping-service-secret' },
+    });
+    expect(overlapping.statusCode).toBe(400);
+    pending.release();
+    expect((await replacing).statusCode).toBe(200);
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(
+      'replacement-service-secret',
+    );
+    expect(value.behavior.keys).not.toContain('overlapping-service-secret');
   });
 
   it('persists the server binding across restarts and ignores a stale or short legacy password after setup', async () => {
@@ -870,7 +964,7 @@ describe('configured Jellyfin administrator sessions', () => {
       JELLYFIN_PASSWORD,
       SERVER_ID,
     );
-    expect(value.auth.createApiKey).toHaveBeenCalledOnce();
+    expect(value.auth.validateApiKey).toHaveBeenCalled();
   });
 
   it('keeps the original server URL and fingerprint during local authentication recovery', async () => {
@@ -881,43 +975,35 @@ describe('configured Jellyfin administrator sessions', () => {
     expect(reset).not.toHaveProperty('setupCode');
     expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(previousKey);
     const initial = await anonymous(value.app);
-    const previousCalls = value.auth.authenticate.mock.calls.length;
+    const previousCalls = value.auth.validateApiKey.mock.calls.length;
     const wrongServer = await value.app.inject({
       method: 'POST',
       url: '/api/setup/connect',
       headers: headers(initial),
       payload: {
         jellyfin_url: 'https://different-server.test',
-        username: 'administrator',
-        password: JELLYFIN_PASSWORD,
+        api_key: API_KEY,
       },
     });
     expect([400, 403]).toContain(wrongServer.statusCode);
-    expect(value.auth.authenticate).toHaveBeenCalledTimes(previousCalls);
+    expect(value.auth.validateApiKey).toHaveBeenCalledTimes(previousCalls);
     expect(value.app.jellyport.store.authState()).toEqual(reset);
-    value.auth.authenticate.mockImplementationOnce(
-      async (_url, _username, _password, expectedServerId) => {
-        expect(expectedServerId).toBe(SERVER_ID);
-        throw new JellyfinAuthError(
-          'The connected Jellyfin server does not match this installation.',
-          502,
-        );
-      },
-    );
+    value.auth.validateApiKey.mockImplementationOnce(async (_url, _apiKey, expectedServerId) => {
+      expect(expectedServerId).toBe(SERVER_ID);
+      throw new JellyfinAuthError(
+        'The connected Jellyfin server does not match this installation.',
+        502,
+      );
+    });
     const changedServer = await value.app.inject({
       method: 'POST',
       url: '/api/setup/connect',
       headers: headers(initial),
-      payload: { jellyfin_url: SERVER_URL, username: 'administrator', password: JELLYFIN_PASSWORD },
+      payload: { jellyfin_url: SERVER_URL, api_key: API_KEY },
     });
     expect(changedServer.statusCode).toBe(502);
     const connected = await connect(value, initial);
-    expect(value.auth.authenticate).toHaveBeenLastCalledWith(
-      SERVER_URL,
-      'administrator',
-      JELLYFIN_PASSWORD,
-      SERVER_ID,
-    );
+    expect(value.auth.validateApiKey).toHaveBeenLastCalledWith(SERVER_URL, API_KEY, SERVER_ID);
     expect((await complete(value, connected.current)).statusCode).toBe(200);
     expect(value.app.jellyport.store.authState()).toMatchObject({
       kind: 'configured',
@@ -941,17 +1027,11 @@ describe('configured Jellyfin administrator sessions', () => {
       headers: headers(initial),
       payload: {
         jellyfin_url: relocatedUrl,
-        username: 'administrator',
-        password: JELLYFIN_PASSWORD,
+        api_key: API_KEY,
       },
     });
     expect(connection.statusCode).toBe(200);
-    expect(value.auth.authenticate).toHaveBeenLastCalledWith(
-      relocatedUrl,
-      'administrator',
-      JELLYFIN_PASSWORD,
-      SERVER_ID,
-    );
+    expect(value.auth.validateApiKey).toHaveBeenLastCalledWith(relocatedUrl, API_KEY, SERVER_ID);
     expect((await complete(value, browser(connection, true))).statusCode).toBe(200);
     expect(value.app.jellyport.store.authState()).toMatchObject({
       kind: 'configured',
@@ -1038,16 +1118,16 @@ describe('configured Jellyfin administrator sessions', () => {
     ).toBe(401);
   });
 
-  it('expires setup sessions after thirty minutes and revokes their interactive token', async () => {
+  it('expires setup sessions after thirty minutes without revoking the supplied API key', async () => {
     const value = await fixture();
     const { current } = await connect(value);
     vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 1_801_000);
     expect(
       (await value.app.inject({ url: '/api/setup', headers: headers(current) })).statusCode,
     ).toBe(403);
-    expect(value.auth.signOut).toHaveBeenCalledWith(SERVER_URL, value.behavior.tokens[0]);
+    expect(value.auth.signOut).not.toHaveBeenCalled();
     expect(value.app.jellyport.store.authState()?.kind).toBe('pending');
-    expect(value.auth.createApiKey).not.toHaveBeenCalled();
+    expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe('');
   });
 
   it('expires authenticated sessions after eight hours and revokes only their interactive token', async () => {
@@ -1058,7 +1138,6 @@ describe('configured Jellyfin administrator sessions', () => {
         .statusCode,
     ).toBe(401);
     expect(value.auth.signOut).toHaveBeenCalledWith(SERVER_URL, value.behavior.tokens[0]);
-    expect(value.auth.deleteApiKey).not.toHaveBeenCalled();
     expect(value.app.jellyport.store.settings().jellyfin_api_key).toBe(value.behavior.keys[0]);
   });
 });

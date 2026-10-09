@@ -74,8 +74,7 @@ async function apiFixture(demo = false) {
     authenticate: async () => identity,
     validateSession: async () => identity,
     signOut: async () => {},
-    createApiKey: async () => 'private-managed-key',
-    deleteApiKey: async () => {},
+    validateApiKey: async () => ({ serverId: identity.serverId, apiKeyName: 'test API key' }),
   };
   const app = await createApp({
     demo,

@@ -19,7 +19,7 @@ afterEach(async () => {
   }
 });
 
-it('runs production HTTP clients through a Jellyfin 10.11 wizard, managed service access, logout, and administrator login', async () => {
+it('runs production HTTP clients through manual-key setup, separate admin login, key replacement, and logout', async () => {
   const serverId = 'http-fixture-server';
   const password = 'fixture-administrator-password!42';
   const administrator: MediaUser = {
@@ -36,7 +36,11 @@ it('runs production HTTP clients through a Jellyfin 10.11 wizard, managed servic
     Configuration: {},
   };
   const interactiveTokens = new Map<string, MediaUser>();
-  const serviceKeys = new Map<string, string>();
+  // Created by the operator before Jellyport setup. Labels need not be unique or Jellyport-specific.
+  const serviceKeys = new Map<string, string>([
+    ['service-http-1', 'My manually created key'],
+    ['unrelated-service-key', 'My manually created key'],
+  ]);
   const requests: Array<{ method: string; path: string; token: string; authorization: string }> =
     [];
   const handlerErrors: unknown[] = [];
@@ -86,14 +90,7 @@ it('runs production HTTP clients through a Jellyfin 10.11 wizard, managed servic
         send(200, template);
       } else if (request.method === 'GET' && path === '/System/Info') {
         send(200, { Id: serverId, ServerName: 'HTTP fixture', Version: '10.11.0' });
-      } else if (request.method === 'POST' && path === '/Auth/Keys') {
-        expect(isInteractive).toBe(true);
-        const appName = address.searchParams.get('app');
-        expect(appName).toMatch(/^Jellyport [a-f0-9-]{36}$/);
-        serviceKeys.set(`service-http-${serviceKeys.size + 1}`, appName!);
-        send(204);
       } else if (request.method === 'GET' && path === '/Auth/Keys') {
-        expect(isInteractive).toBe(true);
         send(200, {
           Items: [...serviceKeys].map(([AccessToken, AppName]) => ({
             AccessToken,
@@ -140,9 +137,10 @@ it('runs production HTTP clients through a Jellyfin 10.11 wizard, managed servic
     method: 'POST',
     url: '/api/setup/connect',
     headers: anonymous,
-    payload: { jellyfin_url: baseUrl, username: 'Administrator', password },
+    payload: { jellyfin_url: baseUrl, api_key: 'service-http-1' },
   });
   expect(connected.statusCode).toBe(200);
+  expect(interactiveTokens.size).toBe(0);
   expect(connected.json().templates).toEqual([{ Id: 'template-id', Name: 'Member template' }]);
   const pending = getBrowser(connected, true);
   const finished = await app.inject({
@@ -153,12 +151,29 @@ it('runs production HTTP clients through a Jellyfin 10.11 wizard, managed servic
   });
   expect(finished.statusCode).toBe(200);
   expect(finished.json()).toMatchObject({
+    authenticated: false,
+    setup_required: false,
+    setup_connected: false,
+  });
+  expect(finished.json()).not.toHaveProperty('user');
+  expect(interactiveTokens.size).toBe(0);
+  expect(app.jellyport.store.settings().jellyfin_api_key).toBe('service-http-1');
+  expect(serviceKeys.size).toBe(2);
+  expect((await app.inject({ url: '/api/users', headers: getBrowser(finished) })).statusCode).toBe(
+    401,
+  );
+  const firstLogin = await app.inject({
+    method: 'POST',
+    url: '/api/login',
+    headers: getBrowser(finished),
+    payload: { username: 'Administrator', password },
+  });
+  expect(firstLogin.statusCode).toBe(200);
+  expect(firstLogin.json()).toMatchObject({
     authenticated: true,
     user: { id: administrator.Id, name: administrator.Name },
   });
-  const signedIn = getBrowser(finished);
-  expect(app.jellyport.store.settings().jellyfin_api_key).toBe('service-http-1');
-  expect(serviceKeys.size).toBe(1);
+  const signedIn = getBrowser(firstLogin);
   const users = await app.inject({ url: '/api/users', headers: signedIn });
   expect(users.statusCode).toBe(200);
   expect(users.json().jellyfin.map((item: { Id: string }) => item.Id)).toContain('template-id');
@@ -167,10 +182,46 @@ it('runs production HTTP clients through a Jellyfin 10.11 wizard, managed servic
       (request) => request.path === '/jellyfin/Users' && request.token === 'service-http-1',
     ),
   ).toBe(true);
+  const rejectedKey = await app.inject({
+    method: 'POST',
+    url: '/api/auth/service-key',
+    headers: signedIn,
+    payload: { api_key: 'not-a-valid-server-key' },
+  });
+  expect(rejectedKey.statusCode).toBe(400);
+  expect(rejectedKey.body).not.toContain('not-a-valid-server-key');
+  expect(app.jellyport.store.settings().jellyfin_api_key).toBe('service-http-1');
+  expect((await app.inject({ url: '/api/settings', headers: signedIn })).statusCode).toBe(200);
+  const userToken = await app.inject({
+    method: 'POST',
+    url: '/api/auth/service-key',
+    headers: signedIn,
+    payload: { api_key: 'interactive-http-1' },
+  });
+  expect(userToken.statusCode).toBe(403);
+  expect(app.jellyport.store.settings().jellyfin_api_key).toBe('service-http-1');
+  serviceKeys.set('service-http-2', 'A replacement I created');
+  const replacement = await app.inject({
+    method: 'POST',
+    url: '/api/auth/service-key',
+    headers: signedIn,
+    payload: { api_key: 'service-http-2' },
+  });
+  expect(replacement.statusCode).toBe(200);
+  expect(app.jellyport.store.settings().jellyfin_api_key).toBe('service-http-2');
+  expect(serviceKeys.has('service-http-1')).toBe(true);
+  expect(serviceKeys.size).toBe(3);
+  const replacedUsers = await app.inject({ url: '/api/users', headers: signedIn });
+  expect(replacedUsers.statusCode).toBe(200);
+  expect(
+    requests.some(
+      (request) => request.path === '/jellyfin/Users' && request.token === 'service-http-2',
+    ),
+  ).toBe(true);
   const loggedOut = await app.inject({ method: 'POST', url: '/api/logout', headers: signedIn });
   expect(loggedOut.statusCode).toBe(200);
   expect(interactiveTokens.size).toBe(0);
-  expect(serviceKeys.size).toBe(1);
+  expect(serviceKeys.size).toBe(3);
   const login = await app.inject({
     method: 'POST',
     url: '/api/login',
@@ -192,7 +243,29 @@ it('runs production HTTP clients through a Jellyfin 10.11 wizard, managed servic
     for (const token of [...interactiveTokens.keys(), ...serviceKeys.keys()])
       expect(request.path).not.toContain(token);
   }
-  for (const secret of [password, 'interactive-http-1', 'interactive-http-2', 'service-http-1'])
-    expect(connected.body + finished.body + login.body + users.body).not.toContain(secret);
+  for (const secret of [
+    password,
+    'interactive-http-1',
+    'interactive-http-2',
+    'service-http-1',
+    'service-http-2',
+    'unrelated-service-key',
+  ])
+    expect(
+      connected.body +
+        finished.body +
+        firstLogin.body +
+        login.body +
+        users.body +
+        replacement.body +
+        replacedUsers.body +
+        rejectedKey.body +
+        userToken.body,
+    ).not.toContain(secret);
+  expect(
+    requests
+      .filter((request) => request.path.startsWith('/jellyfin/Auth/Keys'))
+      .every((request) => request.method === 'GET'),
+  ).toBe(true);
   expect(handlerErrors).toEqual([]);
 });

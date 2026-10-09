@@ -20,7 +20,7 @@ sudo install -d -m 700 -o 1000 -g 1000 /path/to/jellyport
 
 Use the actual host path in the Compose volume entry. On a NAS shell already running as root, omit `sudo`. The `user: "1000:1000"` entry sets the container process's UID and GID directly; change it and the directory ownership together if your host uses different IDs. Jellyport does not interpret `PUID` or `PGID` environment variables. Docker documents the [Compose user setting](https://docs.docker.com/reference/compose-file/services/#user) and [bind mounts](https://docs.docker.com/engine/storage/bind-mounts/).
 
-Jellyport uses your Jellyfin administrator account for setup and sign-in. Use `TZ=Etc/UTC` or another valid timezone in the container environment; no localtime mount is required.
+Jellyport pairs with a pre-created Jellyfin API key; ordinary sign-in uses your Jellyfin administrator account. Enter the key in the web wizard, without adding it or an administrator password to Compose or Portainer's environment variables. Use `TZ=Etc/UTC` or another valid timezone in the container environment; no localtime mount is required.
 
 ## Configure image access in Portainer
 
@@ -34,11 +34,11 @@ Version 0.7.0 upgrades existing identity links and mappings to primary account s
 
 ## Complete first-run setup
 
-Open Jellyport using its private LAN IP, local hostname, or localhost, and enter the Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password in the setup wizard. Set the public Jellyfin URL that your users should receive; selecting an existing enabled, non-administrator legacy template user is optional. The wizard can finish without one. After completing setup, add the Emby source URL and API key in Settings. Pairing requires both a private/loopback connection source and a local Host header. Complete setup before exposing a reverse proxy; the first qualifying visitor can link the server. A permitted public proxy hostname cannot perform first pairing, even when the proxy connects from a private address. For loopback-only deployments, use a local browser or SSH tunnel.
+Sign in to Jellyfin as an administrator and create a dedicated key under **Dashboard → Advanced → API Keys**. Label it `Jellyport` for easy identification; any key name is accepted. Open Jellyport using its private LAN IP, local hostname, or localhost, and enter the Jellyfin server URL and paste that key in the setup wizard. Set the public Jellyfin URL that your users should receive; selecting an existing enabled, non-administrator legacy template user is optional. The wizard can finish without one. After completing setup, add the Emby source URL and API key in Settings. Pairing requires both a private/loopback connection source and a local Host header. Complete setup before exposing a reverse proxy; the first qualifying visitor can link the server. A permitted public proxy hostname cannot perform first pairing, even when the proxy connects from a private address. For loopback-only deployments, use a local browser or SSH tunnel.
 
-Jellyport verifies the administrator with Jellyfin, creates its own API key for background operations, and encrypts the pairing and key in `/data`. It does not retain your Jellyfin password. Subsequent sign-ins use an enabled administrator account on the linked Jellyfin server. Jellyfin must be reachable for sign-in and authorization checks.
+Jellyport validates the supplied API key and server identity. The pending key stays in server memory until you finish setup; the saved pairing and key are encrypted in `/data`. The key is never returned in browser responses or stored in localStorage or sessionStorage. Jellyport does not create, delete, or revoke API keys. Completing setup returns you to sign-in: use an enabled administrator account on the linked Jellyfin server with a nonempty password. Jellyport does not retain that password. Jellyfin must be reachable for sign-in and authorization checks.
 
-When upgrading from shared-password sign-in, complete the wizard with your Jellyfin administrator account. The wizard keeps an existing saved Jellyfin server address fixed. Remove the obsolete `JELLYPORT_ADMIN_PASSWORD` variable from the service configuration and Portainer's stack variables; it is ignored. Preserve the existing data directory when upgrading. Installations already paired with Jellyfin continue using their normal Jellyfin sign-in.
+When upgrading from shared-password sign-in, complete the wizard with a pre-created Jellyfin API key, then sign in with your Jellyfin administrator account. The wizard keeps an existing saved Jellyfin server address fixed. Remove the obsolete `JELLYPORT_ADMIN_PASSWORD` variable from the service configuration and Portainer's stack variables; it is ignored. Preserve the existing data directory when upgrading. Installations already paired with Jellyfin keep their existing API key and normal Jellyfin sign-in. Switching to manual key setup does not require resetting pairing or deleting any data.
 
 ## Choose account defaults
 
@@ -54,7 +54,7 @@ The examples publish `8000:8000`; the left number is the host port and can be ch
 
 After pairing, route your HTTPS reverse proxy to Jellyport's container port `8000`, set `JELLYPORT_SECURE_COOKIE=true`, and add its hostname to `JELLYPORT_ALLOWED_HOSTS`, then recreate the container. For example, set `JELLYPORT_ALLOWED_HOSTS=jellyport.example.com` in Portainer's stack environment variables. Use comma-separated hostnames without schemes, ports, paths, or wildcards. IP literals, single-label names, `.local`, `.localhost`, and `.home.arpa` names are permitted by default; other DNS names require this setting.
 
-Preserve the original Host header, including a nondefault browser port. Jellyport compares browser Origin headers against it and rejects cross-site API requests. Do not expose first-run setup through a proxy that rewrites a public hostname into a local one. Forwarded IP headers are not trusted; proxy clients share its peer address for rate limits. Keep the raw application port private. Keep `JELLYPORT_SECURE_COOKIE=false` while accessing the app over HTTP, because browsers will not send a secure session cookie over HTTP. HTTP alone does not encrypt administrator passwords or session cookies; use HTTPS or an encrypted VPN for confidential access. Serve the app at the root of its host or subdomain. A proxy container must be able to reach Jellyport, typically through a shared Docker network. See [the security review](security-review.md) for the data and trust model.
+Preserve the original Host header, including a nondefault browser port. Jellyport compares browser Origin headers against it and rejects cross-site API requests. Do not expose first-run setup through a proxy that rewrites a public hostname into a local one. Forwarded IP headers are not trusted; proxy clients share its peer address for rate limits. Keep the raw application port private. Keep `JELLYPORT_SECURE_COOKIE=false` while accessing the app over HTTP, because browsers will not send a secure session cookie over HTTP. HTTP alone does not encrypt API keys, administrator passwords, or session cookies; use HTTPS or an encrypted VPN for confidential access. Serve the app at the root of its host or subdomain. A proxy container must be able to reach Jellyport, typically through a shared Docker network. See [the security review](security-review.md) for the data and trust model.
 
 Enter the Jellyfin URL in the setup wizard and the Emby URL and API key in Settings. With the standalone example, use hostnames or server addresses reachable from inside the Jellyport container, including each server's published port. `localhost` points to Jellyport's own container.
 
@@ -77,7 +77,7 @@ Keep the existing stack's top-level network definition. Do not replace it with `
 
 ## Troubleshooting startup
 
-If the setup page reports an unreachable server, confirm that the Jellyfin URL is reachable from the container and includes the correct port and any reverse-proxy base path. Jellyfin sign-in requires an enabled administrator account. The Jellyfin service key is managed separately; if it is revoked, sign in as a Jellyfin administrator and refresh the key from Settings. Refresh creates a new key and keeps the previous one available for already queued jobs; remove obsolete Jellyport keys in Jellyfin's dashboard after those jobs finish.
+If the setup page reports an unreachable server, confirm that the Jellyfin URL is reachable from the container and includes the correct port and any reverse-proxy base path. Jellyfin sign-in requires an enabled administrator account. The Jellyfin service key is separate from sign-in; if it is revoked or needs replacing, create a new key in Jellyfin's **Dashboard → Advanced → API Keys**, sign in to Jellyport as a Jellyfin administrator, and paste the new key into the API-key replacement field in Settings. Replacement keeps the previous key available for already queued jobs. Wait until those jobs finish before manually revoking the obsolete key in Jellyfin; earlier revocation can interrupt them.
 
 For a permission-denied startup message, check that the mounted directory and its existing database, journal files, and `secret.key` are owned by the configured container user and group. The bind-mount examples use `1000:1000`; the default named-volume deployment uses `10001:10001`.
 
@@ -95,7 +95,7 @@ docker compose run --rm --no-deps jellyport node dist/server/reset-auth.js
 docker compose up -d jellyport
 ```
 
-The command confirms that authentication was reset. Open Jellyport and complete the wizard again using your Jellyfin administrator account.
+The command confirms that authentication was reset. Open Jellyport and complete the wizard again using a valid API key for the same Jellyfin server, then sign in with your Jellyfin administrator account. The reset does not revoke keys on Jellyfin.
 
 If the same Jellyfin server has moved to a new address, add `--server-url http://NEW_JELLYFIN_ADDRESS:8096` after `reset-auth.js` in the reset command. This changes the address used by the wizard while still requiring the original Jellyfin server's identity. Without this option, recovery keeps the previous address fixed.
 
@@ -108,7 +108,7 @@ docker run --rm --user 1000:1000 \
   ghcr.io/cruv/jellyport:latest node dist/server/reset-auth.js
 ```
 
-Use the same image version as the stopped container, then start Jellyport in Portainer and complete setup with your Jellyfin administrator account. Reset preserves server settings, account links, jobs, history, and `secret.key`; it requires setup again against the same Jellyfin server. Keep the app stopped throughout the reset, and never delete the database or encryption key to recover a login.
+Use the same image version as the stopped container, then start Jellyport in Portainer and complete setup with a valid API key for the same Jellyfin server, followed by your Jellyfin administrator sign-in. Reset preserves server settings, account links, jobs, history, and `secret.key`; it requires setup again against the same Jellyfin server. Keep the app stopped throughout the reset, and never delete the database or encryption key to recover a login.
 
 ## Existing installations and backups
 

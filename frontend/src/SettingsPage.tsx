@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { Callout, Heading, Icon } from './components';
 import AdminAlertsPanel from './AdminAlertsPanel';
 import {
@@ -204,6 +204,15 @@ export default function SettingsPage({
   const [roles, setRoles] = useState<AccountRole[]>([]);
   const [rolesError, setRolesError] = useState('');
   const [defaultRoleId, setDefaultRoleId] = useState(s.default_role_id || '');
+  const replacementKey = useRef<HTMLInputElement | null>(null);
+  const serviceKeyRequest = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const keyField = replacementKey.current;
+    return () => {
+      if (keyField) keyField.value = '';
+      serviceKeyRequest.current?.abort();
+    };
+  }, []);
   useEffect(() => setDefaultRoleId(s.default_role_id || ''), [s.default_role_id]);
   useEffect(() => {
     const controller = new AbortController();
@@ -224,6 +233,7 @@ export default function SettingsPage({
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
+    if (replacementKey.current) replacementKey.current.value = '';
     setBusy('save');
     try {
       const data: Record<string, unknown> = {};
@@ -278,19 +288,35 @@ export default function SettingsPage({
       setBusy('');
     }
   }
-  async function refreshServiceKey() {
+  async function replaceServiceKey() {
+    if (serviceKeyRequest.current) return;
+    const apiKey = replacementKey.current?.value.trim() || '';
+    if (replacementKey.current) replacementKey.current.value = '';
+    if (!apiKey) {
+      notify('Enter a new Jellyfin API key first.', true);
+      return;
+    }
+    const controller = new AbortController();
+    serviceKeyRequest.current = controller;
     setBusy('service-key');
     try {
-      await api<Settings>('/api/auth/service-key', { method: 'POST', body: {} });
-      notify('Jellyfin service key refreshed.');
+      await api<Settings>('/api/auth/service-key', {
+        method: 'POST',
+        body: { api_key: apiKey },
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+      notify('Jellyfin API key replaced.');
       await refresh();
     } catch (error) {
+      if (controller.signal.aborted) return;
       notify(
-        error instanceof Error ? error.message : 'The Jellyfin service key could not be refreshed.',
+        error instanceof Error ? error.message : 'The Jellyfin API key could not be replaced.',
         true,
       );
     } finally {
-      setBusy('');
+      if (serviceKeyRequest.current === controller) serviceKeyRequest.current = null;
+      if (!controller.signal.aborted) setBusy('');
     }
   }
   return (
@@ -348,20 +374,31 @@ export default function SettingsPage({
                 />
                 {s.jellyfin_auth_managed ? (
                   <div className="field">
-                    <label>Jellyfin service key</label>
-                    <p className="muted text-small">
-                      Jellyport manages a dedicated key for account and watch history operations.
-                    </p>
+                    <label htmlFor="replacement-jellyfin-api-key">
+                      Replacement Jellyfin API key
+                    </label>
+                    <input
+                      ref={replacementKey}
+                      id="replacement-jellyfin-api-key"
+                      type="password"
+                      autoComplete="new-password"
+                      spellCheck={false}
+                      placeholder="Paste a newly created API key"
+                      disabled={!!busy || demo}
+                    />
                     <button
                       className="btn btn-small btn-quiet"
                       type="button"
-                      onClick={() => void refreshServiceKey()}
+                      onClick={() => void replaceServiceKey()}
                       disabled={!!busy || demo}
                     >
                       <Icon name="refresh" />
-                      {busy === 'service-key' ? 'Refreshing key…' : 'Refresh Jellyfin service key'}
+                      {busy === 'service-key' ? 'Replacing key…' : 'Replace Jellyfin API key'}
                     </button>
-                    <small>Refresh this key if it has been revoked in Jellyfin.</small>
+                    <small>
+                      Create a key in Jellyfin Dashboard → Advanced → API Keys. We recommend naming
+                      it Jellyport; any name works. The saved key is never displayed.
+                    </small>
                   </div>
                 ) : (
                   <Field
@@ -370,7 +407,7 @@ export default function SettingsPage({
                     type="password"
                     secret
                     saved={s.jellyfin_api_key_set}
-                    hint="Generate a key in Jellyfin Dashboard → API Keys."
+                    hint="Generate a key in Jellyfin Dashboard → Advanced → API Keys."
                   />
                 )}
               </div>

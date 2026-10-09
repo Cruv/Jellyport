@@ -30,8 +30,10 @@ async function fixture(demo = false, allowedHosts: string[] = []) {
     },
     validateSession: async () => identity,
     signOut: async () => {},
-    createApiKey: async () => 'private-service-key',
-    deleteApiKey: async () => {},
+    validateApiKey: async () => {
+      authentications++;
+      return { serverId: identity.serverId, apiKeyName: 'test API key' };
+    },
   };
   const app = await createApp({ dataDir: directory, demo, allowedHosts, authClient });
   resources.push({ app, directory });
@@ -138,12 +140,11 @@ describe('request boundaries', () => {
         ...connection,
         payload: {
           jellyfin_url: 'http://192.168.1.3:8096',
-          username: 'Administrator',
-          password: 'private-password',
+          api_key: 'private-supplied-key',
         },
       });
       expect(connect.statusCode).toBe(403);
-      expect(connect.body).not.toContain('private-password');
+      expect(connect.body).not.toContain('private-supplied-key');
     }
     expect(authentications()).toBe(0);
     expect(app.jellyport.store.authState()?.kind).toBe('pending');

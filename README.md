@@ -52,11 +52,11 @@ sudo install -d -m 700 -o 1000 -g 1000 /path/to/jellyport
 
 `user: "1000:1000"` sets the real process UID and GID; change it and the directory owner together if your host uses different IDs. Jellyport does not use `PUID` or `PGID` environment variables.
 
-Open `http://YOUR_LAN_IP:8000` or `http://localhost:8000` and complete the setup wizard with your Jellyfin server URL and an enabled Jellyfin administrator's username and nonempty password. Set the public Jellyfin URL; selecting a legacy template user is optional. After setup, choose a saved default account role or a template before creating or migrating accounts. Subsequent sign-ins use your Jellyfin administrator account. Initial pairing requires both a private connection source and a local hostname or private IP address; complete it before exposing any reverse proxy. The first qualifying visitor can pair the installation.
+Create a dedicated API key in Jellyfin's **Dashboard → Advanced → API Keys** first, then open `http://YOUR_LAN_IP:8000` or `http://localhost:8000` and complete the setup wizard with your Jellyfin server URL and that key. Set the public Jellyfin URL; selecting a legacy template user is optional. After setup, sign in with an enabled Jellyfin administrator account, then choose a saved default account role or a template before creating or migrating accounts. Initial pairing requires both a private connection source and a local hostname or private IP address; complete it before exposing any reverse proxy. The first qualifying visitor can pair the installation.
 
 For HTTPS through a reverse proxy, set `JELLYPORT_SECURE_COOKIE=true` and add its hostname to `JELLYPORT_ALLOWED_HOSTS`, for example `jellyport.example.com` (comma-separated hostnames, without schemes or ports). Preserve the browser's Host header. IP literals, single-label local names, and `.local`, `.localhost`, or `.home.arpa` names work by default. A public hostname cannot perform initial pairing. Use [examples/compose.shared-network.yaml](examples/compose.shared-network.yaml) when joining an existing media-server network from a separate stack; set `JELLYPORT_MEDIA_NETWORK` to the actual Docker network name. Jellyport connects through server APIs and only needs its own `/data` mount. It does not need access to media files or the Jellyfin configuration directory.
 
-Use HTTPS or an encrypted VPN to protect administrator passwords and session cookies in transit. Review [the security assessment and deployment assumptions](docs/security-review.md) before exposing the administration interface.
+Use HTTPS or an encrypted VPN to protect API keys, administrator passwords, and session cookies in transit. Review [the security assessment and deployment assumptions](docs/security-review.md) before exposing the administration interface.
 
 For network details, updates, backups, and moving an existing named-volume deployment, see [Docker and Portainer deployment](docs/docker-deployment.md).
 
@@ -69,7 +69,7 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and complete setup with your Jellyfin server URL and administrator account. Compose binds to `127.0.0.1:8000` by default; an SSH tunnel can provide localhost access from another machine during setup. After pairing, configure your HTTPS reverse proxy, set `JELLYPORT_SECURE_COOKIE=true` and `JELLYPORT_ALLOWED_HOSTS` in `.env`, then recreate the container. A proxy in another container needs a route to the host or an explicitly configured shared Docker network.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and complete setup with your Jellyfin server URL and a pre-created API key, then sign in with your Jellyfin administrator account. Compose binds to `127.0.0.1:8000` by default; an SSH tunnel can provide localhost access from another machine during setup. After pairing, configure your HTTPS reverse proxy, set `JELLYPORT_SECURE_COOKIE=true` and `JELLYPORT_ALLOWED_HOSTS` in `.env`, then recreate the container. A proxy in another container needs a route to the host or an explicitly configured shared Docker network.
 
 The container must be able to reach both media servers. A server URL containing `localhost` refers to the Jellyport container itself. Use reachable hostnames or addresses; reverse proxy base paths are supported.
 
@@ -77,13 +77,20 @@ Serve Jellyport at the root of its own host/subdomain. Run one application worke
 
 ## Set up Jellyfin sign-in and your servers
 
-The first-run wizard links Jellyport to one Jellyfin server. Enter the server URL and an enabled administrator's username and password. Jellyport verifies those credentials with Jellyfin and creates a dedicated API key for background account operations. You do not need to create or name an API key yourself. It encrypts the key in its data directory and does not save your Jellyfin password.
+The first-run wizard links Jellyport to one Jellyfin server using an API key you create beforehand:
+
+1. Sign in to Jellyfin as an administrator and open **Dashboard → Advanced → API Keys**.
+2. Create a dedicated key. `Jellyport` is a useful label, but any name is accepted. Copy the key.
+3. Enter the Jellyfin server URL and paste the key into Jellyport's setup wizard. Select an optional legacy template and set the public Jellyfin URL, then finish setup.
+4. Sign in to Jellyport with an enabled Jellyfin administrator's username and nonempty password. Completing setup does not sign you in to the administration console.
+
+Jellyport validates the key and server identity before pairing. The pending key stays in server memory until setup finishes; the saved key is encrypted in the data directory. Keys are never returned in browser responses or stored in browser storage. Jellyport does not create, delete, or revoke API keys. No setup password or API-key environment variable is required. The Jellyfin dashboard's [Advanced navigation](https://github.com/jellyfin/jellyfin-web/blob/master/src/apps/dashboard/components/drawer/sections/AdvancedDrawerSection.tsx) contains the API Keys page.
 
 The wizard can finish without a template user. After setup, use **Account roles** to capture an enabled, non-administrator Jellyfin account's supported settings, then choose that saved role as the default in Settings. Alternatively, select a legacy template user in Settings to copy its policy and configuration during provisioning. A default account role takes precedence when both are configured. Set the public Jellyfin URL that users should receive in their credential message, and configure the Emby source URL and API key in Settings.
 
 After setup, sign in with the linked server's Jellyfin administrator username and password. Only enabled administrator accounts are accepted. Jellyport keeps each interactive Jellyfin token in server memory, checks the account's authorization on protected requests, and revokes that token on sign-out. The background API key is separate, so signing out does not interrupt queued work or the optional bot. Jellyfin sign-in requires the linked server to be reachable.
 
-Settings keeps the sign-in server address fixed. If the background key is revoked, an authenticated administrator can refresh it from Settings. Refresh creates a new key while preserving the previous key for already queued jobs; remove obsolete Jellyport keys in Jellyfin's dashboard after those jobs finish. Use the [local authentication reset](docs/docker-deployment.md#reset-jellyfin-pairing) to recover access or update the linked server's address. Linking a different Jellyfin server requires a new Jellyport data directory, because existing account links and jobs belong to the original server.
+Settings keeps the sign-in server address fixed. To replace the background key, create another key in Jellyfin first, then paste it into the API-key replacement field in Settings while signed in as an administrator. Replacement preserves the previous key for already queued jobs; manually revoke obsolete keys in Jellyfin's dashboard after those jobs finish. Revoking a key sooner can interrupt jobs that still use it. Use the [local authentication reset](docs/docker-deployment.md#reset-jellyfin-pairing) to recover access or update the linked server's address. Linking a different Jellyfin server requires a new Jellyport data directory, because existing account links and jobs belong to the original server.
 
 Save your Emby settings and test the connections. The Emby key needs access to its users and their library data; Emby is used as a read-only source. Discord and all automatic actions are disabled by default; the web app can operate without a bot.
 
@@ -275,7 +282,7 @@ Do not run both versions against the same volume. Keep your pre-upgrade backup i
 
 ### Upgrading from shared-password sign-in
 
-Keep the same data mount and back it up before updating the image. On the first visit after upgrading, complete the setup wizard with your Jellyfin administrator account. If a Jellyfin URL is already saved, the wizard keeps that server address fixed. Existing accounts, jobs, links, and settings remain in the data directory. Remove `JELLYPORT_ADMIN_PASSWORD` from your stack configuration if present; it is ignored. Installations already paired with Jellyfin continue using their normal Jellyfin sign-in.
+Keep the same data mount and back it up before updating the image. On the first visit after upgrading, complete the setup wizard with a pre-created Jellyfin API key, then sign in with your Jellyfin administrator account. If a Jellyfin URL is already saved, the wizard keeps that server address fixed. Existing accounts, jobs, links, and settings remain in the data directory. Remove `JELLYPORT_ADMIN_PASSWORD` from your stack configuration if present; it is ignored. Installations already paired with Jellyfin keep their existing background key and normal Jellyfin sign-in; the change to manual key setup does not require resetting or deleting data.
 
 ## Development and local demo
 
@@ -294,7 +301,7 @@ For real local operation, run:
 HOST=127.0.0.1 npm start
 ```
 
-Open the app and complete the setup wizard with your Jellyfin server URL and administrator account.
+Open the app and complete the setup wizard with your Jellyfin server URL and a pre-created API key, then sign in with your Jellyfin administrator account.
 
 The demo uses simulated in-memory servers, makes no Emby/Jellyfin/Discord API calls, and keeps settings read-only. Use a separate data directory:
 
@@ -311,13 +318,13 @@ For development with hot reload, run `npm run dev` for the API and `npm run dev:
 
 ## API
 
-The browser uses authenticated session cookies. Mutating API requests require the session's `X-CSRF-Token`; get an anonymous session from `GET /api/session` before calling `POST /api/login` with a Jellyfin `username` and `password`. First-run setup uses the same CSRF protection and verifies a Jellyfin administrator account before pairing the server. Jellyfin access tokens and API keys are not returned to the browser. `/health` is unauthenticated. There is no public subscription webhook endpoint.
+The browser uses authenticated session cookies. Mutating API requests require the session's `X-CSRF-Token`; get an anonymous session from `GET /api/session` before calling `POST /api/login` with a Jellyfin `username` and `password`. First-run setup uses the same CSRF protection and validates a pre-created Jellyfin API key and the server identity before pairing. Setup does not establish an administrator session; a separate Jellyfin administrator sign-in is required. Jellyfin access tokens and API keys are not returned to the browser. `/health` is unauthenticated. There is no public subscription webhook endpoint.
 
 | Operation | Endpoint |
 | --- | --- |
 | Read or update configuration | `GET` / `PUT /api/settings` |
 | Connect Jellyfin and complete first-run setup | `GET /api/setup`, `POST /api/setup/connect`, `POST /api/setup/complete` |
-| Refresh the managed background API key | `POST /api/auth/service-key` |
+| Replace the background key with a pre-created key | `POST /api/auth/service-key` with `{"api_key": "NEW_KEY"}` |
 | Read, save, or remove account roles | `GET` / `POST /api/account-roles`, `DELETE /api/account-roles/:id` |
 | Capture supported Jellyfin user settings | `POST /api/account-roles/import` |
 | Assign or unassign saved roles without remote writes | `POST /api/account-roles/assign`, `POST /api/account-roles/unassign` |

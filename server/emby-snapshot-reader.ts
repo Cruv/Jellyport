@@ -18,6 +18,10 @@ const MAX_USERS = 1_000;
 const MAX_LIBRARY_ITEMS = 2_000_000;
 const MAX_USER_ITEMS = 100_000;
 const MAX_USER_BYTES = 32 * 1024 * 1024;
+// Keep the partial index and history predicate identical. Date-only, count-only
+// and rating-only entries are meaningful even when an item is not played.
+const personalState =
+  'played=1 OR playCount>0 OR isFavorite=1 OR playbackPositionTicks>0 OR LastPlayedDateInt IS NOT NULL OR rating IS NOT NULL';
 // API-verified Folder rows are excluded by migrationItems' IncludeItemTypes too.
 const excludedTypes = new Set([3]);
 const itemTypes: Readonly<Record<number, string>> = {
@@ -80,7 +84,9 @@ function withDatabase<T>(path: string, read: (database: DatabaseSync) => T): T {
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink()) throw invalid();
     database = new DatabaseSync(path, { readOnly: true, allowExtension: false });
-    database.exec('PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000;');
+    database.exec(
+      'PRAGMA query_only=ON; PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE; PRAGMA mmap_size=0;',
+    );
     return read(database);
   } catch (error) {
     if (error instanceof ServiceError) throw error;
@@ -227,7 +233,7 @@ export function projectLibrary(rawPath: string, outputPath: string): void {
     created = true;
     database = new DatabaseSync(outputPath, { allowExtension: false });
     database.exec(
-      'PRAGMA trusted_schema=OFF; PRAGMA page_size=4096; PRAGMA max_page_count=2097152;',
+      'PRAGMA trusted_schema=OFF; PRAGMA page_size=4096; PRAGMA max_page_count=2097152; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE; PRAGMA mmap_size=0;',
     );
     database.prepare('ATTACH DATABASE ? AS captured').run(rawPath);
     database.exec(`
@@ -249,7 +255,8 @@ export function projectLibrary(rawPath: string, outputPath: string): void {
         SELECT UserDataKeyId,userId,rating,played,playCount,isFavorite,
           playbackPositionTicks,LastPlayedDateInt FROM captured.UserDatas;
       CREATE INDEX JellyportMediaUserDataKey ON MediaItems(UserDataKeyId);
-      CREATE INDEX JellyportUserDataUser ON UserDatas(userId,UserDataKeyId);
+      CREATE INDEX JellyportUserDataUser ON UserDatas(userId,UserDataKeyId)
+        WHERE ${personalState};
       COMMIT;
     `);
     database.close();
@@ -295,10 +302,10 @@ export function readSnapshotItems(
         m.ParentIndexNumber,m.IndexNumberEnd,m.RunTimeTicks,
         substr(s.ProviderIds,1,16385) AS SeriesProviderIds,
         ud.played,ud.playCount,ud.isFavorite,ud.playbackPositionTicks,ud.LastPlayedDateInt,ud.rating
-      FROM UserDatas ud JOIN MediaItems m ON m.UserDataKeyId=ud.UserDataKeyId
+      FROM UserDatas ud CROSS JOIN MediaItems m ON m.UserDataKeyId=ud.UserDataKeyId
       LEFT JOIN MediaItems s ON s.Id=m.SeriesId AND s.type=6
-      WHERE ud.userId=? AND ${scope === 'watched_only' ? 'ud.played=1' : '(ud.played=1 OR ud.playCount>0 OR ud.isFavorite=1 OR ud.playbackPositionTicks>0 OR ud.LastPlayedDateInt IS NOT NULL OR ud.rating IS NOT NULL)'}
-      ORDER BY m.Id LIMIT ?`);
+      WHERE ud.userId=? AND ${scope === 'watched_only' ? 'played=1' : `(${personalState})`}
+      LIMIT ?`);
     query.setReadBigInts(true);
     const items: MediaItem[] = [];
     let bytes = 2; // JSON array brackets; reserve commas as items are appended.
@@ -351,6 +358,10 @@ export function readSnapshotItems(
         throw new ServiceError('This Emby snapshot exceeds the supported per-user history size.');
       items.push(item);
     }
-    return items;
+    // CROSS JOIN keeps per-user state ahead of catalog lookups. Do not sort in
+    // SQLite: a temporary sort must finish before iteration and may process a
+    // user's entire history before the row/byte ceiling can reject it. Preserve
+    // deterministic item-ID order only after accepting the bounded result.
+    return items.sort((left, right) => Number(left.Id) - Number(right.Id));
   });
 }

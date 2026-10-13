@@ -106,6 +106,39 @@ describe('playback-conscious migration orchestration', () => {
     return { select, items };
   }
 
+  it.each(['completed', 'failed', 'canceled'] as const)(
+    'releases a bulk snapshot job reference when the job is %s',
+    async (outcome) => {
+      const entered = deferred(),
+        release = deferred();
+      releases.push(release.resolve);
+      const releaseSnapshots = vi.fn(async () => {});
+      const retain = vi
+        .spyOn(service.sourceSnapshots, 'retainForJob')
+        .mockReturnValue(releaseSnapshots);
+      const saved = snapshots(async () => {
+        entered.resolve();
+        await release.promise;
+        if (outcome === 'failed') throw new MediaError('Fixture snapshot read failed.');
+        return [
+          { Id: '2', Type: 'Movie', ProviderIds: { Tmdb: '120467' }, UserData: { Played: true } },
+        ];
+      });
+      const id = '7d1a6301-8c1c-4c1c-a1b1-b2139d712b80';
+      const job = await service.migrateUsers(['e-river'], {}, undefined, 'complete', {
+        'e-river': id,
+      });
+      await entered.promise;
+      expect(retain).toHaveBeenCalledExactlyOnceWith([id]);
+      expect(releaseSnapshots).not.toHaveBeenCalled();
+      if (outcome === 'canceled') service.cancelJob(job.id);
+      release.resolve();
+      expect((await finish(job)).status).toBe(outcome);
+      expect(saved.items).toHaveBeenCalledOnce();
+      expect(releaseSnapshots).toHaveBeenCalledOnce();
+    },
+  );
+
   it('does no catalog work in live previews and pins one 100,000-item metadata array across users even after TTL expiry', async () => {
     let clock = Date.UTC(2026, 9, 8, 12),
       advanceDuringFirstUser = true;

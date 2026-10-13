@@ -1,6 +1,6 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import { MediaError, ServiceError } from './errors.js';
-import { caseFold, type MatchPlan } from './matching.js';
+import { caseFold, createMatcher, type MatchPlan, type PreparedMatcher } from './matching.js';
 import {
   UserMappings,
   validateExistingMappingUsername,
@@ -492,6 +492,7 @@ export class Service {
     settings: Settings,
     sourcePlaylists = 0,
     scope: MigrationScope = 'complete',
+    preparedMatcher?: PreparedMatcher,
   ): [MatchPlan, JobStats] {
     const playable = new Set([
       'Movie',
@@ -506,7 +507,7 @@ export class Service {
     const played = source.filter(
       (item) => playable.has(item.Type ?? '') && item.UserData?.Played === true,
     );
-    const plan = statePlan(source, target, settings, scope);
+    const plan = statePlan(source, target, settings, scope, preparedMatcher);
     return [
       plan,
       {
@@ -701,6 +702,7 @@ export class Service {
           // Only new destinations share this preview's catalog. Strip template personal data
           // before reuse; existing destinations always read their own user-scoped state.
           let newTargetCatalog: Promise<MediaItem[]> | undefined;
+          let newTargetMatcher: PreparedMatcher | undefined;
           const targetCatalogFor = (target: MediaUser | null | undefined) => {
             const read = (userId?: string) =>
               jellyfin.migrationItems ? jellyfin.migrationItems(userId) : jellyfin.items(userId);
@@ -791,12 +793,16 @@ export class Service {
             ]);
             checkCanceled();
             const targetItems = targetCatalog;
+            const matcher = target
+              ? createMatcher(targetItems, settings.path_mappings)
+              : (newTargetMatcher ??= createMatcher(targetItems, settings.path_mappings));
             const [plan, stats] = this.plan(
               sourceItems,
               targetItems,
               settings,
               playlists.count,
               scope,
+              matcher,
             );
             const warnings = [
               ...playlists.warnings,
@@ -2425,12 +2431,14 @@ export class Service {
         const targetItems = await (jellyfin.migrationItems
           ? jellyfin.migrationItems(target.Id)
           : jellyfin.items(target.Id));
+        const matcher = createMatcher(targetItems, settings.path_mappings);
         const [plan, stats] = this.plan(
           source.items,
           targetItems,
           settings,
           source.playlists.length,
           scope,
+          matcher,
         );
         Object.assign(result, stats);
         result.unmatched_items = plan.unmatched.slice(0, 200).map((item) => {
@@ -2513,6 +2521,7 @@ export class Service {
             result.data,
             guard,
             () => this.save(job),
+            matcher,
           );
         }
         guard();
@@ -2591,9 +2600,15 @@ export class Service {
     job.status = 'running';
     job.started_at = new Date().toISOString();
     this.save(job);
+    let releaseSnapshots: (() => Promise<void>) | undefined;
     try {
       this.checkJobStopped(job);
       this.assertConnections(settings);
+      releaseSnapshots = this.sourceSnapshots.retainForJob(
+        requests.flatMap((request) =>
+          request.source_snapshot_id ? [request.source_snapshot_id] : [],
+        ),
+      );
       await this.withClient(
         settings,
         'jellyfin',
@@ -2716,6 +2731,12 @@ export class Service {
             : 'Job failed unexpectedly. Check configuration and server availability.';
       }
     } finally {
+      try {
+        await releaseSnapshots?.();
+      } catch {
+        if (job.status === 'completed') job.status = 'partial';
+        job.error ??= 'Temporary snapshot cleanup failed. Review private storage permissions.';
+      }
       job.finished_at = new Date().toISOString();
       this.save(job);
     }

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { createMatcher, matchItems, type MatchPlan } from './matching.js';
+import { setTimeout as delay } from 'node:timers/promises';
+import { createMatcher, type MatchPlan, type PreparedMatcher } from './matching.js';
 import {
   isObject,
   type MediaAPI,
@@ -103,15 +104,15 @@ export function statePlan(
   target: MediaItem[],
   settings: Settings,
   scope: MigrationScope = 'complete',
+  preparedMatcher?: PreparedMatcher,
 ): MatchPlan {
-  return matchItems(
+  const match = preparedMatcher ?? createMatcher(target, settings.path_mappings);
+  return match(
     source.filter((item) =>
       scope === 'watched_only'
         ? playable.has(item.Type ?? '') && item.UserData?.Played === true
         : item.Type !== 'Playlist' && hasPersonalState(item),
     ),
-    target,
-    settings.path_mappings,
   );
 }
 
@@ -439,6 +440,12 @@ export async function migrateItemState(
           processed++;
           if (changed) reportedUpdated++;
           options.progress?.(processed, plan.matches.length, reportedUpdated);
+          // Unchanged histories can complete entirely through resolved promises. Yield
+          // periodically so timer/request-driven cancellation can run between no-ops.
+          if (processed % 250 === 0) {
+            await delay(0);
+            guard();
+          }
         }
       }
     } catch (error) {
@@ -469,6 +476,7 @@ export async function migratePlaylists(
   details: MigrationDetails,
   stopped: () => void,
   saved: () => void,
+  preparedMatcher?: PreparedMatcher,
 ): Promise<void> {
   if (!source.length) return;
   let capabilities = { privatePlaylists: false, playlistDuplicates: false };
@@ -488,7 +496,7 @@ export async function migratePlaylists(
     );
     return;
   }
-  const matchPlaylist = createMatcher(targetItems, settings.path_mappings);
+  const matchPlaylist = preparedMatcher ?? createMatcher(targetItems, settings.path_mappings);
   for (const entry of source) {
     stopped();
     if (entry.error) {

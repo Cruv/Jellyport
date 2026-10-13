@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { MediaAPI, MediaItem, MediaPlaylist, MediaUserDataPatch } from '../server/media.js';
 import { MediaError, ServiceError } from '../server/errors.js';
+import { createMatcher } from '../server/matching.js';
 import {
   hasPersonalState,
   mergeUserData,
@@ -504,6 +505,40 @@ describe('user-state application and reporting', () => {
     ambiguous: [],
   });
   const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  it('yields an already-merged large history so timer-driven cancellation can stop promptly', async () => {
+    const plan = matchedPlan(10_000);
+    for (const match of plan.matches) match.target.UserData = { ...match.source.UserData };
+    const userData = vi.fn(async () => ({}));
+    const updateUserData = vi.fn(async () => {});
+    const canceled = new ServiceError('Canceled fixture');
+    let stopped = false;
+    let processed = 0;
+    const timer = setTimeout(() => {
+      stopped = true;
+    }, 0);
+    try {
+      await expect(
+        migrateItemState(
+          client({ migrationCapabilities: modernCapabilities, userData, updateUserData }),
+          'user',
+          plan,
+          migrationDetails(),
+          () => {
+            if (stopped) throw canceled;
+          },
+          () => {},
+          { progress: (value) => (processed = value) },
+        ),
+      ).rejects.toBe(canceled);
+    } finally {
+      clearTimeout(timer);
+    }
+    expect(processed).toBeGreaterThanOrEqual(250);
+    expect(processed).toBeLessThanOrEqual(4 * 250);
+    expect(userData).not.toHaveBeenCalled();
+    expect(updateUserData).not.toHaveBeenCalled();
+  });
 
   it('uses fresh data for watched-only writes without importing excluded fields or altering already-watched items', async () => {
     const source = [
@@ -1111,6 +1146,41 @@ describe('user-state application and reporting', () => {
 });
 
 describe('private playlist migration and durable retries', () => {
+  it('shares one prepared destination matcher across state and playlist planning', async () => {
+    const fixture = playlistFixture();
+    const prepared = vi.fn(createMatcher(fixture.target, settings.path_mappings));
+    const sourceWithState = fixture.source.map((item) => ({
+      ...item,
+      UserData: { Played: true, IsFavorite: true },
+    }));
+    expect(statePlan(sourceWithState, fixture.target, settings, 'complete', prepared)).toEqual(
+      statePlan(sourceWithState, fixture.target, settings),
+    );
+    expect(prepared).toHaveBeenCalledOnce();
+    const details = migrationDetails();
+    await migratePlaylists(
+      store(),
+      settings,
+      'source-user',
+      'target-user',
+      fixture.sourcePlaylists,
+      fixture.target,
+      fixture.api,
+      details,
+      () => {},
+      () => {},
+      prepared,
+    );
+    expect(prepared).toHaveBeenCalledTimes(2);
+    expect(fixture.createPlaylist).toHaveBeenCalledWith(
+      'target-user',
+      expect.any(String),
+      'Audio',
+      ['target-0', 'target-1'],
+    );
+    expect(details).toMatchObject({ playlists_created: 1, playlist_items_added: 2 });
+  });
+
   it('keeps ordered duplicates on supported Jellyfin and completes only after readback', async () => {
     const database = store(),
       fixture = playlistFixture(2, true),

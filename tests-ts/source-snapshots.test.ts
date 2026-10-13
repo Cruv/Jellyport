@@ -433,6 +433,133 @@ it('authenticates database bytes against the selected generation and deletes fai
   expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
 });
 
+it('decrypts once for 100 bulk-job users across long write intervals and promptly removes plaintext on release', async () => {
+  const f = await fixture();
+  const capture = await f.complete({ identities: { [userId]: 7, [otherUserId]: 8 } });
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  const decrypt = vi.spyOn(snapshotFiles, 'decryptDatabase');
+  const paths = new Set<string>();
+  worker.mockImplementation(async (request) => {
+    const read = request as { path: string; user_id: string };
+    paths.add(read.path);
+    return [{ Id: read.user_id, Type: 'Movie', UserData: { Played: true } }];
+  });
+  const release = f.manager.retainForJob([capture.id, capture.id]);
+  vi.useFakeTimers();
+  for (let index = 0; index < 100; index++) {
+    const id = index % 2 ? otherUserId : userId;
+    expect(await f.manager.items(selected, id, 'complete')).toEqual([
+      { Id: id, Type: 'Movie', UserData: { Played: true } },
+    ]);
+    await vi.advanceTimersByTimeAsync(120_000);
+  }
+  expect(decrypt).toHaveBeenCalledOnce();
+  expect(paths.size).toBe(1);
+  expect(worker).toHaveBeenCalledTimes(100);
+  await expect(f.manager.clear()).rejects.toThrow('using saved data');
+  await release();
+  await release();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+  expect((await stat(join(f.shared, `${capture.id}.db.enc`))).isFile()).toBe(true);
+});
+
+it('keeps independent job references until the final release without retaining per-user state', async () => {
+  const f = await fixture();
+  await f.complete();
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  worker.mockResolvedValue([]);
+  const first = f.manager.retainForJob([selected.id]);
+  const second = f.manager.retainForJob([selected.id]);
+  await f.manager.items(selected, userId, 'complete');
+  await first();
+  await first();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toHaveLength(1);
+  await second();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+});
+
+it('removes job plaintext after a failed worker and does not let job references delay shutdown', async () => {
+  const f = await fixture();
+  await f.complete();
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  const release = f.manager.retainForJob([selected.id]);
+  worker.mockRejectedValueOnce(new Error('fixture read failed'));
+  await expect(f.manager.items(selected, userId, 'complete')).rejects.toThrow(
+    'fixture read failed',
+  );
+  await release();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+  const stoppedRelease = f.manager.retainForJob([selected.id]);
+  worker.mockResolvedValue([]);
+  await f.manager.items(selected, userId, 'complete');
+  await f.manager.stop();
+  await stoppedRelease();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+  expect(() => f.manager.retainForJob([selected.id])).toThrow('unavailable');
+});
+
+it('rejects invalid or unbounded job references before retaining any database', async () => {
+  const f = await fixture();
+  await f.complete();
+  expect(() => f.manager.retainForJob(['../library.db'])).toThrow('invalid');
+  expect(() => f.manager.retainForJob(Array.from({ length: 9 }, () => randomUUID()))).toThrow(
+    'invalid',
+  );
+  expect(worker).not.toHaveBeenCalled();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+});
+
+it.each(['clear', 'stop'] as const)(
+  'releases every job generation despite one cleanup failure and retries tracked plaintext on %s',
+  async (retry) => {
+    const f = await fixture();
+    const first = await f.complete();
+    const second = await f.complete();
+    const selections = await Promise.all(
+      [first.id, second.id].map((id) =>
+        f.manager.select(userId, f.settings, 'fixture-emby-server', id),
+      ),
+    );
+    const release = f.manager.retainForJob([first.id, second.id]);
+    worker.mockResolvedValue([]);
+    for (const selected of selections) await f.manager.items(selected, userId, 'complete');
+    const internal = f.manager as unknown as {
+      cleanReadDirectory(directory: string): Promise<void>;
+    };
+    vi.spyOn(internal, 'cleanReadDirectory').mockRejectedValueOnce(new Error('fixture denial'));
+    await expect(release()).rejects.toThrow('cleanup failed');
+    expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toHaveLength(1);
+    await expect(f.manager.items(selections[0]!, userId, 'complete')).rejects.toThrow(
+      'cleanup failed',
+    );
+    expect(worker).toHaveBeenCalledTimes(2);
+    await f.manager[retry]();
+    expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+  },
+);
+
+it('handles idle cleanup rejection without an unhandled promise or further plaintext accumulation', async () => {
+  const f = await fixture();
+  await f.complete();
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  worker.mockResolvedValue([]);
+  vi.useFakeTimers();
+  await f.manager.items(selected, userId, 'complete');
+  const internal = f.manager as unknown as { cleanReadDirectory(directory: string): Promise<void> };
+  vi.spyOn(internal, 'cleanReadDirectory').mockRejectedValueOnce(new Error('fixture denial'));
+  await vi.advanceTimersByTimeAsync(60_000);
+  vi.useRealTimers();
+  await vi.waitFor(async () =>
+    expect((await f.manager.status()).last_error).toContain('cleanup failed'),
+  );
+  await expect(f.manager.items(selected, userId, 'complete')).rejects.toThrow('cleanup failed');
+  expect(worker).toHaveBeenCalledOnce();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toHaveLength(1);
+  await f.manager.clear();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+  expect((await f.manager.status()).last_error).toBeNull();
+});
+
 it('stop aborts externally signaled workers, waits for them to drain and removes all decrypted data', async () => {
   const f = await fixture();
   await f.complete();

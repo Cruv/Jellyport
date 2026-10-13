@@ -12,6 +12,7 @@
     "dev:ui": "vite --host 127.0.0.1",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.frontend.json",
     "test": "vitest run",
+    "benchmark:snapshots": "node --import tsx scripts/benchmark-snapshots.ts",
     "format": "prettier --write server frontend tests-ts scripts *.ts *.json .github/**/*.yml",
     "build": "npm run typecheck && tsc -p tsconfig.build.json && vite build",
     "start": "node dist/server/index.js"

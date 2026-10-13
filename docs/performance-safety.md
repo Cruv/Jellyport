@@ -196,6 +196,61 @@ configuration, profile images and playlist metadata/entries live. Jellyfin acces
 and destination state remain live. Neither capture method makes these separate
 databases and API responses one consistent transaction.
 
+## Local snapshot performance
+
+The local history reader starts with one user's indexed meaningful state and
+looks up matching catalog rows by key. New private projections use a partial
+index covering watched flags, positive counts, favorites, resume positions,
+playback dates and ratings, including zero ratings. Every original projected
+state row remains in the database; older full-index projections still work.
+These indexes belong only to Jellyport's private projection, never Emby's live
+database or its backup files.
+
+SQLite no longer sorts the joined history before iteration. The reader validates
+the row and serialized-byte ceilings first, then sorts the bounded result by item
+ID for deterministic matching. Native SQLite caches use an 8 MiB limit, temporary
+data uses disk, and memory mapping is disabled. These controls do not establish
+a hard process RSS ceiling.
+
+An active bulk job retains one decrypted projection per selected generation
+across long Jellyfin write phases. The previous 60-second idle eviction could
+force the next account to decrypt the whole database again. Jobs release their
+references on completion, failure and cancellation; the final reference removes
+idle plaintext promptly. Shared in-flight readers finish before removal, and
+shutdown drains them and removes decrypted files. Failed removals remain tracked
+for a later clear/shutdown attempt; cleanup errors are sanitized, idle failures
+cannot reject an unhandled promise, and new decryptions stop until cleanup
+succeeds. Standalone
+previews retain the existing short idle cache. Personal account results are not
+cached between users.
+
+Each destination catalog now builds one matching index for both history and
+playlist planning. New-account snapshot previews reuse their existing shared
+metadata catalog and index; existing accounts still read their own Jellyfin
+state. A matching plan retains at most 200,000 ambiguous candidate references.
+Over-limit plans fail rather than drop candidates or guess a match. Item workers
+yield every 250 processed items so large already-merged histories remain
+cancelable. Fresh pre-write Jellyfin checks and the four-worker ceiling remain.
+
+Run `npm run benchmark:snapshots` for an opt-in, synthetic-only benchmark. It
+accepts no production paths or URLs, generates 100,000 catalog items and 500,000
+state rows across 100 users, and removes its temporary workspace. Five runs of
+each query/index strategy compare complete output checksums. On one Apple M5
+Mac with Node 22.23.2/SQLite 3.53.4, projection took approximately 161 ms and
+extracting 50,000 meaningful history records across all 100 users took a median
+431 ms with the old SQL sort/full index versus 230 ms with the optimized partial
+index. All outputs were identical.
+
+These are local component measurements, not an end-to-end migration estimate or
+a memory benchmark. Strategies use the same cache settings and final bounded
+JavaScript sort; sequential runs can benefit from filesystem caches. Backup
+creation, decryption, subprocess startup, matching and Jellyfin API work are
+excluded. Every destination account still requires its permission-scoped catalog
+read, and every potential change still needs fresh state before a write. Those
+network operations can dominate total duration; higher write concurrency is not
+assumed safe. Completed plugin-backup import remains pending format/completion
+verification as described in [the plugin guide](emby-plugin-backups.md).
+
 ## Observability and verification
 
 Source workload events contain fixed operation labels and aggregate numbers:

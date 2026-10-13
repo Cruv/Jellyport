@@ -344,9 +344,14 @@ export default function UserDirectoryPage({
         title="Everyone, across both servers."
         description="Organize paid members, family, and independent media accounts in one place."
         actions={
-          <button className="btn" disabled={busy || loading} onClick={() => void reload()}>
-            <Icon name="refresh" /> Refresh
-          </button>
+          <>
+            <button className="btn" disabled={busy || loading} onClick={() => void reload()}>
+              <Icon name="refresh" /> Refresh
+            </button>
+            <button className="btn btn-primary" onClick={() => navigate('accounts')}>
+              <Icon name="userPlus" /> Create Jellyfin account
+            </button>
+          </>
         }
       />
       <Callout icon="users" title="Discord and subscriptions are optional.">

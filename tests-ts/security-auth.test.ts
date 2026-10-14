@@ -396,13 +396,37 @@ describe('session capacity and private data', () => {
         expect(response.json(), url).toEqual({ detail: 'Sign in to Jellyport.' });
         expect(response.headers['cache-control']).toBe('no-store');
       }
-      const credentials = await app.inject({
-        method: 'POST',
-        url: '/api/jobs/private-job/credentials',
-        headers,
-      });
-      expect(credentials.statusCode).toBe(401);
+      for (const url of ['/api/jobs/private-job/credentials', '/api/jobs/private-job/cancel']) {
+        const response = await app.inject({ method: 'POST', url, headers });
+        expect(response.statusCode).toBe(401);
+        expect(response.headers['cache-control']).toBe('no-store');
+      }
     }
+  });
+
+  it('requires CSRF authorization before looking up a job to cancel', async () => {
+    const { app } = await fixture(true);
+    const initial = browser(await app.inject('/api/session'));
+    const signedIn = await app.inject({
+      method: 'POST',
+      url: '/api/login',
+      headers: initial,
+      payload: { username: 'admin', password: 'demo-jellyport' },
+    });
+    const authorized = browser(signedIn);
+    const denied = await app.inject({
+      method: 'POST',
+      url: '/api/jobs/private-job/cancel',
+      headers: { cookie: authorized.cookie },
+    });
+    expect(denied.statusCode).toBe(403);
+    const allowed = await app.inject({
+      method: 'POST',
+      url: '/api/jobs/private-job/cancel',
+      headers: authorized,
+    });
+    expect(allowed.statusCode).toBe(400);
+    expect(allowed.json()).toEqual({ detail: 'Job not found.' });
   });
 
   it('does not serve the database, encryption key, server code, or debug maps', async () => {

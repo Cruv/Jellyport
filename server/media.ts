@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import { MediaError } from './errors.js';
+import type { MediaReadOperation, MediaWorkload } from './media-workload.js';
 
 export type MediaKind = 'emby' | 'jellyfin';
 export type JsonObject = Record<string, unknown>;
@@ -57,6 +58,14 @@ export interface MediaAPI {
   setDisplayPreferences?(userId: string, preferences: JsonObject): Promise<void>;
   markPlayed(userId: string, itemId: string, datePlayed?: string): Promise<void>;
   migrationItems?(userId?: string): Promise<MediaItem[]>;
+  /** Reusable identity metadata. Never includes personal state. */
+  catalogItems?(): Promise<MediaItem[]>;
+  /** Complete state, read by explicit catalog IDs without a per-user library crawl. */
+  migrationState?(
+    userId: string,
+    catalog: MediaItem[],
+    scope?: 'complete' | 'watched_only',
+  ): Promise<MediaItem[]>;
   watchedItems?(userId: string): Promise<MediaItem[]>;
   migrationCapabilities?(): Promise<MigrationCapabilities>;
   updateUserData?(userId: string, itemId: string, patch: MediaUserDataPatch): Promise<void>;
@@ -82,13 +91,115 @@ export interface MediaClientOptions {
   timeoutMs?: number;
   /** Can lower the 8 MiB response ceiling for constrained deployments and tests. */
   maxResponseBytes?: number;
+  /** One shared governor for all live source migration reads. */
+  workload?: MediaWorkload;
 }
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 1024 * 1024;
+export const MAX_CATALOG_ITEMS = 200_000;
+export const MAX_CATALOG_BYTES = 64 * 1024 * 1024;
+export const MAX_MIGRATION_STATE_ITEMS = 100_000;
+export const MAX_MIGRATION_STATE_BYTES = 32 * 1024 * 1024;
+const MAX_STATE_BATCH_IDS = 100;
+const MAX_ENCODED_BATCH_IDS = 6000;
+const playableTypes = new Set([
+  'Movie',
+  'Episode',
+  'Audio',
+  'MusicVideo',
+  'Video',
+  'Book',
+  'AudioBook',
+  'Trailer',
+]);
 const MIGRATION_ITEM_TYPES =
   'Movie,Episode,Series,Season,Audio,MusicAlbum,MusicArtist,MusicVideo,Video,Book,AudioBook,Photo,PhotoAlbum,BoxSet,Trailer';
 const PLAYLIST_MEDIA_TYPES = new Set(['Audio', 'Video', 'Photo', 'Book']);
+
+function itemIdentifier(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 128 &&
+    !/[,\u0000-\u001f\u007f]/.test(value) &&
+    value !== '.' &&
+    value !== '..'
+  );
+}
+
+/** Keep only fields used by matching, merge safety, and review labels. */
+export function projectCatalogItem(value: unknown): MediaItem {
+  if (!isObject(value) || !itemIdentifier(value.Id))
+    throw new MediaError('The media server returned invalid catalog identifiers.');
+  const item: MediaItem = { Id: value.Id };
+  for (const [field, maximum] of [
+    ['Name', 2048],
+    ['Type', 64],
+    ['Path', 16_384],
+    ['SeriesId', 128],
+  ] as const) {
+    const entry = value[field];
+    if (entry === undefined || entry === null) continue;
+    if (typeof entry !== 'string' || entry.length > maximum || /[\u0000-\u001f\u007f]/.test(entry))
+      throw new MediaError('The media server returned invalid catalog metadata.');
+    item[field] = entry;
+  }
+  if (typeof item.Type !== 'string' || !item.Type)
+    throw new MediaError('The media server returned catalog items without media types.');
+  for (const field of [
+    'IndexNumber',
+    'ParentIndexNumber',
+    'IndexNumberEnd',
+    'RunTimeTicks',
+  ] as const) {
+    const entry = value[field];
+    if (entry === undefined || entry === null) continue;
+    // Matching historically accepts integer strings from API-compatible servers.
+    if (!(
+      (typeof entry === 'number' && Number.isSafeInteger(entry) && entry >= 0) ||
+      (typeof entry === 'string' && /^\d{1,16}$/.test(entry) && Number.isSafeInteger(Number(entry)))
+    ))
+      throw new MediaError('The media server returned invalid catalog numbering.');
+    item[field] = entry;
+  }
+  for (const field of ['ProviderIds', 'SeriesProviderIds'] as const) {
+    const entry = value[field];
+    if (entry === undefined || entry === null) continue;
+    if (!isObject(entry) || Object.keys(entry).length > 64)
+      throw new MediaError('The media server returned invalid provider identifiers.');
+    const providers: JsonObject = {};
+    for (const [key, id] of Object.entries(entry)) {
+      if (
+        !key ||
+        key.length > 128 ||
+        /[\u0000-\u001f\u007f]/.test(key) ||
+        !(
+          (typeof id === 'string' && id.length <= 1024 && !/[\u0000-\u001f\u007f]/.test(id)) ||
+          (typeof id === 'number' && Number.isSafeInteger(id))
+        )
+      )
+        throw new MediaError('The media server returned invalid provider identifiers.');
+      Object.defineProperty(providers, key, { value: id, enumerable: true, writable: true });
+    }
+    item[field] = providers;
+  }
+  return item;
+}
+
+function personalState(item: MediaItem): boolean {
+  const data = item.UserData ?? {};
+  return (
+    data.IsFavorite === true ||
+    typeof data.Likes === 'boolean' ||
+    (typeof data.Rating === 'number' && data.Rating >= 0 && data.Rating <= 10) ||
+    (playableTypes.has(item.Type ?? '') &&
+      (data.Played === true ||
+        Number(data.PlaybackPositionTicks ?? 0) > 0 ||
+        Number(data.PlayCount ?? 0) > 0 ||
+        (typeof data.LastPlayedDate === 'string' && Date.parse(data.LastPlayedDate) >= 0)))
+  );
+}
 
 function versionAtLeast(version: string | undefined, major: number, minor = 0): boolean {
   // Unknown and prerelease versions fail closed for privacy-sensitive writes.
@@ -97,6 +208,32 @@ function versionAtLeast(version: string | undefined, major: number, minor = 0): 
     !!match &&
     (Number(match[1]) > major || (Number(match[1]) === major && Number(match[2]) >= minor))
   );
+}
+
+/** RFC Retry-After values only; retain a bounded duration, never the raw header. */
+function retryAfterMilliseconds(value: string | null): number | undefined {
+  if (value === null) return undefined;
+  const text = value.trim();
+  if (!text || text.length > 128) return undefined;
+  if (/^\d+$/.test(text)) {
+    const seconds = Number(text);
+    return Number.isFinite(seconds) ? Math.min(86_400_000, seconds * 1000) : undefined;
+  }
+  // IMF-fixdate plus the two obsolete HTTP-date forms recipients may receive.
+  const day = '(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)';
+  const month = '(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)';
+  const time = '\\d{2}:\\d{2}:\\d{2}';
+  const imf = new RegExp(`^${day}, \\d{2} ${month} \\d{4} ${time} GMT$`);
+  const obsolete = new RegExp(
+    `^(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), \\d{2}-${month}-\\d{2} ${time} GMT$`,
+  );
+  const asctime = new RegExp(`^${day} ${month} {1,2}\\d{1,2} ${time} \\d{4}$`);
+  if (!imf.test(text) && !obsolete.test(text) && !asctime.test(text)) return undefined;
+  // HTTP asctime is UTC too, even though its spelling has no explicit timezone.
+  const timestamp = Date.parse(asctime.test(text) ? `${text} GMT` : text);
+  return Number.isFinite(timestamp)
+    ? Math.min(86_400_000, Math.max(0, timestamp - Date.now()))
+    : undefined;
 }
 
 function dateValue(value: unknown): string {
@@ -223,6 +360,7 @@ export class MediaClient implements MediaAPI {
   private readonly sleep: (milliseconds: number) => Promise<unknown>;
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
+  private readonly workload?: MediaWorkload;
   private readonly controller = new AbortController();
   private capabilities?: Promise<MigrationCapabilities>;
 
@@ -263,6 +401,7 @@ export class MediaClient implements MediaAPI {
     this.sleep = options.sleep ?? delay;
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
+    this.workload = options.workload;
     if (
       !Number.isFinite(this.timeoutMs) ||
       this.timeoutMs <= 0 ||
@@ -291,17 +430,23 @@ export class MediaClient implements MediaAPI {
     body?: unknown,
     decode: boolean | 'image' = true,
     bodyContentType?: MediaUserImage['contentType'],
+    options: { signal?: AbortSignal; retry?: boolean; timeoutMs?: number } = {},
   ): Promise<unknown> {
-    const attempts = method === 'GET' ? 3 : 1;
+    const attempts = method === 'GET' && options.retry !== false ? 3 : 1;
+    const timeoutMs = Math.min(this.timeoutMs, options.timeoutMs ?? this.timeoutMs);
     const url = new URL(this.baseUrl + path.replace(/^\/+/, ''));
     for (const [key, value] of Object.entries(params ?? {}))
       url.searchParams.set(key, String(value));
     for (let attempt = 0; attempt < attempts; attempt++) {
       const timeout = new AbortController();
-      const deadline = Date.now() + this.timeoutMs;
-      const timer = setTimeout(() => timeout.abort(), this.timeoutMs);
+      const deadline = Date.now() + timeoutMs;
+      const timer = setTimeout(() => timeout.abort(), timeoutMs);
       timer.unref();
-      const signal = AbortSignal.any([this.controller.signal, timeout.signal]);
+      const signal = AbortSignal.any([
+        this.controller.signal,
+        timeout.signal,
+        ...(options.signal ? [options.signal] : []),
+      ]);
       let response: Response | undefined;
       let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
       try {
@@ -349,6 +494,7 @@ export class MediaClient implements MediaAPI {
           throw new MediaError(
             `${this.label} rejected the request (HTTP ${response.status}).`,
             response.status,
+            retryAfterMilliseconds(response.headers.get('Retry-After')),
           );
         if (!decode || response.status === 204) return null;
         const maxBytes =
@@ -471,45 +617,87 @@ export class MediaClient implements MediaAPI {
     return this.validUser(await this.request('GET', `Users/${this.id(id)}`));
   }
 
+  private async yieldRead(): Promise<void> {
+    try {
+      await delay(0, undefined, { signal: this.controller.signal });
+    } catch {
+      throw new MediaError(`${this.label} migration read was canceled.`);
+    }
+  }
+
+  private async readPage(
+    operation: MediaReadOperation,
+    path: string,
+    params: Record<string, string | number>,
+  ): Promise<JsonObject> {
+    const read = async (signal: AbortSignal) =>
+      this.object(
+        await this.request('GET', path, params, undefined, true, undefined, {
+          signal,
+          retry: false,
+          timeoutMs: this.workload?.maxReadMs ?? 5000,
+        }),
+      );
+    if (this.kind === 'emby' && this.workload)
+      return this.workload.read(operation, read, {
+        signal: this.controller.signal,
+        items: (data) => (Array.isArray(data.Items) ? data.Items.length : 0),
+      });
+    // Yield even with a synthetic immediate transport, so close() can interrupt long reads.
+    await this.yieldRead();
+    return read(this.controller.signal);
+  }
+
   private async itemsByType(
     userId: string | undefined,
     itemTypes: string,
     expanded = false,
     watchedOnly = false,
+    catalogOnly = false,
   ): Promise<MediaItem[]> {
     const path = userId !== undefined ? `Users/${this.id(userId)}/Items` : 'Items';
     const items: MediaItem[] = [];
     const seenIds = new Set<string>();
     let start = 0;
     let total: number | undefined;
+    let retainedBytes = 0;
+    if (!Number.isSafeInteger(this.pageSize) || this.pageSize < 1)
+      throw new MediaError('Invalid media pagination size.');
+    const pageSize = Math.min(this.kind === 'emby' ? 100 : 500, this.pageSize);
     while (true) {
-      const data = this.object(
-        await this.request('GET', path, {
-          IncludeItemTypes: itemTypes,
-          Recursive: 'true',
-          Fields:
-            expanded && this.kind === 'emby'
-              ? 'ProviderIds,Path,UserDataPlayCount,UserDataLastPlayedDate'
-              : 'ProviderIds,Path',
-          EnableUserData: userId !== undefined ? 'true' : 'false',
-          EnableImages: 'false',
-          SortBy: 'SortName',
-          SortOrder: 'Ascending',
-          StartIndex: start,
-          Limit: this.pageSize,
-          EnableTotalRecordCount: start === 0 ? 'true' : 'false',
-          ...(watchedOnly ? { IsPlayed: 'true' } : {}),
-        }),
-      );
+      const params = {
+        IncludeItemTypes: itemTypes,
+        Recursive: 'true',
+        Fields:
+          expanded && this.kind === 'emby'
+            ? 'ProviderIds,Path,UserDataPlayCount,UserDataLastPlayedDate'
+            : 'ProviderIds,Path',
+        EnableUserData: userId !== undefined ? 'true' : 'false',
+        EnableImages: 'false',
+        SortBy: 'SortName',
+        SortOrder: 'Ascending',
+        StartIndex: start,
+        Limit: pageSize,
+        EnableTotalRecordCount: !catalogOnly && start === 0 ? 'true' : 'false',
+        ...(watchedOnly ? { IsPlayed: 'true' } : {}),
+      };
+      const operation = itemTypes === 'Playlist' ? 'playlists' : userId ? 'user_state' : 'catalog';
+      const data =
+        this.kind === 'emby' || catalogOnly
+          ? await this.readPage(operation, path, params)
+          : this.object(await this.request('GET', path, params));
       if (!Array.isArray(data.Items) || data.Items.some((item) => !isObject(item)))
         throw new MediaError(`${this.label} returned an invalid library page.`);
       if (!data.Items.length) break;
       if (data.Items.some((item) => typeof item.Id !== 'string' || !item.Id))
         throw new MediaError(`${this.label} returned library items without identifiers.`);
-      const page = data.Items as MediaItem[];
+      if (data.Items.length > pageSize)
+        throw new MediaError(`${this.label} returned an oversized library page.`);
+      const page = catalogOnly ? data.Items.map(projectCatalogItem) : (data.Items as MediaItem[]);
       // With counting disabled, some servers report only this page's size (or zero).
       // Keep the first requested total instead of treating those later values as an end.
       if (
+        !catalogOnly &&
         start === 0 &&
         typeof data.TotalRecordCount === 'number' &&
         Number.isSafeInteger(data.TotalRecordCount) &&
@@ -521,11 +709,20 @@ export class MediaClient implements MediaAPI {
           `${this.label} repeated a library page; refresh the library and retry.`,
         );
       for (const item of page) {
-        if (!seenIds.has(item.Id)) items.push(item);
+        if (catalogOnly && seenIds.has(item.Id))
+          throw new MediaError(
+            `${this.label} repeated catalog identifiers; refresh the catalog before retrying.`,
+          );
+        if (!seenIds.has(item.Id)) {
+          retainedBytes += Buffer.byteLength(JSON.stringify(item));
+          if (items.length >= MAX_CATALOG_ITEMS || retainedBytes > MAX_CATALOG_BYTES)
+            throw new MediaError(`${this.label} catalog exceeds the supported migration size.`);
+          items.push(item);
+        }
         seenIds.add(item.Id);
       }
       start += page.length;
-      if (start > 2_000_000)
+      if (start > MAX_CATALOG_ITEMS)
         throw new MediaError(`${this.label} library exceeds the supported migration size.`);
       if (total !== undefined && start >= total) break;
       // Without a valid first total, continue to an empty page. A server may return
@@ -551,6 +748,140 @@ export class MediaClient implements MediaAPI {
       for (const item of items) {
         const values = item.SeriesId ? providers.get(item.SeriesId) : undefined;
         if (values && !item.SeriesProviderIds) item.SeriesProviderIds = structuredClone(values);
+      }
+    }
+    return items;
+  }
+
+  /**
+   * One reusable, user-neutral catalog. SortName is the documented common order;
+   * the API has no verified ID tie-break/cursor. Retain it only here, never on state reads.
+   * Concurrent library edits can still shift OFFSET pages; repeated IDs fail closed.
+   */
+  async catalogItems(): Promise<MediaItem[]> {
+    const items = await this.itemsByType(undefined, MIGRATION_ITEM_TYPES, false, false, true);
+    // Account for existing projected fields before adding any derived identities.
+    let bytes = 0;
+    for (let index = 0; index < items.length; index++) {
+      if (index % 1000 === 0) await this.yieldRead();
+      bytes += Buffer.byteLength(JSON.stringify(items[index]));
+      if (bytes > MAX_CATALOG_BYTES)
+        throw new MediaError(`${this.label} catalog exceeds the supported migration size.`);
+    }
+    const providers = new Map(
+      items
+        .filter((item) => item.Type === 'Series' && isObject(item.ProviderIds))
+        .map((item) => [item.Id, item.ProviderIds!]),
+    );
+    for (let index = 0; index < items.length; index++) {
+      if (index % 1000 === 0) await this.yieldRead();
+      const item = items[index]!;
+      const values = item.SeriesId ? providers.get(item.SeriesId) : undefined;
+      if (!values || item.SeriesProviderIds) continue;
+      const nextBytes =
+        bytes +
+        Buffer.byteLength(JSON.stringify({ ...item, SeriesProviderIds: values })) -
+        Buffer.byteLength(JSON.stringify(item));
+      if (nextBytes > MAX_CATALOG_BYTES)
+        throw new MediaError(`${this.label} catalog exceeds the supported migration size.`);
+      item.SeriesProviderIds = values;
+      bytes = nextBytes;
+    }
+    return items;
+  }
+
+  async migrationState(
+    userId: string,
+    catalog: MediaItem[],
+    scope: 'complete' | 'watched_only' = 'complete',
+  ): Promise<MediaItem[]> {
+    if (this.kind !== 'emby')
+      throw new MediaError('Explicit migration-state reads are verified only for Emby sources.');
+    this.id(userId);
+    if (
+      !Array.isArray(catalog) ||
+      catalog.length > MAX_CATALOG_ITEMS ||
+      !['complete', 'watched_only'].includes(scope)
+    )
+      throw new MediaError('Invalid migration state catalog.');
+    const seenCatalog = new Set<string>();
+    let catalogBytes = 0;
+    for (let index = 0; index < catalog.length; index++) {
+      if (index % 1000 === 0) await this.yieldRead();
+      const item = catalog[index]!;
+      const projected = projectCatalogItem(item);
+      if (seenCatalog.has(projected.Id))
+        throw new MediaError('The migration catalog contains duplicate identifiers.');
+      seenCatalog.add(projected.Id);
+      catalogBytes += Buffer.byteLength(JSON.stringify(projected));
+      if (catalogBytes > MAX_CATALOG_BYTES)
+        throw new MediaError('The migration catalog exceeds the supported size.');
+    }
+    const items: MediaItem[] = [];
+    let retainedBytes = 0;
+    for (let offset = 0; offset < catalog.length;) {
+      const batch: MediaItem[] = [];
+      while (offset < catalog.length && batch.length < MAX_STATE_BATCH_IDS) {
+        const candidate = catalog[offset]!;
+        const ids = [...batch.map((item) => item.Id), candidate.Id].join(',');
+        if (encodeURIComponent(ids).length > MAX_ENCODED_BATCH_IDS && batch.length) break;
+        batch.push(candidate);
+        offset++;
+      }
+      const allowed = new Map(batch.map((item) => [item.Id, item]));
+      const seen = new Set<string>();
+      let start = 0;
+      while (seen.size < allowed.size) {
+        const data = await this.readPage('user_state', `Users/${this.id(userId)}/Items`, {
+          Ids: batch.map((item) => item.Id).join(','),
+          EnableUserData: 'true',
+          EnableImages: 'false',
+          EnableTotalRecordCount: 'false',
+          ...(this.kind === 'emby' ? { Fields: 'UserDataPlayCount,UserDataLastPlayedDate' } : {}),
+          StartIndex: start,
+          Limit: batch.length,
+        });
+        if (!Array.isArray(data.Items) || data.Items.length > batch.length)
+          throw new MediaError(`${this.label} returned an invalid user-state page.`);
+        if (!data.Items.length) break; // Deleted/inaccessible catalog IDs are omitted by the API.
+        for (const value of data.Items) {
+          if (
+            !isObject(value) ||
+            !itemIdentifier(value.Id) ||
+            !allowed.has(value.Id) ||
+            seen.has(value.Id)
+          )
+            throw new MediaError(
+              `${this.label} returned unexpected or repeated user-state identifiers.`,
+            );
+          const metadata = allowed.get(value.Id)!;
+          if (value.Type !== undefined && value.Type !== metadata.Type)
+            throw new MediaError(
+              `${this.label} changed a catalog item type during the migration read.`,
+            );
+          if (!isObject(value.UserData))
+            throw new MediaError(`${this.label} returned user state without a valid data object.`);
+          const state = writableUserData(value.UserData, true);
+          const item = { ...metadata, UserData: state };
+          seen.add(value.Id);
+          if (
+            scope === 'watched_only'
+              ? !playableTypes.has(item.Type ?? '') || state.Played !== true
+              : !personalState(item)
+          )
+            continue;
+          const projected = { ...projectCatalogItem(metadata), UserData: state };
+          retainedBytes += Buffer.byteLength(JSON.stringify(projected));
+          if (
+            items.length >= MAX_MIGRATION_STATE_ITEMS ||
+            retainedBytes > MAX_MIGRATION_STATE_BYTES
+          )
+            throw new MediaError(
+              `${this.label} personal state exceeds the supported migration size.`,
+            );
+          items.push(projected);
+        }
+        start += data.Items.length;
       }
     }
     return items;
@@ -652,17 +983,23 @@ export class MediaClient implements MediaAPI {
     const items: MediaItem[] = [];
     const seenPages = new Set<string>();
     let start = 0;
+    let retainedBytes = 0;
+    if (!Number.isSafeInteger(this.pageSize) || this.pageSize < 1)
+      throw new MediaError('Invalid media pagination size.');
+    const pageSize = Math.min(this.kind === 'emby' ? 100 : 500, this.pageSize);
     while (true) {
-      const data = this.object(
-        await this.request('GET', path, {
-          userId,
-          Fields: 'ProviderIds,Path',
-          EnableUserData: 'true',
-          EnableImages: 'false',
-          StartIndex: start,
-          Limit: this.pageSize,
-        }),
-      );
+      const params = {
+        userId,
+        Fields: 'ProviderIds,Path',
+        EnableUserData: 'true',
+        EnableImages: 'false',
+        StartIndex: start,
+        Limit: pageSize,
+      };
+      const data =
+        this.kind === 'emby'
+          ? await this.readPage('playlist_items', path, params)
+          : this.object(await this.request('GET', path, params));
       if (
         !Array.isArray(data.Items) ||
         data.Items.some((item) => !isObject(item) || typeof item.Id !== 'string' || !item.Id)
@@ -682,11 +1019,18 @@ export class MediaClient implements MediaAPI {
           throw new MediaError(`${this.label} repeated a playlist page; refresh and retry.`);
         seenPages.add(signature);
       }
-      items.push(...page);
+      if (page.length > pageSize)
+        throw new MediaError(`${this.label} returned an oversized playlist page.`);
+      for (const item of page) {
+        retainedBytes += Buffer.byteLength(JSON.stringify(item));
+        if (items.length >= MAX_MIGRATION_STATE_ITEMS || retainedBytes > MAX_MIGRATION_STATE_BYTES)
+          throw new MediaError(`${this.label} playlist exceeds the supported migration size.`);
+        items.push(item);
+      }
       start += page.length;
       if (start > 100_000)
         throw new MediaError(`${this.label} playlist exceeds the supported migration size.`);
-      if ((hasTotal && start >= total) || (!hasTotal && page.length < this.pageSize)) break;
+      if ((hasTotal && start >= total) || (!hasTotal && page.length < pageSize)) break;
     }
     return items;
   }

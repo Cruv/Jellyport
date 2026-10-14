@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { MediaAPI, MediaItem, MediaPlaylist, MediaUserDataPatch } from '../server/media.js';
 import { MediaError, ServiceError } from '../server/errors.js';
+import { createMatcher } from '../server/matching.js';
 import {
   hasPersonalState,
   mergeUserData,
@@ -504,6 +505,40 @@ describe('user-state application and reporting', () => {
     ambiguous: [],
   });
   const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+  it('yields an already-merged large history so timer-driven cancellation can stop promptly', async () => {
+    const plan = matchedPlan(10_000);
+    for (const match of plan.matches) match.target.UserData = { ...match.source.UserData };
+    const userData = vi.fn(async () => ({}));
+    const updateUserData = vi.fn(async () => {});
+    const canceled = new ServiceError('Canceled fixture');
+    let stopped = false;
+    let processed = 0;
+    const timer = setTimeout(() => {
+      stopped = true;
+    }, 0);
+    try {
+      await expect(
+        migrateItemState(
+          client({ migrationCapabilities: modernCapabilities, userData, updateUserData }),
+          'user',
+          plan,
+          migrationDetails(),
+          () => {
+            if (stopped) throw canceled;
+          },
+          () => {},
+          { progress: (value) => (processed = value) },
+        ),
+      ).rejects.toBe(canceled);
+    } finally {
+      clearTimeout(timer);
+    }
+    expect(processed).toBeGreaterThanOrEqual(250);
+    expect(processed).toBeLessThanOrEqual(4 * 250);
+    expect(userData).not.toHaveBeenCalled();
+    expect(updateUserData).not.toHaveBeenCalled();
+  });
 
   it('uses fresh data for watched-only writes without importing excluded fields or altering already-watched items', async () => {
     const source = [
@@ -1111,6 +1146,41 @@ describe('user-state application and reporting', () => {
 });
 
 describe('private playlist migration and durable retries', () => {
+  it('shares one prepared destination matcher across state and playlist planning', async () => {
+    const fixture = playlistFixture();
+    const prepared = vi.fn(createMatcher(fixture.target, settings.path_mappings));
+    const sourceWithState = fixture.source.map((item) => ({
+      ...item,
+      UserData: { Played: true, IsFavorite: true },
+    }));
+    expect(statePlan(sourceWithState, fixture.target, settings, 'complete', prepared)).toEqual(
+      statePlan(sourceWithState, fixture.target, settings),
+    );
+    expect(prepared).toHaveBeenCalledOnce();
+    const details = migrationDetails();
+    await migratePlaylists(
+      store(),
+      settings,
+      'source-user',
+      'target-user',
+      fixture.sourcePlaylists,
+      fixture.target,
+      fixture.api,
+      details,
+      () => {},
+      () => {},
+      prepared,
+    );
+    expect(prepared).toHaveBeenCalledTimes(2);
+    expect(fixture.createPlaylist).toHaveBeenCalledWith(
+      'target-user',
+      expect.any(String),
+      'Audio',
+      ['target-0', 'target-1'],
+    );
+    expect(details).toMatchObject({ playlists_created: 1, playlist_items_added: 2 });
+  });
+
   it('keeps ordered duplicates on supported Jellyfin and completes only after readback', async () => {
     const database = store(),
       fixture = playlistFixture(2, true),
@@ -1338,19 +1408,56 @@ describe('private playlist migration and durable retries', () => {
 });
 
 describe('source snapshot scope, bounds and safe errors', () => {
-  it('uses the watched-only source query when supported and keeps complete reads broad', async () => {
-    const watchedItems = vi.fn(async () => [media('watched', { Played: true })]);
-    const migrationItems = vi.fn(async () => [media('favorite', { IsFavorite: true })]);
-    const api = client({ watchedItems, migrationItems });
-    const quick = await readMigrationSource(api, 'selected-user', 'watched_only');
-    expect(watchedItems).toHaveBeenCalledWith('selected-user');
-    expect(migrationItems).not.toHaveBeenCalled();
-    expect(quick.items.map((item) => item.Id)).toEqual(['watched']);
-    watchedItems.mockClear();
-    const complete = await readMigrationSource(api, 'selected-user');
-    expect(migrationItems).toHaveBeenCalledWith('selected-user');
+  it('requires prepared history before any identity, catalog or playlist API read', async () => {
+    const user = vi.fn(async (Id: string) => ({ Id, Name: 'alice' }));
+    const items = vi.fn(async () => []);
+    const migrationItems = vi.fn(async () => []);
+    const watchedItems = vi.fn(async () => []);
+    const catalogItems = vi.fn(async () => []);
+    const migrationState = vi.fn(async () => []);
+    const playlists = vi.fn(async () => []);
+    const playlistItems = vi.fn(async () => []);
+    const api = client({
+      user,
+      items,
+      migrationItems,
+      watchedItems,
+      catalogItems,
+      migrationState,
+      playlists,
+      playlistItems,
+    });
+    for (const prepared of [undefined, null, {}])
+      await expect(
+        readMigrationSource(api, 'selected-user', 'complete', prepared as MediaItem[] | undefined),
+      ).rejects.toThrow('Prepared source history is required');
+    for (const read of [
+      user,
+      items,
+      migrationItems,
+      watchedItems,
+      catalogItems,
+      migrationState,
+      playlists,
+      playlistItems,
+    ])
+      expect(read).not.toHaveBeenCalled();
+  });
+
+  it('uses only prepared bounded history for complete and watched-only snapshots', async () => {
+    const watchedItems = vi.fn(async () => []);
+    const migrationItems = vi.fn(async () => []);
+    const items = vi.fn(async () => []);
+    const api = client({ watchedItems, migrationItems, items });
+    const watched = [media('watched', { Played: true })];
+    const favorites = [media('favorite', { IsFavorite: true })];
+    const quick = await readMigrationSource(api, 'selected-user', 'watched_only', watched);
+    expect(quick.items).toBe(watched);
+    const complete = await readMigrationSource(api, 'selected-user', 'complete', favorites);
+    expect(complete.items).toBe(favorites);
     expect(watchedItems).not.toHaveBeenCalled();
-    expect(complete.items.map((item) => item.Id)).toEqual(['favorite']);
+    expect(migrationItems).not.toHaveBeenCalled();
+    expect(items).not.toHaveBeenCalled();
   });
 
   it('does not request playlist metadata or entries for a watched-only source snapshot', async () => {
@@ -1366,8 +1473,9 @@ describe('source snapshot scope, bounds and safe errors', () => {
       client({ migrationItems, playlists, playlistItems }),
       'selected-user',
       'watched_only',
+      items,
     );
-    expect(migrationItems).toHaveBeenCalledWith('selected-user');
+    expect(migrationItems).not.toHaveBeenCalled();
     expect(source).toMatchObject({
       user: { Id: 'selected-user' },
       items,
@@ -1378,8 +1486,9 @@ describe('source snapshot scope, bounds and safe errors', () => {
     expect(playlistItems).not.toHaveBeenCalled();
   });
 
-  it('uses broad reads for the selected user and keeps playlist failures separate from library data', async () => {
-    const migrationItems = vi.fn(async () => [media('one', { IsFavorite: true })]);
+  it('keeps prepared history and playlist failures separate without a catalog crawl', async () => {
+    const prepared = [media('one', { IsFavorite: true })];
+    const migrationItems = vi.fn(async () => []);
     const items = vi.fn(async () => []);
     const playlistItems = vi.fn(async (id: string) => {
       if (id === 'bad') throw new Error('private-source-api-key');
@@ -1394,8 +1503,8 @@ describe('source snapshot scope, bounds and safe errors', () => {
       ],
       playlistItems,
     });
-    const snapshot = await readMigrationSource(source, 'selected-user');
-    expect(migrationItems).toHaveBeenCalledWith('selected-user');
+    const snapshot = await readMigrationSource(source, 'selected-user', 'complete', prepared);
+    expect(migrationItems).not.toHaveBeenCalled();
     expect(items).not.toHaveBeenCalled();
     expect(playlistItems).toHaveBeenCalledWith('good', 'selected-user');
     expect(snapshot.items).toHaveLength(1);
@@ -1403,10 +1512,16 @@ describe('source snapshot scope, bounds and safe errors', () => {
     expect(JSON.stringify(snapshot)).not.toContain('private-source-api-key');
   });
 
-  it('retains watched-only source compatibility with an explicit playlist warning', async () => {
-    const items = vi.fn(async () => [media('one', { Played: true })]);
-    const snapshot = await readMigrationSource(client({ items }), 'selected-user');
-    expect(items).toHaveBeenCalledWith('selected-user');
+  it('retains prepared history with an explicit warning when playlist APIs are unavailable', async () => {
+    const prepared = [media('one', { Played: true })];
+    const items = vi.fn(async () => []);
+    const snapshot = await readMigrationSource(
+      client({ items }),
+      'selected-user',
+      'complete',
+      prepared,
+    );
+    expect(items).not.toHaveBeenCalled();
     expect(snapshot.items).toHaveLength(1);
     expect(snapshot.warnings.join(' ')).toMatch(/playlist/);
   });
@@ -1420,6 +1535,8 @@ describe('source snapshot scope, bounds and safe errors', () => {
     const snapshot = await readMigrationSource(
       client({ playlists: async () => playlists, playlistItems }),
       'selected-user',
+      'complete',
+      [],
     );
     expect(playlistItems.mock.calls.length).toBeLessThanOrEqual(500);
     expect(snapshot.playlists.length).toBeLessThanOrEqual(500);
@@ -1440,6 +1557,8 @@ describe('source snapshot scope, bounds and safe errors', () => {
         playlistItems,
       }),
       'selected-user',
+      'complete',
+      [],
     );
     expect(
       snapshot.playlists.reduce((total, entry) => total + entry.items.length, 0),

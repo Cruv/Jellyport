@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import SourceSnapshotsPanel from './SourceSnapshotsPanel';
+import { SourceSnapshotNote } from './components';
 import type { Api, ApiOptions, SourceSnapshotStatus } from './types';
 
 const status: SourceSnapshotStatus = {
@@ -54,6 +55,92 @@ afterEach(() => {
 });
 
 describe('Saved Emby database capture settings', () => {
+  it('labels the active file-copy helper and retained copies without promising transactional history', async () => {
+    const copied: SourceSnapshotStatus = {
+      ...status,
+      capture_method: 'file_copy',
+      records: status.records.map((record) => ({ ...record, source_type: 'file_copy' })),
+    };
+    const api: Api = async <T,>() => copied as T;
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    await screen.findByText('Scheduled file copy');
+    expect(screen.getByText('File copy')).toBeTruthy();
+    expect(screen.getByText('File copies use best-effort history.')).toBeTruthy();
+    expect(screen.getByText(/Live file copies are not transactional/)).toBeTruthy();
+    expect(
+      screen.getByText(/Some history may be missing or inconsistent even when validation passes/),
+    ).toBeTruthy();
+    expect(screen.getByText(/no filesystem snapshot or downtime is needed/)).toBeTruthy();
+    expect(screen.queryByText(/consistent SQLite online backup is captured/)).toBeNull();
+    const row = screen.getByText('File copy').closest('tr')!;
+    expect(within(row).getByText('Complete migration data')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Capture database now' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+  });
+
+  it('retains file-copy provenance and its warning when the helper switches back to online backups', async () => {
+    const api: Api = async <T,>() =>
+      ({
+        ...status,
+        last_error: 'Database capture validation failed.',
+        records: status.records.map((record) => ({ ...record, source_type: 'file_copy' })),
+      }) as T;
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    await screen.findByText('File copy');
+    expect(screen.getByText('SQLite online backup')).toBeTruthy();
+    expect(screen.getByText(/consistent SQLite online backup is captured/)).toBeTruthy();
+    expect(screen.getByText(/Live file copies are not transactional/)).toBeTruthy();
+    expect(
+      screen.getByText(/Database capture validation failed.*Previous valid captures are retained/),
+    ).toBeTruthy();
+    expect(screen.getByText(/Failed captures keep the last good copy/)).toBeTruthy();
+    expect(screen.queryByText('Scheduled file copy')).toBeNull();
+  });
+
+  it('defaults an old status response without capture metadata to online backup guidance', async () => {
+    const legacy: SourceSnapshotStatus = {
+      ...status,
+      capture_method: undefined,
+      records: status.records.map((record) => ({ ...record, source_type: undefined })),
+    };
+    const api: Api = async <T,>() => legacy as T;
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    await screen.findByText('All Emby users');
+    expect(screen.getByText('SQLite online backup')).toBeTruthy();
+    expect(screen.getByText(/consistent SQLite online backup is captured/)).toBeTruthy();
+    expect(screen.getByText('Complete data')).toBeTruthy();
+    expect(screen.queryByText('File copies use best-effort history.')).toBeNull();
+    expect(screen.queryByText('Scheduled file copy')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Capture database now' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+  });
+
+  it('carries file-copy provenance and history limitations into shared migration review and result notes', () => {
+    render(<SourceSnapshotNote snapshot={{ ...status.records[0]!, source_type: 'file_copy' }} />);
+    expect(screen.getByText(/Saved Emby snapshot · File copy · Emby 4.10.1.0/)).toBeTruthy();
+    expect(screen.getByText(/Copy window:/)).toBeTruthy();
+    expect(
+      screen.getByText(/some history may be missing or inconsistent even when validation passes/),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Read window:/)).toBeNull();
+  });
+
+  it.each(['sqlite_online_backup', undefined] as const)(
+    'keeps existing online and legacy migration notes compatible (%s)',
+    (source_type) => {
+      render(<SourceSnapshotNote snapshot={{ ...status.records[0]!, source_type }} />);
+      expect(screen.getByText(/Saved Emby snapshot · Emby 4.10.1.0/)).toBeTruthy();
+      expect(screen.getByText(/Read window:/)).toBeTruthy();
+      expect(screen.getByText(/Activity after this window is not included/)).toBeTruthy();
+      expect(screen.queryByText(/not transactional/)).toBeNull();
+      expect(screen.queryByText(/File copy/)).toBeNull();
+    },
+  );
+
   it('starts scheduling off at the server time and saves a revision-checked schedule independently', async () => {
     const calls: { path: string; options?: ApiOptions }[] = [];
     const api: Api = async <T,>(path: string, options?: ApiOptions) => {

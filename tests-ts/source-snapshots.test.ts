@@ -67,13 +67,18 @@ async function fixture(demo = false) {
   // Keep scheduling deterministic: these tests explicitly tick the file protocol.
   clearInterval((manager as unknown as { timer?: ReturnType<typeof setInterval> }).timer);
   const key = demo ? undefined : await snapshotKey(shared);
-  async function heartbeat(updatedAt = new Date().toISOString(), version = SNAPSHOT_VERSION) {
+  async function heartbeat(
+    updatedAt = new Date().toISOString(),
+    version = SNAPSHOT_VERSION,
+    captureMethod?: unknown,
+  ) {
     await writeEnvelope(
       join(shared, 'helper.status'),
       {
         version: 1,
         emby_version: version,
         updated_at: updatedAt,
+        ...(captureMethod === undefined ? {} : { capture_method: captureMethod }),
       },
       key!,
     );
@@ -201,6 +206,58 @@ it('collects stale unfinished ciphertext while preserving recent work and the la
   await expect(stat(stale)).rejects.toMatchObject({ code: 'ENOENT' });
   expect(await readFile(recent, 'utf8')).toBe('unfinished-recent-ciphertext');
   expect((await stat(join(f.shared, `${completed.id}.db.enc`))).isFile()).toBe(true);
+});
+
+it('pins a file-copy helper method and preserves its provenance across restart and helper changes', async () => {
+  const f = await fixture();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  expect(await f.manager.status()).toMatchObject({ available: true, capture_method: 'file_copy' });
+  await f.manager.refresh();
+  const request = await f.pendingRequest();
+  expect(request.capture_method).toBe('file_copy');
+  const capture = await f.finish(request);
+  expect(
+    (await f.manager.select(userId, f.settings, 'fixture-emby-server')).metadata.source_type,
+  ).toBe('file_copy');
+  await f.restart();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'sqlite_online_backup');
+  expect(await f.manager.status()).toMatchObject({
+    capture_method: 'sqlite_online_backup',
+    records: [{ id: capture.id, source_type: 'file_copy' }],
+  });
+  await f.heartbeat(new Date(Date.now() - 30_000).toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  expect(await f.manager.status()).toMatchObject({ available: false, capture_method: 'file_copy' });
+});
+
+it('rejects an authenticated result that silently changes file-copy capture to online backup', async () => {
+  const f = await fixture();
+  const good = await f.complete();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  await f.manager.refresh();
+  const request = await f.pendingRequest();
+  await f.finish(request, { capture_method: 'sqlite_online_backup' });
+  expect(await f.manager.status()).toMatchObject({
+    running: false,
+    records: [{ id: good.id }],
+    last_error: 'Database capture could not be validated. The last good copy is preserved.',
+  });
+});
+
+it('rejects unknown helper capture methods before making any Emby API request', async () => {
+  const f = await fixture();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'unrecognized-capture-method');
+  await expect(f.manager.refresh()).rejects.toThrow('helper is unavailable');
+  expect(f.factory).not.toHaveBeenCalled();
+});
+
+it('reads legacy capture manifests without a method as SQLite online backups', async () => {
+  const f = await fixture();
+  const capture = await f.complete({ capture_method: undefined });
+  await f.restart();
+  expect(
+    (await f.manager.select(userId, f.settings, 'fixture-emby-server', capture.id)).metadata
+      .source_type,
+  ).toBe('sqlite_online_backup');
 });
 
 it('fails closed for stale helpers, unsupported server versions and unsupported public user IDs', async () => {
@@ -374,6 +431,133 @@ it('authenticates database bytes against the selected generation and deletes fai
   );
   expect(worker).not.toHaveBeenCalled();
   expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+});
+
+it('decrypts once for 100 bulk-job users across long write intervals and promptly removes plaintext on release', async () => {
+  const f = await fixture();
+  const capture = await f.complete({ identities: { [userId]: 7, [otherUserId]: 8 } });
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  const decrypt = vi.spyOn(snapshotFiles, 'decryptDatabase');
+  const paths = new Set<string>();
+  worker.mockImplementation(async (request) => {
+    const read = request as { path: string; user_id: string };
+    paths.add(read.path);
+    return [{ Id: read.user_id, Type: 'Movie', UserData: { Played: true } }];
+  });
+  const release = f.manager.retainForJob([capture.id, capture.id]);
+  vi.useFakeTimers();
+  for (let index = 0; index < 100; index++) {
+    const id = index % 2 ? otherUserId : userId;
+    expect(await f.manager.items(selected, id, 'complete')).toEqual([
+      { Id: id, Type: 'Movie', UserData: { Played: true } },
+    ]);
+    await vi.advanceTimersByTimeAsync(120_000);
+  }
+  expect(decrypt).toHaveBeenCalledOnce();
+  expect(paths.size).toBe(1);
+  expect(worker).toHaveBeenCalledTimes(100);
+  await expect(f.manager.clear()).rejects.toThrow('using saved data');
+  await release();
+  await release();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+  expect((await stat(join(f.shared, `${capture.id}.db.enc`))).isFile()).toBe(true);
+});
+
+it('keeps independent job references until the final release without retaining per-user state', async () => {
+  const f = await fixture();
+  await f.complete();
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  worker.mockResolvedValue([]);
+  const first = f.manager.retainForJob([selected.id]);
+  const second = f.manager.retainForJob([selected.id]);
+  await f.manager.items(selected, userId, 'complete');
+  await first();
+  await first();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toHaveLength(1);
+  await second();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+});
+
+it('removes job plaintext after a failed worker and does not let job references delay shutdown', async () => {
+  const f = await fixture();
+  await f.complete();
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  const release = f.manager.retainForJob([selected.id]);
+  worker.mockRejectedValueOnce(new Error('fixture read failed'));
+  await expect(f.manager.items(selected, userId, 'complete')).rejects.toThrow(
+    'fixture read failed',
+  );
+  await release();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+  const stoppedRelease = f.manager.retainForJob([selected.id]);
+  worker.mockResolvedValue([]);
+  await f.manager.items(selected, userId, 'complete');
+  await f.manager.stop();
+  await stoppedRelease();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+  expect(() => f.manager.retainForJob([selected.id])).toThrow('unavailable');
+});
+
+it('rejects invalid or unbounded job references before retaining any database', async () => {
+  const f = await fixture();
+  await f.complete();
+  expect(() => f.manager.retainForJob(['../library.db'])).toThrow('invalid');
+  expect(() => f.manager.retainForJob(Array.from({ length: 9 }, () => randomUUID()))).toThrow(
+    'invalid',
+  );
+  expect(worker).not.toHaveBeenCalled();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+});
+
+it.each(['clear', 'stop'] as const)(
+  'releases every job generation despite one cleanup failure and retries tracked plaintext on %s',
+  async (retry) => {
+    const f = await fixture();
+    const first = await f.complete();
+    const second = await f.complete();
+    const selections = await Promise.all(
+      [first.id, second.id].map((id) =>
+        f.manager.select(userId, f.settings, 'fixture-emby-server', id),
+      ),
+    );
+    const release = f.manager.retainForJob([first.id, second.id]);
+    worker.mockResolvedValue([]);
+    for (const selected of selections) await f.manager.items(selected, userId, 'complete');
+    const internal = f.manager as unknown as {
+      cleanReadDirectory(directory: string): Promise<void>;
+    };
+    vi.spyOn(internal, 'cleanReadDirectory').mockRejectedValueOnce(new Error('fixture denial'));
+    await expect(release()).rejects.toThrow('cleanup failed');
+    expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toHaveLength(1);
+    await expect(f.manager.items(selections[0]!, userId, 'complete')).rejects.toThrow(
+      'cleanup failed',
+    );
+    expect(worker).toHaveBeenCalledTimes(2);
+    await f.manager[retry]();
+    expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+  },
+);
+
+it('handles idle cleanup rejection without an unhandled promise or further plaintext accumulation', async () => {
+  const f = await fixture();
+  await f.complete();
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  worker.mockResolvedValue([]);
+  vi.useFakeTimers();
+  await f.manager.items(selected, userId, 'complete');
+  const internal = f.manager as unknown as { cleanReadDirectory(directory: string): Promise<void> };
+  vi.spyOn(internal, 'cleanReadDirectory').mockRejectedValueOnce(new Error('fixture denial'));
+  await vi.advanceTimersByTimeAsync(60_000);
+  vi.useRealTimers();
+  await vi.waitFor(async () =>
+    expect((await f.manager.status()).last_error).toContain('cleanup failed'),
+  );
+  await expect(f.manager.items(selected, userId, 'complete')).rejects.toThrow('cleanup failed');
+  expect(worker).toHaveBeenCalledOnce();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toHaveLength(1);
+  await f.manager.clear();
+  expect((await readdir(f.shared)).filter((name) => name.startsWith('read-'))).toEqual([]);
+  expect((await f.manager.status()).last_error).toBeNull();
 });
 
 it('stop aborts externally signaled workers, waits for them to drain and removes all decrypted data', async () => {
@@ -570,6 +754,24 @@ it('restores the named-zone schedule and last daily attempt across a manager res
   await f.tick();
   expect(f.factory).toHaveBeenCalledTimes(2);
   expect(await f.pendingRequest()).toMatchObject({ requested_at: '2026-01-16T08:15:00.000Z' });
+});
+
+it('uses the file-copy method for daily scheduled captures without repeating the daily attempt', async () => {
+  vi.setSystemTime(new Date('2026-10-09T03:30:00Z'));
+  const f = await fixture();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  const config = (await f.manager.status()).config;
+  await f.manager.configure({ ...config, enabled: true, expected_revision: config.revision });
+  await f.tick();
+  const request = await f.pendingRequest();
+  expect(request.capture_method).toBe('file_copy');
+  await f.finish(request);
+  await f.tick();
+  expect(f.factory).toHaveBeenCalledOnce();
+  expect(await f.manager.status()).toMatchObject({
+    capture_method: 'file_copy',
+    records: [{ source_type: 'file_copy' }],
+  });
 });
 
 it('does not capture twice when daylight saving repeats the scheduled local wall-clock time', async () => {

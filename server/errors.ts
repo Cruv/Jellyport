@@ -9,6 +9,8 @@ export class MediaError extends Error {
   constructor(
     message: string,
     public readonly statusCode?: number,
+    /** Sanitized server backoff hint; never retains the original response header. */
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = 'MediaError';

@@ -12,15 +12,19 @@ import {
   readEnvelope,
   snapshotId,
   snapshotKey,
+  snapshotCaptureMethod,
   writeEnvelope,
   SNAPSHOT_VERSION,
   MAX_SNAPSHOT_BYTES,
   type CaptureRequest,
   type CaptureResult,
   type SnapshotBinding,
+  type SnapshotCaptureMethod,
 } from './snapshot-files.js';
 
 const MAX_AGE = 48 * 60 * 60_000;
+const CLEANUP_ERROR =
+  'Temporary snapshot cleanup failed. Clear saved data or review private storage permissions.';
 interface Config {
   enabled: boolean;
   hour: number;
@@ -45,7 +49,7 @@ export interface SnapshotMetadata {
   playlist_entries: number;
   bytes: number;
   avatar: boolean;
-  source_type: 'sqlite_online_backup';
+  source_type: SnapshotCaptureMethod;
   schema: string;
 }
 interface State {
@@ -68,6 +72,8 @@ export class SourceSnapshots {
   private clearing = false;
   private readonly reads = new AbortController();
   private readonly previewPins = new Map<string, number>();
+  private readonly jobReaders = new Map<string, number>();
+  private readonly pendingCleanup = new Set<string>();
   private readonly databases = new Map<
     string,
     {
@@ -114,21 +120,24 @@ export class SourceSnapshots {
     this.timer.unref();
     await this.tick();
   }
-  private async available(): Promise<boolean> {
-    if (!this.key || this.options.demo) return false;
+  private async helperStatus(): Promise<{ capture_method: SnapshotCaptureMethod } | null> {
+    if (!this.key || this.options.demo) return null;
     try {
       const status = await readEnvelope<{
         version: number;
         emby_version: string;
         updated_at: string;
+        capture_method?: unknown;
       }>(join(this.directory, 'helper.status'), this.key);
-      return (
+      if (!(
         status.version === 1 &&
         status.emby_version === SNAPSHOT_VERSION &&
         Math.abs(Date.now() - Date.parse(status.updated_at)) < 20_000
-      );
+      ))
+        return null;
+      return { capture_method: snapshotCaptureMethod(status.capture_method) };
     } catch {
-      return false;
+      return null;
     }
   }
   private async result(id: string): Promise<CaptureResult> {
@@ -154,6 +163,7 @@ export class SourceSnapshots {
         Date.parse(value.finished_at) < Date.parse(value.started_at)
       )
         throw new Error('Invalid capture.');
+      snapshotCaptureMethod(value.capture_method);
       const database = await lstat(join(this.directory, `${id}.db.enc`));
       if (!database.isFile() || database.isSymbolicLink() || database.size !== value.bytes + 28)
         throw new Error('Missing or changed capture.');
@@ -185,7 +195,7 @@ export class SourceSnapshots {
       playlist_entries: 0,
       bytes: value.bytes!,
       avatar: false,
-      source_type: 'sqlite_online_backup',
+      source_type: snapshotCaptureMethod(value.capture_method),
       schema: value.schema!,
     };
   }
@@ -198,10 +208,13 @@ export class SourceSnapshots {
         } catch {
           /* Retained error is reported separately. */
         }
+    const helper = await this.helperStatus();
     return {
       config: this.state.config,
-      available: await this.available(),
-      capture_method: 'sqlite_online_backup',
+      available: helper !== null,
+      capture_method:
+        helper?.capture_method ??
+        snapshotCaptureMethod(this.state.active?.capture_method ?? records[0]?.source_type),
       running: !!this.state.active,
       last_attempt_at: this.state.last_attempt_at,
       last_finished_at: this.state.last_finished_at,
@@ -250,7 +263,8 @@ export class SourceSnapshots {
   async refresh() {
     if (this.clearing || this.stopping)
       throw new ServiceError('Snapshot changes are in progress. Retry shortly.');
-    if (this.options.demo || !this.key || !(await this.available()))
+    const helper = await this.helperStatus();
+    if (this.options.demo || !this.key || !helper)
       throw new ServiceError(
         'The snapshot helper is unavailable. Check its same-host read-only mount and shared directory.',
       );
@@ -296,6 +310,7 @@ export class SourceSnapshots {
       requested_at: new Date().toISOString(),
       binding,
       user_ids: userIds,
+      capture_method: helper.capture_method,
     };
     this.state.active = request;
     this.state.last_attempt_at = request.requested_at;
@@ -329,6 +344,11 @@ export class SourceSnapshots {
           result.id === active.id &&
           JSON.stringify(result.binding) === JSON.stringify(active.binding)
         ) {
+          if (
+            snapshotCaptureMethod(result.capture_method) !==
+            snapshotCaptureMethod(active.capture_method)
+          )
+            throw new Error('The capture method changed during the request.');
           if (result.ok) {
             await this.result(active.id);
             if (active.user_ids?.some((id) => !Object.hasOwn(result!.identities!, id)))
@@ -452,6 +472,9 @@ export class SourceSnapshots {
       throw new ServiceError('Database snapshots are unavailable. Review a new preview.');
     let entry = this.databases.get(selected.id);
     if (!entry) {
+      // Do not accumulate more plaintext after a failed removal. Existing
+      // readers can drain; clear/stop retry the tracked private directories.
+      if (this.pendingCleanup.size) throw new ServiceError(CLEANUP_ERROR);
       const created = { promise: Promise.resolve(''), users: 0 } as {
         promise: Promise<string>;
         directory?: string;
@@ -495,18 +518,79 @@ export class SourceSnapshots {
       );
     } finally {
       entry.users--;
-      if (!entry.users)
-        entry.timer = setTimeout(() => void this.removeDatabase(selected.id), 60_000);
+      if (!entry.users && !this.jobReaders.has(selected.id))
+        entry.timer = setTimeout(() => {
+          void this.removeDatabase(selected.id).catch(() => {
+            this.recordCleanupError();
+          });
+        }, 60_000);
       entry.timer?.unref();
     }
   }
+  /** Keep one decrypted projection through a bulk job, including long destination writes.
+   * This grants no read access: select/items still validate server, age and generation.
+   * Release promptly on completion, failure or cancellation rather than extending idle TTLs.
+   */
+  retainForJob(ids: string[]): () => Promise<void> {
+    const generations = new Set(ids);
+    if (
+      this.stopping ||
+      this.clearing ||
+      generations.size > 8 ||
+      [...generations].some((id) => !snapshotId.test(id))
+    )
+      throw new ServiceError('Saved database job references are unavailable or invalid.');
+    for (const id of generations) {
+      this.jobReaders.set(id, (this.jobReaders.get(id) ?? 0) + 1);
+      clearTimeout(this.databases.get(id)?.timer);
+    }
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      const idle: string[] = [];
+      for (const id of generations) {
+        const remaining = (this.jobReaders.get(id) ?? 1) - 1;
+        if (remaining > 0) this.jobReaders.set(id, remaining);
+        else {
+          this.jobReaders.delete(id);
+          idle.push(id);
+        }
+      }
+      const results = await Promise.allSettled(idle.map((id) => this.removeDatabase(id)));
+      if (results.some((result) => result.status === 'rejected'))
+        throw new ServiceError('Temporary snapshot cleanup failed.');
+    };
+  }
   private async removeDatabase(id: string) {
     const entry = this.databases.get(id);
-    if (!entry || entry.users) return;
+    if (!entry || entry.users || (!this.stopping && this.jobReaders.has(id))) return;
     clearTimeout(entry.timer);
     this.databases.delete(id);
     await entry.promise.catch(() => {});
-    if (entry.directory) await rm(entry.directory, { recursive: true, force: true });
+    if (entry.directory) {
+      this.pendingCleanup.add(entry.directory);
+      await this.cleanReadDirectory(entry.directory);
+    }
+  }
+  private async cleanReadDirectory(directory: string): Promise<void> {
+    try {
+      await rm(directory, { recursive: true, force: true });
+      this.pendingCleanup.delete(directory);
+    } catch {
+      // Keep failed removals separate from active cache entries so a replacement
+      // read can never be deleted by an older cleanup, and clear/stop can retry.
+      this.recordCleanupError();
+      throw new ServiceError(CLEANUP_ERROR);
+    }
+  }
+  private recordCleanupError(): void {
+    this.state.last_error = CLEANUP_ERROR;
+    try {
+      this.save();
+    } catch {
+      // Shutdown may already have closed the store; never reject an idle timer.
+    }
   }
   private pins(): Set<string> {
     return new Set(
@@ -557,6 +641,7 @@ export class SourceSnapshots {
     if (
       this.clearing ||
       this.state.active ||
+      this.jobReaders.size ||
       this.pins().size ||
       [...this.databases.values()].some((value) => value.users)
     )
@@ -566,12 +651,14 @@ export class SourceSnapshots {
     this.clearing = true;
     try {
       for (const id of this.databases.keys()) await this.removeDatabase(id);
+      for (const directory of this.pendingCleanup) await this.cleanReadDirectory(directory);
       for (const id of this.state.generations) {
         await rm(join(this.directory, `${id}.db.enc`), { force: true });
         await rm(join(this.directory, `${id}.result`), { force: true });
       }
       this.state.generations = [];
       this.previewPins.clear();
+      if (this.state.last_error === CLEANUP_ERROR) this.state.last_error = null;
       this.save();
       return await this.status();
     } finally {
@@ -580,6 +667,7 @@ export class SourceSnapshots {
   }
   async stop() {
     this.stopping = true;
+    this.jobReaders.clear();
     clearInterval(this.timer);
     this.reads.abort();
     while (this.ticking) await new Promise((resolve) => setTimeout(resolve, 20));
@@ -589,5 +677,6 @@ export class SourceSnapshots {
       await value.promise.catch(() => {});
       if (!value.users) await this.removeDatabase(id);
     }
+    for (const directory of this.pendingCleanup) await this.cleanReadDirectory(directory);
   }
 }

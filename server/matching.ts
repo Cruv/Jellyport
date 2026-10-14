@@ -1,6 +1,7 @@
 import { posix } from 'node:path';
 import { isObject, type MediaItem } from './media.js';
 import { nameKey } from './identity.js';
+import { MediaError } from './errors.js';
 
 export interface PathMapping {
   source: string;
@@ -20,6 +21,10 @@ export interface MatchPlan {
   unmatched: MediaItem[];
   ambiguous: AmbiguousMatch[];
 }
+/** Reusable only while its destination catalog and path mappings remain unchanged. */
+export type PreparedMatcher = (source: MediaItem[]) => MatchPlan;
+/** Fail closed instead of truncating ambiguity decisions or retaining quadratic result arrays. */
+export const MAX_AMBIGUOUS_CANDIDATES = 200_000;
 /** Lists library item types with a supported, conservative identity strategy. */
 export const MIGRATABLE_ITEM_TYPES = [
   'Movie',
@@ -199,7 +204,7 @@ function lookup(index: Map<string, Set<number>>, key: unknown[]): Set<number> {
 export function createMatcher(
   targetItems: MediaItem[],
   pathMappings: PathMapping[] = [],
-): (source: MediaItem[]) => MatchPlan {
+): PreparedMatcher {
   const target = targetItems.slice();
   const providerIndex = new Map<string, Set<number>>(),
     seriesIndex = new Map<string, Set<number>>(),
@@ -228,6 +233,7 @@ export function createMatcher(
     .sort((a, b) => b[0].length - a[0].length);
   return (source) => {
     const result: MatchPlan = { matches: [], unmatched: [], ambiguous: [] };
+    let retainedCandidates = 0;
     for (const item of source) {
       const type = kind(item);
       if (!supportedTypes.has(type)) {
@@ -254,7 +260,14 @@ export function createMatcher(
         candidates = new Set(pathCandidates);
         method = 'path';
       }
-      const values = () => [...candidates].sort((a, b) => a - b).map((index) => target[index]!);
+      const values = () => {
+        if (candidates.size > MAX_AMBIGUOUS_CANDIDATES - retainedCandidates)
+          throw new MediaError(
+            'The migration matching plan contains too many ambiguous candidates. Resolve duplicate media identities before retrying.',
+          );
+        retainedCandidates += candidates.size;
+        return [...candidates].sort((a, b) => a - b).map((index) => target[index]!);
+      };
       if ([...candidates].some((index) => !compatible(item, target[index]!))) {
         result.ambiguous.push({ source: item, candidates: values() });
         continue;

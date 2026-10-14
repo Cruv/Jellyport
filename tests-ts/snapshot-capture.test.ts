@@ -15,6 +15,7 @@ import {
   writeEnvelope,
   type CaptureRequest,
   type CaptureResult,
+  type SnapshotCaptureMethod,
 } from '../server/snapshot-files.js';
 import { snapshotProcess } from '../server/snapshot-process.js';
 import { readSnapshotItems } from '../server/emby-snapshot-reader.js';
@@ -298,10 +299,10 @@ it('fails closed on malformed recovery messages and never follows artifact symli
   });
 });
 
-it('captures a consistent local WAL view while writes continue and publishes only migration tables', async () => {
+async function verifyCaptureWhileWriting(captureMethod: SnapshotCaptureMethod) {
   const path = await directory();
   const sourcePath = join(path, 'library.db');
-  const outputPath = join(path, 'migration-projection.db');
+  const outputPath = join(await directory(), 'migration-projection.db');
   const source = new DatabaseSync(sourcePath);
   let writer: ReturnType<typeof setInterval> | undefined;
   let writes = 0;
@@ -362,7 +363,12 @@ it('captures a consistent local WAL view while writes continue and publishes onl
       schema: string;
       bytes: number;
       item_count: number;
-    }>({ operation: 'capture', directory: path, output: outputPath });
+    }>({
+      operation: 'capture',
+      directory: path,
+      output: outputPath,
+      capture_method: captureMethod,
+    });
     const writesAtCompletion = writes;
     clearInterval(writer);
     writer = undefined;
@@ -389,8 +395,8 @@ it('captures a consistent local WAL view while writes continue and publishes onl
         LastPlayedDate: '2025-02-03T04:05:06.000Z',
       },
     });
-    // The copied counter belongs to one earlier read view while the source keeps
-    // accepting commits after that view is pinned, rather than forcing writer idle.
+    // Both methods copy earlier history while the source continues accepting writes.
+    // File-copy validation does not claim a transactional view across the source files.
     expect(items[0]!.UserData!.PlayCount).toBeGreaterThanOrEqual(7);
     expect(items[0]!.UserData!.PlayCount).toBeLessThan(7 + writesAtCompletion);
     const projected = new DatabaseSync(outputPath, { readOnly: true });
@@ -427,4 +433,8 @@ it('captures a consistent local WAL view while writes continue and publishes onl
     clearInterval(writer);
     source.close();
   }
-});
+}
+it.each(['sqlite_online_backup', 'file_copy'] as const)(
+  'captures %s while writes continue and publishes only migration tables',
+  verifyCaptureWhileWriting,
+);

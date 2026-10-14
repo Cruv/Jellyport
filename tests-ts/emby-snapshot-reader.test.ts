@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -23,6 +23,7 @@ const schema = readFileSync(
 );
 const directories: string[] = [];
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const directory of directories.splice(0))
     rmSync(directory, { recursive: true, force: true });
 });
@@ -319,6 +320,92 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
     expect(() => projectLibrary(f.path, existing)).toThrow('invalid format');
     expect(readFileSync(existing, 'utf8')).toBe('private-existing-file');
     expect(readFileSync(f.path)).toEqual(before);
+  });
+
+  it('indexes every kind of personal state while omitting empty rows from the lookup index', () => {
+    const f = fixture();
+    for (const [offset, fields] of [
+      { played: 1 },
+      { playCount: 2 },
+      { isFavorite: 1 },
+      { playbackPositionTicks: 123_456 },
+      { LastPlayedDateInt: 1_738_555_506 },
+      { rating: 0 },
+      {},
+    ].entries()) {
+      f.item(100 + offset, 5, 200 - offset);
+      f.state(200 - offset, 2, fields);
+    }
+    f.database.close();
+    const target = join(f.directory, 'indexed-state.db');
+    projectLibrary(f.path, target);
+    expect(readSnapshotItems(target, alice, identities)).toEqual(
+      readSnapshotItems(f.path, alice, identities),
+    );
+    const ids = readSnapshotItems(target, alice, identities).map((item) => item.Id);
+    expect(ids).toEqual(['10', '11', '13', '100', '101', '102', '103', '104', '105']);
+    expect(readSnapshotItems(target, alice, identities).at(-1)?.UserData?.Rating).toBe(0);
+    const projected = new DatabaseSync(target, { readOnly: true });
+    expect(
+      projected
+        .prepare('PRAGMA index_list(UserDatas)')
+        .all()
+        .find((row) => row.name === 'JellyportUserDataUser')?.partial,
+    ).toBe(1);
+    projected.close();
+  });
+
+  it.each(['complete', 'watched_only'] as const)(
+    'uses indexed per-user lookups without a catalog scan or SQL sort in %s mode',
+    (scope) => {
+      const f = fixture();
+      f.database.close();
+      const target = join(f.directory, 'query-plan.db');
+      projectLibrary(f.path, target);
+      const statements: string[] = [];
+      const prepare = DatabaseSync.prototype.prepare;
+      const spy = vi.spyOn(DatabaseSync.prototype, 'prepare').mockImplementation(function (
+        this: DatabaseSync,
+        sql: string,
+      ) {
+        statements.push(sql);
+        return prepare.call(this, sql);
+      });
+      readSnapshotItems(target, alice, identities, scope);
+      spy.mockRestore();
+      const select = statements.find((sql) => sql.includes('FROM UserDatas ud'))!;
+      const database = new DatabaseSync(target, { readOnly: true });
+      const plan = database
+        .prepare(`EXPLAIN QUERY PLAN ${select}`)
+        .all(2, 100_001)
+        .map((row) => String(row.detail));
+      database.close();
+      expect(plan[0]).toMatch(/SEARCH ud USING INDEX JellyportUserDataUser \(userId=\?\)/);
+      expect(plan).toEqual(
+        expect.arrayContaining([
+          expect.stringMatching(/SEARCH m USING INDEX JellyportMediaUserDataKey/),
+          expect.stringMatching(/SEARCH s USING INTEGER PRIMARY KEY/),
+        ]),
+      );
+      expect(plan.join('\n')).not.toMatch(/SCAN |TEMP B-TREE/);
+      expect(select).not.toMatch(/ORDER BY/i);
+    },
+  );
+
+  it('keeps previous projections with a full per-user index readable', () => {
+    const f = fixture();
+    f.database.close();
+    const target = join(f.directory, 'previous-generation.db');
+    projectLibrary(f.path, target);
+    const database = new DatabaseSync(target);
+    database.exec(`
+      DROP INDEX JellyportUserDataUser;
+      CREATE INDEX JellyportUserDataUser ON UserDatas(userId,UserDataKeyId);
+    `);
+    database.close();
+    expect(readSnapshotItems(target, alice, identities)).toEqual(
+      readSnapshotItems(f.path, alice, identities),
+    );
   });
 
   it.each(['complete', 'watched_only'] as const)(

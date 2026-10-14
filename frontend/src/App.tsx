@@ -593,6 +593,32 @@ export default function App() {
       notify('Migration started. You can follow its progress here.');
     });
   }
+  function cancelJob(id: string) {
+    void work(`cancel-job-${id}`, async () => {
+      const job = await api<Job>(`/api/jobs/${encodeURIComponent(id)}/cancel`, {
+        method: 'POST',
+        body: {},
+      });
+      setJobs((current) => [job, ...current.filter((item) => item.id !== id)]);
+      setOverview((current) =>
+        current
+          ? {
+              ...current,
+              recent_jobs: current.recent_jobs.map((item) => (item.id === id ? job : item)),
+            }
+          : current,
+      );
+      setDialog((current) =>
+        current?.kind === 'job' && current.job.id === id ? { kind: 'job', job } : current,
+      );
+      setPollPaused(false);
+      notify(
+        job.status === 'canceled'
+          ? 'Job canceled. Completed changes are kept; review results before rerunning.'
+          : 'Cancellation requested. Completed changes are kept; review results before rerunning.',
+      );
+    });
+  }
   function reveal(id: string) {
     const version = dialogVersion.current;
     void work('reveal', async () => {
@@ -881,7 +907,7 @@ export default function App() {
               {page === 'migrate' && previewProgress && (
                 <div className="setup-server preview-progress mb-17" role="status">
                   <span>
-                    Reading libraries and matching history… {previewProgress.processed} of{' '}
+                    Preparing migration review… {previewProgress.processed} of{' '}
                     {previewProgress.total} {previewProgress.total === 1 ? 'user' : 'users'}{' '}
                     complete.
                   </span>
@@ -890,7 +916,7 @@ export default function App() {
                     type="button"
                     onClick={cancelPreview}
                   >
-                    Cancel matching
+                    Cancel preview
                   </button>
                 </div>
               )}
@@ -906,6 +932,7 @@ export default function App() {
           close={closeDialog}
           startMigration={startMigration}
           reveal={reveal}
+          cancelJob={cancelJob}
           showReveal={(jobId) => showDialog({ kind: 'reveal', jobId })}
           apply={apply}
           busy={busy}
@@ -984,6 +1011,7 @@ function DialogContent({
   close,
   startMigration,
   reveal,
+  cancelJob,
   showReveal,
   apply,
   busy,
@@ -994,6 +1022,7 @@ function DialogContent({
   close: () => void;
   startMigration: (event: FormEvent<HTMLFormElement>) => void;
   reveal: (id: string) => void;
+  cancelJob: (id: string) => void;
   showReveal: (id: string) => void;
   apply: (event: SubscriptionEvent) => void;
   busy: Set<string>;
@@ -1052,59 +1081,73 @@ function DialogContent({
                 </p>
               )}
               {user.source_snapshot && <SourceSnapshotNote snapshot={user.source_snapshot} />}
-              <div className="preview-stats">
-                {[
-                  { value: user.stats.source_played, label: 'Played in Emby', color: '' },
-                  { value: user.stats.matched, label: 'Matched to Jellyfin', color: 'mint' },
-                  ...(!watchedOnly
-                    ? [
-                        {
-                          value: user.stats.source_favorites,
-                          label: 'Favorites in Emby',
-                          color: '',
-                        },
-                        { value: user.stats.source_resume, label: 'Resume positions', color: '' },
-                        { value: user.stats.source_playlists, label: 'Playlists', color: '' },
-                      ]
-                    : []),
-                  {
-                    value: user.stats.unmatched,
-                    label: 'Unmatched',
-                    color: user.stats.unmatched ? '' : 'muted',
-                  },
-                  {
-                    value: user.stats.ambiguous,
-                    label: 'Ambiguous',
-                    color: user.stats.ambiguous ? '' : 'muted',
-                  },
-                ].map((stat) => (
-                  <div className="preview-stat" key={stat.label}>
-                    <strong className={stat.color}>{num(stat.value)}</strong>
-                    <span>{stat.label}</span>
-                  </div>
-                ))}
-              </div>
+              {user.stats ? (
+                <div className="preview-stats">
+                  {[
+                    { value: user.stats.source_played, label: 'Played in Emby', color: '' },
+                    { value: user.stats.matched, label: 'Matched to Jellyfin', color: 'mint' },
+                    ...(!watchedOnly
+                      ? [
+                          {
+                            value: user.stats.source_favorites,
+                            label: 'Favorites in Emby',
+                            color: '',
+                          },
+                          { value: user.stats.source_resume, label: 'Resume positions', color: '' },
+                          { value: user.stats.source_playlists, label: 'Playlists', color: '' },
+                        ]
+                      : []),
+                    {
+                      value: user.stats.unmatched,
+                      label: 'Unmatched',
+                      color: user.stats.unmatched ? '' : 'muted',
+                    },
+                    {
+                      value: user.stats.ambiguous,
+                      label: 'Ambiguous',
+                      color: user.stats.ambiguous ? '' : 'muted',
+                    },
+                  ].map((stat) => (
+                    <div className="preview-stat" key={stat.label}>
+                      <strong className={stat.color}>{num(stat.value)}</strong>
+                      <span>{stat.label}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <Callout icon="info" title="History details deferred">
+                  This lightweight review checks accounts without scanning their history.{' '}
+                  {watchedOnly
+                    ? 'Matching and watched history are read after approval.'
+                    : 'Matching, history, favorites, resume positions and playlist details are read after approval.'}{' '}
+                  Counts and item issues will appear in the migration results.
+                </Callout>
+              )}
               <div className="preview-user-body">
                 {user.warnings?.map((warning, index) => (
                   <p className="subtle text-small" key={index}>
                     {warning}
                   </p>
                 ))}
-                {!!user.stats.already_played && (
+                {!!user.stats?.already_played && (
                   <p className="subtle text-tiny mb-14">
                     {num(user.stats.already_played)} matched items are already played on Jellyfin.
                   </p>
                 )}
-                <Issues
-                  label="Unmatched items"
-                  items={user.unmatched}
-                  count={user.stats.unmatched}
-                />
-                <Issues
-                  label="Ambiguous items"
-                  items={user.ambiguous}
-                  count={user.stats.ambiguous}
-                />
+                {user.stats && (
+                  <>
+                    <Issues
+                      label="Unmatched items"
+                      items={user.unmatched}
+                      count={user.stats.unmatched}
+                    />
+                    <Issues
+                      label="Ambiguous items"
+                      items={user.ambiguous}
+                      count={user.stats.ambiguous}
+                    />
+                  </>
+                )}
                 {user.target_exists && (
                   <p className="subtle text-tiny mb-14">
                     The existing Jellyfin password and account permissions will be preserved.
@@ -1143,6 +1186,17 @@ function DialogContent({
             <button className="btn btn-quiet" onClick={close}>
               Close
             </button>
+            {activeJob(job) && (
+              <button
+                className="btn btn-quiet"
+                onClick={() => cancelJob(job.id)}
+                disabled={!!job.cancel_requested || busy.has(`cancel-job-${job.id}`)}
+              >
+                {job.cancel_requested || busy.has(`cancel-job-${job.id}`)
+                  ? 'Canceling…'
+                  : 'Cancel job'}
+              </button>
+            )}
             {mayHaveCredentials && (
               <button className="btn btn-primary" onClick={() => showReveal(job.id)}>
                 <Icon name="key" />
@@ -1162,6 +1216,12 @@ function DialogContent({
           <Status value={job.status} />
         </div>
         <JobProgressDetails job={job} />
+        {activeJob(job) && (
+          <p className="subtle text-small mt-15">
+            You can cancel queued or running work. Changes already applied to media accounts are
+            kept and are not rolled back. Review the results before rerunning.
+          </p>
+        )}
         {job.error && <div className="error-block mt-15">{job.error}</div>}
         {job.results?.map((result, index) => (
           <section className="job-result" key={index}>
@@ -1175,6 +1235,13 @@ function DialogContent({
               </p>
             )}
             {result.source_snapshot && <SourceSnapshotNote snapshot={result.source_snapshot} />}
+            {result.source_catalog && (
+              <p className="subtle text-small">
+                Matching catalog collected {date(result.source_catalog.captured_at)} ·{' '}
+                {num(result.source_catalog.items)} items. Personal activity was read live; library
+                changes after collection require another migration.
+              </p>
+            )}
             {result.role_name && (
               <p className="subtle text-small">
                 Account role: {result.role_name} · Applied groups:{' '}

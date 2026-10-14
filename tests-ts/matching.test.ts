@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { createMatcher, matchItems, MIGRATABLE_ITEM_TYPES } from '../server/matching.js';
+import {
+  createMatcher,
+  matchItems,
+  MAX_AMBIGUOUS_CANDIDATES,
+  MIGRATABLE_ITEM_TYPES,
+} from '../server/matching.js';
+import { MediaError } from '../server/errors.js';
 import type { MediaItem } from '../server/media.js';
 
 const item = (Id: string, fields: Partial<MediaItem> = {}): MediaItem => ({
@@ -8,6 +14,104 @@ const item = (Id: string, fields: Partial<MediaItem> = {}): MediaItem => ({
   ...fields,
 });
 describe('conservative media matching', () => {
+  it('retains complete ambiguous results exactly at the aggregate candidate bound', () => {
+    const collisionSize = 2_000;
+    const targets = Array.from({ length: collisionSize }, (_, index) =>
+      item(`target-${index}`, {
+        ProviderIds: { Imdb: 'same-id' },
+        Path: `/media/${index}.mkv`,
+      }),
+    );
+    const source = Array.from({ length: MAX_AMBIGUOUS_CANDIDATES / collisionSize }, (_, index) =>
+      item(`source-${index}`, { ProviderIds: { Imdb: 'same-id' } }),
+    );
+    const match = createMatcher(targets);
+    const plan = match([
+      ...source,
+      // Matching/path narrowing must remain available after the ambiguity budget is full.
+      item('unique', { ProviderIds: { Imdb: 'same-id' }, Path: '/media/0.mkv' }),
+    ]);
+    expect(plan.ambiguous).toHaveLength(source.length);
+    expect(plan.ambiguous.reduce((total, entry) => total + entry.candidates.length, 0)).toBe(
+      MAX_AMBIGUOUS_CANDIDATES,
+    );
+    expect(plan.ambiguous[0]!.candidates).toEqual(targets);
+    expect(plan.ambiguous.at(-1)!.candidates).toEqual(targets);
+    expect(plan.matches).toEqual([
+      {
+        source: expect.objectContaining({ Id: 'unique' }),
+        target: targets[0],
+        method: 'provider_id+path',
+      },
+    ]);
+    // The bound belongs to each plan, not to the reusable destination index.
+    expect(match([source[0]!]).ambiguous[0]!.candidates).toEqual(targets);
+  });
+
+  it('fails closed when high-collision history would exceed retained ambiguous candidates', () => {
+    const collisionSize = 2_000;
+    const targets = Array.from({ length: collisionSize }, (_, index) =>
+      item(`target-${index}`, { ProviderIds: { Imdb: 'same-id' } }),
+    );
+    const source = Array.from(
+      { length: MAX_AMBIGUOUS_CANDIDATES / collisionSize + 1 },
+      (_, index) => item(`source-${index}`, { ProviderIds: { Imdb: 'same-id' } }),
+    );
+    const match = createMatcher(targets);
+    let failure: unknown;
+    try {
+      match(source);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(MediaError);
+    expect(failure).toMatchObject({
+      message:
+        'The migration matching plan contains too many ambiguous candidates. Resolve duplicate media identities before retrying.',
+    });
+  });
+
+  it('indexes a large destination once across one hundred independent user plans', () => {
+    const catalogSize = 85_000;
+    const historySize = 250;
+    let pathReads = 0;
+    let providerReads = 0;
+    const targets = Array.from({ length: catalogSize }, (_, index) => ({
+      Id: `target-${index}`,
+      Type: 'Movie',
+      get Path() {
+        pathReads++;
+        return `/media/${index}.mkv`;
+      },
+      get ProviderIds() {
+        providerReads++;
+        return { Imdb: `tt${index}` };
+      },
+    }));
+    const match = createMatcher(targets);
+    expect(pathReads).toBe(catalogSize);
+    expect(providerReads).toBe(catalogSize);
+    for (let user = 0; user < 100; user++) {
+      const source = Array.from({ length: historySize }, (_, index) => ({
+        Id: `source-${user}-${index}`,
+        Type: 'Movie',
+        Path: `/media/${index}.mkv`,
+        ProviderIds: { Imdb: `tt${index}` },
+        UserData: { Played: true },
+      }));
+      const plan = match(source);
+      expect(plan.matches).toHaveLength(historySize);
+      expect(plan.unmatched).toHaveLength(0);
+      expect(plan.ambiguous).toHaveLength(0);
+      expect(plan.matches[0]!.source.Id).toBe(`source-${user}-0`);
+      // Destination metadata is shared, while every plan retains only its own source state.
+      expect(plan.matches[0]!.target).toBe(targets[0]);
+    }
+    expect(pathReads).toBe(catalogSize);
+    // A unique lookup checks its one candidate, never rescans the full library.
+    expect(providerReads).toBe(catalogSize + 100 * historySize);
+  });
+
   it('reuses destination indexes while keeping independent plans and conservative matches', () => {
     const targets = [
       item('movie', { ProviderIds: { Imdb: 'tt42' }, Path: '/media/film.mkv' }),

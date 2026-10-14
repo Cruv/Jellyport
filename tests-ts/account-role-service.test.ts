@@ -298,13 +298,10 @@ describe('saved role provisioning and controlled account updates', () => {
     servers.users.jellyfin = servers.users.jellyfin.filter((user) => user.Id !== 'template');
     const preview = await service.preview(['e-alex']);
     expect(preview.users[0]?.target_exists).toBe(false);
-    expect(preview.users[0]?.stats.matched).toBeGreaterThan(0);
-    expect(preview.users[0]?.warnings.join(' ')).toMatch(
-      /server catalog.*role may limit library access/,
-    );
-    expect(calls.filter((call) => call.method === 'migrationItems')).toEqual([
-      { method: 'migrationItems', id: undefined },
-    ]);
+    expect(preview.users[0]?.stats).toBeNull();
+    expect(preview.users[0]?.history_deferred).toBe(true);
+    expect(preview.users[0]?.warnings.join(' ')).toMatch(/role may limit library access/);
+    expect(calls.filter((call) => call.method === 'migrationItems')).toEqual([]);
     expect(writes()).toEqual([]);
   });
   it('preserves existing Jellyfin policy, preferences, home layout, and lack of role assignment during migration', async () => {

@@ -149,6 +149,20 @@ afterEach(() => {
 });
 
 describe('User directory and Discord organization', () => {
+  it('keeps manual account creation reachable when the directory cannot load', async () => {
+    const api = vi.fn(async () => {
+      throw new Error('The Emby server is unavailable.');
+    }) as Api;
+    const { navigate } = page(api);
+    await screen.findByRole('alert');
+    fireEvent.click(screen.getByRole('button', { name: 'Create Jellyfin account' }));
+    expect(navigate).toHaveBeenCalledWith('accounts');
+    expect(api).toHaveBeenCalledTimes(1);
+    expect(api).toHaveBeenCalledWith('/api/user-directory', {
+      signal: expect.any(AbortSignal),
+    });
+  });
+
   it('shows standalone family accounts and filters server presence and access independently', async () => {
     page();
     await screen.findByRole('button', { name: 'Link Discord owner for Child' });

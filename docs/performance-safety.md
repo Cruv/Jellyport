@@ -272,21 +272,21 @@ admission, idle waits, active reads and timeouts. The workload governor's tests 
 an injected clock/sleeper where appropriate; they do not establish production
 throughput or identify Emby's internal contention mechanism.
 
-No production deployment or load test is part of this patch. A conservative
-approval plan is:
+The 0.13.0 change was merged on **2026-10-13** in
+[PR #11](https://github.com/Cruv/Jellyport/pull/11); its verification included no
+production deployment or load test. The source/runtime observations and dated
+component measurements above retain their original scope. They are not fresh
+production approval or a required audit for every later edit.
 
-1. Review the patch, automated results and the source query contract first.
-2. Obtain separate approval before deploying a candidate or running migration
-   workload against production. Agree on the accounts, request/page budget,
-   observation window and stop conditions beforehand.
-3. Establish playback-progress latency, Emby RSS/thread count and active-session
-   baselines using existing read-only telemetry. Do not create synthetic playback
-   or disable client progress reporting.
-4. Start with a bounded, explicitly approved source-read check and one account.
-   Observe source latency and memory while retaining the governor's defaults.
-   Approval for reads does not authorize destination account or state writes.
-5. Increase the scope only after reviewing that evidence. Cancel Jellyport work
-   if playback degrades; do not automatically restart either media server.
+For an explicitly authorized production migration trial, agree on accounts,
+request/page budget, observation window and stop conditions. Use existing
+read-only playback-latency, RSS/thread and active-session telemetry as a baseline,
+then start with a bounded check and one account. Approval for reads does not
+authorize destination writes. Increase scope only after reviewing that evidence;
+cancel if playback degrades. Do not create synthetic production playback, disable
+client reporting, change Emby's databases/indexes or automatically restart servers.
 
-This patch does not alter Emby's databases or indexes, move transcode storage,
-disable playback reporting, change proxy caching, or restart media servers.
+The authorization boundary is canonical in [AGENTS.md](../AGENTS.md); proportional
+local verification and evidence reuse are in [development procedures](development.md).
+This operational trial guidance applies to live workloads, not documentation-only
+changes, local mocks or already authorized read-only backup inspection.

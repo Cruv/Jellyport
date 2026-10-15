@@ -31,12 +31,15 @@ jobs:
     outputs:
       sha: ${{ steps.verify.outputs.sha }}
       image: ${{ steps.verify.outputs.image }}
+      publish: ${{ steps.verify.outputs.publish }}
     steps:
       - name: Require successful Checks for the exact current main commit
         id: verify
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id || '' }}
+          EVENT_NAME: ${{ github.event_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -46,18 +49,66 @@ jobs:
             echo '::error::Only the current main commit can publish an image.'
             exit 1
           fi
-          gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
-            -f head_sha="$SOURCE_SHA" -f branch=main -f event=push -f status=success \
-            -f per_page=100 |
-            jq -e --arg sha "$SOURCE_SHA" --arg repo "$GITHUB_REPOSITORY" \
-              'any(.workflow_runs[]; .head_sha == $sha and .head_branch == "main" and
-                .head_repository.full_name == $repo and .event == "push" and
-                .status == "completed" and .conclusion == "success")' > /dev/null
+          runs=$(gh api --method GET "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs" \
+            -f head_sha="$SOURCE_SHA" -f branch=main -f status=success -f per_page=100)
+          run_ids=$(jq -r --arg sha "$SOURCE_SHA" --arg repo "$GITHUB_REPOSITORY" \
+            --arg event "$EVENT_NAME" --arg run "$SOURCE_RUN_ID" \
+            '.workflow_runs[] | select(.head_sha == $sha and .head_branch == "main" and
+              .head_repository.full_name == $repo and .status == "completed" and .conclusion == "success" and
+              ((.event == "push") or (.event == "workflow_dispatch"))) |
+              select($event != "workflow_run" or (.event == "push" and (.id | tostring) == $run)) | .id' <<< "$runs")
+          if [[ -z "$run_ids" ]]; then
+            echo '::error::Successful same-repository main Checks are required for this exact commit.'
+            exit 1
+          fi
+          runtime_verified=false
+          docs_verified=false
+          for run_id in $run_ids; do
+            [[ "$run_id" =~ ^[0-9]+$ ]]
+            jobs=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100")
+            if jq -e --arg sha "$SOURCE_SHA" '
+              [.[].jobs[] | select(.name == "test (22)" or .name == "test (24)" or .name == "docker")] as $required |
+                ([$required[].name] | sort) == ["docker", "test (22)", "test (24)"] and
+                all($required[]; .head_sha == $sha and .status == "completed" and .conclusion == "success" and
+                  (((.name == "test (22)" or .name == "test (24)") and
+                    any(.steps[]?; .name == "Runtime checks passed" and .conclusion == "success")) or
+                    (.name == "docker" and any(.steps[]?;
+                      .name == "Runtime Docker checks passed" and .conclusion == "success"))))' <<< "$jobs" > /dev/null; then
+              runtime_verified=true
+              break
+            fi
+            if jq -e --arg sha "$SOURCE_SHA" '
+              [.[].jobs[] | select(.name == "test (22)" or .name == "test (24)" or .name == "docker")] as $required |
+                ([$required[].name] | sort) == ["docker", "test (22)", "test (24)"] and
+                all($required[]; .head_sha == $sha and .status == "completed" and .conclusion == "success" and
+                  any(.steps[]?; .name == "Documentation-only checks passed" and .conclusion == "success") and
+                  all(.steps[]?;
+                    ((.name != "Runtime checks passed" and .name != "Runtime Docker checks passed") or
+                      .conclusion == "skipped")))' <<< "$jobs" > /dev/null; then
+              docs_verified=true
+            fi
+          done
+          if [[ "$runtime_verified" != true ]]; then
+            if [[ "$EVENT_NAME" == workflow_run && "$docs_verified" == true ]]; then
+              echo 'Documentation-only Checks passed; image publication is skipped.'
+              echo 'publish=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "$EVENT_NAME" == workflow_run ]]; then
+              echo '::error::Checks did not provide complete runtime or documentation-only validation evidence.'
+              exit 1
+            fi
+            echo '::error::Run Checks manually on current main for the full Node/Docker suite, then retry publication.'
+            exit 1
+          fi
           printf 'sha=%s\n' "$SOURCE_SHA" >> "$GITHUB_OUTPUT"
-          printf 'image=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          printf 'image=ghcr.io/%s\n' "$image_name" >> "$GITHUB_OUTPUT"
+          echo 'publish=true' >> "$GITHUB_OUTPUT"
 
   build:
     needs: verify
+    if: needs.verify.outputs.publish == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -144,6 +195,7 @@ jobs:
 
   publish:
     needs: [verify, build]
+    if: needs.verify.outputs.publish == 'true'
     runs-on: ubuntu-24.04
     permissions:
       contents: read

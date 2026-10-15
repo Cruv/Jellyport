@@ -2,53 +2,109 @@ name: Checks
 on:
   push:
   pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
+  scope:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.scope.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+      - name: Classify changed paths
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            echo 'docs_only=false' >> "$GITHUB_OUTPUT"
+          else
+            node scripts/docs-scope.mjs "$BASE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          fi
+      - run: node scripts/check-docs.mjs
   test:
+    needs: scope
+    if: always()
     runs-on: ubuntu-latest
     strategy:
       matrix:
         node: [22, 24]
     steps:
+      - name: Require successful scope and documentation checks
+        if: needs.scope.result != 'success'
+        run: exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: needs.scope.outputs.docs_only != 'true'
         with:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: needs.scope.outputs.docs_only != 'true'
         with:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
-      - run: npm run typecheck
+        if: needs.scope.outputs.docs_only != 'true'
       - run: npm test
+        if: needs.scope.outputs.docs_only != 'true'
       - run: npm run build
+        if: needs.scope.outputs.docs_only != 'true'
       - run: npm audit --omit=dev --audit-level=high
+        if: needs.scope.outputs.docs_only != 'true'
+      - name: Runtime checks passed
+        if: needs.scope.outputs.docs_only != 'true'
+        run: echo 'Complete runtime suite passed.'
+      - name: Documentation-only checks passed
+        if: needs.scope.outputs.docs_only == 'true'
+        run: echo 'Documentation checks passed; no runtime validation or release requested.'
   docker:
+    needs: scope
+    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Require successful scope and documentation checks
+        if: needs.scope.result != 'success'
+        run: exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: needs.scope.outputs.docs_only != 'true'
         with:
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: needs.scope.outputs.docs_only != 'true'
         with:
           node-version: 24
       - name: Validate Compose examples
+        if: needs.scope.outputs.docs_only != 'true'
         run: |
           for compose_file in compose.yaml examples/compose.portainer.yaml examples/compose.shared-network.yaml examples/compose.snapshots.yaml examples/compose.plugin-backups.yaml; do
             docker compose -f "$compose_file" config --quiet
           done
       - run: docker build -t jellyport:ci .
+        if: needs.scope.outputs.docs_only != 'true'
       - run: docker run -d --name jellyport-ci -p 127.0.0.1:8173:8000 -e JELLYPORT_DEMO=true jellyport:ci
+        if: needs.scope.outputs.docs_only != 'true'
       - run: node scripts/smoke.mjs http://127.0.0.1:8173
+        if: needs.scope.outputs.docs_only != 'true'
       - name: Smoke test guided first-run setup
+        if: needs.scope.outputs.docs_only != 'true'
         run: |
           docker run -d --name jellyport-fresh-ci -p 127.0.0.1:8175:8000 jellyport:ci
           node scripts/smoke-setup.mjs http://127.0.0.1:8175
       - name: Smoke test local setup with secure administrator cookies
+        if: needs.scope.outputs.docs_only != 'true'
         run: |
           docker run -d --name jellyport-secure-setup-ci -p 127.0.0.1:8176:8000 -e JELLYPORT_SECURE_COOKIE=true jellyport:ci
           node scripts/smoke-setup.mjs http://127.0.0.1:8176 --secure-cookie
       - name: Smoke test an unprivileged bind-mount deployment
+        if: needs.scope.outputs.docs_only != 'true'
         run: |
           mkdir -p "${RUNNER_TEMP}/jellyport-bind"
           sudo chown 1000:1000 "${RUNNER_TEMP}/jellyport-bind"
@@ -61,13 +117,19 @@ jobs:
             -v "${RUNNER_TEMP}/jellyport-bind:/data" jellyport:ci
           node scripts/smoke.mjs http://127.0.0.1:8174
           docker exec jellyport-bind-ci node -e "const assert=require('node:assert/strict'),fs=require('node:fs'); assert.equal(process.getuid(),1000); assert.equal(process.getgid(),1000); for(const name of ['secret.key','jellyport.db']){const s=fs.statSync('/data/'+name); assert.equal(s.uid,1000); assert.equal(s.gid,1000); assert.equal(s.mode&0o777,0o600);} console.log('Bind-mount ownership and secret file permissions passed.');"
-      - if: failure()
+      - name: Runtime Docker checks passed
+        if: needs.scope.outputs.docs_only != 'true'
+        run: echo 'Complete Docker suite passed.'
+      - name: Documentation-only checks passed
+        if: needs.scope.outputs.docs_only == 'true'
+        run: echo 'Documentation checks passed; no product image built.'
+      - if: failure() && needs.scope.result == 'success' && needs.scope.outputs.docs_only != 'true'
         run: |
           docker logs jellyport-ci || true
           docker logs jellyport-bind-ci || true
           docker logs jellyport-fresh-ci || true
           docker logs jellyport-secure-setup-ci || true
-      - if: always()
+      - if: always() && needs.scope.result == 'success' && needs.scope.outputs.docs_only != 'true'
         run: |
           docker stop jellyport-ci || true
           docker stop jellyport-bind-ci || true

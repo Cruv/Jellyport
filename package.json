@@ -8,6 +8,7 @@
     "node": "^22.16.0 || ^24.0.0"
   },
   "scripts": {
+    "docs:check": "node scripts/check-docs.mjs",
     "dev": "tsx watch server/index.ts",
     "dev:ui": "vite --host 127.0.0.1",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.frontend.json",

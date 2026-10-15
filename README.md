@@ -4,7 +4,7 @@ Jellyport is a self-hosted web app for moving one or several users from Emby to 
 
 The app uses TypeScript throughout: React/Vite for the web interface, Fastify on Node.js for the API, discord.js for the optional bot, and SQLite for encrypted settings, account links, audit records, and queued jobs. Docker packages the built interface and API together.
 
-This is an initial implementation. Automated tests and the local demo cover the implemented workflows; compatibility has not yet been validated against your live Emby, Jellyfin, or Discord servers.
+Automated tests and isolated demos cover the implemented workflows. The source API was verified with isolated Emby 4.10.1.0, and plugin history imports with private copies of Emby 4.10.1.0 / Backup & Restore 1.8.7.0 backups. These checks do not establish production performance or exact-version coverage for every Jellyfin/Discord integration. See [capabilities](docs/migration-capabilities.md) and the dated [performance evidence](docs/performance-safety.md).
 
 ![Jellyport demo dashboard](docs/jellyport-preview.jpg)
 
@@ -12,7 +12,7 @@ This is an initial implementation. Automated tests and the local demo cover the 
 
 ### Portainer or a prebuilt image
 
-The public image is `ghcr.io/cruv/jellyport:latest`, published for Linux x86-64 and ARM64 after the main branch passes CI. Portainer can pull it without GitHub credentials. Each publication also has a `sha-<full-commit-sha>` tag for selecting a commit; pin the image's manifest digest when you need an immutable deployment.
+The public image is `ghcr.io/cruv/jellyport:latest`, published for Linux x86-64 and ARM64 after runtime changes pass main-branch CI and image checks. Documentation-only merges do not publish an image. Portainer can pull it without GitHub credentials. Each publication also has a `sha-<full-commit-sha>` tag for selecting a commit; pin the image's manifest digest when you need an immutable deployment. See [delivery gates and tags](docs/development.md#merge-and-publication-gates).
 
 Paste [examples/compose.portainer.yaml](examples/compose.portainer.yaml) into Portainer's stack editor, or use this equivalent example:
 
@@ -164,15 +164,11 @@ Jellyfin **10.9+** is required for detailed user data and explicit private playl
 
 Jellyport **0.14.0+** can import saved history from Emby's official Backup & Restore plugin, verified with Emby **4.10.1.0** and plugin **1.8.7.0**. Use the [plugin-backup Compose example](examples/compose.plugin-backups.yaml): its isolated helper mounts only the backup root read-only, validates the full backup and creates an encrypted migration projection. It never opens Emby's live databases or starts Emby's backup task. Original backup time controls the 48-hour history limit; importing an unchanged backup does not renew its age. See [plugin setup, supported fields and limitations](docs/emby-plugin-backups.md).
 
-The optional local snapshot helper captures library history once for all users, then creates a new database containing only allowlisted migration item metadata and personal history. Set `JELLYPORT_SNAPSHOT_METHOD=file_copy` on the helper for ordinary best-effort scheduled file copies while Emby runs. This copies only `library.db`, `users.db` and their available `-wal` files into helper-private work space; it makes no SQLite queries against the source and does not copy `-shm` or authentication databases. SQLite performs normal WAL recovery, integrity checks and schema validation on the private copies before the encrypted projection is published. No ZFS, downtime, backup plugin or special storage is required. Copies made during writes are not atomic, and successful integrity checks cannot prove complete or current history. Jellyport does not use `.recover` or accept salvaged data. Failed captures preserve the last good snapshot without switching to live history reads.
+The helper is optional, network-isolated and read-only against its source. Plugin mode mounts only the backup root. The [legacy capture example](examples/compose.snapshots.yaml) instead mounts live database files and selects best-effort `file_copy`; omitting its method keeps `sqlite_online_backup`, which pins a source read transaction and can delay WAL checkpoints. All methods publish an encrypted allowlisted migration projection, keep raw copies in helper-only `/work`, and consume CPU and disk bandwidth. None guarantees zero playback impact; structural validation does not prove an atomic file/plugin backup. See [deployment](docs/docker-deployment.md#optional-local-emby-snapshots--0120) for legacy capture and the plugin guide for backup imports.
 
-Omitting the method keeps the existing `sqlite_online_backup` behavior, which pins a consistent library read transaction and can delay WAL checkpoints. Both methods consume disk bandwidth and CPU, have a five-minute worker deadline for capture and projection, and keep raw data exclusively in the helper's private work directory until cleanup. This migration projection cannot restore an Emby server. File copying avoids a source SQLite read transaction; it does not guarantee zero playback impact or a consistent capture across database files.
+Automatic capture/import scheduling is off by default. Plugin-backed web migrations default to saved history, including when the helper is unavailable; an unknown configured source requires an explicit choice. Legacy capture setups default to live reads. A saved preview pins the shown generations. Missing, incompatible, changed or expired history stops the review without switching to a live scan. History expires after 48 hours, measured from the original backup date for plugin imports.
 
-The helper runs on the same Linux Docker host as Emby, has no network, and mounts the local database directory read-only. It has its own private `/work` mount for raw temporary copies; the web container receives only the separate snapshot exchange directory. The initial version-specific adapter targets Emby **4.10.1.0**; unknown schemas are rejected. The helper checks the mounted server's `device.txt` identity and `lastversion.txt` before and after capture against the configured API server. Authentication databases are not copied, and unrelated library tables and fields are excluded from the projection. See the [optional helper Compose example](examples/compose.snapshots.yaml) and [deployment instructions](docs/docker-deployment.md#optional-local-emby-snapshots--0120); never point it at SMB/NFS or a laptop-mounted share.
-
-Snapshots and automatic capture are opt-in. The [helper Compose example](examples/compose.snapshots.yaml) selects `file_copy`; existing helpers keep Online Backup unless their method is changed. Capture one from Settings or reuse the existing daily schedule and timezone, then select snapshots for a migration review. Status and preview identify the capture method and pin the exact generations for approval; old records without a method retain their Online Backup meaning. A missing, expired after 48 hours, incompatible, or changed snapshot requires a new capture and review. Snapshot selection never silently switches back to a live catalog scan. The ordinary migration default remains live reads.
-
-Both migration scopes can use saved library history. **Complete** still reads source account configuration, profile images, and playlist metadata/contents through the Emby API; **Watched only** needs live source identity validation but gets watched items from the saved library. Destination permissions and Jellyfin activity are always read live. File-copy history is best effort; Online Backup provides a consistent library view but neither method captures every database and API response in one transaction. History may be older than activity since capture. Protect the exchange directory, which contains encrypted personal data and its encryption material, and the helper work directory, whose raw `users.db` copy can contain private account data. See [snapshot capabilities](docs/migration-capabilities.md#saved-emby-source-snapshots--0120).
+Both migration scopes can use saved history. **Complete** still reads account preferences, supported images and playlists through bounded live APIs; **Watched only** validates source identity but skips those extras. Destination access and activity remain live. Protect the exchange and helper-work directories: the exchange contains encryption material, and raw copies can contain private account data. See [snapshot capabilities and retention](docs/migration-capabilities.md#saved-emby-source-snapshots--0120).
 
 ### Map accounts with different usernames
 
@@ -326,35 +322,22 @@ Keep the same data mount and back it up before updating the image. On the first 
 
 ## Development and local demo
 
-Use Node.js 24 (recommended) or Node.js 22.16 or newer in the 22.x series. Node 22.16 is required for the SQLite backup API used by the optional helper. Dependencies are pinned in `package-lock.json`:
+Use Node.js 24 or the supported Node 22 range in `package.json`. Install the pinned lockfile:
 
 ```sh
 npm ci
-npm run typecheck
-npm test
-npm run build
 ```
 
-For real local operation, run:
-
-```sh
-HOST=127.0.0.1 npm start
-```
-
-Open the app and complete the setup wizard with your Jellyfin server URL and a pre-created API key, then sign in with your Jellyfin administrator account.
-
-The demo uses simulated in-memory servers, makes no Emby/Jellyfin/Discord API calls, and keeps settings read-only. Use a separate data directory:
+For an isolated demo, start the API below and run `npm run dev:ui` in a second terminal. Open `http://127.0.0.1:5173`:
 
 ```sh
 JELLYPORT_DEMO=true \
 JELLYPORT_DATA_DIR=/tmp/jellyport-demo \
 JELLYPORT_SECURE_COOKIE=false \
-HOST=127.0.0.1 npm start
+HOST=127.0.0.1 npm run dev
 ```
 
-Sign in with username `admin` and password `demo-jellyport`. Demo server fixtures reset when the process restarts. Demo startup refuses a directory containing production settings, authentication, or user data.
-
-For development with hot reload, run `npm run dev` for the API and `npm run dev:ui` in a second terminal. Open Vite's local URL at [http://127.0.0.1:5173](http://127.0.0.1:5173); it proxies `/api` to the Node service at port 8000. Production uses the compiled `dist/server` and `dist/client` files. Source lives in `server/` and `frontend/src/`; Vitest covers backend, Discord, persistence compatibility, and React safeguards. CI checks Node 22 and 24, the production build, dependency vulnerabilities, and a Docker demo smoke test.
+Sign in with `admin` / `demo-jellyport`. The demo uses simulated servers, makes no media-server or Discord API calls, and refuses production data directories. See [development procedures](docs/development.md) for entrypoints, proportional checks, evidence reuse, release gates and resumption. `npm run build` already includes typechecking; `npm start` requires that build.
 
 ## API
 

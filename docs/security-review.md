@@ -1,5 +1,10 @@
 # Security review — 8 October 2026
 
+This is a dated review record with versioned follow-ups. Test counts and advisory
+findings retain the dates and inputs of those checks; they are not current scan
+results. Current verification and publication procedures are in
+[development](development.md).
+
 This review covers Jellyport's TypeScript server, React interface, Jellyfin authentication and first-run setup, persistence, account and Discord ownership checks, Docker configuration, dependencies, and GitHub release workflows. It includes the hardening changes described below.
 
 The work consists of ordinary code review, defensive regression tests with synthetic data, and passive dependency, image, secret, and workflow checks. Tests use application injection and controlled local fixtures. No deployed NAS, real media-server accounts, Discord guild, MEE6 membership, Stripe account, or Portainer instance was targeted. Dependency registries, image registries, and public security advisories were consulted for passive checks. This is a focused review, not an independent penetration-test certification or a guarantee that every vulnerability has been found.
@@ -56,7 +61,7 @@ deployments were performed, and no real backup data enters fixtures or commits.
 | Release integrity | Mutable action tags, inherited CI permissions, retained checkout credentials, and rebuilding an image after its smoke test widened the release trust boundary. | Pinned action SHAs and the official multiarchitecture Node base digest; restricted CI permissions and checkout credentials; disabled unnecessary publisher package-manager caching. Each architecture's candidate is built once with provenance and an SBOM, tested by its exact registry digest, and included in release tags only after both candidates pass. |
 | Container confinement | The runtime did not require a writable root filesystem or an unrestricted process count. | Compose examples now use a read-only root filesystem, a 16 MiB `noexec,nosuid` temporary filesystem, and a PID limit of 128, alongside the existing unprivileged user, dropped capabilities, and `no-new-privileges`. Application data remains writable through its dedicated mount. |
 
-The release workflow still requires a successful same-repository push to `main`, verifies the exact tested commit against current `main`, and checks again before publishing release tags. Fork pull-request code is not checked out in the privileged publisher. Untagged candidate digests can exist in the registry before smoke tests finish; `latest` and commit tags are assembled only from the candidates that passed.
+Automatic publication requires successful full runtime Checks from a same-repository push to `main`. Manual publication can also use full manual Checks for that exact current-main revision; documentation-only checks cannot authorize an image. The publisher verifies the tested commit against current `main` and checks again before promoting tags. Fork pull-request code is not checked out in the privileged publisher. Untagged candidate digests can exist in the registry before smoke tests finish; `latest` and commit tags are assembled only from the candidates that passed. See [delivery gates](development.md#merge-and-publication-gates).
 
 ## Session and user-data safeguards reviewed
 
@@ -178,7 +183,13 @@ Queued membership work checks the current entitlement revision before remote wri
 
 Validation passed: 832 tests, production typecheck/build, an npm audit reporting zero known dependency vulnerabilities, and a hardened local Docker smoke check. New HTTP tests verify administrator authorization/revocation, CSRF, cross-site rejection, no-store responses, strict request bounds, stale reviews, and exclusion of passwords, tokens, and arbitrary metadata from membership responses. Lifecycle tests cover migration, separate histories/passwords, collisions, upgrade/downgrade/renewal, uncertain writes, cancellation races and holds, and server scope changes. The new interface was inspected with synthetic local accounts; no production server, Discord, or billing account was contacted.
 
-## Playback workload follow-up — 0.13.0 patch candidate
+<a id="playback-workload-follow-up--0130-patch-candidate"></a>
+
+## Playback workload follow-up — 0.13.0
+
+Historical review of the change merged on **2026-10-13** in
+[PR #11](https://github.com/Cruv/Jellyport/pull/11). The original anchor is kept
+for existing links; this is completed implementation evidence, not pending work.
 
 The October 8 production evidence supports catalog-read contention as a strong
 suspect, not a proven Emby lock or query-plan diagnosis. The replacement live path
@@ -215,8 +226,8 @@ remain in place.
 
 The source contract was verified using an isolated Emby 4.10.1.0 container and
 synthetic media. Mocked large-catalog, failure, memory-budget, cancellation,
-cache-scope and preservation tests cover the patch. This is a reviewable candidate;
-no production deployment or load test was performed. The live cold catalog still
+cache-scope and preservation tests covered the merged change. No production
+deployment or load test was performed in that review. The live cold catalog still
 uses documented name ordering and OFFSET pagination, and database captures
 still consume I/O; the legacy Online Backup method can delay WAL checkpoints.
 Neither path guarantees zero

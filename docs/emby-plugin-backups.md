@@ -1,59 +1,86 @@
-# Emby Backup & Restore as a migration source
+# Emby Backup & Restore history imports — 0.14.0
 
-Emby's official Backup & Restore plugin can produce completed backups for a
-future Jellyport importer. **Plugin backup import is not implemented yet.**
-Current Jellyport versions and the existing snapshot helper cannot consume
-plugin output directly.
+Jellyport imports saved history from the **full-backup layout** produced by Emby
+Server **4.10.1.0** with Backup & Restore **1.8.7.0**. Both the web app and isolated
+helper must run Jellyport **0.14.0 or later**. Other versions and dated database-only
+folders are rejected until their format and source binding are verified.
 
-## Configure Emby's plugin
+## Configure Emby and the helper
 
-1. Validate **Emby Premiere**, install Backup & Restore from Emby's plugin catalog,
-   then open **Advanced → Backup & Restore**. If installation requires a restart,
-   arrange it separately during maintenance.
-2. Choose a dedicated Linux Docker host directory and bind it into Emby. For
-   example, host `/path/to/emby-backups` could map to container `/backups`. Enter
-   the **absolute container path** `/backups` in the plugin and ensure Emby's
-   container user can write there. A macOS-mounted share path is not the Docker
-   host path. Adding a mount normally recreates the container; prepare that
-   change for maintenance.
-3. Leave optional metadata at defaults initially unless needed for full-server
-   recovery. Additional metadata increases time and space. Jellyport's minimum
-   required selection remains unverified; do not remove required data.
-4. Review **Scheduled Tasks → Emby Server Backup**. Emby defaults to daily backups
-   and supports a manual run. Set its schedule in Emby; do not enable a second
-   live-copy schedule in Jellyport. Observe playback during the first run;
-   plugin workload has not been measured here.
-5. Record the server/plugin versions, backup paths and successful task completion
-   time. A folder appearing or unchanged size does not prove completion. Retain
-   that generation for local inspection; do not restore it over the live server.
+1. Emby's plugin requires a validated **Emby Premiere** subscription. Install it
+   through Emby's plugin catalog and configure an absolute backup folder writable
+   by Emby's container user. Configure its **Emby Server Backup** scheduled task.
+   Jellyport does not start, stop or reschedule that task. See the
+   [official setup guide](https://emby.media/support/articles/Backup-Using-Plugin.html).
+2. Use [compose.plugin-backups.yaml](../examples/compose.plugin-backups.yaml).
+   Set `JELLYPORT_SNAPSHOT_METHOD=plugin_backup` and
+   `JELLYPORT_EMBY_BACKUP_DIR=/emby-backups` on the helper. Bind the Docker host's
+   **backup root** read-only at `/emby-backups`; it must contain
+   `embyserver-backup-full/backupinfo.json` and that folder's `data/library.db`,
+   `data/users.db` and `data/device.txt`. A laptop's mounted-share path is not the
+   Docker host's path. Do not substitute a live database mount.
+3. Keep `/work` helper-only and private. Share only the separate `/snapshots`
+   exchange with Jellyport, and preserve the existing Jellyport `/data` mount.
+   The helper needs no network and opens only copied private SQLite databases.
+4. In **Settings → Saved Emby database snapshots**, confirm **Emby plugin backup**,
+   then choose **Import latest backup**. The existing daily schedule becomes an
+   import schedule. Run it after the Emby task finishes, leaving at least five
+   minutes after the last backup-file write. It does not create a second backup.
+5. Plugin-backed migrations default to saved history. If the history source is
+   unknown, choose it explicitly before previewing; missing or expired saved data
+   stops the preview without switching to live history. Check the original backup
+   date and warnings before starting. Accounts added after the backup are absent
+   until a newer backup includes them; other backed-up users remain usable.
 
-See [Emby's official setup guide](https://emby.media/support/articles/Backup-Using-Plugin.html).
+## Validation and freshness
 
-## What the backup covers
+The importer reads a fixed allowlist only. It checks the known manifest version,
+`CanRestore`, full-backup flag, original date, embedded server ID and exact user
+identity set. Files must be regular, settled and unchanged before/open/after the
+copy; manifest and identity bytes are rechecked. Symlinks, database sidecars,
+changes, unsupported schemas and corruption fail without replacing saved history.
+SQLite integrity checks, schema validation and projection run on private copies.
+Copied-byte fingerprints identify unchanged generations. Authentication databases,
+configuration, artwork and raw user account records are never published.
 
-Emby documents core play states, favorites, users, playlists and server settings.
-Databases owned by other plugins are excluded, distinct from built-in watched
-state. Its restore interface can copy playback state and favorites between Emby
-accounts. [Backup coverage](https://emby.media/support/articles/Backup-Using-Plugin.html),
-[playback-state restore](https://emby.media/support/articles/Backup-Restore-Playbacks-And-Favorites.html).
+History expires **48 hours after the backup's original date**, with one minute of
+future-clock tolerance. Import times are displayed separately. Reimporting the
+same fingerprint does not add a generation or renew its history age. A newer
+plugin generation cannot be replaced by an older one for the same server.
+Explicitly switching from live capture to plugin backup may select older saved
+history within that limit; Jellyfin's newer activity remains protected by merge.
+Failures keep the last valid generation, without falling back to live catalog
+reads. At most eight generations may be retained, including pinned jobs/previews.
 
-Counts, timestamps, resume positions, playlist entries and matching metadata
-still need verification in the actual output. History remains as old as its
-backup, regardless of import time.
+The full-backup folder is refreshed in place. Emby does not document an atomic
+completion marker. `CanRestore`, five-minute settling, unchanged bytes/statistics
+and integrity checks provide validation evidence, **not proof of a transactionally
+atomic backup or zero missing recent activity**. Schedule imports after a successful
+plugin task. The helper has a five-minute worker deadline, an 8 GiB combined input
+limit and a separate private work area; reserve room for raw copies and projection.
+Backup creation itself still consumes Emby resources; it was not load-tested here.
 
-## Protect the backup and validate the importer
+## History fields and limitations
 
-Keep sensitive raw backups out of the web container, public shares and
-repositories. The planned isolated importer will receive read-only access, use a
-private workspace, and publish only a validated encrypted migration projection.
-Failure must preserve the last good generation without a live catalog fallback.
-Previews must show backup age/provenance and protect newer Jellyfin activity.
+The verified database layout provides watched flags, play counts, latest playback
+dates, favorites, resume ticks, ratings and matching metadata (provider IDs,
+series/episode numbering and paths). Supported upgraded column declarations and
+composite unique indexes are validated without arbitrary schema coercion.
+Negative resume values are omitted with a warning, preserving other valid state;
+they are not changed to zero. Invalid display names are omitted and reported while
+identity metadata remains unchanged. Unsupported item types and orphan state with
+no current catalog identity are reported by aggregate count rather than aborting
+all valid history or guessing a target. Deleted media cannot be reliably matched
+from a bare user-data key. Collection IDs named `Tmdb` and `TmdbCollection` are
+normalized only within the collection type, preserving contradictory-ID checks.
 
-Before implementation, verify completion evidence, format/version, server/account
-binding and matching/history fields. Enforce size, extraction, memory and time
-limits. A future local format inspector could produce sanitized structural
-output without uploading a full backup; that tool is not implemented yet.
+This is a history import, not a full server restore. **Complete** migrations still
+read account preferences, supported profile images and playlist definitions/entries
+through the Emby API; destination access and Jellyfin activity remain live. The
+backup also includes playlists, but offline playlist extraction is not implemented.
+Plugin-owned reporting databases, credentials and full playback-event ledgers are
+outside this adapter. See [migration capabilities](migration-capabilities.md).
 
-Next: confirm the Docker host backup path and plugin version, then inspect a
-completed generation locally. No plugin-import environment variables or Compose
-configuration exist yet.
+Local simulations use private backup copies and fake destination clients. Only
+synthetic regression fixtures enter the repository; no backup, account identity,
+media name/path, playback value or credential is committed or sent to a live target.

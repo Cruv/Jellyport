@@ -1,15 +1,25 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { Callout, Icon } from './components';
-import type { Api, Notify, SourceSnapshotConfig, SourceSnapshotStatus } from './types';
+import type {
+  Api,
+  Notify,
+  SourceSnapshotConfig,
+  SourceSnapshotMetadata,
+  SourceSnapshotStatus,
+} from './types';
 
 const clock = (config: SourceSnapshotConfig) =>
   `${String(config.hour).padStart(2, '0')}:${String(config.minute).padStart(2, '0')}`;
-const timestamp = (value: string) => new Date(value).toLocaleString();
-const age = (value: string) => {
+const timestamp = (value: string | undefined) =>
+  value ? new Date(value).toLocaleString() : 'Time unavailable';
+const historyDate = (record: SourceSnapshotMetadata) =>
+  record.source_type === 'plugin_backup' ? record.backup_created_at : record.finished_at;
+const age = (value: string | undefined) => {
+  if (!value) return 'Age unavailable';
   const minutes = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 60_000));
   if (!Number.isFinite(minutes)) return 'Age unavailable';
   return minutes < 1
-    ? 'Captured just now'
+    ? 'Just now'
     : minutes < 60
       ? `${minutes}m old`
       : `${Math.floor(minutes / 60)}h ${minutes % 60}m old`;
@@ -113,18 +123,26 @@ export default function SourceSnapshotsPanel({
       }
       notify(
         kind === 'schedule'
-          ? 'Database capture schedule saved.'
+          ? pluginBackup
+            ? 'Backup import schedule saved.'
+            : 'Database capture schedule saved.'
           : kind === 'capture'
-            ? 'Database capture started. You can follow its status here.'
+            ? pluginBackup
+              ? 'Backup import started. You can follow its status here.'
+              : 'Database capture started. You can follow its status here.'
             : 'Saved database captures cleared.',
       );
     } catch {
       if (mounted.current && !controller.signal.aborted && requestVersion.current === version)
         setError(
           kind === 'schedule'
-            ? 'The capture schedule could not be saved. Refresh status and reload the saved schedule before trying again.'
+            ? pluginBackup
+              ? 'The import schedule could not be saved. Refresh status and reload the saved schedule before trying again.'
+              : 'The capture schedule could not be saved. Refresh status and reload the saved schedule before trying again.'
             : kind === 'capture'
-              ? 'Database capture could not start. Check the read-only source mount and refresh status.'
+              ? pluginBackup
+                ? 'Backup import could not start. Check the backup folder and refresh status.'
+                : 'Database capture could not start. Check the read-only source mount and refresh status.'
               : 'Saved captures could not be cleared. A capture or migration may still be using them. Refresh status and try again.',
         );
     } finally {
@@ -152,25 +170,46 @@ export default function SourceSnapshotsPanel({
     setError('');
   }
   const fileCopy = status?.capture_method === 'file_copy';
+  const pluginBackup = status?.capture_method === 'plugin_backup';
   const hasFileCopies =
     fileCopy || status?.records.some((record) => record.source_type === 'file_copy');
+  const hasPluginBackups =
+    pluginBackup || status?.records.some((record) => record.source_type === 'plugin_backup');
   return (
     <section className="panel mt-18" aria-label="Saved Emby database snapshots">
       <div className="panel-header">
         <div>
           <h2>Saved Emby database snapshots</h2>
-          <p>Capture the database once, then read saved user history for migrations.</p>
+          <p>
+            {pluginBackup
+              ? 'Import an Emby backup, then read saved user history for migrations.'
+              : 'Capture the database once, then read saved user history for migrations.'}
+          </p>
         </div>
       </div>
       <div className="panel-body form-stack">
         <p className="muted text-small">
-          A network-isolated helper uses a read-only Emby database mount on the same Docker host.{' '}
-          {fileCopy
-            ? 'File copies run while Emby stays online; no filesystem snapshot or downtime is needed.'
-            : 'Emby can keep running while a consistent SQLite online backup is captured.'}{' '}
+          {pluginBackup ? (
+            'A network-isolated helper reads saved Emby Backup & Restore backups. Jellyport does not start Emby’s backup task or open its live databases.'
+          ) : (
+            <>
+              A network-isolated helper uses a read-only Emby database mount on the same Docker
+              host.{' '}
+              {fileCopy
+                ? 'File copies run while Emby stays online; no filesystem snapshot or downtime is needed.'
+                : 'Emby can keep running while a consistent SQLite online backup is captured.'}
+            </>
+          )}{' '}
           This avoids a full library scan through Emby’s API. Database captures support both
           complete and watched-only migrations.
         </p>
+        {hasPluginBackups && (
+          <Callout icon="info" title="Backup age stays with the original backup.">
+            Import after Emby’s backup finishes. Jellyport checks stable backup files before
+            importing and keeps the last good import if validation fails. History expires 48 hours
+            after the original backup time. Importing an unchanged backup does not make it newer.
+          </Callout>
+        )}
         {hasFileCopies && (
           <Callout icon="info" title="File copies use best-effort history.">
             Live file copies are not transactional. Some history may be missing or inconsistent even
@@ -178,8 +217,15 @@ export default function SourceSnapshotsPanel({
           </Callout>
         )}
         {status?.available === false && (
-          <Callout warning title="Emby database source is unavailable.">
-            Configure the read-only source mount using the{' '}
+          <Callout
+            warning
+            title={
+              pluginBackup
+                ? 'Emby backup source is unavailable.'
+                : 'Emby database source is unavailable.'
+            }
+          >
+            Configure the {pluginBackup ? 'backup folder' : 'read-only source mount'} using the{' '}
             <a
               href="https://github.com/Cruv/Jellyport/blob/main/docs/docker-deployment.md"
               target="_blank"
@@ -198,16 +244,27 @@ export default function SourceSnapshotsPanel({
         {status && (
           <div aria-live="polite">
             <p className="muted text-small">
-              Capture method:{' '}
-              <strong>{fileCopy ? 'Scheduled file copy' : 'SQLite online backup'}</strong>
+              History source:{' '}
+              <strong>
+                {pluginBackup
+                  ? 'Emby plugin backup'
+                  : fileCopy
+                    ? 'Scheduled file copy'
+                    : 'SQLite online backup'}
+              </strong>
             </p>
             <strong>
               {status.running
-                ? 'Capturing Emby database…'
+                ? pluginBackup
+                  ? 'Importing Emby backup…'
+                  : 'Capturing Emby database…'
                 : `${status.snapshots} saved database ${status.snapshots === 1 ? 'capture' : 'captures'}`}
             </strong>
             {status.running && (
-              <progress className="progress-track" aria-label="Database capture progress" />
+              <progress
+                className="progress-track"
+                aria-label={pluginBackup ? 'Backup import progress' : 'Database capture progress'}
+              />
             )}
             {status.users_total > 0 && (
               <p className="muted text-small">
@@ -219,7 +276,10 @@ export default function SourceSnapshotsPanel({
               <p className="muted text-small">Last attempt {timestamp(status.last_attempt_at)}</p>
             )}
             {status.last_finished_at && (
-              <p className="muted text-small">Last finished {timestamp(status.last_finished_at)}</p>
+              <p className="muted text-small">
+                {pluginBackup ? 'Last import' : 'Last finished'}{' '}
+                {timestamp(status.last_finished_at)}
+              </p>
             )}
             {status.last_error && (
               <p className="error-block">
@@ -229,7 +289,11 @@ export default function SourceSnapshotsPanel({
           </div>
         )}
         {draft && status && (
-          <form onSubmit={save} className="form-stack" aria-label="Database capture schedule">
+          <form
+            onSubmit={save}
+            className="form-stack"
+            aria-label={pluginBackup ? 'Backup import schedule' : 'Database capture schedule'}
+          >
             <label className="check-label">
               <input
                 type="checkbox"
@@ -237,11 +301,13 @@ export default function SourceSnapshotsPanel({
                 onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
                 disabled={demo || !!busy}
               />
-              Enable daily database capture
+              {pluginBackup ? 'Enable daily backup import' : 'Enable daily database capture'}
             </label>
             <div className="field-row">
               <div className="field">
-                <label htmlFor="snapshot-time">Capture time</label>
+                <label htmlFor="snapshot-time">
+                  {pluginBackup ? 'Import time' : 'Capture time'}
+                </label>
                 <input
                   id="snapshot-time"
                   type="time"
@@ -264,8 +330,10 @@ export default function SourceSnapshotsPanel({
               </div>
             </div>
             <small id="snapshot-schedule-help">
-              Scheduling starts off. Times use the time zone shown here, supplied by the server.
-              Each capture includes data for both migration scopes.
+              Scheduling starts off. Times use the time zone shown here, supplied by the server.{' '}
+              {pluginBackup
+                ? 'Schedule imports after Emby’s backup task finishes. This does not change Emby’s backup schedule.'
+                : 'Each capture includes data for both migration scopes.'}
             </small>
             {draft.revision !== status.config.revision && (
               <p className="error-block">
@@ -278,7 +346,11 @@ export default function SourceSnapshotsPanel({
                 type="submit"
                 disabled={demo || !!busy || draft.revision !== status.config.revision}
               >
-                {busy === 'schedule' ? 'Saving schedule…' : 'Save capture schedule'}
+                {busy === 'schedule'
+                  ? 'Saving schedule…'
+                  : pluginBackup
+                    ? 'Save import schedule'
+                    : 'Save capture schedule'}
               </button>
               <button
                 className="btn btn-quiet"
@@ -307,7 +379,13 @@ export default function SourceSnapshotsPanel({
             onClick={() => void change('capture')}
             disabled={demo || !!busy || !status || status.running || status.available === false}
           >
-            {busy === 'capture' ? 'Starting capture…' : 'Capture database now'}
+            {busy === 'capture'
+              ? pluginBackup
+                ? 'Starting import…'
+                : 'Starting capture…'
+              : pluginBackup
+                ? 'Import latest backup'
+                : 'Capture database now'}
           </button>
           <button
             className="btn btn-quiet"
@@ -327,7 +405,7 @@ export default function SourceSnapshotsPanel({
               <thead>
                 <tr>
                   <th>Source</th>
-                  <th>Captured</th>
+                  <th>History date</th>
                   <th>Contents</th>
                   <th>Availability</th>
                 </tr>
@@ -344,21 +422,25 @@ export default function SourceSnapshotsPanel({
                       <small>Source {record.source_server_id}</small>
                     </td>
                     <td>
-                      <strong>{timestamp(record.finished_at)}</strong>
-                      <small>{age(record.finished_at)}</small>
+                      <strong>{timestamp(historyDate(record))}</strong>
+                      <small>{age(historyDate(record))}</small>
                       <small>
-                        Read window {timestamp(record.started_at)} – {timestamp(record.finished_at)}
+                        {record.source_type === 'plugin_backup'
+                          ? `Imported ${timestamp(record.finished_at)}`
+                          : `Read window ${timestamp(record.started_at)} – ${timestamp(record.finished_at)}`}
                       </small>
                     </td>
                     <td>
                       <strong>
-                        {record.source_type === 'file_copy'
-                          ? 'File copy'
-                          : record.source_type === 'sqlite_online_backup'
-                            ? 'SQLite online backup'
-                            : record.scope === 'watched_only'
-                              ? 'Watched-only data'
-                              : 'Complete data'}
+                        {record.source_type === 'plugin_backup'
+                          ? 'Emby plugin backup'
+                          : record.source_type === 'file_copy'
+                            ? 'File copy'
+                            : record.source_type === 'sqlite_online_backup'
+                              ? 'SQLite online backup'
+                              : record.scope === 'watched_only'
+                                ? 'Watched-only data'
+                                : 'Complete data'}
                       </strong>
                       {record.source_type && (
                         <small>

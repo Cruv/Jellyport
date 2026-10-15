@@ -106,9 +106,13 @@ function providers(item: MediaItem, field: string): Map<string, Set<string>> {
   const allowed = field === 'SeriesProviderIds' ? videoProviders : typeProviders[kind(item)];
   for (const [key, value] of Object.entries(raw)) {
     const providerKey = caseFold(key.trim());
-    const provider = Object.hasOwn(providerNames, providerKey)
+    let provider = Object.hasOwn(providerNames, providerKey)
       ? providerNames[providerKey]
       : undefined;
+    // Verified Emby backups store collection IDs as Tmdb on BoxSet items; also
+    // accept the explicit TmdbCollection alias. Keep this interpretation
+    // within BoxSet identity, collecting conflicting aliases conservatively.
+    if (provider === 'tmdb' && kind(item) === 'boxset') provider = 'tmdbcollection';
     if (
       provider &&
       allowed?.has(provider) &&

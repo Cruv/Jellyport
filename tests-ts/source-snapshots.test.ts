@@ -10,6 +10,7 @@ import type { Job } from '../server/service.js';
 import {
   encryptDatabase,
   readEnvelope,
+  recoverSnapshotHelper,
   snapshotKey,
   writeEnvelope,
   SNAPSHOT_VERSION,
@@ -149,6 +150,309 @@ async function fixture(demo = false) {
   };
 }
 
+async function pluginCapture(
+  f: Awaited<ReturnType<typeof fixture>>,
+  overrides: Partial<CaptureResult> = {},
+) {
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  await f.manager.refresh();
+  return f.finish(await f.pendingRequest(), {
+    backup_created_at: new Date(Date.now() - 60 * 60_000).toISOString(),
+    backup_fingerprint: 'a'.repeat(64),
+    plugin_version: '1.8.7.0',
+    ...overrides,
+  });
+}
+
+it('imports plugin provenance with original history age and permits accounts created after the backup', async () => {
+  const f = await fixture();
+  f.client.users.mockResolvedValue([
+    { Id: userId, Name: 'fixture-user' },
+    { Id: otherUserId, Name: 'new-fixture-user' },
+  ]);
+  const backupTime = new Date(Date.now() - 24 * 60 * 60_000).toISOString();
+  const capture = await pluginCapture(f, { backup_created_at: backupTime });
+  expect(await f.manager.status()).toMatchObject({
+    running: false,
+    capture_method: 'plugin_backup',
+    snapshots: 1,
+    records: [
+      {
+        id: capture.id,
+        source_type: 'plugin_backup',
+        backup_created_at: backupTime,
+        backup_fingerprint: 'a'.repeat(64),
+        plugin_version: '1.8.7.0',
+        finished_at: capture.finished_at,
+        expires_at: new Date(Date.parse(backupTime) + 48 * 60 * 60_000).toISOString(),
+      },
+    ],
+  });
+  expect((await f.manager.select(userId, f.settings, 'fixture-emby-server')).id).toBe(capture.id);
+  await expect(f.manager.select(otherUserId, f.settings, 'fixture-emby-server')).rejects.toThrow(
+    'user is absent',
+  );
+  await f.restart();
+  expect((await f.manager.status()).records[0]?.backup_created_at).toBe(backupTime);
+  expect(f.factory).toHaveBeenCalledOnce();
+  expect(worker).not.toHaveBeenCalled();
+});
+
+it.each([
+  { plugin_version: undefined },
+  { plugin_version: '1.8.8.0' },
+  { backup_fingerprint: undefined },
+  { backup_fingerprint: '../private-backup' },
+  { backup_created_at: undefined },
+  { backup_created_at: 'not-a-date' },
+  { backup_created_at: '2026-02-30T03:00:00.000Z' },
+])('rejects invalid plugin metadata while preserving completed history (%j)', async (override) => {
+  const f = await fixture();
+  const good = await pluginCapture(f);
+  const invalid = await pluginCapture(f, override);
+  expect(await f.manager.status()).toMatchObject({
+    snapshots: 1,
+    records: [{ id: good.id }],
+    last_error: 'Database capture could not be validated. The last good copy is preserved.',
+  });
+  await expect(stat(join(f.shared, `${invalid.id}.db.enc`))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+  await expect(stat(join(f.shared, `${invalid.id}.result`))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+});
+
+it.each([-49 * 60 * 60_000, 2 * 60_000])(
+  'rejects a stale or future original plugin timestamp even when import has just finished (%i)',
+  async (offset) => {
+    const f = await fixture();
+    const good = await pluginCapture(f);
+    await pluginCapture(f, {
+      backup_created_at: new Date(Date.now() + offset).toISOString(),
+      backup_fingerprint: 'b'.repeat(64),
+    });
+    expect((await f.manager.status()).records.map((record) => record.id)).toEqual([good.id]);
+    expect((await f.manager.status()).last_error).toContain('last good copy is preserved');
+  },
+);
+
+it('does not renew the original plugin age through a new import and stops migration after 48 hours', async () => {
+  const f = await fixture();
+  const now = Date.now();
+  const capture = await pluginCapture(f, {
+    backup_created_at: new Date(now - 47 * 60 * 60_000).toISOString(),
+  });
+  vi.spyOn(Date, 'now').mockReturnValue(now + 2 * 60 * 60_000);
+  await expect(
+    f.manager.select(userId, f.settings, 'fixture-emby-server', capture.id),
+  ).rejects.toThrow('48 hours');
+  expect(worker).not.toHaveBeenCalled();
+});
+
+it.each<Record<string, number>>([
+  {},
+  { [otherUserId]: 10 },
+  { [userId]: -1 },
+  { [userId]: 7, [otherUserId]: 7 },
+  { 'not-a-public-guid': 7 },
+])(
+  'rejects invalid or unrelated plugin identities without accepting partial unsafe maps (%j)',
+  async (identities) => {
+    const f = await fixture();
+    const good = await pluginCapture(f);
+    await pluginCapture(f, { identities });
+    expect((await f.manager.status()).records.map((record) => record.id)).toEqual([good.id]);
+  },
+);
+
+it('keeps per-user history diagnostics on that read instead of the shared decrypted database cache', async () => {
+  const f = await fixture();
+  await f.complete({ identities: { [userId]: 7, [otherUserId]: 8 } });
+  const first = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  const second = await f.manager.select(otherUserId, f.settings, 'fixture-emby-server');
+  const diagnostics = {
+    unsupported_state_items: 2,
+    invalid_resume_positions: 1,
+    invalid_display_names: 3,
+    orphan_state_items: 4,
+  };
+  worker.mockResolvedValueOnce({
+    items: [{ Id: 'first-item', UserData: { Played: true } }],
+    diagnostics,
+  });
+  expect(await f.manager.items(first, userId, 'complete')).toEqual([
+    { Id: 'first-item', UserData: { Played: true } },
+  ]);
+  expect(first.metadata.diagnostics).toEqual(diagnostics);
+  diagnostics.unsupported_state_items = 99;
+  expect(first.metadata.diagnostics?.unsupported_state_items).toBe(2);
+  expect(second.metadata.diagnostics).toBeUndefined();
+  worker.mockResolvedValueOnce({
+    items: [],
+    diagnostics: {
+      unsupported_state_items: 0,
+      invalid_resume_positions: 0,
+      invalid_display_names: 0,
+    },
+  });
+  expect(await f.manager.items(second, otherUserId, 'complete')).toEqual([]);
+  expect(first.metadata.diagnostics?.unsupported_state_items).toBe(2);
+  expect(first.metadata.diagnostics?.orphan_state_items).toBe(4);
+  expect(second.metadata.diagnostics?.unsupported_state_items).toBe(0);
+  expect(second.metadata.diagnostics?.orphan_state_items).toBe(0);
+  expect((await f.manager.status()).records[0]?.diagnostics).toBeUndefined();
+  worker.mockResolvedValueOnce([]);
+  await f.manager.items(first, userId, 'complete');
+  expect(first.metadata.diagnostics).toBeUndefined();
+});
+
+it.each([
+  { items: 'not-history', diagnostics: {} },
+  { items: [], diagnostics: undefined },
+  {
+    items: [],
+    diagnostics: {
+      unsupported_state_items: -1,
+      invalid_resume_positions: 0,
+      invalid_display_names: 0,
+    },
+  },
+  {
+    items: [],
+    diagnostics: {
+      unsupported_state_items: 0,
+      invalid_resume_positions: 100_001,
+      invalid_display_names: 0,
+    },
+  },
+  {
+    items: [],
+    diagnostics: {
+      unsupported_state_items: 0,
+      invalid_resume_positions: 0.5,
+      invalid_display_names: 0,
+    },
+  },
+  {
+    items: [],
+    diagnostics: {
+      unsupported_state_items: 0,
+      invalid_resume_positions: 0,
+      invalid_display_names: undefined,
+    },
+  },
+  {
+    items: [],
+    diagnostics: {
+      unsupported_state_items: 0,
+      invalid_resume_positions: 0,
+      invalid_display_names: 0,
+      orphan_state_items: -1,
+    },
+  },
+  {
+    items: [],
+    diagnostics: {
+      unsupported_state_items: 0,
+      invalid_resume_positions: 0,
+      invalid_display_names: 0,
+      orphan_state_items: 100_001,
+    },
+  },
+])('rejects malformed or unbounded snapshot diagnostics (%j)', async (value) => {
+  const f = await fixture();
+  await f.complete();
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  worker.mockResolvedValueOnce(value);
+  await expect(f.manager.items(selected, userId, 'complete')).rejects.toThrow(/history/);
+  expect(selected.metadata.diagnostics).toBeUndefined();
+});
+
+it('deduplicates the same plugin backup without replacing its generation or renewing history age', async () => {
+  const f = await fixture();
+  const good = await pluginCapture(f);
+  const duplicate = await pluginCapture(f, { backup_created_at: good.backup_created_at });
+  expect(await f.manager.status()).toMatchObject({
+    snapshots: 1,
+    records: [{ id: good.id, backup_created_at: good.backup_created_at }],
+    last_finished_at: good.finished_at,
+    last_error: null,
+  });
+  await expect(stat(join(f.shared, `${duplicate.id}.db.enc`))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+  await expect(stat(join(f.shared, `${duplicate.id}.result`))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+});
+
+it('does not regress source history or let a changed timestamp relabel the same plugin backup', async () => {
+  const f = await fixture();
+  const good = await pluginCapture(f);
+  await pluginCapture(f, {
+    backup_created_at: new Date(Date.parse(good.backup_created_at!) - 1_000).toISOString(),
+    backup_fingerprint: 'b'.repeat(64),
+  });
+  await pluginCapture(f, {
+    backup_created_at: new Date(Date.parse(good.backup_created_at!) + 1_000).toISOString(),
+  });
+  expect((await f.manager.status()).records.map((record) => record.id)).toEqual([good.id]);
+});
+
+it('allows switching from a fresher legacy capture to a valid older plugin backup without renewing its original age', async () => {
+  const f = await fixture();
+  const good = await f.complete();
+  const backup = await pluginCapture(f);
+  expect((await f.manager.status()).records.map((record) => record.id)).toEqual([
+    backup.id,
+    good.id,
+  ]);
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  expect(selected.id).toBe(backup.id);
+  expect(selected.metadata.backup_created_at).toBe(backup.backup_created_at);
+  expect(selected.metadata.expires_at).toBe(
+    new Date(Date.parse(backup.backup_created_at!) + 48 * 60 * 60_000).toISOString(),
+  );
+});
+
+it('allows original plugin history to replace a capture from a different bound connection', async () => {
+  const f = await fixture();
+  await f.complete();
+  f.store.saveSettings({ ...f.settings, emby_url: 'http://replacement-emby:8096' });
+  const next = await pluginCapture(f);
+  expect((await f.manager.status()).records[0]?.id).toBe(next.id);
+});
+
+it('recovers a completed plugin import with newly created users absent while rejecting stale backup recovery', async () => {
+  const f = await fixture();
+  f.client.users.mockResolvedValue([
+    { Id: userId, Name: 'fixture-user' },
+    { Id: otherUserId, Name: 'new-fixture-user' },
+  ]);
+  const capture = await pluginCapture(f);
+  const working = join(f.shared, `${capture.id}.working`);
+  const request: CaptureRequest = {
+    id: capture.id,
+    requested_at: capture.requested_at,
+    binding: capture.binding,
+    user_ids: capture.user_ids,
+    capture_method: 'plugin_backup',
+  };
+  await writeEnvelope(working, request, f.key!);
+  await recoverSnapshotHelper(f.shared, f.key!);
+  expect(
+    (await readEnvelope<CaptureResult>(join(f.shared, `${capture.id}.result`), f.key!)).ok,
+  ).toBe(true);
+  await writeEnvelope(working, request, f.key!);
+  vi.spyOn(Date, 'now').mockReturnValue(Date.parse(capture.backup_created_at!) + 49 * 60 * 60_000);
+  await recoverSnapshotHelper(f.shared, f.key!);
+  expect(
+    (await readEnvelope<CaptureResult>(join(f.shared, `${capture.id}.result`), f.key!)).ok,
+  ).toBe(false);
+  await expect(stat(working)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
 it('starts disabled at 03:00 in the server time zone and never initializes helper files in demo mode', async () => {
   const f = await fixture(true);
   expect(await f.manager.status()).toMatchObject({
@@ -226,7 +530,58 @@ it('pins a file-copy helper method and preserves its provenance across restart a
     records: [{ id: capture.id, source_type: 'file_copy' }],
   });
   await f.heartbeat(new Date(Date.now() - 30_000).toISOString(), SNAPSHOT_VERSION, 'file_copy');
-  expect(await f.manager.status()).toMatchObject({ available: false, capture_method: 'file_copy' });
+  expect(await f.manager.status()).toMatchObject({
+    available: false,
+    capture_method: 'sqlite_online_backup',
+    history_source_known: true,
+    records: [{ id: capture.id, source_type: 'file_copy' }],
+  });
+});
+
+it('remembers an authenticated plugin source without any imported generation through helper failure and restart', async () => {
+  const f = await fixture();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  expect(await f.manager.status()).toMatchObject({
+    available: true,
+    history_source_known: true,
+    capture_method: 'plugin_backup',
+    snapshots: 0,
+  });
+  await f.heartbeat(new Date(Date.now() - 30_000).toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  expect(await f.manager.status()).toMatchObject({
+    available: false,
+    history_source_known: true,
+    capture_method: 'plugin_backup',
+    snapshots: 0,
+  });
+  await rm(join(f.shared, 'helper.status'));
+  await f.restart();
+  expect(await f.manager.status()).toMatchObject({
+    available: false,
+    history_source_known: true,
+    capture_method: 'plugin_backup',
+    snapshots: 0,
+  });
+  expect(f.factory).not.toHaveBeenCalled();
+  expect(worker).not.toHaveBeenCalled();
+});
+
+it('marks an unobserved configured source as unknown instead of authorizing a default live path', async () => {
+  const f = await fixture();
+  await rm(join(f.shared, 'helper.status'));
+  expect(await f.manager.status()).toMatchObject({
+    available: false,
+    history_source_known: false,
+    snapshots: 0,
+  });
+  await f.heartbeat(new Date(Date.now() - 30_000).toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  expect((await f.manager.status()).history_source_known).toBe(false);
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  expect(await f.manager.status()).toMatchObject({
+    available: true,
+    history_source_known: true,
+    capture_method: 'plugin_backup',
+  });
 });
 
 it('rejects an authenticated result that silently changes file-copy capture to online backup', async () => {

@@ -21,6 +21,200 @@ const catalog = (length: number): MediaItem[] =>
   }));
 
 describe('playback-safe catalog and explicit-ID state reads', () => {
+  it('projects large Jellyfin migration DTO pages before retaining them without raising response or catalog bounds', async () => {
+    const total = 5000;
+    const overview = 'unused-description-'.repeat(800);
+    let rawBytes = 0;
+    let calls = 0;
+    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      transport: async (address) => {
+        calls++;
+        const url = new URL(address);
+        expect(url.pathname).toBe('/Users/alice/Items');
+        expect(url.searchParams.get('Fields')).toBe('ProviderIds,Path');
+        expect(url.searchParams.get('EnableUserData')).toBe('true');
+        const start = Number(url.searchParams.get('StartIndex'));
+        const count = Math.min(Number(url.searchParams.get('Limit')), total - start);
+        const Items = Array.from({ length: count }, (_, index) => ({
+          Id: `movie-${start + index}`,
+          Type: 'Movie',
+          Name: `Movie ${start + index}`,
+          Path: `/media/${start + index}.mkv`,
+          ProviderIds: { Tmdb: String(start + index) },
+          UserData: { Played: true, PlayCount: 2, Key: 'private-key', PlayedPercentage: 100 },
+          Overview: overview,
+          MediaSources: [
+            { Id: 'private-stream-source', MediaStreams: [{ Codec: 'unused-codec' }] },
+          ],
+          ImageTags: { Primary: 'unused-image' },
+        }));
+        const encoded = JSON.stringify({ Items, TotalRecordCount: total });
+        const pageBytes = Buffer.byteLength(encoded);
+        expect(pageBytes).toBeLessThan(8 * 1024 * 1024);
+        rawBytes += pageBytes;
+        return new Response(encoded);
+      },
+    });
+    try {
+      const items = await client.migrationItems('alice');
+      expect(items).toHaveLength(total);
+      expect(calls).toBe(10);
+      expect(rawBytes).toBeGreaterThan(MAX_CATALOG_BYTES);
+      expect(Buffer.byteLength(JSON.stringify(items))).toBeLessThan(2 * 1024 * 1024);
+      expect(items[0]).toEqual({
+        Id: 'movie-0',
+        Type: 'Movie',
+        Name: 'Movie 0',
+        Path: '/media/0.mkv',
+        ProviderIds: { Tmdb: '0' },
+        UserData: { Played: true, PlayCount: 2 },
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('preserves all writable fresh Jellyfin activity and series matching while dropping only unsupported DTO fields', async () => {
+    const states = {
+      Played: false,
+      IsFavorite: false,
+      Likes: false,
+      PlaybackPositionTicks: 0,
+      PlayCount: 0,
+      LastPlayedDate: '2026-10-15T03:00:00.0000000Z',
+      Rating: 0,
+    };
+    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      transport: async () =>
+        json({
+          TotalRecordCount: 2,
+          Items: [
+            { Id: 'series', Type: 'Series', Name: 'A show', ProviderIds: { Tvdb: '42' } },
+            {
+              Id: 'episode',
+              Type: 'Episode',
+              Name: 'bad\ncosmetic label',
+              SeriesId: 'series',
+              IndexNumber: 4,
+              ParentIndexNumber: 2,
+              IndexNumberEnd: 5,
+              RunTimeTicks: 3600,
+              Path: '/media/show/episode.mkv',
+              ProviderIds: { Imdb: 'tt12345' },
+              UserData: {
+                ...states,
+                Key: 'private-identity',
+                UnplayedItemCount: 9,
+                PlayedPercentage: 0,
+              },
+              Overview: 'unused',
+              MediaSources: [{ Id: 'unused' }],
+            },
+          ],
+        }),
+    });
+    try {
+      const items = await client.migrationItems('alice');
+      expect(items[1]).toEqual({
+        Id: 'episode',
+        Type: 'Episode',
+        SeriesId: 'series',
+        IndexNumber: 4,
+        ParentIndexNumber: 2,
+        IndexNumberEnd: 5,
+        RunTimeTicks: 3600,
+        Path: '/media/show/episode.mkv',
+        ProviderIds: { Imdb: 'tt12345' },
+        SeriesProviderIds: { Tvdb: '42' },
+        UserData: { ...states, LastPlayedDate: '2026-10-15T03:00:00.000Z' },
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('reads destination activity anew for each account and each call without a shared personal-state cache', async () => {
+    const calls: string[] = [];
+    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      transport: async (address) => {
+        const path = new URL(address).pathname;
+        calls.push(path);
+        return json({
+          TotalRecordCount: 1,
+          Items: [
+            {
+              Id: 'movie',
+              Type: 'Movie',
+              UserData: {
+                Played: true,
+                IsFavorite: true,
+                Likes: true,
+                Rating: 9,
+                PlayCount: calls.length,
+                PlaybackPositionTicks: calls.length * 1000,
+                LastPlayedDate: `2026-10-15T03:0${calls.length}:00Z`,
+              },
+            },
+          ],
+        });
+      },
+    });
+    try {
+      const first = await client.migrationItems('alice');
+      const second = await client.migrationItems('bob');
+      const third = await client.migrationItems('alice');
+      expect(calls).toEqual(['/Users/alice/Items', '/Users/bob/Items', '/Users/alice/Items']);
+      expect(first[0]!.UserData?.PlayCount).toBe(1);
+      expect(second[0]!.UserData?.PlayCount).toBe(2);
+      expect(third[0]!.UserData).toEqual({
+        Played: true,
+        IsFavorite: true,
+        Likes: true,
+        Rating: 9,
+        PlayCount: 3,
+        PlaybackPositionTicks: 3000,
+        LastPlayedDate: '2026-10-15T03:03:00.000Z',
+      });
+    } finally {
+      await client.close();
+    }
+  });
+
+  it.each([
+    { Id: '', Type: 'Movie', UserData: { Played: true } },
+    { Id: 'movie', Type: 'Movie', Path: 'invalid\nidentity', UserData: { Played: true } },
+    { Id: 'movie', Type: 'Movie', ProviderIds: { Tmdb: {} }, UserData: { Played: true } },
+    { Id: 'movie', Type: 'Movie', UserData: { Played: 'true' } },
+    { Id: 'movie', Type: 'Movie', UserData: { PlayCount: -1 } },
+  ])(
+    'keeps destination identity and activity validation strict when projecting (%j)',
+    async (item) => {
+      const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+        transport: async () => json({ TotalRecordCount: 1, Items: [item] }),
+      });
+      try {
+        await expect(client.migrationItems('alice')).rejects.toThrow();
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
+  it('retains the 8 MiB per-response ceiling even when oversized fields would be projected away', async () => {
+    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      transport: async () =>
+        json({
+          TotalRecordCount: 1,
+          Items: [{ Id: 'movie', Type: 'Movie', Overview: 'x'.repeat(8 * 1024 * 1024) }],
+        }),
+    });
+    try {
+      await expect(client.migrationItems('alice')).rejects.toThrow(/response exceeds/);
+    } finally {
+      await client.close();
+    }
+  });
+
   it('projects a neutral catalog, never retaining state, arbitrary fields, or image data', async () => {
     const calls: URL[] = [];
     const client = new MediaClient('http://emby.test', 'fixture-key', 'emby', {

@@ -47,6 +47,7 @@ import {
   type UserMapping,
   type DiscordMember,
   type PreviewUser,
+  type SourceSnapshotStatus,
 } from './types';
 
 const pages: Record<Page, { title: string; icon: string }> = {
@@ -114,6 +115,8 @@ export default function App() {
   const [selected, setSelected] = useState(new Set<string>());
   const [migrationScope, setMigrationScope] = useState<MigrationScope>('complete');
   const [useSnapshots, setUseSnapshots] = useState(false);
+  const [sourceDefaults, setSourceDefaults] = useState<'loading' | 'ready' | 'error'>('loading');
+  const sourceChosen = useRef(false);
   const [search, setSearch] = useState('');
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const dialogRef = useRef(dialog);
@@ -181,6 +184,8 @@ export default function App() {
     setSelected(new Set());
     setMigrationScope('complete');
     setUseSnapshots(false);
+    sourceChosen.current = false;
+    setSourceDefaults('loading');
     setSearch('');
     setToasts([]);
     setMobileOpen(false);
@@ -261,6 +266,37 @@ export default function App() {
     },
     [notify],
   );
+  useEffect(() => {
+    if (page !== 'migrate' || !session?.authenticated) return;
+    const controller = new AbortController();
+    if (!sourceChosen.current) setSourceDefaults('loading');
+    void api<SourceSnapshotStatus>('/api/source-snapshots', { signal: controller.signal })
+      .then((value) => {
+        if (controller.signal.aborted || sourceChosen.current) return;
+        if (
+          !value ||
+          value.history_source_known === false ||
+          !Number.isSafeInteger(value.snapshots) ||
+          value.snapshots < 0 ||
+          !Array.isArray(value.records) ||
+          ![undefined, 'sqlite_online_backup', 'file_copy', 'plugin_backup'].includes(
+            value.capture_method,
+          )
+        )
+          throw new Error('Unsupported history source settings.');
+        setUseSnapshots(value.capture_method === 'plugin_backup');
+        setSourceDefaults('ready');
+      })
+      .catch(() => {
+        if (!controller.signal.aborted && !sourceChosen.current) setSourceDefaults('error');
+      });
+    return () => controller.abort();
+  }, [api, page, session?.authenticated]);
+  function chooseHistorySource(saved: boolean) {
+    sourceChosen.current = true;
+    setUseSnapshots(saved);
+    setSourceDefaults('ready');
+  }
   const load = useCallback(
     async (target: Page) => {
       const version = ++loadVersion.current;
@@ -447,6 +483,10 @@ export default function App() {
     });
   function preview() {
     if (busyRef.current.has('preview')) return;
+    if (!sourceChosen.current && sourceDefaults !== 'ready') {
+      notify('Choose a history source before preparing a migration preview.', true);
+      return;
+    }
     if (selected.size > 100) {
       notify('Select up to 100 users for one migration.', true);
       return;
@@ -719,21 +759,46 @@ export default function App() {
     );
   else if (page === 'migrate' && overview)
     content = (
-      <MigratePage
-        users={users}
-        overview={overview}
-        selected={selected}
-        select={setSelected}
-        search={search}
-        setSearch={setSearch}
-        preview={preview}
-        migrationScope={migrationScope}
-        setMigrationScope={setMigrationScope}
-        useSnapshots={useSnapshots}
-        setUseSnapshots={setUseSnapshots}
-        busy={busy.has('preview')}
-        navigate={navigate}
-      />
+      <>
+        {sourceDefaults !== 'ready' && !sourceChosen.current && (
+          <div className="mb-17" role={sourceDefaults === 'error' ? 'alert' : 'status'}>
+            <Callout
+              warning={sourceDefaults === 'error'}
+              title={
+                sourceDefaults === 'error'
+                  ? 'History source settings could not be loaded.'
+                  : 'Checking history source settings…'
+              }
+            >
+              Choose a source explicitly to continue. Saved history avoids a live Emby catalog read;
+              missing or expired saved data stops the preview.
+              <div className="button-row mt-12">
+                <button className="btn btn-quiet" onClick={() => chooseHistorySource(true)}>
+                  Use saved history
+                </button>
+                <button className="btn btn-quiet" onClick={() => chooseHistorySource(false)}>
+                  Use live Emby reads
+                </button>
+              </div>
+            </Callout>
+          </div>
+        )}
+        <MigratePage
+          users={users}
+          overview={overview}
+          selected={selected}
+          select={setSelected}
+          search={search}
+          setSearch={setSearch}
+          preview={preview}
+          migrationScope={migrationScope}
+          setMigrationScope={setMigrationScope}
+          useSnapshots={useSnapshots}
+          setUseSnapshots={chooseHistorySource}
+          busy={busy.has('preview')}
+          navigate={navigate}
+        />
+      </>
     );
   else if (page === 'mappings')
     content = (

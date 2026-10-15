@@ -50,6 +50,7 @@ import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { SourceSnapshots, type SnapshotMetadata } from './source-snapshots.js';
 import { MediaWorkload, type MediaWorkloadEvent } from './media-workload.js';
 import { MigrationCatalogCache, type MigrationCatalog } from './migration-catalog.js';
+import { snapshotHistoryWarnings } from './emby-snapshot-reader.js';
 
 export { ServiceError } from './errors.js';
 export interface JobRequest {
@@ -805,6 +806,7 @@ export class Service {
               matcher,
             );
             const warnings = [
+              ...snapshotHistoryWarnings(saved.metadata.diagnostics),
               ...playlists.warnings,
               ...(!target && template.accountRole
                 ? [
@@ -2129,7 +2131,7 @@ export class Service {
               request.source_snapshot_id,
             );
             savedMetadata = selected.metadata;
-            return readMigrationSource(
+            const source = await readMigrationSource(
               emby,
               request.source_user_id!,
               scope,
@@ -2141,6 +2143,8 @@ export class Service {
               ),
               this.jobControllers.get(job.id)?.signal,
             );
+            source.warnings.push(...snapshotHistoryWarnings(selected.metadata.diagnostics));
+            return source;
           },
           this.jobControllers.get(job.id)?.signal,
         );

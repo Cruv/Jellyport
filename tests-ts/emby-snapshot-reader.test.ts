@@ -7,8 +7,10 @@ import {
   EMBY_SNAPSHOT_VERSION,
   inspectLibrary,
   projectLibrary,
+  readSnapshotHistory,
   readSnapshotItems,
   readUserIdentities,
+  snapshotHistoryWarnings,
 } from '../server/emby-snapshot-reader.js';
 
 // Values compared with API output from a clean official Emby 4.10.1.0 server.
@@ -27,12 +29,12 @@ afterEach(() => {
   for (const directory of directories.splice(0))
     rmSync(directory, { recursive: true, force: true });
 });
-function fixture() {
+function fixture(definition = schema) {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-offline-reader-'));
   directories.push(directory);
   const path = join(directory, 'library.db');
   const database = new DatabaseSync(path);
-  database.exec(schema);
+  database.exec(definition);
   const item = (Id: number, type: number, key: number, fields: Record<string, unknown> = {}) => {
     database
       .prepare('INSERT OR IGNORE INTO UserDataKeys2(Id,UserDataKey) VALUES (?,?)')
@@ -121,6 +123,59 @@ function fixture() {
 }
 
 describe('verified Emby 4.10.1.0 offline history reader', () => {
+  const upgradedSchema = schema
+    .replace('RunTimeTicks INTEGER', 'RunTimeTicks BIGINT')
+    .replace('rating REAL', 'rating FLOAT')
+    .replace('played INT not null', 'played BIT not null')
+    .replace('isFavorite INT not null', 'isFavorite BIT not null')
+    .replace('playbackPositionTicks INTEGER', 'playbackPositionTicks BIGINT')
+    .replace(/guid BLOB/g, 'guid GUID')
+    .replace('data TEXT NOT NULL', 'data BLOB NOT NULL')
+    .replace(/,\s*PRIMARY KEY \(UserDataKeyId,userId\)/, '')
+    .replace(
+      ') STRICT, WITHOUT ROWID;',
+      '); CREATE UNIQUE INDEX UpgradedUserDataUnique ON UserDatas(UserDataKeyId,userId);',
+    )
+    .replace(/ STRICT/g, '');
+
+  it('accepts verified upgraded affinity declarations with a complete unique history key', () => {
+    const f = fixture(upgradedSchema);
+    f.database.close();
+    expect(readUserIdentities(f.path)).toEqual(identities);
+    expect(inspectLibrary(f.path)).toMatchObject({ item_count: 4, user_data_count: 4 });
+    const expected = readSnapshotHistory(f.path, alice, identities);
+    expect(expected.items).toHaveLength(3);
+    expect(expected.diagnostics).toEqual({
+      unsupported_state_items: 0,
+      invalid_resume_positions: 0,
+      invalid_display_names: 0,
+      orphan_state_items: 0,
+    });
+    const projected = join(f.directory, 'upgraded-projection.db');
+    projectLibrary(f.path, projected);
+    expect(readSnapshotHistory(projected, alice, identities)).toEqual(expected);
+  });
+
+  it.each([
+    '',
+    'CREATE INDEX InvalidKey ON UserDatas(UserDataKeyId,userId)',
+    'CREATE UNIQUE INDEX InvalidKey ON UserDatas(UserDataKeyId,userId) WHERE played=1',
+    'CREATE UNIQUE INDEX InvalidKey ON UserDatas(UserDataKeyId,userId,playCount)',
+    'CREATE UNIQUE INDEX InvalidKey ON UserDatas(UserDataKeyId,lower(userId))',
+  ])('requires a complete unique composite key in upgraded schemas: %s', (replacement) => {
+    const f = fixture(upgradedSchema);
+    f.database.exec('DROP INDEX UpgradedUserDataUnique');
+    if (replacement) f.database.exec(replacement);
+    f.database.close();
+    expect(() => inspectLibrary(f.path)).toThrow('invalid format');
+  });
+
+  it('rejects unverified declarations instead of accepting arbitrary affinity coercion', () => {
+    const f = fixture(upgradedSchema.replace('RunTimeTicks BIGINT', 'RunTimeTicks NUMERIC'));
+    f.database.close();
+    expect(() => inspectLibrary(f.path)).toThrow('invalid format');
+  });
+
   it('maps .NET GUID blobs to public API IDs without reading secret user JSON', () => {
     const f = fixture();
     f.database.close();
@@ -409,15 +464,20 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
   });
 
   it.each(['complete', 'watched_only'] as const)(
-    'fails closed for unverified types carrying personal state in %s mode',
+    'reports unverified personal-state types while preserving supported history in %s mode',
     (scope) => {
       const f = fixture();
       f.item(90, 999, 90);
       f.state(90, 2, { played: 1 });
       f.database.close();
-      expect(() => readSnapshotItems(f.path, alice, identities, scope)).toThrow(
-        'unsupported media type',
+      const history = readSnapshotHistory(f.path, alice, identities, scope);
+      expect(history.items.map((item) => item.Id)).toEqual(
+        scope === 'complete' ? ['10', '11', '13'] : ['10', '13'],
       );
+      expect(history.diagnostics.unsupported_state_items).toBe(1);
+      expect(snapshotHistoryWarnings(history.diagnostics)).toEqual([
+        '1 saved history entries use unsupported media types. Their state was not migrated; supported history is preserved.',
+      ]);
     },
   );
 
@@ -471,15 +531,105 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
   it.each([
     'UPDATE UserDatas SET played=2 WHERE UserDataKeyId=8 AND userId=2',
     'UPDATE UserDatas SET LastPlayedDateInt=-1 WHERE UserDataKeyId=8 AND userId=2',
-    'UPDATE UserDatas SET playbackPositionTicks=9223372036854775807 WHERE UserDataKeyId=8 AND userId=2',
     "UPDATE MediaItems SET ProviderIds='Tmdb=a|Tmdb=b' WHERE Id=10",
-    "UPDATE MediaItems SET Name=printf('%01025d',0) WHERE Id=10",
   ])('rejects malformed normalized fields: %s', (sql) => {
     const f = fixture();
     f.database.exec(sql);
     f.database.close();
     expect(() => readSnapshotItems(f.path, alice, identities)).toThrow('invalid format');
   });
+
+  it.each([-1n, 9_223_372_036_854_775_807n])(
+    'omits an invalid resume position without replacing it with zero or losing other state: %s',
+    (position) => {
+      const f = fixture();
+      f.database
+        .prepare('UPDATE UserDatas SET playbackPositionTicks=? WHERE UserDataKeyId=8 AND userId=2')
+        .run(position);
+      f.database.close();
+      const history = readSnapshotHistory(f.path, alice, identities);
+      expect(history.items[0]?.UserData).toEqual({
+        Played: true,
+        PlayCount: 7,
+        IsFavorite: true,
+        LastPlayedDate: '2025-02-03T04:05:06.000Z',
+      });
+      expect(history.diagnostics.invalid_resume_positions).toBe(1);
+      expect(snapshotHistoryWarnings(history.diagnostics)).toEqual([
+        '1 invalid saved resume positions were omitted. Valid watched flags, counts, dates and favorites are preserved.',
+      ]);
+      expect(
+        readSnapshotHistory(f.path, alice, identities, 'watched_only').diagnostics
+          .invalid_resume_positions,
+      ).toBe(0);
+    },
+  );
+
+  it.each(['Synthetic\tlabel', 'x'.repeat(1_025)])(
+    'omits an invalid display label while retaining reliable matching metadata and history',
+    (name) => {
+      const f = fixture();
+      f.database.prepare('UPDATE MediaItems SET Name=? WHERE Id=10').run(name);
+      f.database.close();
+      const history = readSnapshotHistory(f.path, alice, identities);
+      expect(history.items[0]).not.toHaveProperty('Name');
+      expect(history.items[0]).toMatchObject({
+        Id: '10',
+        Path: '/media/10',
+        ProviderIds: { Tmdb: '987654321', Imdb: 'tt999999991' },
+        UserData: { Played: true, PlayCount: 7, IsFavorite: true },
+      });
+      expect(history.diagnostics.invalid_display_names).toBe(1);
+      expect(snapshotHistoryWarnings(history.diagnostics)).toEqual([
+        '1 invalid saved display names were omitted. Matching still uses media identities and paths.',
+      ]);
+    },
+  );
+
+  it('keeps legacy missing diagnostics quiet and rejects nonnumeric diagnostic output', () => {
+    expect(snapshotHistoryWarnings()).toEqual([]);
+    expect(() =>
+      snapshotHistoryWarnings({ unsupported_state_items: 'private-source' } as never),
+    ).toThrow('invalid format');
+  });
+
+  it.each(['complete', 'watched_only'] as const)(
+    'reports history for removed library items and bounds its indexed lookup in %s mode',
+    (scope) => {
+      const f = fixture();
+      f.database
+        .prepare('INSERT INTO UserDataKeys2(Id,UserDataKey) VALUES (?,?)')
+        .run(900, 'synthetic-removed');
+      f.state(900, 2, { played: 1, playCount: 3 });
+      f.database.close();
+      const projected = join(f.directory, 'orphan-history.db');
+      projectLibrary(f.path, projected);
+      const history = readSnapshotHistory(projected, alice, identities, scope);
+      expect(history.items.map((item) => item.Id)).toEqual(
+        scope === 'complete' ? ['10', '11', '13'] : ['10', '13'],
+      );
+      expect(history.diagnostics.orphan_state_items).toBe(1);
+      expect(snapshotHistoryWarnings(history.diagnostics)).toEqual([
+        '1 saved history entries no longer have a library item. They cannot be matched safely and were not migrated.',
+      ]);
+      expect(() =>
+        readSnapshotHistory(projected, alice, identities, scope, {
+          maxItems: history.items.length,
+        }),
+      ).toThrow('history size');
+      const database = new DatabaseSync(projected, { readOnly: true });
+      const plan = database
+        .prepare(
+          `EXPLAIN QUERY PLAN SELECT 1 FROM UserDatas ud WHERE ud.userId=? AND played=1 AND NOT EXISTS(SELECT 1 FROM MediaItems m WHERE m.UserDataKeyId=ud.UserDataKeyId) LIMIT ?`,
+        )
+        .all(2, 100001)
+        .map((row) => String(row.detail));
+      database.close();
+      expect(plan.join('\n')).not.toMatch(/SCAN |TEMP B-TREE/);
+      expect(plan.join('\n')).toMatch(/JellyportUserDataUser/);
+      expect(plan.join('\n')).toMatch(/JellyportMediaUserDataKey/);
+    },
+  );
 
   it('refuses schema replacements and never creates missing database paths', () => {
     const f = fixture();

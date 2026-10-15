@@ -48,6 +48,22 @@ const status: SourceSnapshotStatus = {
     },
   ],
 };
+const pluginStatus: SourceSnapshotStatus = {
+  ...status,
+  capture_method: 'plugin_backup',
+  last_attempt_at: '2026-10-15T03:05:00Z',
+  last_finished_at: '2026-10-15T03:05:10Z',
+  records: status.records.map((record) => ({
+    ...record,
+    source_type: 'plugin_backup',
+    backup_created_at: '2026-10-14T03:00:00Z',
+    backup_fingerprint: 'a'.repeat(64),
+    plugin_version: '1.8.7.0',
+    started_at: '2026-10-15T03:05:00Z',
+    finished_at: '2026-10-15T03:05:10Z',
+    expires_at: '2026-10-16T03:00:00Z',
+  })),
+};
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -55,6 +71,129 @@ afterEach(() => {
 });
 
 describe('Saved Emby database capture settings', () => {
+  it('shows plugin history age from the original backup and separately labels the later import', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-15T04:00:00Z'));
+    const api: Api = async <T,>() => pluginStatus as T;
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    await screen.findByLabelText('Enable daily backup import');
+    const row = screen.getByText('All Emby users').closest('tr')!;
+    expect(within(row).getByText(new Date('2026-10-14T03:00:00Z').toLocaleString())).toBeTruthy();
+    expect(within(row).getByText('25h 0m old')).toBeTruthy();
+    expect(
+      within(row).getByText(`Imported ${new Date('2026-10-15T03:05:10Z').toLocaleString()}`),
+    ).toBeTruthy();
+    expect(within(row).getByText('Available')).toBeTruthy();
+    expect(
+      screen.getByText(/History expires 48 hours after the original backup time/),
+    ).toBeTruthy();
+    expect(screen.getByText(/Importing an unchanged backup does not make it newer/)).toBeTruthy();
+    expect(screen.getByText(/Jellyport checks stable backup files before importing/)).toBeTruthy();
+    expect(screen.queryByText(/consistent SQLite online backup/)).toBeNull();
+    expect(screen.queryByText(pluginStatus.records[0]!.backup_fingerprint!)).toBeNull();
+  });
+
+  it('retains plugin provenance and backup-age guidance when the active helper uses another method', async () => {
+    const api: Api = async <T,>() =>
+      ({ ...pluginStatus, capture_method: 'sqlite_online_backup' }) as T;
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    await screen.findByText('Emby plugin backup');
+    expect(screen.getByText('SQLite online backup')).toBeTruthy();
+    expect(screen.getByText('Backup age stays with the original backup.')).toBeTruthy();
+    expect(
+      screen.getByText(/History expires 48 hours after the original backup time/),
+    ).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Capture database now' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(screen.queryByRole('button', { name: 'Import latest backup' })).toBeNull();
+  });
+
+  it('expires plugin history at 48 hours even when the backup was imported recently', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-16T03:01:00Z'));
+    const api: Api = async <T,>() =>
+      ({
+        ...pluginStatus,
+        records: pluginStatus.records.map((record) => ({
+          ...record,
+          finished_at: '2026-10-16T03:00:50Z',
+        })),
+      }) as T;
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    await screen.findByText('Expired');
+    expect(screen.getByText('48h 1m old')).toBeTruthy();
+    expect(screen.queryByText('Just now')).toBeNull();
+  });
+
+  it('labels manual import and daily scheduling while using the existing authenticated routes', async () => {
+    const calls: { path: string; options?: ApiOptions }[] = [];
+    const api: Api = async <T,>(path: string, options?: ApiOptions) => {
+      calls.push({ path, options });
+      return pluginStatus as T;
+    };
+    const notify = vi.fn();
+    render(<SourceSnapshotsPanel api={api} notify={notify} demo={false} />);
+    const time = await screen.findByLabelText('Import time');
+    expect(screen.getByLabelText('Enable daily backup import')).toHaveProperty('checked', false);
+    expect(screen.getByText(/This does not change Emby’s backup schedule/)).toBeTruthy();
+    fireEvent.click(screen.getByLabelText('Enable daily backup import'));
+    fireEvent.change(time, { target: { value: '04:15' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save import schedule' }));
+    await waitFor(() => expect(notify).toHaveBeenCalledWith('Backup import schedule saved.'));
+    expect(calls.find((call) => call.options?.method === 'PUT')).toMatchObject({
+      path: '/api/source-snapshots/schedule',
+      options: { body: { enabled: true, hour: 4, minute: 15, expected_revision: 'revision-1' } },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Import latest backup' }));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith('Backup import started. You can follow its status here.'),
+    );
+    expect(calls.find((call) => call.options?.method === 'POST')).toMatchObject({
+      path: '/api/source-snapshots/refresh',
+    });
+  });
+
+  it('reports plugin source failures without exposing paths and keeps existing imports visible', async () => {
+    const api: Api = async <T,>(_path: string, options?: ApiOptions) => {
+      if (options?.method === 'POST') throw new Error('PRIVATE_BACKUP_PATH');
+      return pluginStatus as T;
+    };
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Import latest backup' }));
+    await screen.findByRole('alert');
+    expect(
+      screen.getByText(
+        'Backup import could not start. Check the backup folder and refresh status.',
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText('All Emby users')).toBeTruthy();
+    expect(screen.queryByText('PRIVATE_BACKUP_PATH')).toBeNull();
+  });
+
+  it('shows a plugin-specific unavailable source and disables import when its helper is absent', async () => {
+    const api: Api = async <T,>() => ({ ...pluginStatus, available: false }) as T;
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    await screen.findByText('Emby backup source is unavailable.');
+    expect(screen.getByRole('button', { name: 'Import latest backup' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(screen.getByText(/Configure the backup folder using/)).toBeTruthy();
+  });
+
+  it('carries original backup and import dates separately into migration review and result notes', () => {
+    render(<SourceSnapshotNote snapshot={pluginStatus.records[0]!} />);
+    const note = screen.getByText(/Saved Emby plugin backup/);
+    expect(note.textContent).toContain(
+      `backed up ${new Date('2026-10-14T03:00:00Z').toLocaleString()}`,
+    );
+    expect(note.textContent).toContain(
+      `Imported ${new Date('2026-10-15T03:05:10Z').toLocaleString()}`,
+    );
+    expect(note.textContent).toContain('importing it again does not refresh its history');
+    expect(note.textContent).not.toContain('Read window');
+  });
+
   it('labels the active file-copy helper and retained copies without promising transactional history', async () => {
     const copied: SourceSnapshotStatus = {
       ...status,

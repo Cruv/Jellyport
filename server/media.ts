@@ -283,6 +283,21 @@ function writableUserData(value: unknown, requireFields = false): MediaUserDataP
   return body;
 }
 
+/** Retain matching fields and writable activity, rather than a destination's complete item DTO. */
+function projectMigrationItem(value: unknown): MediaItem {
+  if (!isObject(value)) return projectCatalogItem(value);
+  const name = value.Name;
+  const invalidName =
+    name !== undefined &&
+    name !== null &&
+    (typeof name !== 'string' || name.length > 2048 || /[\u0000-\u001f\u007f]/.test(name));
+  // A label cannot change matching identity or activity. Keep every identity field strict.
+  const projected = projectCatalogItem(invalidName ? { ...value, Name: undefined } : value);
+  if (value.UserData !== undefined && value.UserData !== null)
+    projected.UserData = writableUserData(value.UserData);
+  return projected;
+}
+
 /** Accept small raster avatars only; PNG/JPEG dimensions also bound decompression work. */
 function validateImage(image: MediaUserImage): MediaUserImage {
   const invalid = () => new MediaError('The profile image is not a supported small PNG or JPEG.');
@@ -654,6 +669,7 @@ export class MediaClient implements MediaAPI {
     expanded = false,
     watchedOnly = false,
     catalogOnly = false,
+    migrationProjection = false,
   ): Promise<MediaItem[]> {
     const path = userId !== undefined ? `Users/${this.id(userId)}/Items` : 'Items';
     const items: MediaItem[] = [];
@@ -665,6 +681,7 @@ export class MediaClient implements MediaAPI {
       throw new MediaError('Invalid media pagination size.');
     const pageSize = Math.min(this.kind === 'emby' ? 100 : 500, this.pageSize);
     while (true) {
+      if (migrationProjection) await this.yieldRead();
       const params = {
         IncludeItemTypes: itemTypes,
         Recursive: 'true',
@@ -693,7 +710,11 @@ export class MediaClient implements MediaAPI {
         throw new MediaError(`${this.label} returned library items without identifiers.`);
       if (data.Items.length > pageSize)
         throw new MediaError(`${this.label} returned an oversized library page.`);
-      const page = catalogOnly ? data.Items.map(projectCatalogItem) : (data.Items as MediaItem[]);
+      const page = catalogOnly
+        ? data.Items.map(projectCatalogItem)
+        : migrationProjection
+          ? data.Items.map(projectMigrationItem)
+          : (data.Items as MediaItem[]);
       // With counting disabled, some servers report only this page's size (or zero).
       // Keep the first requested total instead of treating those later values as an end.
       if (
@@ -889,15 +910,24 @@ export class MediaClient implements MediaAPI {
 
   /** Reads per-user state beyond movies/episodes without requesting image or media streams. */
   async migrationItems(userId?: string): Promise<MediaItem[]> {
-    const items = await this.itemsByType(userId, MIGRATION_ITEM_TYPES, true);
+    const compact = this.kind === 'jellyfin';
+    const items = await this.itemsByType(userId, MIGRATION_ITEM_TYPES, true, false, false, compact);
     const providers = new Map(
       items
         .filter((item) => item.Type === 'Series' && isObject(item.ProviderIds))
         .map((item) => [item.Id, item.ProviderIds!]),
     );
-    for (const item of items) {
+    let retainedBytes = 0;
+    for (let index = 0; index < items.length; index++) {
+      if (compact && index % 1000 === 0) await this.yieldRead();
+      const item = items[index]!;
       const values = item.SeriesId ? providers.get(item.SeriesId) : undefined;
       if (values && !item.SeriesProviderIds) item.SeriesProviderIds = structuredClone(values);
+      if (compact) {
+        retainedBytes += Buffer.byteLength(JSON.stringify(item));
+        if (retainedBytes > MAX_CATALOG_BYTES)
+          throw new MediaError(`${this.label} catalog exceeds the supported migration size.`);
+      }
     }
     return items;
   }

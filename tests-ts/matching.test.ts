@@ -515,6 +515,35 @@ describe('conservative media matching', () => {
     const movie = item('movie', { ProviderIds: source.ProviderIds });
     expect(matchItems([movie], [item('t', { ...movie, Id: 't' })]).matches).toEqual([]);
   });
+  it('canonicalizes Tmdb collection IDs only inside BoxSet identity without needing a path', () => {
+    const source = item('source-set', { Type: 'BoxSet', ProviderIds: { Tmdb: '100' } });
+    const target = item('target-set', { Type: 'BoxSet', ProviderIds: { TmdbCollection: '100' } });
+    const movie = item('movie', { Type: 'Movie', ProviderIds: { Tmdb: '100' } });
+    expect(matchItems([source], [target, movie]).matches).toEqual([
+      { source, target, method: 'provider_id' },
+    ]);
+    expect(matchItems([target], [source, movie]).matches).toEqual([
+      { source: target, target: source, method: 'provider_id' },
+    ]);
+    expect(matchItems([source], [movie]).unmatched).toEqual([source]);
+    expect(matchItems([movie], [source, target]).unmatched).toEqual([movie]);
+  });
+  it('keeps contradictory Tmdb and TmdbCollection aliases ambiguous in either direction', () => {
+    const source = item('source-set', {
+      Type: 'BoxSet',
+      Path: '/same',
+      ProviderIds: { Tmdb: '100', TmdbCollection: '200' },
+    });
+    const target = item('target-set', {
+      Type: 'BoxSet',
+      Path: '/same',
+      ProviderIds: { TmdbCollection: '100' },
+    });
+    expect(matchItems([source], [target]).ambiguous).toEqual([{ source, candidates: [target] }]);
+    expect(matchItems([target], [source]).ambiguous).toEqual([
+      { source: target, candidates: [source] },
+    ]);
+  });
   it('matches book metadata while keeping case-sensitive Google Books IDs distinct', () => {
     for (const ProviderIds of [{ ISBN: '978-1-4028-9462-6' }, { ComicVine: '123' }]) {
       const source = item('s', { Type: 'Book', ProviderIds });

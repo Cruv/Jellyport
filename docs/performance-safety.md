@@ -248,8 +248,12 @@ creation, decryption, subprocess startup, matching and Jellyfin API work are
 excluded. Every destination account still requires its permission-scoped catalog
 read, and every potential change still needs fresh state before a write. Those
 network operations can dominate total duration; higher write concurrency is not
-assumed safe. Completed plugin-backup import remains pending format/completion
-verification as described in [the plugin guide](emby-plugin-backups.md).
+assumed safe. Verified full-backup history imports are available as described in
+[the plugin guide](emby-plugin-backups.md). They use the same local projection,
+indexed reads, bounded matching and merge safeguards. Plugin imports never query
+live SQLite; original backup age, source identity, strict copy stability and
+integrity are checked before adoption. Importing the same generation preserves
+its original age and does not accumulate duplicate retained projections.
 
 ## Observability and verification
 

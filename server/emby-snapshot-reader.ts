@@ -99,7 +99,7 @@ function withDatabase<T>(path: string, read: (database: DatabaseSync) => T): T {
 function requireTable(
   database: DatabaseSync,
   name: string,
-  columns: Record<string, [string, number]>,
+  columns: Record<string, [string | readonly string[], number]>,
 ): void {
   const table = database
     .prepare('SELECT type,substr(sql,1,65537) AS sql FROM sqlite_master WHERE name=?')
@@ -116,7 +116,8 @@ function requireTable(
   const fields = database.prepare(`PRAGMA table_info(${name})`).all();
   for (const [column, [type, primaryKey]] of Object.entries(columns)) {
     const field = fields.find((value) => value.name === column);
-    if (!field || String(field.type).toUpperCase() !== type || field.pk !== primaryKey)
+    const types = typeof type === 'string' ? [type] : type;
+    if (!field || !types.includes(String(field.type).toUpperCase()) || field.pk !== primaryKey)
       throw invalid();
   }
 }
@@ -132,19 +133,40 @@ function validateLibrary(database: DatabaseSync): void {
     IndexNumber: ['INT', 0],
     ParentIndexNumber: ['INT', 0],
     IndexNumberEnd: ['INT', 0],
-    RunTimeTicks: ['INTEGER', 0],
+    // Fresh installs use SQLite STRICT declarations; upgraded installations
+    // retain Emby's older, affinity-equivalent declarations at this version.
+    RunTimeTicks: [['INTEGER', 'BIGINT'], 0],
     UserDataKeyId: ['INT', 0],
   });
+  const stateFields = database.prepare('PRAGMA table_info(UserDatas)').all();
+  const declaredPrimaryKey = stateFields.find((field) => field.name === 'UserDataKeyId')?.pk === 1;
+  const primaryFields = stateFields.filter((field) => Number(field.pk) > 0);
+  if (declaredPrimaryKey ? primaryFields.length !== 2 : primaryFields.length !== 0) throw invalid();
   requireTable(database, 'UserDatas', {
-    UserDataKeyId: ['INT', 1],
-    userId: ['INT', 2],
-    rating: ['REAL', 0],
-    played: ['INT', 0],
+    UserDataKeyId: ['INT', declaredPrimaryKey ? 1 : 0],
+    userId: ['INT', declaredPrimaryKey ? 2 : 0],
+    rating: [['REAL', 'FLOAT'], 0],
+    played: [['INT', 'BIT'], 0],
     playCount: ['INT', 0],
-    isFavorite: ['INT', 0],
-    playbackPositionTicks: ['INTEGER', 0],
+    isFavorite: [['INT', 'BIT'], 0],
+    playbackPositionTicks: [['INTEGER', 'BIGINT'], 0],
     LastPlayedDateInt: ['INT', 0],
   });
+  if (!declaredPrimaryKey) {
+    // The verified upgraded 4.10.1.0 schema enforces the same composite key
+    // through a non-partial unique index rather than a declared primary key.
+    const indexes = database.prepare('PRAGMA index_list(UserDatas)').all();
+    const unique = indexes.some((index) => {
+      if (index.unique !== 1 || index.partial !== 0 || typeof index.name !== 'string') return false;
+      const fields = database
+        .prepare('SELECT name FROM pragma_index_info(?) ORDER BY seqno')
+        .all(index.name);
+      return (
+        fields.length === 2 && fields[0]?.name === 'UserDataKeyId' && fields[1]?.name === 'userId'
+      );
+    });
+    if (!unique) throw invalid();
+  }
 }
 
 function integer(value: unknown, min = 0, max = Number.MAX_SAFE_INTEGER): number {
@@ -184,7 +206,7 @@ function providerIds(value: unknown): Record<string, string> | undefined {
 /** Reads only the two identity columns; password/configuration JSON is never selected. */
 export function readUserIdentities(path: string): Record<string, number> {
   return withDatabase(path, (database) => {
-    requireTable(database, 'LocalUsersv2', { Id: ['INTEGER', 1], guid: ['BLOB', 0] });
+    requireTable(database, 'LocalUsersv2', { Id: ['INTEGER', 1], guid: [['BLOB', 'GUID'], 0] });
     const query = database.prepare('SELECT Id,substr(guid,1,17) AS guid FROM LocalUsersv2 LIMIT ?');
     query.setReadBigInts(true);
     const identities: Record<string, number> = {};
@@ -274,13 +296,51 @@ export function projectLibrary(rawPath: string, outputPath: string): void {
 }
 
 /** Works on an isolated completed library backup, never Emby's live database path. */
-export function readSnapshotItems(
+export interface SnapshotHistoryDiagnostics {
+  unsupported_state_items: number;
+  invalid_resume_positions: number;
+  invalid_display_names: number;
+  /** Absent on older saved diagnostics. */
+  orphan_state_items?: number;
+}
+
+export interface SnapshotHistoryResult {
+  items: MediaItem[];
+  diagnostics: SnapshotHistoryDiagnostics;
+}
+
+/** Fixed labels and aggregate counts only; never include source metadata or IDs. */
+export function snapshotHistoryWarnings(diagnostics?: SnapshotHistoryDiagnostics): string[] {
+  if (!diagnostics) return [];
+  for (const count of Object.values(diagnostics))
+    if (count !== undefined) integer(count, 0, MAX_USER_ITEMS);
+  const warnings: string[] = [];
+  if (diagnostics.unsupported_state_items)
+    warnings.push(
+      `${diagnostics.unsupported_state_items} saved history entries use unsupported media types. Their state was not migrated; supported history is preserved.`,
+    );
+  if (diagnostics.invalid_resume_positions)
+    warnings.push(
+      `${diagnostics.invalid_resume_positions} invalid saved resume positions were omitted. Valid watched flags, counts, dates and favorites are preserved.`,
+    );
+  if (diagnostics.invalid_display_names)
+    warnings.push(
+      `${diagnostics.invalid_display_names} invalid saved display names were omitted. Matching still uses media identities and paths.`,
+    );
+  if (diagnostics.orphan_state_items)
+    warnings.push(
+      `${diagnostics.orphan_state_items} saved history entries no longer have a library item. They cannot be matched safely and were not migrated.`,
+    );
+  return warnings;
+}
+
+export function readSnapshotHistory(
   path: string,
   publicUserId: string,
   identities: Record<string, number>,
   scope: MigrationScope = 'complete',
   limits: { maxItems?: number; maxBytes?: number } = {},
-): MediaItem[] {
+): SnapshotHistoryResult {
   if (!['complete', 'watched_only'].includes(scope))
     throw new ServiceError('Choose a valid migration scope.');
   if (
@@ -308,6 +368,12 @@ export function readSnapshotItems(
       LIMIT ?`);
     query.setReadBigInts(true);
     const items: MediaItem[] = [];
+    const diagnostics: SnapshotHistoryDiagnostics = {
+      unsupported_state_items: 0,
+      invalid_resume_positions: 0,
+      invalid_display_names: 0,
+      orphan_state_items: 0,
+    };
     let bytes = 2; // JSON array brackets; reserve commas as items are appended.
     let rows = 0;
     for (const row of query.iterate(userId, maxItems + 1)) {
@@ -316,16 +382,22 @@ export function readSnapshotItems(
       const typeCode = integer(row.type);
       if (excludedTypes.has(typeCode)) continue;
       const type = itemTypes[typeCode];
-      if (!type)
-        throw new ServiceError(
-          'This Emby snapshot contains personal state for an unsupported media type. Use a live migration for this account.',
-        );
+      if (!type) {
+        diagnostics.unsupported_state_items++;
+        continue;
+      }
       if (scope === 'watched_only' && !playableTypes.has(type)) continue;
       const data: MediaUserDataPatch = { Played: flag(row.played) };
       if (scope === 'complete') {
         data.PlayCount = integer(row.playCount, 0, 2_147_483_647);
         data.IsFavorite = flag(row.isFavorite);
-        data.PlaybackPositionTicks = integer(row.playbackPositionTicks);
+        try {
+          data.PlaybackPositionTicks = integer(row.playbackPositionTicks);
+        } catch {
+          // Omit an invalid position rather than inventing a zero that could
+          // erase destination progress. Other valid personal state survives.
+          diagnostics.invalid_resume_positions++;
+        }
         if (row.rating !== null) {
           if (
             typeof row.rating !== 'number' ||
@@ -342,8 +414,15 @@ export function readSnapshotItems(
         data.LastPlayedDate = new Date(seconds * 1000).toISOString();
       }
       const item: MediaItem = { Id: String(integer(row.Id, 1)), Type: type, UserData: data };
-      const name = text(row.Name, 1_024),
-        path = text(row.Path, 8_192);
+      let name: string | undefined;
+      try {
+        name = text(row.Name, 1_024);
+      } catch {
+        // Labels do not establish identity. A malformed label must not prevent
+        // migrating valid state matched by providers, series numbers or paths.
+        diagnostics.invalid_display_names++;
+      }
+      const path = text(row.Path, 8_192);
       if (name !== undefined) item.Name = name;
       if (path !== undefined) item.Path = path;
       const providers = providerIds(row.ProviderIds),
@@ -358,10 +437,34 @@ export function readSnapshotItems(
         throw new ServiceError('This Emby snapshot exceeds the supported per-user history size.');
       items.push(item);
     }
+    // Removed media can leave legitimate history keys behind. Count these
+    // separately instead of silently hiding them in the catalog join. Both
+    // lookups use projection indexes; iteration/limit keep this work bounded.
+    const orphans = database.prepare(`
+      SELECT 1 FROM UserDatas ud
+      WHERE ud.userId=? AND ${scope === 'watched_only' ? 'played=1' : `(${personalState})`}
+        AND NOT EXISTS (SELECT 1 FROM MediaItems m WHERE m.UserDataKeyId=ud.UserDataKeyId)
+      LIMIT ?`);
+    for (const _row of orphans.iterate(userId, maxItems - rows + 1)) {
+      diagnostics.orphan_state_items!++;
+      if (++rows > maxItems)
+        throw new ServiceError('This Emby snapshot exceeds the supported per-user history size.');
+    }
     // CROSS JOIN keeps per-user state ahead of catalog lookups. Do not sort in
     // SQLite: a temporary sort must finish before iteration and may process a
     // user's entire history before the row/byte ceiling can reject it. Preserve
     // deterministic item-ID order only after accepting the bounded result.
-    return items.sort((left, right) => Number(left.Id) - Number(right.Id));
+    return { items: items.sort((left, right) => Number(left.Id) - Number(right.Id)), diagnostics };
   });
+}
+
+/** Compatibility convenience for local tooling; application reads also report diagnostics. */
+export function readSnapshotItems(
+  path: string,
+  publicUserId: string,
+  identities: Record<string, number>,
+  scope: MigrationScope = 'complete',
+  limits: { maxItems?: number; maxBytes?: number } = {},
+): MediaItem[] {
+  return readSnapshotHistory(path, publicUserId, identities, scope, limits).items;
 }

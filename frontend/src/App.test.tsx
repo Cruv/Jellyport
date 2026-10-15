@@ -2,7 +2,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import App from './App';
-import type { Job, Session, Settings, SetupConnection, SourceSnapshotMetadata } from './types';
+import type {
+  Job,
+  Session,
+  Settings,
+  SetupConnection,
+  SourceSnapshotMetadata,
+  SourceSnapshotStatus,
+} from './types';
 
 const session: Session = {
   authenticated: true,
@@ -185,6 +192,161 @@ async function selectAndPreview() {
   await screen.findByText('Preparing migration review… 0 of 2 users complete.');
 }
 describe('React account safeguards', () => {
+  it('defaults plugin migrations to saved history even before any backup has been imported', async () => {
+    prepareRunningPreview();
+    responses['/api/source-snapshots'] = {
+      ...(responses['/api/source-snapshots'] as SourceSnapshotStatus),
+      capture_method: 'plugin_backup',
+      available: false,
+    };
+    responses['/api/migrations/preview'] = {
+      id: 'missing-backup-preview',
+      status: 'failed',
+      error: 'No completed database capture is available. Import an Emby backup first.',
+    };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    const choice = await screen.findByLabelText('Use saved Emby snapshot');
+    await waitFor(() => expect(choice).toHaveProperty('checked', true));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+    await screen.findByText(
+      'No completed database capture is available. Import an Emby backup first.',
+    );
+    const preview = requests.find((request) => request.path === '/api/migrations/preview')!;
+    expect(JSON.parse(String(preview.options?.body)).use_snapshots).toBe(true);
+    expect(requests.filter((request) => request.path === '/api/source-snapshots')).toHaveLength(1);
+    expect(requests.some((request) => request.path === '/api/source-snapshots/refresh')).toBe(
+      false,
+    );
+  });
+
+  it.each(['sqlite_online_backup', 'file_copy', undefined] as const)(
+    'keeps the existing live default for a verified legacy source mode (%s)',
+    async (capture_method) => {
+      prepareRunningPreview();
+      responses['/api/source-snapshots'] = {
+        ...(responses['/api/source-snapshots'] as SourceSnapshotStatus),
+        capture_method,
+      };
+      render(<App />);
+      fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+      await screen.findByLabelText('Use saved Emby snapshot');
+      await waitFor(() =>
+        expect(screen.queryByText('Checking history source settings…')).toBeNull(),
+      );
+      expect(screen.getByLabelText('Use saved Emby snapshot')).toHaveProperty('checked', false);
+    },
+  );
+
+  it.each(['failed', 'unsupported', 'unobserved'] as const)(
+    'requires an explicit source choice when history defaults cannot be verified (%s)',
+    async (mode) => {
+      prepareRunningPreview();
+      responses['/api/migrations/preview'] = {
+        id: 'explicit-live-preview',
+        status: 'failed',
+        error: 'Fixture preview stopped.',
+      };
+      if (mode === 'failed') {
+        statuses['/api/source-snapshots'] = 500;
+        responses['/api/source-snapshots'] = { detail: 'PRIVATE_SOURCE_DETAIL' };
+      } else if (mode === 'unsupported')
+        responses['/api/source-snapshots'] = {
+          snapshots: 0,
+          records: [],
+          capture_method: 'unknown-method',
+        };
+      else
+        responses['/api/source-snapshots'] = {
+          ...(responses['/api/source-snapshots'] as SourceSnapshotStatus),
+          history_source_known: false,
+        };
+      render(<App />);
+      fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+      await screen.findByText('History source settings could not be loaded.');
+      fireEvent.click(
+        await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+      expect(requests.some((request) => request.path === '/api/migrations/preview')).toBe(false);
+      expect(screen.queryByText('PRIVATE_SOURCE_DETAIL')).toBeNull();
+      fireEvent.click(screen.getByRole('button', { name: 'Use live Emby reads' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+      await screen.findByText('Fixture preview stopped.');
+      const preview = requests.find((request) => request.path === '/api/migrations/preview')!;
+      expect(JSON.parse(String(preview.options?.body))).not.toHaveProperty('use_snapshots');
+    },
+  );
+
+  it.each([true, false])(
+    'does not override an explicit source choice when defaults arrive late (saved=%s)',
+    async (saved) => {
+      prepareRunningPreview();
+      const transport = vi.mocked(fetch).getMockImplementation()!;
+      let release!: (value: Response) => void;
+      vi.mocked(fetch).mockImplementation(async (input, options) => {
+        if (String(input) !== '/api/source-snapshots') return transport(input, options);
+        requests.push({ path: String(input), options });
+        return new Promise<Response>((resolve) => {
+          release = resolve;
+        });
+      });
+      render(<App />);
+      fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+      await screen.findByLabelText('Use saved Emby snapshot');
+      expect(screen.getByText('Checking history source settings…')).toBeTruthy();
+      if (saved) fireEvent.click(screen.getByLabelText('Use saved Emby snapshot'));
+      else fireEvent.click(screen.getByRole('button', { name: 'Use live Emby reads' }));
+      await act(async () =>
+        release(
+          new Response(
+            JSON.stringify({
+              ...(responses['/api/source-snapshots'] as SourceSnapshotStatus),
+              capture_method: saved ? 'sqlite_online_backup' : 'plugin_backup',
+            }),
+          ),
+        ),
+      );
+      expect(screen.getByLabelText('Use saved Emby snapshot')).toHaveProperty('checked', saved);
+      expect(screen.queryByText('Checking history source settings…')).toBeNull();
+    },
+  );
+
+  it('aborts a pending history-source lookup on navigation away without adopting its late defaults', async () => {
+    prepareRunningPreview();
+    const transport = vi.mocked(fetch).getMockImplementation()!;
+    let release!: (value: Response) => void;
+    let signal: AbortSignal | null | undefined;
+    vi.mocked(fetch).mockImplementation(async (input, options) => {
+      if (String(input) !== '/api/source-snapshots') return transport(input, options);
+      requests.push({ path: String(input), options });
+      signal = options?.signal;
+      return new Promise<Response>((resolve) => {
+        release = resolve;
+      });
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    await screen.findByLabelText('Use saved Emby snapshot');
+    fireEvent.click(
+      within(screen.getByRole('navigation')).getByRole('button', { name: 'Overview' }),
+    );
+    await screen.findByText('Everyone’s next chapter.');
+    expect(signal?.aborted).toBe(true);
+    await act(async () =>
+      release(
+        new Response(
+          JSON.stringify({
+            ...(responses['/api/source-snapshots'] as SourceSnapshotStatus),
+            capture_method: 'plugin_backup',
+          }),
+        ),
+      ),
+    );
+    expect(screen.queryByText('History source settings could not be loaded.')).toBeNull();
+  });
+
   it('loads editable tier defaults and only saves their definitions without provisioning accounts', async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));

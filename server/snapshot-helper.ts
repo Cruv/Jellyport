@@ -12,15 +12,19 @@ import {
   snapshotId,
   snapshotKey,
   snapshotCaptureMethod,
+  snapshotIdentitiesMatch,
   writeEnvelope,
   type CaptureRequest,
   type CaptureResult,
 } from './snapshot-files.js';
 
 const directory = process.env.JELLYPORT_SNAPSHOT_DIR;
-const source = process.env.JELLYPORT_EMBY_DATA_DIR;
 const workDirectory = process.env.JELLYPORT_SNAPSHOT_WORK_DIR;
 const captureMethod = snapshotCaptureMethod(process.env.JELLYPORT_SNAPSHOT_METHOD);
+const source =
+  captureMethod === 'plugin_backup'
+    ? process.env.JELLYPORT_EMBY_BACKUP_DIR
+    : process.env.JELLYPORT_EMBY_DATA_DIR;
 if (
   !directory ||
   !source ||
@@ -28,7 +32,7 @@ if (
   process.env.JELLYPORT_EMBY_VERSION !== SNAPSHOT_VERSION
 )
   throw new Error(
-    'Configure snapshot directory, local Emby data mount and supported Emby version.',
+    'Configure snapshot exchange, private work directory, the selected Emby source mount and supported version.',
   );
 process.umask(0o077);
 await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -122,7 +126,7 @@ while (!stopping) {
       try {
         if (snapshotCaptureMethod(request.capture_method) !== captureMethod)
           throw new Error('The helper capture method changed. Request a new capture.');
-        await sourceIdentity(request.binding.server_id);
+        if (captureMethod !== 'plugin_backup') await sourceIdentity(request.binding.server_id);
         temporary = await mkdtemp(join(workDirectory, `capture-${id}-`));
         const output = join(temporary, 'library.db');
         const value = await snapshotProcess<{
@@ -130,18 +134,18 @@ while (!stopping) {
           schema: string;
           bytes: number;
         }>(
-          { operation: 'capture', directory: source, output, capture_method: captureMethod },
+          {
+            operation: 'capture',
+            directory: source,
+            output,
+            capture_method: captureMethod,
+            server_id: request.binding.server_id,
+          },
           controller.signal,
         );
-        if (
-          !request.user_ids?.length ||
-          request.user_ids.length > 1000 ||
-          request.user_ids.some(
-            (id) => typeof id !== 'string' || !Object.hasOwn(value.identities, id),
-          )
-        )
+        if (!snapshotIdentitiesMatch(value.identities, request.user_ids, captureMethod))
           throw new Error('The mounted database does not contain the requested users.');
-        await sourceIdentity(request.binding.server_id);
+        if (captureMethod !== 'plugin_backup') await sourceIdentity(request.binding.server_id);
         await encryptDatabase(
           output,
           join(directory, `${id}.db.enc.pending`),

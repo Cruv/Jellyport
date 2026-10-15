@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from 'node:util';
 import {
   inspectLibrary,
   projectLibrary,
-  readSnapshotItems,
+  readSnapshotHistory,
   readUserIdentities,
 } from './emby-snapshot-reader.js';
 import {
@@ -15,6 +15,7 @@ import {
   type SnapshotCaptureMethod,
 } from './snapshot-files.js';
 import { captureFileCopy } from './snapshot-copy.js';
+import { importPluginBackup } from './plugin-backup.js';
 import type { MigrationScope } from './migration.js';
 
 type Request =
@@ -23,6 +24,7 @@ type Request =
       directory: string;
       output: string;
       capture_method?: SnapshotCaptureMethod;
+      server_id?: string;
     }
   | {
       operation: 'read';
@@ -50,17 +52,21 @@ process.once('message', (request: Request) => {
 });
 async function run(request: Request): Promise<unknown> {
   if (request.operation === 'read') {
-    const items = readSnapshotItems(
+    const history = readSnapshotHistory(
       request.path,
       request.user_id,
       request.identities,
       request.scope,
     );
-    if (Buffer.byteLength(JSON.stringify(items)) > 32 * 1024 * 1024)
+    if (Buffer.byteLength(JSON.stringify(history.items)) > 32 * 1024 * 1024)
       throw new Error('Result too large.');
-    return items;
+    return history;
   }
   if (request.operation !== 'capture') throw new Error('Unknown operation.');
+  if (snapshotCaptureMethod(request.capture_method) === 'plugin_backup') {
+    if (!request.server_id) throw new Error('A verified source server identity is required.');
+    return importPluginBackup(request.directory, request.output, request.server_id);
+  }
   if (snapshotCaptureMethod(request.capture_method) === 'file_copy')
     return captureFileCopy(request.directory, request.output);
   const path = join(request.directory, 'library.db');

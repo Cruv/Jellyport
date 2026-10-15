@@ -8,10 +8,13 @@ export const snapshotId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{
 export const SNAPSHOT_VERSION = '4.10.1.0';
 export const MAX_SNAPSHOT_BYTES = 8 * 1024 ** 3;
 export const CAPTURE_DEADLINE = 5 * 60_000;
-export type SnapshotCaptureMethod = 'sqlite_online_backup' | 'file_copy';
+export const SNAPSHOT_MAX_AGE = 48 * 60 * 60_000;
+export const SNAPSHOT_PLUGIN_VERSION = '1.8.7.0';
+export type SnapshotCaptureMethod = 'sqlite_online_backup' | 'file_copy' | 'plugin_backup';
 export function snapshotCaptureMethod(value: unknown): SnapshotCaptureMethod {
   if (value === undefined || value === 'sqlite_online_backup') return 'sqlite_online_backup';
   if (value === 'file_copy') return 'file_copy';
+  if (value === 'plugin_backup') return 'plugin_backup';
   throw new Error('Unsupported snapshot capture method.');
 }
 const aad = Buffer.from('Jellyport SQLite snapshot v1');
@@ -139,7 +142,57 @@ export interface CaptureResult extends CaptureRequest {
   item_count?: number;
   schema?: string;
   identities?: Record<string, number>;
+  backup_created_at?: string;
+  backup_fingerprint?: string;
+  plugin_version?: string;
   error?: string;
+}
+
+/** Preserve source history age independently of when a completed backup was imported. */
+export function snapshotHistoryTime(value: CaptureResult): string {
+  if (snapshotCaptureMethod(value.capture_method) !== 'plugin_backup') return value.finished_at;
+  if (
+    value.plugin_version !== SNAPSHOT_PLUGIN_VERSION ||
+    typeof value.backup_fingerprint !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(value.backup_fingerprint) ||
+    typeof value.backup_created_at !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,7})?Z$/.test(value.backup_created_at) ||
+    !Number.isFinite(Date.parse(value.backup_created_at)) ||
+    new Date(value.backup_created_at).toISOString().slice(0, 19) !==
+      value.backup_created_at.slice(0, 19)
+  )
+    throw new Error('Unsupported plugin backup metadata.');
+  return value.backup_created_at;
+}
+
+/** A completed backup may predate new accounts; every selected account is checked again. */
+export function snapshotIdentitiesMatch(
+  identities: unknown,
+  userIds: string[] | undefined,
+  method: SnapshotCaptureMethod,
+): identities is Record<string, number> {
+  if (
+    userIds !== undefined &&
+    (!Array.isArray(userIds) ||
+      !userIds.length ||
+      userIds.length > 1000 ||
+      userIds.some((user) => typeof user !== 'string' || !/^[a-f0-9]{32}$/.test(user)))
+  )
+    return false;
+  if (!identities || Array.isArray(identities) || typeof identities !== 'object') return false;
+  const entries = Object.entries(identities);
+  if (
+    !entries.length ||
+    entries.length > 1000 ||
+    entries.some(
+      ([user, local]) => !/^[a-f0-9]{32}$/.test(user) || !Number.isSafeInteger(local) || local < 1,
+    ) ||
+    new Set(entries.map(([, local]) => local)).size !== entries.length
+  )
+    return false;
+  return method === 'plugin_backup'
+    ? !!userIds?.some((user) => Object.hasOwn(identities, user))
+    : !userIds?.some((user) => !Object.hasOwn(identities, user));
 }
 
 function recoveredRequest(value: CaptureRequest, id: string): CaptureRequest {
@@ -200,14 +253,17 @@ async function completedCapture(
       !Number.isSafeInteger(value.bytes) ||
       value.bytes! < 1 ||
       value.bytes! > MAX_SNAPSHOT_BYTES ||
-      !value.identities ||
-      Array.isArray(value.identities) ||
-      typeof value.identities !== 'object' ||
-      Object.entries(value.identities).some(
-        ([user, local]) =>
-          !/^[a-f0-9]{32}$/.test(user) || !Number.isSafeInteger(local) || local < 1,
-      ) ||
-      request.user_ids?.some((user) => !Object.hasOwn(value.identities!, user))
+      !snapshotIdentitiesMatch(
+        value.identities,
+        request.user_ids,
+        snapshotCaptureMethod(value.capture_method),
+      )
+    )
+      return false;
+    const sourceTime = Date.parse(snapshotHistoryTime(value));
+    if (
+      snapshotCaptureMethod(value.capture_method) === 'plugin_backup' &&
+      (Date.now() - sourceTime > SNAPSHOT_MAX_AGE || sourceTime > Date.now() + 60_000)
     )
       return false;
     const path = join(directory, `${request.id}.db.enc`);

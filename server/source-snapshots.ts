@@ -13,16 +13,19 @@ import {
   snapshotId,
   snapshotKey,
   snapshotCaptureMethod,
+  snapshotHistoryTime,
+  snapshotIdentitiesMatch,
   writeEnvelope,
   SNAPSHOT_VERSION,
   MAX_SNAPSHOT_BYTES,
+  SNAPSHOT_MAX_AGE,
   type CaptureRequest,
   type CaptureResult,
   type SnapshotBinding,
   type SnapshotCaptureMethod,
 } from './snapshot-files.js';
 
-const MAX_AGE = 48 * 60 * 60_000;
+const MAX_AGE = SNAPSHOT_MAX_AGE;
 const CLEANUP_ERROR =
   'Temporary snapshot cleanup failed. Clear saved data or review private storage permissions.';
 interface Config {
@@ -51,9 +54,19 @@ export interface SnapshotMetadata {
   avatar: boolean;
   source_type: SnapshotCaptureMethod;
   schema: string;
+  backup_created_at?: string;
+  backup_fingerprint?: string;
+  plugin_version?: string;
+  diagnostics?: {
+    unsupported_state_items: number;
+    invalid_resume_positions: number;
+    invalid_display_names: number;
+    orphan_state_items?: number;
+  };
 }
 interface State {
   config: Config;
+  last_capture_method?: SnapshotCaptureMethod;
   active?: CaptureRequest;
   generations: string[];
   last_attempt_at: string | null;
@@ -135,7 +148,12 @@ export class SourceSnapshots {
         Math.abs(Date.now() - Date.parse(status.updated_at)) < 20_000
       ))
         return null;
-      return { capture_method: snapshotCaptureMethod(status.capture_method) };
+      const capture_method = snapshotCaptureMethod(status.capture_method);
+      if (this.state.last_capture_method !== capture_method) {
+        this.state.last_capture_method = capture_method;
+        this.save();
+      }
+      return { capture_method };
     } catch {
       return null;
     }
@@ -153,7 +171,11 @@ export class SourceSnapshots {
         value.id !== id ||
         value.binding.version !== SNAPSHOT_VERSION ||
         value.schema !== 'emby-4.10.1.0' ||
-        !value.identities ||
+        !snapshotIdentitiesMatch(
+          value.identities,
+          value.user_ids,
+          snapshotCaptureMethod(value.capture_method),
+        ) ||
         typeof value.bytes !== 'number' ||
         !Number.isSafeInteger(value.bytes) ||
         value.bytes < 1 ||
@@ -163,7 +185,7 @@ export class SourceSnapshots {
         Date.parse(value.finished_at) < Date.parse(value.started_at)
       )
         throw new Error('Invalid capture.');
-      snapshotCaptureMethod(value.capture_method);
+      snapshotHistoryTime(value);
       const database = await lstat(join(this.directory, `${id}.db.enc`));
       if (!database.isFile() || database.isSymbolicLink() || database.size !== value.bytes + 28)
         throw new Error('Missing or changed capture.');
@@ -189,7 +211,7 @@ export class SourceSnapshots {
       scope: 'complete',
       started_at: value.started_at,
       finished_at: value.finished_at,
-      expires_at: new Date(Date.parse(value.finished_at) + MAX_AGE).toISOString(),
+      expires_at: new Date(Date.parse(snapshotHistoryTime(value)) + MAX_AGE).toISOString(),
       items: value.item_count ?? 0,
       playlists: 0,
       playlist_entries: 0,
@@ -197,6 +219,13 @@ export class SourceSnapshots {
       avatar: false,
       source_type: snapshotCaptureMethod(value.capture_method),
       schema: value.schema!,
+      ...(snapshotCaptureMethod(value.capture_method) === 'plugin_backup'
+        ? {
+            backup_created_at: value.backup_created_at,
+            backup_fingerprint: value.backup_fingerprint,
+            plugin_version: value.plugin_version,
+          }
+        : {}),
     };
   }
   async status() {
@@ -209,12 +238,16 @@ export class SourceSnapshots {
           /* Retained error is reported separately. */
         }
     const helper = await this.helperStatus();
+    const rememberedMethod =
+      helper?.capture_method ??
+      this.state.last_capture_method ??
+      this.state.active?.capture_method ??
+      records[0]?.source_type;
     return {
       config: this.state.config,
       available: helper !== null,
-      capture_method:
-        helper?.capture_method ??
-        snapshotCaptureMethod(this.state.active?.capture_method ?? records[0]?.source_type),
+      capture_method: snapshotCaptureMethod(rememberedMethod),
+      history_source_known: !this.key || rememberedMethod !== undefined,
       running: !!this.state.active,
       last_attempt_at: this.state.last_attempt_at,
       last_finished_at: this.state.last_finished_at,
@@ -351,10 +384,21 @@ export class SourceSnapshots {
             throw new Error('The capture method changed during the request.');
           if (result.ok) {
             await this.result(active.id);
-            if (active.user_ids?.some((id) => !Object.hasOwn(result!.identities!, id)))
+            if (
+              !snapshotIdentitiesMatch(
+                result.identities,
+                active.user_ids,
+                snapshotCaptureMethod(result.capture_method),
+              )
+            )
               throw new Error('The mounted database does not contain the configured server users.');
-            this.state.generations.unshift(active.id);
-            this.state.last_finished_at = result.finished_at;
+            if (
+              snapshotCaptureMethod(result.capture_method) !== 'plugin_backup' ||
+              (await this.adoptPluginBackup(result))
+            ) {
+              this.state.generations.unshift(active.id);
+              this.state.last_finished_at = result.finished_at;
+            }
             this.state.last_error = null;
           } else
             this.state.last_error =
@@ -417,13 +461,57 @@ export class SourceSnapshots {
         }
       }
     } catch {
+      const failed = this.state.active;
       this.state.last_error =
         'Database capture could not be validated. The last good copy is preserved.';
       delete this.state.active;
       this.save();
+      if (failed)
+        await Promise.allSettled(
+          ['db.enc', 'result'].map((extension) =>
+            rm(join(this.directory, `${failed.id}.${extension}`), { force: true }),
+          ),
+        );
     } finally {
       this.ticking = false;
     }
+  }
+  /** Importing the same backup does not renew its history age or create another generation. */
+  private async adoptPluginBackup(value: CaptureResult): Promise<boolean> {
+    const time = Date.parse(snapshotHistoryTime(value));
+    if (Date.now() - time > MAX_AGE || time > Date.now() + 60_000)
+      throw new Error('The plugin backup is stale or has a future timestamp.');
+    let duplicate = false;
+    for (const id of this.state.generations) {
+      let previous: CaptureResult;
+      try {
+        previous = await this.result(id);
+      } catch {
+        continue;
+      }
+      if (
+        previous.binding.url !== value.binding.url ||
+        previous.binding.server_id !== value.binding.server_id ||
+        previous.binding.version !== value.binding.version ||
+        snapshotCaptureMethod(previous.capture_method) !== 'plugin_backup'
+      )
+        continue;
+      if (time < Date.parse(snapshotHistoryTime(previous)))
+        throw new Error('The plugin backup is older than retained source history.');
+      if (previous.backup_fingerprint === value.backup_fingerprint) {
+        if (
+          previous.backup_created_at !== value.backup_created_at ||
+          previous.plugin_version !== value.plugin_version
+        )
+          throw new Error('The plugin backup identity changed.');
+        duplicate = true;
+      }
+    }
+    if (duplicate) {
+      await rm(join(this.directory, `${value.id}.db.enc`), { force: true });
+      await rm(join(this.directory, `${value.id}.result`), { force: true });
+    }
+    return !duplicate;
   }
   async select(
     userId: string,
@@ -444,8 +532,8 @@ export class SourceSnapshots {
         'The saved database belongs to a different Emby connection. Capture the configured server again.',
       );
     if (
-      Date.now() - Date.parse(result.finished_at) > MAX_AGE ||
-      Date.parse(result.finished_at) > Date.now() + 60_000
+      Date.now() - Date.parse(snapshotHistoryTime(result)) > MAX_AGE ||
+      Date.parse(snapshotHistoryTime(result)) > Date.now() + 60_000
     )
       throw new ServiceError(
         'The saved database is more than 48 hours old. Capture Emby again before migrating.',
@@ -505,7 +593,19 @@ export class SourceSnapshots {
     entry.users++;
     try {
       const path = await entry.promise;
-      return await snapshotProcess<MediaItem[]>(
+      delete selected.metadata.diagnostics;
+      const value = await snapshotProcess<
+        | MediaItem[]
+        | {
+            items: MediaItem[];
+            diagnostics: {
+              unsupported_state_items: number;
+              invalid_resume_positions: number;
+              invalid_display_names: number;
+              orphan_state_items?: number;
+            };
+          }
+      >(
         {
           operation: 'read',
           path,
@@ -516,6 +616,34 @@ export class SourceSnapshots {
         AbortSignal.any([this.reads.signal, ...(signal ? [signal] : [])]),
         2 * 60_000,
       );
+      const items = Array.isArray(value) ? value : value?.items;
+      if (
+        !Array.isArray(items) ||
+        items.length > 100_000 ||
+        Buffer.byteLength(JSON.stringify(items)) > 32 * 1024 * 1024
+      )
+        throw new ServiceError('The saved database returned unsupported or oversized history.');
+      if (Array.isArray(value)) delete selected.metadata.diagnostics;
+      else {
+        const diagnostics = value?.diagnostics;
+        if (
+          !diagnostics ||
+          [
+            diagnostics.unsupported_state_items,
+            diagnostics.invalid_resume_positions,
+            diagnostics.invalid_display_names,
+            diagnostics.orphan_state_items === undefined ? 0 : diagnostics.orphan_state_items,
+          ].some((count) => !Number.isSafeInteger(count) || count < 0 || count > 100_000)
+        )
+          throw new ServiceError('The saved database returned invalid history diagnostics.');
+        selected.metadata.diagnostics = {
+          unsupported_state_items: diagnostics.unsupported_state_items,
+          invalid_resume_positions: diagnostics.invalid_resume_positions,
+          invalid_display_names: diagnostics.invalid_display_names,
+          orphan_state_items: diagnostics.orphan_state_items ?? 0,
+        };
+      }
+      return items;
     } finally {
       entry.users--;
       if (!entry.users && !this.jobReaders.has(selected.id))

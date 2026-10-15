@@ -485,6 +485,18 @@ export function JobProgressDetails({ job }: { job: Job }) {
 }
 export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetadata }) {
   const fileCopy = snapshot.source_type === 'file_copy';
+  if (snapshot.source_type === 'plugin_backup')
+    return (
+      <p className="subtle text-small">
+        Saved Emby plugin backup · Emby {snapshot.source_server_version} ·{' '}
+        {snapshot.scope === 'watched_only' ? 'watched-only' : 'complete'} · backed up{' '}
+        {snapshot.backup_created_at
+          ? new Date(snapshot.backup_created_at).toLocaleString()
+          : 'at an unavailable time'}
+        . Imported {new Date(snapshot.finished_at).toLocaleString()}. Activity after the backup time
+        is not included; importing it again does not refresh its history.
+      </p>
+    );
   return (
     <p className="subtle text-small">
       Saved Emby snapshot{fileCopy ? ' · File copy' : ''} · Emby {snapshot.source_server_version} ·{' '}

@@ -308,7 +308,7 @@ describe('account migration and subscription safety', () => {
     expect(targetReads).not.toHaveBeenCalled();
   });
 
-  it('bounds preview detail arrays while retaining full unmatched and ambiguous counts', async () => {
+  it('defers saved-preview matching even when history contains many unmatched and ambiguous items', async () => {
     service.clientFactory = (...args) => {
       const client = servers.factory(...args);
       client.migrationItems = async () =>
@@ -339,20 +339,17 @@ describe('account migration and subscription safety', () => {
     };
     savedPreview();
     const preview = await service.preview(['e-river'], { use_snapshots: true });
-    expect(preview.users[0]?.stats).toMatchObject({
-      source_items: 402,
-      unmatched: 201,
-      ambiguous: 201,
-    });
-    expect(preview.users[0]?.unmatched).toHaveLength(200);
-    expect(preview.users[0]?.ambiguous).toHaveLength(200);
-    expect(preview.users[0]?.ambiguous.every((entry) => entry.candidates.length === 20)).toBe(true);
-    expect(preview.users[0]?.warnings).toContain(
-      'Preview details are limited to 200 unmatched items, 200 ambiguous items, and 20 candidates per item. Full counts are shown; migration checks every item.',
-    );
+    expect(preview.users[0]?.stats).toBeNull();
+    expect(preview.users[0]?.history_deferred).toBe(true);
+    expect(preview.users[0]?.unmatched).toEqual([]);
+    expect(preview.users[0]?.ambiguous).toEqual([]);
+    expect(service.sourceSnapshots.items).not.toHaveBeenCalled();
+    expect(
+      preview.users[0]?.warnings.some((warning) => warning.includes('deferred until approval')),
+    ).toBe(true);
   });
 
-  it('projects preview details to bounded primitive strings without retaining nested upstream data', async () => {
+  it('does not materialize or expose nested upstream history in a saved preview', async () => {
     const privateObject = { private_plugin_token: 'private-plugin-value' };
     service.clientFactory = (...args) => {
       const client = servers.factory(...args);
@@ -410,18 +407,12 @@ describe('account migration and subscription safety', () => {
     savedPreview();
     const preview = await service.preview(['e-river'], { use_snapshots: true });
     const details = preview.users[0]!;
-    expect(details.unmatched[0]).toEqual({ Id: 'nested-source', Type: 'Movie' });
-    expect(details.unmatched[1]?.Id).toHaveLength(128);
-    expect(details.unmatched[1]?.Name).toHaveLength(512);
-    expect(details.unmatched[2]).toEqual({ Id: 'nested-type', Name: 'Nested type' });
-    expect(details.unmatched[3]?.Type).toHaveLength(64);
-    expect(details.ambiguous[0]?.source).toEqual({ Id: 'ambiguous-source', Type: 'Movie' });
-    expect(details.ambiguous[0]?.candidates[0]).toEqual({ Id: 'nested-candidate', Type: 'Movie' });
-    expect(details.ambiguous[0]?.candidates[1]?.Id).toHaveLength(128);
-    expect(details.ambiguous[0]?.candidates[1]?.Name).toHaveLength(512);
+    expect(details.unmatched).toEqual([]);
+    expect(details.ambiguous).toEqual([]);
+    expect(details.stats).toBeNull();
+    expect(service.sourceSnapshots.items).not.toHaveBeenCalled();
     expect(JSON.stringify(preview)).not.toContain('private-plugin-value');
     expect(JSON.stringify(preview)).not.toContain('private_plugin_token');
-    expect(details.stats).toMatchObject({ source_items: 5, unmatched: 4, ambiguous: 1 });
   });
 
   it('rejects an already canceled preview without opening media clients', async () => {
@@ -797,7 +788,7 @@ describe('account migration and subscription safety', () => {
       expect(job.status).toBe('completed');
       expect(job.source_snapshot_ids).toEqual({ 'e-river': approved });
       expect(job.results[0]?.source_snapshot).toMatchObject({ id: approved });
-      expect(items).toHaveBeenCalledTimes(2);
+      expect(items).toHaveBeenCalledTimes(1);
       expect(select.mock.calls.map((call) => call[3])).toEqual([undefined, approved, approved]);
       expect(forbiddenSourceReads).not.toHaveBeenCalled();
       expect(freshTargetReads).toHaveBeenCalledWith('j-river', '2');
@@ -1601,11 +1592,23 @@ describe('account migration and subscription safety', () => {
     savedPreview();
     const preview = await service.preview(['e-alex'], { use_snapshots: true });
     expect(JSON.stringify(preview)).not.toContain('private-library-token');
-    expect(preview.users[0]?.unmatched[0]).toEqual({
-      Id: 'missing',
-      Name: 'An unmatched library item',
-      Type: 'Movie',
+    expect(preview.users[0]?.unmatched).toEqual([]);
+    expect(preview.users[0]?.stats).toBeNull();
+    const job = await finish(
+      await service.migrateUsers(
+        ['e-alex'],
+        {},
+        undefined,
+        'complete',
+        preview.source_snapshot_ids,
+      ),
+    );
+    expect(job.results[0]?.unmatched_items?.[0]).toEqual({
+      id: 'missing',
+      name: 'An unmatched library item',
+      type: 'Movie',
     });
+    expect(JSON.stringify(job)).not.toContain('private-library-token');
   });
   it('prevents an unmapped source or fresh create from claiming a reserved destination ID or name', async () => {
     approveMapping('e-sam', 'river', 'j-river');

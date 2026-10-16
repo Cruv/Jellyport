@@ -1,5 +1,5 @@
 import { posix } from 'node:path';
-import { isObject, type MediaItem } from './media.js';
+import { isObject, MAX_CATALOG_ITEMS, type MediaItem } from './media.js';
 import { nameKey } from './identity.js';
 import { MediaError } from './errors.js';
 
@@ -22,7 +22,11 @@ export interface MatchPlan {
   ambiguous: AmbiguousMatch[];
 }
 /** Reusable only while its destination catalog and path mappings remain unchanged. */
-export type PreparedMatcher = (source: MediaItem[]) => MatchPlan;
+export interface PreparedMatcher {
+  (source: MediaItem[]): MatchPlan;
+  /** All identity candidates, before access filtering, precedence or disambiguation. */
+  candidates(source: MediaItem[]): MediaItem[];
+}
 /** Fail closed instead of truncating ambiguity decisions or retaining quadratic result arrays. */
 export const MAX_AMBIGUOUS_CANDIDATES = 200_000;
 /** Lists library item types with a supported, conservative identity strategy. */
@@ -235,7 +239,7 @@ export function createMatcher(
       return sourcePath && targetPath ? [[sourcePath, targetPath] as [string, string]] : [];
     })
     .sort((a, b) => b[0].length - a[0].length);
-  return (source) => {
+  const match = (source: MediaItem[]): MatchPlan => {
     const result: MatchPlan = { matches: [], unmatched: [], ambiguous: [] };
     let retainedCandidates = 0;
     for (const item of source) {
@@ -290,6 +294,42 @@ export function createMatcher(
     }
     return result;
   };
+  return Object.assign(match, {
+    candidates(source: MediaItem[]): MediaItem[] {
+      const selected = new Set<number>();
+      // Many history entries can share the same identity. Visit each index bucket once
+      // rather than repeatedly expanding large collision sets for every source entry.
+      const visited = new Set<Set<number>>();
+      const collect = (values: Set<number>) => {
+        if (!values.size || visited.has(values)) return;
+        visited.add(values);
+        for (const index of values) {
+          selected.add(index);
+          if (selected.size > MAX_CATALOG_ITEMS)
+            throw new MediaError(
+              'The migration matching candidates exceed the supported item limit.',
+            );
+        }
+      };
+      for (const item of source) {
+        const type = kind(item);
+        if (!supportedTypes.has(type)) continue;
+        if (type !== 'season')
+          for (const [provider, id] of providerEntries(item, 'ProviderIds'))
+            collect(lookup(providerIndex, [type, provider, id]));
+        const numbers = seriesNumbers(item);
+        if (numbers)
+          for (const [provider, id] of providerEntries(item, 'SeriesProviderIds'))
+            collect(lookup(seriesIndex, [type, provider, id, ...numbers]));
+        const value = mappedPath(item, mappings);
+        if (value) collect(lookup(pathIndex, [type, value]));
+      }
+      // Include lower-priority identities and contradictory candidates too. Removing
+      // inaccessible provider hits can reveal a series/path fallback; removing a path
+      // narrowing hit can restore ambiguity. Only final user-scoped matching decides.
+      return [...selected].sort((a, b) => a - b).map((index) => target[index]!);
+    },
+  });
 }
 
 /** Type-scoped provider identity, complete series numbering, then exact mapped path; never titles. */

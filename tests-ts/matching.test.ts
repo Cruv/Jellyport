@@ -6,7 +6,7 @@ import {
   MIGRATABLE_ITEM_TYPES,
 } from '../server/matching.js';
 import { MediaError } from '../server/errors.js';
-import type { MediaItem } from '../server/media.js';
+import { MAX_CATALOG_ITEMS, type MediaItem } from '../server/media.js';
 
 const item = (Id: string, fields: Partial<MediaItem> = {}): MediaItem => ({
   Id,
@@ -14,6 +14,164 @@ const item = (Id: string, fields: Partial<MediaItem> = {}): MediaItem => ({
   ...fields,
 });
 describe('conservative media matching', () => {
+  it('retains provider, series and mapped path fallbacks before checking destination access', () => {
+    const movie = item('source-movie', {
+      ProviderIds: { Imdb: 'tt42' },
+      Path: '/emby/movie.mkv',
+    });
+    const episode = item('source-episode', {
+      Type: 'Episode',
+      ProviderIds: { Tvdb: '555' },
+      SeriesProviderIds: { Tvdb: '100' },
+      ParentIndexNumber: 1,
+      IndexNumber: 2,
+      Path: '/emby/episode.mkv',
+    });
+    const targets = [
+      item('provider-movie', { ProviderIds: movie.ProviderIds }),
+      item('path-movie', { Path: '/media/movie.mkv' }),
+      item('provider-episode', { Type: 'Episode', ProviderIds: episode.ProviderIds }),
+      item('series-episode', {
+        Type: 'Episode',
+        SeriesProviderIds: episode.SeriesProviderIds,
+        ParentIndexNumber: 1,
+        IndexNumber: 2,
+      }),
+      item('path-episode', { Type: 'Episode', Path: '/media/episode.mkv' }),
+      item('unrelated', { ProviderIds: { Imdb: 'tt99' } }),
+      item('wrong-type', { Type: 'Audio', Path: '/media/movie.mkv' }),
+    ];
+    const mappings = [{ source: '/emby', target: '/media' }];
+    const match = createMatcher(targets, mappings);
+    expect(match([movie, episode]).matches.map(({ target }) => target.Id)).toEqual([
+      'provider-movie',
+      'provider-episode',
+    ]);
+    expect(match.candidates([movie, episode])).toEqual(targets.slice(0, 5));
+    const accessible = match
+      .candidates([movie, episode])
+      .filter((target) => !target.Id.startsWith('provider-'));
+    expect(
+      createMatcher(
+        accessible,
+        mappings,
+      )([movie, episode]).matches.map(({ target, method }) => [target.Id, method]),
+    ).toEqual([
+      ['path-movie', 'path'],
+      ['series-episode', 'series_episode'],
+    ]);
+    const onlyPaths = accessible.filter((target) => target.Id.startsWith('path-'));
+    expect(createMatcher(onlyPaths, mappings)([episode]).matches[0]?.target.Id).toBe(
+      'path-episode',
+    );
+  });
+
+  it('keeps narrowed, ambiguous and contradictory identity candidates without admitting unrelated items', () => {
+    const exact = item('source', {
+      ProviderIds: { Imdb: 'tt42' },
+      Path: '/media/movie.mkv',
+    });
+    const targets = [
+      item('first', { ProviderIds: exact.ProviderIds, Path: exact.Path }),
+      item('second', { ProviderIds: exact.ProviderIds, Path: '/media/movie-4k.mkv' }),
+      item('path-only', { Path: exact.Path }),
+      item('unrelated', { ProviderIds: { Imdb: 'tt99' } }),
+      item('unsupported', { Type: 'Folder', Path: exact.Path }),
+    ];
+    const match = createMatcher(targets);
+    expect(match([exact]).matches[0]?.target.Id).toBe('first');
+    expect(match.candidates([exact])).toEqual(targets.slice(0, 3));
+    const withoutPath = { ...exact, Path: undefined };
+    expect(match([withoutPath]).ambiguous[0]?.candidates).toEqual(targets.slice(0, 2));
+    expect(match.candidates([withoutPath])).toEqual(targets.slice(0, 2));
+    const contradictory = { ...exact, ProviderIds: { Imdb: 'tt42', Tmdb: '50' } };
+    const conflict = item('conflict', {
+      ProviderIds: { Imdb: 'tt42', Tmdb: '99' },
+      Path: exact.Path,
+    });
+    const conflicts = createMatcher([conflict, ...targets]);
+    expect(conflicts([contradictory]).ambiguous[0]?.candidates).toEqual([
+      conflict,
+      targets[0],
+      targets[1],
+    ]);
+    expect(conflicts.candidates([contradictory])).toEqual([conflict, ...targets.slice(0, 3)]);
+  });
+
+  it('produces the same final plan as a complete user catalog for every candidate-access subset', () => {
+    const source = [
+      item('movie', { ProviderIds: { Imdb: 'tt42' }, Path: '/media/movie.mkv' }),
+      item('episode', {
+        Type: 'Episode',
+        ProviderIds: { Tvdb: '555' },
+        SeriesProviderIds: { Tvdb: '100' },
+        ParentIndexNumber: 1,
+        IndexNumber: 2,
+        Path: '/media/episode.mkv',
+      }),
+      item('season', {
+        Type: 'Season',
+        SeriesProviderIds: { Tvdb: '100' },
+        IndexNumber: 1,
+        Path: '/media/season',
+      }),
+    ];
+    const targets = [
+      item('movie-provider', { ProviderIds: source[0]!.ProviderIds }),
+      item('movie-path', { Path: source[0]!.Path }),
+      item('episode-provider', { Type: 'Episode', ProviderIds: source[1]!.ProviderIds }),
+      item('episode-series', { ...source[1], Id: 'episode-series', ProviderIds: {} }),
+      item('episode-conflict', { ...source[1], Id: 'episode-conflict', IndexNumber: 3 }),
+      item('episode-path', { Type: 'Episode', Path: source[1]!.Path }),
+      item('season-series', { ...source[2], Id: 'season-series', Path: undefined }),
+      item('season-path', { Type: 'Season', Path: source[2]!.Path }),
+      item('unrelated', { Path: '/elsewhere' }),
+    ];
+    const candidates = createMatcher(targets).candidates(source);
+    expect(candidates).toEqual(targets.slice(0, 8));
+    for (let mask = 0; mask < 1 << candidates.length; mask++) {
+      const allowed = new Set(candidates.filter((_, index) => mask & (1 << index)));
+      allowed.add(targets.at(-1)!);
+      const completeAccessible = targets.filter((target) => allowed.has(target));
+      const selectedAccessible = candidates.filter((target) => allowed.has(target));
+      expect(createMatcher(selectedAccessible)(source)).toEqual(
+        createMatcher(completeAccessible)(source),
+      );
+    }
+  });
+
+  it('deduplicates candidate work and returns independent arrays in original catalog order', () => {
+    const targets = [
+      item('first', { ProviderIds: { Imdb: 'tt42' }, Path: '/media/movie.mkv' }),
+      item('second', { ProviderIds: { Imdb: 'tt42' } }),
+    ];
+    const match = createMatcher(targets);
+    const source = Array.from({ length: 200 }, (_, index) =>
+      item(`source-${index}`, { ProviderIds: { Imdb: 'tt42' }, Path: targets[0]!.Path }),
+    );
+    expect(match.candidates(source)).toEqual(targets);
+    const first = match.candidates(source);
+    first.length = 0;
+    expect(match.candidates(source)).toEqual(targets);
+    expect(match.candidates([])).toEqual([]);
+    expect(match.candidates([item('folder', { Type: 'Folder', Path: targets[0]!.Path })])).toEqual(
+      [],
+    );
+  });
+
+  it('bounds retained unique candidates even when all catalog items collide', () => {
+    const targets = Array.from({ length: MAX_CATALOG_ITEMS + 1 }, (_, index) =>
+      item(`target-${index}`, { ProviderIds: { Imdb: 'same-id' } }),
+    );
+    const source = [item('source', { ProviderIds: { Imdb: 'same-id' } })];
+    expect(createMatcher(targets.slice(0, MAX_CATALOG_ITEMS)).candidates(source)).toHaveLength(
+      MAX_CATALOG_ITEMS,
+    );
+    expect(() => createMatcher(targets).candidates(source)).toThrow(
+      'The migration matching candidates exceed the supported item limit.',
+    );
+  });
+
   it('retains complete ambiguous results exactly at the aggregate candidate bound', () => {
     const collisionSize = 2_000;
     const targets = Array.from({ length: collisionSize }, (_, index) =>
@@ -99,6 +257,7 @@ describe('conservative media matching', () => {
         ProviderIds: { Imdb: `tt${index}` },
         UserData: { Played: true },
       }));
+      expect(match.candidates(source)).toEqual(targets.slice(0, historySize));
       const plan = match(source);
       expect(plan.matches).toHaveLength(historySize);
       expect(plan.unmatched).toHaveLength(0);

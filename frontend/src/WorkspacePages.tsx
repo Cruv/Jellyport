@@ -302,10 +302,11 @@ export function MigratePage({
           Use saved Emby snapshot
         </label>
         <small id="migration-snapshot-help">
-          Live previews check accounts without reading history; matching and selected personal data
-          are read only after approval. Migrations pause between source requests to protect
-          playback. Saved snapshots must cover every selected account and be current enough; missing
-          or expired snapshots stop the preview. File copies provide best-effort saved history.
+          Previews check accounts and backup freshness without scanning libraries; matching and
+          selected personal data are read only after approval. Migrations pause between source
+          requests to protect playback. Saved snapshots must cover every selected account and be
+          current enough; missing or expired snapshots stop the preview. File copies provide
+          best-effort saved history.
         </small>
       </div>
       <div className="steps">

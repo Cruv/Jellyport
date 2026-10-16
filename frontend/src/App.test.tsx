@@ -892,7 +892,9 @@ describe('React account safeguards', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
     expect(
-      await screen.findByText(/Live previews check accounts without reading history/),
+      await screen.findByText(
+        /Previews check accounts and backup freshness without scanning libraries/,
+      ),
     ).toBeTruthy();
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));

@@ -225,7 +225,11 @@ it('recovers interrupted encryption immediately while preserving queued work and
 it('preserves an authenticated completed capture result and removes only its interrupted markers', async () => {
   const path = await directory();
   const key = randomBytes(32);
-  for (const ok of [true, false]) {
+  for (const [ok, orphan_identity_version] of [
+    [true, undefined],
+    [true, 1],
+    [false, undefined],
+  ] as const) {
     const request = recoveryRequest();
     const now = new Date().toISOString();
     const result: CaptureResult = {
@@ -233,6 +237,7 @@ it('preserves an authenticated completed capture result and removes only its int
       ok,
       started_at: now,
       finished_at: now,
+      ...(orphan_identity_version === undefined ? {} : { orphan_identity_version }),
       ...(ok
         ? { bytes: 4, schema: 'emby-4.10.1.0', identities: { [request.user_ids![0]!]: 2 } }
         : { error: 'An already published safe failure.' }),
@@ -254,6 +259,39 @@ it('preserves an authenticated completed capture result and removes only its int
     });
   }
 });
+
+it.each([null, 0, 2, '1'])(
+  'refuses to recover a successful result with an unsupported history identity capability (%j)',
+  async (version) => {
+    const path = await directory();
+    const key = randomBytes(32);
+    const request = recoveryRequest();
+    const now = new Date().toISOString();
+    await writeEnvelope(join(path, `${request.id}.working`), request, key);
+    await writeEnvelope(
+      join(path, `${request.id}.result`),
+      {
+        ...request,
+        ok: true,
+        started_at: now,
+        finished_at: now,
+        bytes: 4,
+        schema: 'emby-4.10.1.0',
+        identities: { [request.user_ids![0]!]: 2 },
+        orphan_identity_version: version,
+      },
+      key,
+    );
+    await writeFile(join(path, `${request.id}.db.enc`), randomBytes(32));
+    await recoverSnapshotHelper(path, key);
+    expect((await readEnvelope<CaptureResult>(join(path, `${request.id}.result`), key)).ok).toBe(
+      false,
+    );
+    await expect(stat(join(path, `${request.id}.working`))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  },
+);
 
 it('fails closed on malformed recovery messages and never follows artifact symlinks or payload paths', async () => {
   const path = await directory();
@@ -378,6 +416,7 @@ async function verifyCaptureWhileWriting(captureMethod: SnapshotCaptureMethod) {
       identities: { [userId]: 2 },
       schema: 'emby-4.10.1.0',
       item_count: 1,
+      orphan_identity_version: 1,
     });
     expect(capture.bytes).toBeLessThan(100 * 1024);
     const items = readSnapshotItems(outputPath, userId, capture.identities);
@@ -403,7 +442,11 @@ async function verifyCaptureWhileWriting(captureMethod: SnapshotCaptureMethod) {
     try {
       expect(
         projected.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all(),
-      ).toEqual([{ name: 'MediaItems' }, { name: 'UserDatas' }]);
+      ).toEqual([
+        { name: 'JellyportRecoveredHistory' },
+        { name: 'MediaItems' },
+        { name: 'UserDatas' },
+      ]);
       expect(
         projected
           .prepare('PRAGMA table_info(MediaItems)')

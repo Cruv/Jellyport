@@ -276,6 +276,7 @@ it('keeps per-user history diagnostics on that read instead of the shared decryp
     invalid_resume_positions: 1,
     invalid_display_names: 3,
     orphan_state_items: 4,
+    recovered_orphan_state_items: 7,
   };
   worker.mockResolvedValueOnce({
     items: [{ Id: 'first-item', UserData: { Played: true } }],
@@ -299,8 +300,10 @@ it('keeps per-user history diagnostics on that read instead of the shared decryp
   expect(await f.manager.items(second, otherUserId, 'complete')).toEqual([]);
   expect(first.metadata.diagnostics?.unsupported_state_items).toBe(2);
   expect(first.metadata.diagnostics?.orphan_state_items).toBe(4);
+  expect(first.metadata.diagnostics?.recovered_orphan_state_items).toBe(7);
   expect(second.metadata.diagnostics?.unsupported_state_items).toBe(0);
   expect(second.metadata.diagnostics?.orphan_state_items).toBe(0);
+  expect(second.metadata.diagnostics?.recovered_orphan_state_items).toBe(0);
   expect((await f.manager.status()).records[0]?.diagnostics).toBeUndefined();
   worker.mockResolvedValueOnce([]);
   await f.manager.items(first, userId, 'complete');
@@ -360,6 +363,15 @@ it.each([
       orphan_state_items: 100_001,
     },
   },
+  ...[-1, 100_001, '1'].map((count) => ({
+    items: [],
+    diagnostics: {
+      unsupported_state_items: 0,
+      invalid_resume_positions: 0,
+      invalid_display_names: 0,
+      recovered_orphan_state_items: count,
+    },
+  })),
 ])('rejects malformed or unbounded snapshot diagnostics (%j)', async (value) => {
   const f = await fixture();
   await f.complete();
@@ -367,6 +379,86 @@ it.each([
   worker.mockResolvedValueOnce(value);
   await expect(f.manager.items(selected, userId, 'complete')).rejects.toThrow(/history/);
   expect(selected.metadata.diagnostics).toBeUndefined();
+});
+
+it.each([null, 0, 2, '1'])(
+  'rejects unsupported history identity capabilities without replacing completed history (%j)',
+  async (version) => {
+    const f = await fixture();
+    const good = await f.complete();
+    const invalid = await f.complete({ orphan_identity_version: version as 1 });
+    expect((await f.manager.status()).records.map((record) => record.id)).toEqual([good.id]);
+    expect((await f.manager.status()).last_error).toContain('last good copy is preserved');
+    await expect(stat(join(f.shared, `${invalid.id}.db.enc`))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  },
+);
+
+it('adopts a capable projection of the same plugin backup while preserving legacy pins and original age', async () => {
+  const f = await fixture();
+  const legacy = await pluginCapture(f);
+  const pinned = await f.manager.select(userId, f.settings, 'fixture-emby-server', legacy.id);
+  const job: Job = {
+    id: randomUUID(),
+    kind: 'migrate',
+    status: 'queued',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+    progress: { processed: 0, total: 1 },
+    results: [],
+    source_snapshot_ids: { [userId]: legacy.id },
+  };
+  f.store.saveJob(job);
+  const capable = await pluginCapture(f, {
+    backup_created_at: legacy.backup_created_at,
+    orphan_identity_version: 1,
+  });
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  expect(selected.id).toBe(capable.id);
+  expect(selected.metadata).toMatchObject({
+    orphan_identity_version: 1,
+    backup_created_at: legacy.backup_created_at,
+    expires_at: pinned.metadata.expires_at,
+  });
+  expect((await f.manager.status()).records.map((record) => record.id)).toEqual([
+    capable.id,
+    legacy.id,
+  ]);
+  expect((await stat(join(f.shared, `${legacy.id}.db.enc`))).isFile()).toBe(true);
+  expect(
+    (await f.manager.select(userId, f.settings, 'fixture-emby-server', legacy.id)).metadata
+      .orphan_identity_version,
+  ).toBeUndefined();
+  for (const orphan_identity_version of [1, undefined] as const) {
+    const duplicate = await pluginCapture(f, {
+      backup_created_at: legacy.backup_created_at,
+      orphan_identity_version,
+    });
+    expect((await f.manager.status()).records.map((record) => record.id)).toEqual([
+      capable.id,
+      legacy.id,
+    ]);
+    expect((await f.manager.status()).last_finished_at).toBe(capable.finished_at);
+    await expect(stat(join(f.shared, `${duplicate.id}.db.enc`))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+    await expect(stat(join(f.shared, `${duplicate.id}.result`))).rejects.toMatchObject({
+      code: 'ENOENT',
+    });
+  }
+  await f.restart();
+  expect((await f.manager.status()).records.map((record) => record.id)).toEqual([
+    capable.id,
+    legacy.id,
+  ]);
+  expect(f.store.job(job.id)?.source_snapshot_ids).toEqual({ [userId]: legacy.id });
+  vi.spyOn(Date, 'now').mockReturnValue(
+    Date.parse(legacy.backup_created_at!) + 48 * 60 * 60_000 + 1,
+  );
+  await expect(
+    f.manager.select(userId, f.settings, 'fixture-emby-server', capable.id),
+  ).rejects.toThrow('48 hours');
 });
 
 it('deduplicates the same plugin backup without replacing its generation or renewing history age', async () => {

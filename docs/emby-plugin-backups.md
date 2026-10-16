@@ -72,9 +72,38 @@ state.
 
 Supported upgraded column declarations and composite unique indexes are validated
 without arbitrary schema coercion. Invalid display names are omitted and reported
-while identity metadata remains unchanged. Unsupported item types and orphan state
-with no current catalog identity produce aggregate diagnostics instead of guessing
-a target. Deleted media cannot be reliably matched from a bare user-data key.
+while identity metadata remains unchanged. Unsupported item types and unresolved
+orphan state produce aggregate diagnostics instead of guessing a target.
+
+### Orphan played history — 0.17.1
+
+Rescans can change an item's history key while leaving played flags under an older
+key. New imports resolve an exact compact or hyphenated GUID fallback key only
+when it identifies exactly one current native Emby media row. The projection
+retains only the old numeric key-to-current-item mapping, not raw history-key
+strings or native GUIDs. Recovered played flags use that item's ordinary metadata
+and pass through the same Jellyfin provider/type/path matching, library-access
+checks and independent readback as other history. Canonical and recovered flags
+are merged once; other source state is not recovered or transferred.
+
+The result shows how many orphan records were reattached before matching. This
+count can include a flag already present under the current Emby key and does not
+claim that every record caused a Jellyfin write.
+
+Numeric, IMDb-like and other provider-like history keys do not establish media
+type. Some episode keys concatenate a parent provider ID and episode numbering;
+movie and series keys use other untyped numbers. Plausible Jellyfin candidates,
+titles or absence from a user's accessible libraries do not prove identity or
+deletion. These records remain unresolved, rather than being guessed or silently
+classified obsolete. The adapter currently cannot confirm obsolete media from a
+bare key; confirmed identity is required before any such classification.
+
+Existing encrypted projections remain readable. Choose **Import latest backup**
+after upgrading both containers to add recovery data, even if the backup itself
+has not changed. A one-time capability upgrade preserves the original backup date
+and expiry and keeps older generations pinned by existing reviews/jobs. Later
+imports of the same capable backup deduplicate normally. A missing native identity
+table or column keeps the older behavior; importing cannot invent lost metadata.
 Collection IDs named `Tmdb` and `TmdbCollection` are normalized only within the
 collection type, preserving contradictory-ID checks.
 

@@ -13,6 +13,7 @@ export interface EmbySnapshotLibraryInfo {
   adapter: 'emby-4.10.1.0';
   item_count: number;
   user_data_count: number;
+  orphan_identity_version?: 1;
 }
 const MAX_USERS = 1_000;
 const MAX_LIBRARY_ITEMS = 2_000_000;
@@ -169,6 +170,58 @@ function validateLibrary(database: DatabaseSync): void {
   }
 }
 
+/** Optional adapter-owned table. Older projections deliberately lack this data. */
+function recoveredHistory(database: DatabaseSync): boolean {
+  if (!database.prepare("SELECT 1 FROM sqlite_master WHERE name='JellyportRecoveredHistory'").get())
+    return false;
+  requireTable(database, 'JellyportRecoveredHistory', {
+    UserDataKeyId: ['INTEGER', 1],
+    ItemId: ['INTEGER', 0],
+  });
+  const columns = database.prepare('PRAGMA table_info(JellyportRecoveredHistory)').all();
+  const sql = database
+    .prepare("SELECT sql FROM sqlite_master WHERE name='JellyportRecoveredHistory'")
+    .get()?.sql;
+  if (
+    columns.length !== 2 ||
+    columns.some((column) => column.notnull !== 1) ||
+    typeof sql !== 'string' ||
+    !/\bSTRICT\s*$/i.test(sql)
+  )
+    throw invalid();
+  return true;
+}
+
+function nativeHistoryIdentity(database: DatabaseSync): boolean {
+  const keys = database.prepare("SELECT 1 FROM sqlite_master WHERE name='UserDataKeys2'").get();
+  const guid = database
+    .prepare('PRAGMA table_info(MediaItems)')
+    .all()
+    .find((column) => column.name === 'guid');
+  if (!keys || !guid) return false;
+  requireTable(database, 'UserDataKeys2', { Id: ['INTEGER', 1], UserDataKey: ['TEXT', 0] });
+  if (!['BLOB', 'GUID'].includes(String(guid.type).toUpperCase()) || guid.pk !== 0) throw invalid();
+  return true;
+}
+
+/** Exact native fallback key only; untyped numeric/provider-like keys are not decoded. */
+function nativeGuidKey(value: unknown): Buffer | undefined {
+  if (
+    typeof value !== 'string' ||
+    !/^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/i.test(value)
+  )
+    return undefined;
+  const normalized = value.replaceAll('-', '');
+  if (/^0{32}$/.test(normalized)) return undefined;
+  const bytes = Buffer.from(normalized, 'hex');
+  return Buffer.concat([
+    Buffer.from(bytes.subarray(0, 4)).reverse(),
+    Buffer.from(bytes.subarray(4, 6)).reverse(),
+    Buffer.from(bytes.subarray(6, 8)).reverse(),
+    bytes.subarray(8),
+  ]);
+}
+
 function integer(value: unknown, min = 0, max = Number.MAX_SAFE_INTEGER): number {
   const result = typeof value === 'bigint' ? Number(value) : value;
   if (typeof result !== 'number' || !Number.isSafeInteger(result) || result < min || result > max)
@@ -240,7 +293,12 @@ export function inspectLibrary(path: string): EmbySnapshotLibraryInfo {
     const userData = integer(
       database.prepare('SELECT count(*) AS count FROM UserDatas').get()!.count,
     );
-    return { adapter: 'emby-4.10.1.0', item_count: items, user_data_count: userData };
+    return {
+      adapter: 'emby-4.10.1.0',
+      item_count: items,
+      user_data_count: userData,
+      ...(recoveredHistory(database) ? { orphan_identity_version: 1 as const } : {}),
+    };
   });
 }
 
@@ -248,6 +306,8 @@ export function inspectLibrary(path: string): EmbySnapshotLibraryInfo {
 export function projectLibrary(rawPath: string, outputPath: string): void {
   if (resolve(rawPath) === resolve(outputPath)) throw invalid();
   inspectLibrary(rawPath);
+  const nativeIdentity = withDatabase(rawPath, nativeHistoryIdentity);
+  const existingRecovery = withDatabase(rawPath, recoveredHistory);
   let database: DatabaseSync | undefined;
   let created = false;
   try {
@@ -279,8 +339,47 @@ export function projectLibrary(rawPath: string, outputPath: string): void {
       CREATE INDEX JellyportMediaUserDataKey ON MediaItems(UserDataKeyId);
       CREATE INDEX JellyportUserDataUser ON UserDatas(userId,UserDataKeyId)
         WHERE ${personalState};
-      COMMIT;
     `);
+    if (nativeIdentity || existingRecovery) {
+      database.exec(`CREATE TABLE JellyportRecoveredHistory (
+        UserDataKeyId INTEGER NOT NULL PRIMARY KEY, ItemId INTEGER NOT NULL
+      ) STRICT;`);
+      if (nativeIdentity) {
+        // One private disk-backed index per import, not a source lookup per user.
+        // Never alter Emby's backup or retain raw keys/GUIDs in the publication.
+        database.exec(`CREATE TEMP TABLE JellyportGuidLookup (
+          guid BLOB NOT NULL, ItemId INTEGER NOT NULL, PRIMARY KEY(guid,ItemId)
+        ) STRICT, WITHOUT ROWID;
+        INSERT INTO JellyportGuidLookup SELECT guid,Id FROM captured.MediaItems
+          WHERE typeof(guid)='blob' AND length(guid)=16;`);
+        const keys = database.prepare(`SELECT k.Id,substr(k.UserDataKey,1,37) AS UserDataKey
+          FROM captured.UserDataKeys2 k
+          WHERE EXISTS (SELECT 1 FROM UserDatas ud WHERE ud.UserDataKeyId=k.Id)
+            AND NOT EXISTS (SELECT 1 FROM MediaItems m WHERE m.UserDataKeyId=k.Id)
+          LIMIT ?`);
+        keys.setReadBigInts(true);
+        const match = database.prepare(
+          'SELECT ItemId FROM JellyportGuidLookup WHERE guid=? LIMIT 2',
+        );
+        match.setReadBigInts(true);
+        const insert = database.prepare('INSERT INTO JellyportRecoveredHistory VALUES (?,?)');
+        let count = 0;
+        for (const row of keys.iterate(MAX_LIBRARY_ITEMS + 1)) {
+          if (++count > MAX_LIBRARY_ITEMS) throw invalid();
+          const guid = nativeGuidKey(row.UserDataKey);
+          if (!guid) continue;
+          const candidates = match.all(guid);
+          if (candidates.length === 1)
+            insert.run(integer(row.Id, 1), integer(candidates[0]!.ItemId, 1));
+        }
+        database.exec('DROP TABLE JellyportGuidLookup;');
+      } else {
+        database.exec(
+          'INSERT INTO JellyportRecoveredHistory SELECT UserDataKeyId,ItemId FROM captured.JellyportRecoveredHistory;',
+        );
+      }
+    }
+    database.exec('COMMIT;');
     database.close();
     database = undefined;
     inspectLibrary(outputPath);
@@ -302,6 +401,8 @@ export interface SnapshotHistoryDiagnostics {
   invalid_display_names: number;
   /** Absent on older saved diagnostics. */
   orphan_state_items?: number;
+  /** Informational resolved rows; canonical played rows can already cover them. */
+  recovered_orphan_state_items?: number;
 }
 
 export interface SnapshotHistoryResult {
@@ -329,7 +430,7 @@ export function snapshotHistoryWarnings(diagnostics?: SnapshotHistoryDiagnostics
     );
   if (diagnostics.orphan_state_items)
     warnings.push(
-      `${diagnostics.orphan_state_items} saved history entries no longer have a library item. They cannot be matched safely and were not migrated.`,
+      `${diagnostics.orphan_state_items} saved history entries have no verified media identity. They remain unresolved and were not assumed obsolete or migrated.`,
     );
   return warnings;
 }
@@ -356,15 +457,17 @@ export function readSnapshotHistory(
   const maxBytes = integer(limits.maxBytes ?? MAX_USER_BYTES, 1, MAX_USER_BYTES);
   return withDatabase(path, (database) => {
     validateLibrary(database);
+    const canRecover = recoveredHistory(database);
     // A watched-only read needs identity metadata and one boolean. Do not fetch or
     // validate excluded personal state: a bad old timestamp cannot invalidate a flag.
-    const query = database.prepare(`
+    const select = `
       SELECT m.Id,m.type,substr(m.Path,1,8193) AS Path,substr(m.Name,1,1025) AS Name,
         substr(m.ProviderIds,1,16385) AS ProviderIds,m.SeriesId,m.IndexNumber,
         m.ParentIndexNumber,m.IndexNumberEnd,
         substr(s.ProviderIds,1,16385) AS SeriesProviderIds,
         substr(s.Name,1,1025) AS SeriesName,ud.played
-        ${scope === 'complete' ? ',m.RunTimeTicks,ud.playCount,ud.isFavorite,ud.playbackPositionTicks,ud.LastPlayedDateInt,ud.rating' : ''}
+        ${scope === 'complete' ? ',m.RunTimeTicks,ud.playCount,ud.isFavorite,ud.playbackPositionTicks,ud.LastPlayedDateInt,ud.rating' : ''}`;
+    const query = database.prepare(`${select}
       FROM UserDatas ud CROSS JOIN MediaItems m ON m.UserDataKeyId=ud.UserDataKeyId
       LEFT JOIN MediaItems s ON s.Id=m.SeriesId AND s.type=6
       WHERE ud.userId=? AND ${scope === 'watched_only' ? 'played=1' : `(${personalState})`}
@@ -376,22 +479,24 @@ export function readSnapshotHistory(
       invalid_resume_positions: 0,
       invalid_display_names: 0,
       orphan_state_items: 0,
+      ...(canRecover ? { recovered_orphan_state_items: 0 } : {}),
     };
     let bytes = 2; // JSON array brackets; reserve commas as items are appended.
     let rows = 0;
-    for (const row of query.iterate(userId, maxItems + 1)) {
+    const accepted = new Map<string, MediaItem>();
+    const accept = (row: Record<string, unknown>, recovered = false) => {
       if (++rows > maxItems)
         throw new ServiceError('This Emby snapshot exceeds the supported per-user history size.');
       const typeCode = integer(row.type);
-      if (excludedTypes.has(typeCode)) continue;
+      if (excludedTypes.has(typeCode)) return;
       const type = itemTypes[typeCode];
       if (!type) {
         diagnostics.unsupported_state_items++;
-        continue;
+        return;
       }
-      if (scope === 'watched_only' && !playableTypes.has(type)) continue;
+      if ((scope === 'watched_only' || recovered) && !playableTypes.has(type)) return;
       const data: MediaUserDataPatch = { Played: flag(row.played) };
-      if (scope === 'complete') {
+      if (scope === 'complete' && !recovered) {
         data.PlayCount = integer(row.playCount, 0, 2_147_483_647);
         data.IsFavorite = flag(row.isFavorite);
         try {
@@ -417,6 +522,14 @@ export function readSnapshotHistory(
         }
       }
       const item: MediaItem = { Id: String(integer(row.Id, 1)), Type: type, UserData: data };
+      if (recovered) {
+        diagnostics.recovered_orphan_state_items!++;
+        const previous = accepted.get(item.Id);
+        if (previous) {
+          previous.UserData!.Played = true;
+          return;
+        }
+      }
       let name: string | undefined;
       try {
         name = text(row.Name, 1_024);
@@ -443,12 +556,25 @@ export function readSnapshotHistory(
       if (row.SeriesId !== null) item.SeriesId = String(integer(row.SeriesId, 1));
       for (const key of ['IndexNumber', 'ParentIndexNumber', 'IndexNumberEnd'])
         if (row[key] !== null) item[key] = integer(row[key]);
-      if (scope === 'complete' && row.RunTimeTicks !== null)
+      if (scope === 'complete' && !recovered && row.RunTimeTicks !== null)
         item.RunTimeTicks = integer(row.RunTimeTicks);
       bytes += Buffer.byteLength(JSON.stringify(item)) + (items.length ? 1 : 0);
       if (bytes > maxBytes)
         throw new ServiceError('This Emby snapshot exceeds the supported per-user history size.');
       items.push(item);
+      accepted.set(item.Id, item);
+    };
+    for (const row of query.iterate(userId, maxItems + 1)) accept(row);
+    if (canRecover) {
+      const recovered = database.prepare(`${select}
+        FROM UserDatas ud CROSS JOIN JellyportRecoveredHistory r ON r.UserDataKeyId=ud.UserDataKeyId
+        CROSS JOIN MediaItems m ON m.Id=r.ItemId
+        LEFT JOIN MediaItems s ON s.Id=m.SeriesId AND s.type=6
+        WHERE ud.userId=? AND ud.played=1
+          AND NOT EXISTS (SELECT 1 FROM MediaItems native WHERE native.UserDataKeyId=ud.UserDataKeyId)
+        LIMIT ?`);
+      recovered.setReadBigInts(true);
+      for (const row of recovered.iterate(userId, maxItems - rows + 1)) accept(row, true);
     }
     // Removed media can leave legitimate history keys behind. Count these
     // separately instead of silently hiding them in the catalog join. Both
@@ -457,6 +583,12 @@ export function readSnapshotHistory(
       SELECT 1 FROM UserDatas ud
       WHERE ud.userId=? AND ${scope === 'watched_only' ? 'played=1' : `(${personalState})`}
         AND NOT EXISTS (SELECT 1 FROM MediaItems m WHERE m.UserDataKeyId=ud.UserDataKeyId)
+        ${
+          canRecover
+            ? `AND NOT (ud.played=1 AND EXISTS (SELECT 1 FROM JellyportRecoveredHistory r
+          JOIN MediaItems m ON m.Id=r.ItemId WHERE r.UserDataKeyId=ud.UserDataKeyId))`
+            : ''
+        }
       LIMIT ?`);
     for (const _row of orphans.iterate(userId, maxItems - rows + 1)) {
       diagnostics.orphan_state_items!++;

@@ -7,6 +7,7 @@ import type { Settings } from './types.js';
 import type { MigrationScope } from './migration.js';
 import { ServiceError } from './errors.js';
 import { snapshotProcess } from './snapshot-process.js';
+import type { SnapshotHistoryDiagnostics } from './emby-snapshot-reader.js';
 import {
   decryptDatabase,
   readEnvelope,
@@ -15,6 +16,7 @@ import {
   snapshotCaptureMethod,
   snapshotHistoryTime,
   snapshotIdentitiesMatch,
+  snapshotOrphanIdentityVersion,
   writeEnvelope,
   SNAPSHOT_VERSION,
   MAX_SNAPSHOT_BYTES,
@@ -54,15 +56,11 @@ export interface SnapshotMetadata {
   avatar: boolean;
   source_type: SnapshotCaptureMethod;
   schema: string;
+  orphan_identity_version?: 1;
   backup_created_at?: string;
   backup_fingerprint?: string;
   plugin_version?: string;
-  diagnostics?: {
-    unsupported_state_items: number;
-    invalid_resume_positions: number;
-    invalid_display_names: number;
-    orphan_state_items?: number;
-  };
+  diagnostics?: SnapshotHistoryDiagnostics;
 }
 interface State {
   config: Config;
@@ -166,6 +164,7 @@ export class SourceSnapshots {
         join(this.directory, `${id}.result`),
         this.key,
       );
+      snapshotOrphanIdentityVersion(value.orphan_identity_version);
       if (
         !value.ok ||
         value.id !== id ||
@@ -219,6 +218,9 @@ export class SourceSnapshots {
       avatar: false,
       source_type: snapshotCaptureMethod(value.capture_method),
       schema: value.schema!,
+      ...(value.orphan_identity_version === undefined
+        ? {}
+        : { orphan_identity_version: value.orphan_identity_version }),
       ...(snapshotCaptureMethod(value.capture_method) === 'plugin_backup'
         ? {
             backup_created_at: value.backup_created_at,
@@ -476,7 +478,7 @@ export class SourceSnapshots {
       this.ticking = false;
     }
   }
-  /** Importing the same backup does not renew its history age or create another generation. */
+  /** Reimporting history never renews its age. A new identity capability may replace a legacy projection. */
   private async adoptPluginBackup(value: CaptureResult): Promise<boolean> {
     const time = Date.parse(snapshotHistoryTime(value));
     if (Date.now() - time > MAX_AGE || time > Date.now() + 60_000)
@@ -504,7 +506,8 @@ export class SourceSnapshots {
           previous.plugin_version !== value.plugin_version
         )
           throw new Error('The plugin backup identity changed.');
-        duplicate = true;
+        if ((previous.orphan_identity_version ?? 0) >= (value.orphan_identity_version ?? 0))
+          duplicate = true;
       }
     }
     if (duplicate) {
@@ -598,12 +601,7 @@ export class SourceSnapshots {
         | MediaItem[]
         | {
             items: MediaItem[];
-            diagnostics: {
-              unsupported_state_items: number;
-              invalid_resume_positions: number;
-              invalid_display_names: number;
-              orphan_state_items?: number;
-            };
+            diagnostics: SnapshotHistoryDiagnostics;
           }
       >(
         {
@@ -633,6 +631,9 @@ export class SourceSnapshots {
             diagnostics.invalid_resume_positions,
             diagnostics.invalid_display_names,
             diagnostics.orphan_state_items === undefined ? 0 : diagnostics.orphan_state_items,
+            diagnostics.recovered_orphan_state_items === undefined
+              ? 0
+              : diagnostics.recovered_orphan_state_items,
           ].some((count) => !Number.isSafeInteger(count) || count < 0 || count > 100_000)
         )
           throw new ServiceError('The saved database returned invalid history diagnostics.');
@@ -641,6 +642,7 @@ export class SourceSnapshots {
           invalid_resume_positions: diagnostics.invalid_resume_positions,
           invalid_display_names: diagnostics.invalid_display_names,
           orphan_state_items: diagnostics.orphan_state_items ?? 0,
+          recovered_orphan_state_items: diagnostics.recovered_orphan_state_items ?? 0,
         };
       }
       return items;

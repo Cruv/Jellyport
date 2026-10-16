@@ -146,6 +146,7 @@ describe('Emby Backup & Restore completed full-backup imports', () => {
     expect(result).toMatchObject({
       schema: 'emby-4.10.1.0',
       item_count: 1,
+      orphan_identity_version: 1,
       identities: { [GUID]: 1 },
       backup_created_at: '2026-10-15T10:00:00.123Z',
       plugin_version: '1.8.7.0',
@@ -170,7 +171,7 @@ describe('Emby Backup & Restore completed full-backup imports', () => {
           .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
           .all()
           .map((row) => row.name),
-      ).toEqual(['MediaItems', 'UserDatas']);
+      ).toEqual(['JellyportRecoveredHistory', 'MediaItems', 'UserDatas']);
     } finally {
       database.close();
     }

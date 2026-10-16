@@ -141,11 +141,19 @@ export interface CaptureResult extends CaptureRequest {
   bytes?: number;
   item_count?: number;
   schema?: string;
+  /** Absent on projections imported before native history identity recovery. */
+  orphan_identity_version?: 1;
   identities?: Record<string, number>;
   backup_created_at?: string;
   backup_fingerprint?: string;
   plugin_version?: string;
   error?: string;
+}
+
+/** Keep legacy projections readable while refusing unknown identity capabilities. */
+export function snapshotOrphanIdentityVersion(value: unknown): 1 | undefined {
+  if (value === undefined || value === 1) return value;
+  throw new Error('Unsupported snapshot history identity version.');
 }
 
 /** Preserve source history age independently of when a completed backup was imported. */
@@ -248,6 +256,7 @@ async function completedCapture(
     )
       return false;
     if (!value.ok) return typeof value.error === 'string';
+    snapshotOrphanIdentityVersion(value.orphan_identity_version);
     if (
       value.schema !== 'emby-4.10.1.0' ||
       !Number.isSafeInteger(value.bytes) ||

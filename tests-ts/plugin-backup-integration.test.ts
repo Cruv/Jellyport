@@ -222,6 +222,7 @@ syncBuiltinESMExports();
     plugin_version: '1.8.7.0',
     schema: 'emby-4.10.1.0',
     item_count: 3,
+    orphan_identity_version: 1,
   });
   expect(result.identities).not.toHaveProperty(NEW_USER);
   expect(result.backup_fingerprint).toMatch(/^[a-f0-9]{64}$/);
@@ -246,7 +247,7 @@ syncBuiltinESMExports();
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
         .all()
         .map((row) => row.name),
-    ).toEqual(['MediaItems', 'UserDatas']);
+    ).toEqual(['JellyportRecoveredHistory', 'MediaItems', 'UserDatas']);
   } finally {
     database.close();
   }
@@ -267,6 +268,7 @@ syncBuiltinESMExports();
     invalid_resume_positions: 1,
     invalid_display_names: 1,
     orphan_state_items: 1,
+    recovered_orphan_state_items: 0,
   });
   expect(history.items).toHaveLength(2);
   expect(history.items[0]?.UserData).toMatchObject({

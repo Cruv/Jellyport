@@ -17,6 +17,7 @@ interface OpenSource {
 export interface FileCopyCaptureResult {
   identities: Record<string, number>;
   schema: string;
+  orphan_identity_version?: 1;
   bytes: number;
   item_count: number;
 }
@@ -219,7 +220,15 @@ export async function captureFileCopy(
     const size = (await lstat(output)).size;
     if (size > maxBytes) throw failed();
     const inspected = inspectLibrary(output);
-    return { identities, schema: inspected.adapter, bytes: size, item_count: inspected.item_count };
+    return {
+      identities,
+      schema: inspected.adapter,
+      bytes: size,
+      item_count: inspected.item_count,
+      ...(inspected.orphan_identity_version === undefined
+        ? {}
+        : { orphan_identity_version: inspected.orphan_identity_version }),
+    };
   } catch {
     if (ownsOutput) await rm(output, { force: true }).catch(() => {});
     throw failed();

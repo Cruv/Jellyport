@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, within } from '@testing-library/react';
-import { JobProgressDetails, JobsTable } from './components';
-import type { Job, JobProgress } from './types';
+import { JobProgressDetails, JobsTable, SourceSnapshotNote } from './components';
+import type { Job, JobProgress, SourceSnapshotMetadata } from './types';
 
 const running: Job = {
   id: 'bulk-migration',
@@ -19,6 +19,51 @@ afterEach(() => {
 });
 
 describe('Migration item progress and timing', () => {
+  it.each(['plugin_backup', 'file_copy', 'sqlite_online_backup'] as const)(
+    'reports resolved orphan records separately from destination writes for %s',
+    (source_type) => {
+      const snapshot: SourceSnapshotMetadata = {
+        id: 'synthetic-capture',
+        source_type,
+        source_server_url: 'http://emby.example.test',
+        source_server_id: 'synthetic-server',
+        source_server_version: '4.10.1.0',
+        source_user_id: '',
+        source_username: 'Synthetic user',
+        scope: 'complete',
+        started_at: '2026-10-16T01:00:00Z',
+        finished_at: '2026-10-16T01:00:01Z',
+        expires_at: '2026-10-18T01:00:00Z',
+        items: 3,
+        playlists: 0,
+        playlist_entries: 0,
+        bytes: 1024,
+        avatar: false,
+        orphan_identity_version: 1,
+        diagnostics: {
+          unsupported_state_items: 0,
+          invalid_resume_positions: 0,
+          invalid_display_names: 0,
+          orphan_state_items: 2,
+          recovered_orphan_state_items: 3,
+        },
+      };
+      const view = render(<SourceSnapshotNote snapshot={snapshot} />);
+      expect(
+        screen.getByText(/3 orphan history records were reattached to verified Emby media/),
+      ).toBeTruthy();
+      expect(
+        screen.getByText(/Duplicate played flags were merged before Jellyfin matching/),
+      ).toBeTruthy();
+      expect(screen.queryByText(/3 played updates/)).toBeNull();
+      view.rerender(
+        <SourceSnapshotNote
+          snapshot={{ ...snapshot, diagnostics: undefined, orphan_identity_version: undefined }}
+        />,
+      );
+      expect(screen.queryByText(/orphan history/)).toBeNull();
+    },
+  );
   it('labels watched-only item progress without claiming favorites are being migrated', () => {
     render(
       <JobProgressDetails

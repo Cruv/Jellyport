@@ -66,6 +66,8 @@ export interface MediaAPI {
     catalog: MediaItem[],
     scope?: 'complete' | 'watched_only',
   ): Promise<MediaItem[]>;
+  /** Fresh, access-scoped destination data for matched catalog candidates only. */
+  destinationItems?(userId: string, candidates: MediaItem[]): Promise<MediaItem[]>;
   watchedItems?(userId: string): Promise<MediaItem[]>;
   migrationCapabilities?(): Promise<MigrationCapabilities>;
   updateUserData?(userId: string, itemId: string, patch: MediaUserDataPatch): Promise<void>;
@@ -85,6 +87,14 @@ export interface MediaAPI {
 }
 export type ClientFactory = (url: string, apiKey: string, kind?: MediaKind) => MediaAPI;
 export type FetchTransport = (url: string, init: RequestInit) => Promise<Response>;
+export interface DestinationReadEvent {
+  event: 'destination_read';
+  operation: 'catalog' | 'user_state';
+  outcome: 'completed' | 'failed' | 'canceled';
+  duration_ms: number;
+  items: number;
+  attempts: number;
+}
 export interface MediaClientOptions {
   transport?: FetchTransport;
   sleep?: (milliseconds: number) => Promise<unknown>;
@@ -93,6 +103,8 @@ export interface MediaClientOptions {
   maxResponseBytes?: number;
   /** One shared governor for all live source migration reads. */
   workload?: MediaWorkload;
+  /** Aggregate destination workload only; excludes credentials and item/user identities. */
+  observeRead?: (event: DestinationReadEvent) => void;
 }
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -101,6 +113,9 @@ export const MAX_CATALOG_ITEMS = 200_000;
 export const MAX_CATALOG_BYTES = 64 * 1024 * 1024;
 export const MAX_MIGRATION_STATE_ITEMS = 100_000;
 export const MAX_MIGRATION_STATE_BYTES = 32 * 1024 * 1024;
+
+/** The reusable destination identities no longer describe the current library. */
+export class CatalogChangedError extends MediaError {}
 const MAX_STATE_BATCH_IDS = 100;
 const MAX_ENCODED_BATCH_IDS = 6000;
 const playableTypes = new Set([
@@ -376,6 +391,7 @@ export class MediaClient implements MediaAPI {
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
   private readonly workload?: MediaWorkload;
+  private readonly observeRead?: (event: DestinationReadEvent) => void;
   private readonly controller = new AbortController();
   private capabilities?: Promise<MigrationCapabilities>;
 
@@ -417,6 +433,7 @@ export class MediaClient implements MediaAPI {
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
     this.workload = options.workload;
+    this.observeRead = options.observeRead;
     if (
       !Number.isFinite(this.timeoutMs) ||
       this.timeoutMs <= 0 ||
@@ -445,7 +462,12 @@ export class MediaClient implements MediaAPI {
     body?: unknown,
     decode: boolean | 'image' = true,
     bodyContentType?: MediaUserImage['contentType'],
-    options: { signal?: AbortSignal; retry?: boolean; timeoutMs?: number } = {},
+    options: {
+      signal?: AbortSignal;
+      retry?: boolean;
+      timeoutMs?: number;
+      onAttempt?: () => void;
+    } = {},
   ): Promise<unknown> {
     const attempts = method === 'GET' && options.retry !== false ? 3 : 1;
     const timeoutMs = Math.min(this.timeoutMs, options.timeoutMs ?? this.timeoutMs);
@@ -466,6 +488,7 @@ export class MediaClient implements MediaAPI {
       let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
       try {
         if (signal.aborted) throw signal.reason;
+        options.onAttempt?.();
         const pending = this.transport(url.toString(), {
           method,
           redirect: 'manual',
@@ -645,12 +668,13 @@ export class MediaClient implements MediaAPI {
     path: string,
     params: Record<string, string | number>,
   ): Promise<JsonObject> {
-    const read = async (signal: AbortSignal) =>
+    const read = async (signal: AbortSignal, onAttempt?: () => void) =>
       this.object(
         await this.request('GET', path, params, undefined, true, undefined, {
           signal,
           retry: false,
           timeoutMs: this.workload?.maxReadMs ?? 5000,
+          onAttempt,
         }),
       );
     if (this.kind === 'emby' && this.workload)
@@ -660,7 +684,41 @@ export class MediaClient implements MediaAPI {
       });
     // Yield even with a synthetic immediate transport, so close() can interrupt long reads.
     await this.yieldRead();
-    return read(this.controller.signal);
+    return this.kind === 'jellyfin'
+      ? this.destinationRead(operation === 'catalog' ? 'catalog' : 'user_state', (onAttempt) =>
+          read(this.controller.signal, onAttempt),
+        )
+      : read(this.controller.signal);
+  }
+
+  private async destinationRead(
+    operation: DestinationReadEvent['operation'],
+    read: (onAttempt: () => void) => Promise<JsonObject>,
+  ): Promise<JsonObject> {
+    const started = performance.now();
+    let items = 0;
+    let attempts = 0;
+    let outcome: DestinationReadEvent['outcome'] = 'failed';
+    try {
+      const data = await read(() => attempts++);
+      items = Array.isArray(data.Items) ? data.Items.length : 0;
+      outcome = 'completed';
+      return data;
+    } finally {
+      if (this.controller.signal.aborted) outcome = 'canceled';
+      try {
+        this.observeRead?.({
+          event: 'destination_read',
+          operation,
+          outcome,
+          duration_ms: Math.max(0, performance.now() - started),
+          items,
+          attempts,
+        });
+      } catch {
+        // Diagnostic callbacks cannot change migration behavior or leak request data.
+      }
+    }
   }
 
   private async itemsByType(
@@ -903,6 +961,115 @@ export class MediaClient implements MediaAPI {
           items.push(projected);
         }
         start += data.Items.length;
+      }
+    }
+    return items;
+  }
+
+  /**
+   * Jellyfin accepts explicit IDs without recursive enumeration or a name sort.
+   * Supply the entire bounded batch as Limit: missing IDs are deleted or unavailable
+   * to this account, never implicit empty state or permission to write them.
+   */
+  async destinationItems(userId: string, candidates: MediaItem[]): Promise<MediaItem[]> {
+    if (this.kind !== 'jellyfin')
+      throw new MediaError('Destination candidate reads require a Jellyfin server.');
+    this.id(userId);
+    if (!Array.isArray(candidates) || candidates.length > MAX_CATALOG_ITEMS)
+      throw new MediaError('Invalid destination candidate catalog.');
+    const identifiers = new Set<string>();
+    let catalogBytes = 0;
+    for (let index = 0; index < candidates.length; index++) {
+      if (index % 1000 === 0) await this.yieldRead();
+      const item = projectCatalogItem(candidates[index]);
+      if (identifiers.has(item.Id))
+        throw new MediaError('The destination candidate catalog contains duplicate identifiers.');
+      identifiers.add(item.Id);
+      catalogBytes += Buffer.byteLength(JSON.stringify(item));
+      if (catalogBytes > MAX_CATALOG_BYTES)
+        throw new MediaError('The destination candidate catalog exceeds the supported size.');
+    }
+    const identity = (item: MediaItem) =>
+      JSON.stringify([
+        item.Type,
+        item.Path ?? null,
+        Object.entries(item.ProviderIds ?? {})
+          .map(([key, value]) => [key, String(value)])
+          .sort(([a], [b]) => a!.localeCompare(b!)),
+        item.SeriesId ?? null,
+        ...(['IndexNumber', 'ParentIndexNumber', 'IndexNumberEnd'] as const).map((field) =>
+          item[field] === undefined ? null : Number(item[field]),
+        ),
+      ]);
+    const items: MediaItem[] = [];
+    let retainedBytes = 0;
+    for (let offset = 0; offset < candidates.length;) {
+      const batch: MediaItem[] = [];
+      while (offset < candidates.length && batch.length < MAX_STATE_BATCH_IDS) {
+        const candidate = candidates[offset]!;
+        const ids = [...batch.map((item) => item.Id), candidate.Id].join(',');
+        let encodedLength: number;
+        try {
+          encodedLength = encodeURIComponent(ids).length;
+        } catch {
+          throw new MediaError('Invalid destination candidate identifiers.');
+        }
+        if (encodedLength > MAX_ENCODED_BATCH_IDS && batch.length) break;
+        if (encodedLength > MAX_ENCODED_BATCH_IDS)
+          throw new MediaError('A destination candidate identifier exceeds the supported size.');
+        batch.push(candidate);
+        offset++;
+      }
+      await this.yieldRead();
+      const data = await this.destinationRead('user_state', async (onAttempt) =>
+        this.object(
+          await this.request(
+            'GET',
+            `Users/${this.id(userId)}/Items`,
+            {
+              Ids: batch.map((item) => item.Id).join(','),
+              Fields: 'ProviderIds,Path',
+              EnableUserData: 'true',
+              EnableImages: 'false',
+              EnableTotalRecordCount: 'false',
+              Limit: batch.length,
+            },
+            undefined,
+            true,
+            undefined,
+            { onAttempt },
+          ),
+        ),
+      );
+      if (!Array.isArray(data.Items) || data.Items.length > batch.length)
+        throw new MediaError('Jellyfin returned an invalid destination candidate page.');
+      const allowed = new Map(batch.map((item) => [item.Id, item]));
+      const seen = new Set<string>();
+      for (const value of data.Items) {
+        if (
+          !isObject(value) ||
+          !itemIdentifier(value.Id) ||
+          !allowed.has(value.Id) ||
+          seen.has(value.Id)
+        )
+          throw new MediaError('Jellyfin returned unexpected or repeated destination identifiers.');
+        if (!isObject(value.UserData))
+          throw new MediaError('Jellyfin returned destination state without a valid data object.');
+        const fresh = projectMigrationItem(value);
+        const cached = projectCatalogItem(allowed.get(value.Id)!);
+        if (identity(fresh) !== identity(cached))
+          throw new CatalogChangedError(
+            'Jellyfin catalog identities changed. Refresh the destination catalog and retry.',
+          );
+        // Derived series IDs are supplied by the neutral catalog, not this DTO.
+        // The caller validates their parent series dependencies before matching.
+        if (cached.SeriesProviderIds && !fresh.SeriesProviderIds)
+          fresh.SeriesProviderIds = { ...cached.SeriesProviderIds };
+        retainedBytes += Buffer.byteLength(JSON.stringify(fresh));
+        if (items.length >= MAX_CATALOG_ITEMS || retainedBytes > MAX_CATALOG_BYTES)
+          throw new MediaError('Jellyfin destination state exceeds the supported migration size.');
+        items.push(fresh);
+        seen.add(value.Id);
       }
     }
     return items;

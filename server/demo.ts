@@ -163,6 +163,10 @@ export class DemoClient implements MediaAPI {
   async catalogItems(): Promise<MediaItem[]> {
     return (await this.migrationItems()).map(({ UserData: _state, ...item }) => item as MediaItem);
   }
+  async destinationItems(userId: string, candidates: MediaItem[]): Promise<MediaItem[]> {
+    const ids = new Set(candidates.map((item) => item.Id));
+    return (await this.migrationItems(userId)).filter((item) => ids.has(item.Id));
+  }
   async migrationState(
     userId: string,
     catalog: MediaItem[],

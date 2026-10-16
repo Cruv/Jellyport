@@ -16,10 +16,6 @@ function deferred() {
   });
   return { promise, resolve };
 }
-async function flush() {
-  for (let index = 0; index < 30; index++) await Promise.resolve();
-}
-
 describe('playback-conscious migration orchestration', () => {
   let directory: string, store: Store, servers: DemoServers, service: Service;
   let events: MediaWorkloadEvent[];
@@ -314,7 +310,7 @@ describe('playback-conscious migration orchestration', () => {
     expect(servers.played['j-river']).toEqual(new Set(['1', '2']));
   });
 
-  it('waits to read snapshot history and destination details until active migration writes finish', async () => {
+  it('completes lightweight snapshot preview while an active migration owns history admission', async () => {
     const entered = deferred(),
       release = deferred();
     releases.push(release.resolve);
@@ -340,32 +336,33 @@ describe('playback-conscious migration orchestration', () => {
       }
       return client;
     };
-    const { select, items } = snapshots(async () => {
-      expect(writesFinished).toBe(true);
-      return [
-        { Id: '2', Type: 'Movie', ProviderIds: { Tmdb: '120467' }, UserData: { Played: true } },
-      ];
-    });
+    const { select, items } = snapshots();
     const job = await service.migrateUsers(['e-river']);
     await entered.promise;
     const opened = factoryCalls.mock.calls.length;
-    const pending = service.preview(['e-river'], { use_snapshots: true });
-    await flush();
-    expect(factoryCalls).toHaveBeenCalledTimes(opened);
-    expect(select).not.toHaveBeenCalled();
+    const progress = vi.fn();
+    const preview = await service.preview(['e-river'], { use_snapshots: true, progress });
+    expect(factoryCalls).toHaveBeenCalledTimes(opened + 2);
+    expect(select).toHaveBeenCalledOnce();
     expect(items).not.toHaveBeenCalled();
-    release.resolve();
-    const [final, preview] = await Promise.all([finish(job), pending]);
-    expect(final.status).toBe('completed');
-    expect(preview.users[0]?.stats).toMatchObject({
-      source_played: 1,
-      matched: 1,
-      already_played: 1,
+    expect(writesFinished).toBe(false);
+    expect(service.getJob(job.id).status).toBe('running');
+    expect(preview.users[0]).toMatchObject({
+      history_deferred: true,
+      stats: null,
+      source_snapshot: { id: '7d1a6301-8c1c-4c1c-a1b1-b2139d712b80' },
     });
-    expect(items).toHaveBeenCalledTimes(1);
+    expect(preview.source_snapshot_ids).toEqual({
+      'e-river': '7d1a6301-8c1c-4c1c-a1b1-b2139d712b80',
+    });
+    expect(progress.mock.calls).toEqual([[1, 1]]);
+    release.resolve();
+    expect((await finish(job)).status).toBe('completed');
+    expect(writesFinished).toBe(true);
+    expect(items).not.toHaveBeenCalled();
   });
 
-  it('does not start migration source reads while a snapshot preview owns history admission', async () => {
+  it('does not block live migration history admission while snapshot preview metadata is pending', async () => {
     const entered = deferred(),
       release = deferred();
     releases.push(release.resolve);
@@ -382,26 +379,30 @@ describe('playback-conscious migration orchestration', () => {
       }
       return client;
     };
-    snapshots(async () => {
+    const saved = snapshots();
+    const select = saved.select.getMockImplementation()!;
+    saved.select.mockImplementation(async (...parameters) => {
       entered.resolve();
       await release.promise;
-      return [
-        { Id: '2', Type: 'Movie', ProviderIds: { Tmdb: '120467' }, UserData: { Played: true } },
-      ];
+      return select(...parameters);
     });
-    const pending = service.preview(['e-river'], { use_snapshots: true });
+    const progress = vi.fn();
+    const pending = service.preview(['e-river'], { use_snapshots: true, progress });
     await entered.promise;
     const job = await service.migrateUsers(['e-river']);
-    await flush();
-    expect(catalogReads).not.toHaveBeenCalled();
-    release.resolve();
-    const [preview, final] = await Promise.all([pending, finish(job)]);
-    expect(preview.users[0]?.stats?.matched).toBe(1);
-    expect(final.status).toBe('completed');
+    expect((await finish(job)).status).toBe('completed');
     expect(catalogReads).toHaveBeenCalledTimes(1);
+    expect(saved.items).not.toHaveBeenCalled();
+    expect(progress).not.toHaveBeenCalled();
+    release.resolve();
+    const preview = await pending;
+    expect(preview.users[0]).toMatchObject({ history_deferred: true, stats: null });
+    expect(saved.select).toHaveBeenCalledOnce();
+    expect(saved.items).not.toHaveBeenCalled();
+    expect(progress.mock.calls).toEqual([[1, 1]]);
   });
 
-  it('cancels a snapshot preview waiting behind a migration without opening clients or disrupting active work', async () => {
+  it('cancels a lightweight snapshot preview without reading history or disrupting active migration', async () => {
     const entered = deferred(),
       release = deferred();
     releases.push(release.resolve);
@@ -425,22 +426,31 @@ describe('playback-conscious migration orchestration', () => {
     await entered.promise;
     const calls = opened.mock.calls.length;
     const controller = new AbortController();
+    const progress = vi.fn();
     const pending = service.preview(['e-river'], {
       use_snapshots: true,
       signal: controller.signal,
+      progress,
     });
     const canceled = expect(pending).rejects.toThrow(/abort|cancel/i);
     controller.abort();
     await canceled;
-    expect(opened).toHaveBeenCalledTimes(calls);
+    expect(opened).toHaveBeenCalledTimes(calls + 2);
     expect(saved.select).not.toHaveBeenCalled();
     expect(saved.items).not.toHaveBeenCalled();
+    expect(progress).not.toHaveBeenCalled();
     expect(service.getJob(job.id).cancel_requested).toBeUndefined();
     release.resolve();
     expect((await finish(job)).status).toBe('completed');
-    // An aborted waiter must release its place without poisoning subsequent admission.
-    expect(
-      (await service.preview(['e-river'], { use_snapshots: true })).users[0]?.stats?.matched,
-    ).toBe(1);
+    // Preview cancellation must not poison later identity checks or snapshot pinning.
+    const laterProgress = vi.fn();
+    const preview = await service.preview(['e-river'], {
+      use_snapshots: true,
+      progress: laterProgress,
+    });
+    expect(preview.users[0]).toMatchObject({ history_deferred: true, stats: null });
+    expect(saved.select).toHaveBeenCalledOnce();
+    expect(saved.items).not.toHaveBeenCalled();
+    expect(laterProgress.mock.calls).toEqual([[1, 1]]);
   });
 });

@@ -28,6 +28,7 @@ import {
   type MediaKind,
   type MediaUser,
   type MediaUserImage,
+  type DestinationReadEvent,
 } from './media.js';
 import type { Store } from './store.js';
 import type { Settings } from './types.js';
@@ -187,6 +188,21 @@ export interface ServiceOptions {
   clientFactory?: ClientFactory;
   demo?: boolean;
   observeMedia?: (event: MediaWorkloadEvent) => void;
+  observeDestination?: (event: DestinationWorkloadEvent) => void;
+}
+export interface DestinationWorkloadEvent extends Omit<DestinationReadEvent, 'event'> {
+  event: 'destination_read' | 'destination_cache_hit';
+  calls: number;
+  pages: number;
+  items_total: number;
+  cache_hits: number;
+  total_duration_ms: number;
+}
+interface DestinationCatalogContext {
+  key?: string;
+  value?: MigrationCatalog;
+  matcher?: PreparedMatcher;
+  byId?: Map<string, MediaItem>;
 }
 interface ProvisioningDefaults extends MediaUser {
   accountRole?: AccountRole;
@@ -250,6 +266,7 @@ class Mutex {
 class StoppedError extends Error {}
 class CanceledError extends StoppedError {}
 class SourcePreparationError extends ServiceError {}
+class DestinationPreparationError extends ServiceError {}
 export function now(): string {
   return new Date().toISOString();
 }
@@ -317,6 +334,8 @@ export class Service {
   private readonly activeJobs = new Map<string, Job>();
   private readonly sourceWorkload: MediaWorkload;
   private readonly sourceCatalogs: MigrationCatalogCache;
+  private readonly destinationCatalogs: MigrationCatalogCache;
+  private readonly destinationCacheHit: (items: number) => void;
   private readonly subscriptionMutex = new Mutex();
   private readonly clients = new Set<MediaAPI>();
   private stopping = false;
@@ -338,11 +357,50 @@ export class Service {
     this.sourceCatalogs = new MigrationCatalogCache({
       hit: (items) => this.sourceWorkload.cacheHit('catalog', items),
     });
+    const totals = { calls: 0, pages: 0, items_total: 0, cache_hits: 0, total_duration_ms: 0 };
+    const report = (
+      event:
+        | DestinationReadEvent
+        | (Omit<DestinationReadEvent, 'event'> & {
+            event: 'destination_cache_hit';
+          }),
+    ) => {
+      try {
+        (options.observeDestination ?? ((value) => console.info(JSON.stringify(value))))({
+          ...event,
+          ...totals,
+        });
+      } catch {
+        // Diagnostics cannot affect migrations or expose upstream response bodies.
+      }
+    };
+    const observeRead = (event: DestinationReadEvent) => {
+      totals.calls += event.attempts;
+      totals.pages += Number(event.outcome === 'completed');
+      totals.items_total += event.items;
+      totals.total_duration_ms += event.duration_ms;
+      report(event);
+    };
+    this.destinationCacheHit = (items) => {
+      totals.cache_hits++;
+      report({
+        event: 'destination_cache_hit',
+        operation: 'catalog',
+        outcome: 'completed',
+        items,
+        attempts: 0,
+        duration_ms: 0,
+      });
+    };
+    this.destinationCatalogs = new MigrationCatalogCache({
+      label: 'destination',
+      hit: this.destinationCacheHit,
+    });
     this.clientFactory =
       options.clientFactory ??
       ((url, key, kind) =>
         new MediaClient(url, key, kind, {
-          ...(kind === 'emby' ? { workload: this.sourceWorkload } : {}),
+          ...(kind === 'emby' ? { workload: this.sourceWorkload } : { observeRead }),
         }));
     this.demo = options.demo ?? false;
     this.mappings = new UserMappings(store);
@@ -632,31 +690,8 @@ export class Service {
     )
       throw new ServiceError('The user mapping changed. Review a new preview before migrating.');
   }
-  private async previewPlaylists(
-    emby: MediaAPI,
-    sourceId: string,
-  ): Promise<{ count: number; warnings: string[] }> {
-    if (!emby.playlists || !emby.playlistItems)
-      return { count: 0, warnings: ['This source client cannot read playlists.'] };
-    try {
-      const playlists = await emby.playlists(sourceId);
-      return {
-        count: Math.min(playlists.length, 500),
-        warnings:
-          playlists.length > 500
-            ? ['Only the first 500 source playlists were read. Remaining playlists were skipped.']
-            : [],
-      };
-    } catch {
-      return {
-        count: 0,
-        warnings: ['Source playlists could not be read; library data can still migrate.'],
-      };
-    }
-  }
   async preview(sourceUserIds: string[], options: MigrationPreviewOptions = {}) {
-    if (!options.use_snapshots) return this.previewRead(sourceUserIds, options);
-    return this.historyMutex.run(() => this.previewRead(sourceUserIds, options), options.signal);
+    return this.previewRead(sourceUserIds, options);
   }
   private async previewRead(
     sourceUserIds: string[],
@@ -676,7 +711,6 @@ export class Service {
     return this.withClient(settings, 'emby', (emby) =>
       this.withClient(settings, 'jellyfin', async (jellyfin) => {
         const cancel = () => {
-          // These clients belong only to this preview; closing them aborts in-flight reads.
           void Promise.allSettled([
             Promise.resolve().then(() => emby.close()),
             Promise.resolve().then(() => jellyfin.close()),
@@ -700,19 +734,6 @@ export class Service {
               'Database snapshots require the verified Emby 4.10.1.0 connection.',
             );
           let captureId: string | undefined;
-          // Only new destinations share this preview's catalog. Strip template personal data
-          // before reuse; existing destinations always read their own user-scoped state.
-          let newTargetCatalog: Promise<MediaItem[]> | undefined;
-          let newTargetMatcher: PreparedMatcher | undefined;
-          const targetCatalogFor = (target: MediaUser | null | undefined) => {
-            const read = (userId?: string) =>
-              jellyfin.migrationItems ? jellyfin.migrationItems(userId) : jellyfin.items(userId);
-            if (target) return read(target.Id);
-            newTargetCatalog ??= read(template.Id || undefined).then((items) =>
-              items.map((item) => ({ ...item, UserData: { Played: false } })),
-            );
-            return newTargetCatalog;
-          };
           for (const sourceId of sourceUserIds) {
             checkCanceled();
             const sourceUser = await emby.user(sourceId);
@@ -741,106 +762,52 @@ export class Service {
               throw new ServiceError(
                 'A disabled Jellyfin account cannot be a migration destination.',
               );
-            if (!options.use_snapshots) {
-              this.assertMapping(mapping, sourceId, settings);
-              users.push({
-                source_user_id: sourceId,
-                source_username: sourceUser.Name,
-                username,
-                target_user_id: target?.Id ?? null,
-                target_exists: Boolean(target),
-                history_deferred: true,
-                stats: null,
-                unmatched: [],
-                ambiguous: [],
-                mapping_id: mapping?.id ?? null,
-                mapping_revision: mapping?.revision ?? null,
-                discord_user_id: mapping?.discord_user_id ?? null,
-                discord_username: mapping?.discord_username ?? null,
-                warnings: [
-                  'Live preview checks account identity only. Complete history, favorites, resume positions, playlists and matching details are read after approval; results report unmatched and ambiguous items. A shared matching catalog is reused during the job, so library changes after collection require another migration. Saved snapshots provide history details before approval.',
-                  ...(!target && template.accountRole
-                    ? [
-                        'The new account’s role may limit library access; final matches are checked using that account.',
-                      ]
-                    : []),
-                ],
-              });
-              options.progress?.(users.length, sourceUserIds.length);
+            // Approval validates identity and pins a suitable generation. It never starts a
+            // catalog crawl, decrypts history, or reads playlists on either server.
+            let snapshot: SnapshotMetadata | undefined;
+            if (options.use_snapshots) {
+              if (!snapshotInfo)
+                throw new ServiceError(
+                  'Saved snapshot identity is unavailable. Review a new preview.',
+                );
+              const saved = await this.sourceSnapshots.select(
+                sourceId,
+                settings,
+                snapshotInfo.Id as string,
+                captureId,
+              );
               checkCanceled();
-              continue;
+              captureId = saved.id;
+              snapshotIds[sourceId] = saved.id;
+              snapshot = { ...saved.metadata, source_username: sourceUser.Name };
             }
-            // Validate account identity first, then overlap independent catalog reads. Preview
-            // needs only playlist metadata; entries are fetched during the actual migration.
-            if (!snapshotInfo)
-              throw new ServiceError(
-                'Saved snapshot identity is unavailable. Review a new preview.',
-              );
-            const saved = await this.sourceSnapshots.select(
-              sourceId,
-              settings,
-              snapshotInfo.Id as string,
-              captureId,
-            );
-            captureId = saved.id;
-            snapshotIds[sourceId] = saved.id;
-            saved.metadata.source_username = sourceUser.Name;
-            const [sourceItems, targetCatalog, playlists] = await Promise.all([
-              this.sourceSnapshots.items(saved, sourceId, scope, options.signal),
-              targetCatalogFor(target),
-              scope === 'watched_only'
-                ? Promise.resolve({ count: 0, warnings: [] })
-                : this.previewPlaylists(emby, sourceId),
-            ]);
-            checkCanceled();
-            const targetItems = targetCatalog;
-            const matcher = target
-              ? createMatcher(targetItems, settings.path_mappings)
-              : (newTargetMatcher ??= createMatcher(targetItems, settings.path_mappings));
-            const [plan, stats] = this.plan(
-              sourceItems,
-              targetItems,
-              settings,
-              playlists.count,
-              scope,
-              matcher,
-            );
-            const warnings = [
-              ...snapshotHistoryWarnings(saved.metadata.diagnostics),
-              ...playlists.warnings,
-              ...(!target && template.accountRole
-                ? [
-                    'This preview uses the server catalog. The new account’s role may limit library access; final matches are checked using that account.',
-                  ]
-                : []),
-            ];
-            if (
-              plan.unmatched.length > 200 ||
-              plan.ambiguous.length > 200 ||
-              plan.ambiguous.some((entry) => entry.candidates.length > 20)
-            )
-              warnings.push(
-                'Preview details are limited to 200 unmatched items, 200 ambiguous items, and 20 candidates per item. Full counts are shown; migration checks every item.',
-              );
             this.assertMapping(mapping, sourceId, settings);
             users.push({
-              source_snapshot: saved.metadata,
+              ...(snapshot ? { source_snapshot: snapshot } : {}),
               source_user_id: sourceId,
               source_username: sourceUser.Name,
               username,
               target_user_id: target?.Id ?? null,
               target_exists: Boolean(target),
-              stats,
-              unmatched: plan.unmatched.slice(0, 200).map(previewItemSummary),
-              ambiguous: plan.ambiguous.slice(0, 200).map((entry) => ({
-                source: previewItemSummary(entry.source),
-                candidates: entry.candidates.slice(0, 20).map(previewItemSummary),
-              })),
+              history_deferred: true,
+              stats: null,
+              unmatched: [],
+              ambiguous: [],
               mapping_id: mapping?.id ?? null,
               mapping_revision: mapping?.revision ?? null,
               discord_user_id: mapping?.discord_user_id ?? null,
               discord_username: mapping?.discord_username ?? null,
-              warnings,
+              warnings: [
+                snapshot
+                  ? 'Saved history is available. Preview checks account identity and backup freshness only. Exact history counts, matching details and playlists are deferred until approval; results report unmatched and ambiguous items. Approval uses this backup generation and a shared Jellyfin matching catalog.'
+                  : 'Live preview checks account identity only. Complete history, favorites, resume positions, playlists and matching details are read after approval; results report unmatched and ambiguous items. Shared matching catalogs are reused during the job, so library changes after collection require another migration.',
+                ...(snapshot ? snapshotHistoryWarnings(snapshot.diagnostics) : []),
+                ...(!target && template.accountRole
+                  ? [
+                      'The new account’s role may limit library access; final matches are checked using that account.',
+                    ]
+                  : []),
+              ],
             });
             options.progress?.(users.length, sourceUserIds.length);
             checkCanceled();
@@ -2040,6 +2007,83 @@ export class Service {
     }
     return [target, true, password];
   }
+  private async destinationItemsFor(
+    source: SourceSnapshot,
+    targetId: string,
+    scope: MigrationScope,
+    settings: Settings,
+    jellyfin: MediaAPI,
+    context: DestinationCatalogContext,
+    guard: () => void,
+  ): Promise<MediaItem[]> {
+    try {
+      if (!jellyfin.catalogItems || !jellyfin.destinationItems)
+        throw new ServiceError(
+          'This destination client cannot perform bounded history reads. Update the Jellyfin integration before migrating.',
+        );
+      guard();
+      const info = await jellyfin.systemInfo();
+      guard();
+      if (typeof info.Id !== 'string' || !info.Id || typeof info.Version !== 'string')
+        throw new ServiceError('The Jellyfin destination identity could not be verified.');
+      const key = MigrationCatalogCache.key(
+        settings.jellyfin_url,
+        settings.jellyfin_api_key,
+        info.Id,
+        info.Version,
+      );
+      if (context.key && context.key !== key)
+        throw new ServiceError(
+          'The Jellyfin destination changed during this job. Review before retrying.',
+        );
+      if (context.value) this.destinationCacheHit(context.value.items.length);
+      else context.value = await this.destinationCatalogs.get(key, () => jellyfin.catalogItems!());
+      context.key = key;
+      guard();
+      context.matcher ??= createMatcher(context.value.items, settings.path_mappings);
+      context.byId ??= new Map(context.value.items.map((item) => [item.Id, item]));
+      // Eligibility is identical to the final state plan. Playlist members need matching
+      // even when they have never been watched or favorited.
+      const eligible = statePlan(source.items, [], settings, scope).unmatched;
+      const candidates = context.matcher.candidates([
+        ...eligible,
+        ...source.playlists.flatMap((playlist) => playlist.items),
+      ]);
+      const ids = new Set(candidates.map((item) => item.Id));
+      // Derived episode/season identifiers depend on their series. Read that small
+      // dependency set too so cached series-provider edits cannot authorize a match.
+      for (const item of [...candidates]) {
+        const series = item.SeriesId ? context.byId.get(item.SeriesId) : undefined;
+        if (series && item.SeriesProviderIds && !ids.has(series.Id)) {
+          ids.add(series.Id);
+          candidates.push(series);
+        }
+      }
+      const items = await jellyfin.destinationItems(targetId, candidates);
+      guard();
+      const returned = new Set(items.map((item) => item.Id));
+      for (const item of items) {
+        const parent = item.SeriesId ? context.byId.get(item.SeriesId) : undefined;
+        if (parent && item.SeriesProviderIds && !returned.has(parent.Id))
+          throw new ServiceError(
+            'A destination series identity could not be verified through this account. Review its library access before retrying.',
+          );
+      }
+      return items;
+    } catch (error) {
+      this.destinationCatalogs.clear();
+      delete context.key;
+      delete context.value;
+      delete context.matcher;
+      delete context.byId;
+      guard();
+      throw new DestinationPreparationError(
+        error instanceof MediaError || error instanceof ServiceError
+          ? error.message
+          : 'The destination catalog or account state could not be prepared. Remaining accounts were not started.',
+      );
+    }
+  }
   private async one(
     job: Job,
     request: JobRequest,
@@ -2047,6 +2091,7 @@ export class Service {
     jellyfin: MediaAPI,
     template: ProvisioningDefaults,
     catalogContext: { key?: string; value?: MigrationCatalog },
+    destinationContext: DestinationCatalogContext,
   ): Promise<void> {
     const scope = migrationScope(request.migration_scope);
     let source: SourceSnapshot | null = null;
@@ -2432,9 +2477,15 @@ export class Service {
         }
         guard();
         phase('reading_target');
-        const targetItems = await (jellyfin.migrationItems
-          ? jellyfin.migrationItems(target.Id)
-          : jellyfin.items(target.Id));
+        const targetItems = await this.destinationItemsFor(
+          source,
+          target.Id,
+          scope,
+          settings,
+          jellyfin,
+          destinationContext,
+          guard,
+        );
         const matcher = createMatcher(targetItems, settings.path_mappings);
         const [plan, stats] = this.plan(
           source.items,
@@ -2575,6 +2626,10 @@ export class Service {
         error instanceof MediaError || error instanceof ServiceError
           ? error.message
           : 'This account could not be completed. Review server connectivity and run again; existing passwords are preserved.';
+      if (error instanceof DestinationPreparationError) {
+        this.save(job);
+        throw error;
+      }
     }
     this.save(job);
   }
@@ -2594,6 +2649,7 @@ export class Service {
       )
     ) {
       this.sourceCatalogs.clear();
+      this.destinationCatalogs.clear();
       throw new ServiceError('A media server connection changed. Review and start a new job.');
     }
   }
@@ -2601,6 +2657,7 @@ export class Service {
     if (this.stopping || !this.store.claimQueuedJob(job.id)) return;
     this.activeJobs.set(job.id, job);
     const catalogContext: { key?: string; value?: MigrationCatalog } = {};
+    const destinationContext: DestinationCatalogContext = {};
     job.status = 'running';
     job.started_at = new Date().toISOString();
     this.save(job);
@@ -2676,10 +2733,20 @@ export class Service {
                     });
                   } else if (job.kind === 'role_update')
                     await this.oneRoleUpdate(job, request, settings, jellyfin);
-                  else await this.one(job, request, settings, jellyfin, template!, catalogContext);
+                  else
+                    await this.one(
+                      job,
+                      request,
+                      settings,
+                      jellyfin,
+                      template!,
+                      catalogContext,
+                      destinationContext,
+                    );
                 } catch (error) {
                   if (error instanceof StoppedError) throw error;
                   if (!(error instanceof MediaError || error instanceof ServiceError)) throw error;
+                  if (error instanceof DestinationPreparationError) throw error;
                   job.results.push({
                     username: request.username ?? request.source_user_id ?? '',
                     status: 'failed',
@@ -2749,6 +2816,7 @@ export class Service {
     this.stopping = true;
     this.sourceWorkload.close();
     this.sourceCatalogs.clear();
+    this.destinationCatalogs.clear();
     await this.sourceSnapshots.stop();
     await Promise.allSettled([...this.clients].map((client) => client.close()));
     await Promise.allSettled([...this.jobTasks.values()]);

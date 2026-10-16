@@ -31,12 +31,14 @@ changing proxy caching as the fix for these source requests.
 
 ## The replacement read path
 
-Live preview checks account identities, mappings, and destination protections.
-It does not enumerate source or destination libraries or source playlists. Its
-history statistics are explicitly deferred rather than shown as zero. Approval
-starts the complete migration; matching details and unmatched or ambiguous items
-appear in its results. A preview using a saved database snapshot can still show
-history details before approval.
+Every preview checks account identities, mappings, and destination protections.
+Saved-history previews also validate the backup's server binding, original age,
+user identity and generation, and pin that generation for approval. Neither mode
+decrypts history, enumerates source or destination libraries, or reads playlists.
+History statistics are explicitly deferred (`stats: null`), rather than shown as
+zero. Approval starts the history preparation and migration; matching details and
+unmatched or ambiguous items appear in its results. A preview never starts a cold
+catalog build in the background.
 
 An approved live migration separates two kinds of source information:
 
@@ -68,6 +70,71 @@ without producing a detectable duplicate: a live catalog is a bounded-age view,
 not an atomic database snapshot. Additions and metadata changes after collection
 can require another migration.
 
+## Destination matching without a full per-user crawl
+
+An approved migration collects one user-neutral Jellyfin catalog, or reuses a
+matching cached catalog, and pins it across every account in that bulk job. Its
+in-process reuse window is ten minutes from the beginning of collection. The
+cache key includes the destination URL, API key, server ID and version; changes
+invalidate reuse. Personal state never enters this cache, and incomplete or failed
+catalog builds are not published. A job retains its selected catalog even if the
+normal reuse window expires while transferring users.
+
+One matching index selects the union of all type-scoped provider, series/episode
+number and exact mapped-path candidates for eligible source history and every
+playlist entry. Lower-priority and contradictory identity candidates remain in
+that union: removing an inaccessible provider match can reveal a series or path
+fallback, or change whether a match is ambiguous. Parent series needed to verify
+derived series identifiers are included as dependencies. Unrelated destination
+items are not read again for each account.
+
+Jellyfin account reads use explicit `Ids` batches of at most 100 identifiers and
+6,000 encoded characters, without recursive enumeration, name sorting or total
+counts. Returned items retain empty personal state so that an accessible unwatched
+item remains a valid destination. Omitted IDs are unavailable to that account,
+not implied empty state or permission to write. Unexpected/repeated IDs, invalid
+data and identity changes fail closed. Fresh metadata is checked against the
+cached identity; a preparation failure clears the cache and stops the remaining
+batch instead of repeating a failed build for every account. Final matching uses
+only the returned, account-scoped items. Potential updates still read fresh
+per-item user data immediately before applying the existing additive merge.
+
+The request shape was checked against Jellyfin's tagged
+[Items controller](https://github.com/jellyfin/jellyfin/blob/v10.11.6/Jellyfin.Api/Controllers/ItemsController.cs#L300),
+[explicit-ID lookup](https://github.com/jellyfin/jellyfin/blob/v10.11.6/MediaBrowser.Controller/Entities/Folder.cs#L833)
+and [DTO access filtering](https://github.com/jellyfin/jellyfin/blob/v10.11.6/Emby.Server.Implementations/Dto/DtoService.cs#L148).
+Explicit IDs bypass recursive folder discovery, and the supplied batch limit is
+forwarded without a server-side clamp in that source. Unlike the separately
+verified Emby source adapter, the Jellyfin adapter does not advance OFFSET by the
+number of visible DTOs: visibility filtering can omit entries after pagination.
+Each bounded ID batch is requested once. Exact production-version behavior has
+not been exercised by this patch; no production trial was performed.
+
+The cold Jellyfin traversal remains sequential, using documented `SortName`
+ordering, pages of at most 500 items, no total counts, and an empty page as its
+stopping condition. It can still take substantial time on a large or busy
+destination; sharing it removes repeated per-user work rather than making the
+first scan free. Catalog reads have a five-second deadline and no automatic
+retry. Explicit-ID account reads use the normal 30-second request deadline and
+at most three attempts for HTTP 429/503, with each retry delay capped at two
+seconds. Reads yield between requests and do not fan out. The existing ceiling
+of four workers for independent destination item transfers is unchanged.
+
+Both the neutral catalog and each account's retained candidate result are bounded
+to 200,000 items and 64 MiB of serialized data. Candidate selection deduplicates
+index work and visits each shared identity bucket once. These are payload bounds,
+not a JavaScript heap or process RSS ceiling. Matching indexes, response buffers,
+source history and the separate source catalog also consume memory. There is no
+fallback to a full per-user destination crawl when a bound or validation fails.
+
+[JellyPlex-Watched's activity queries](https://github.com/luigi311/JellyPlex-Watched/blob/1741166ee439a97d936a0e3a3d39fec4500dd757/src/jellyfin_emby.py#L306)
+and its [watched-state model](https://github.com/luigi311/JellyPlex-Watched/blob/1741166ee439a97d936a0e3a3d39fec4500dd757/src/watched.py#L39)
+inform the separation of reusable matching metadata from account activity. That
+project still enumerates destination libraries; it is not a drop-in solution to
+this bottleneck. Its narrower state model and played/resume filters
+cannot replace Jellyport's Complete semantics, particularly unplayed counts,
+date-only history, dislikes, ratings and playlist members.
+
 ## Why complete state is not a union of three filters
 
 The API behavior was checked using an isolated official Emby 4.10.1.0 container,
@@ -88,8 +155,9 @@ than assuming every documented filter has the required semantics.
 | An unplayed item with a positive play count/date, and a date-only item, were absent from played/favorite/resumable filtered results.                   | Those filters cannot replace complete account-state reads.                                                                   |
 | Multiple filters behaved as AND; likes/dislikes filters did not select the intended subset.                                                            | The implementation does not depend on an unverified filter union.                                                            |
 
-Complete migration therefore examines state for every catalog ID, then retains
-only supported personal state. This preserves watched status, play counts,
+Complete live-source migration therefore examines state for every source catalog
+ID, then retains only supported personal state. A saved source uses the private
+indexed projection instead. This preserves watched status, play counts,
 timestamps, resume positions, favorites, likes/dislikes and supported ratings,
 including a false like and a zero rating. Container favorites and ratings remain
 eligible; derived container playback totals remain excluded as before.
@@ -124,8 +192,10 @@ These limits apply without server-owner tuning:
 | Circuit cooldown                        | At least 5 minutes; reject queued work rather than retry it      |
 | Source catalog/playlist page size       | At most 100 items                                                |
 | IDs in a state batch                    | At most 100, and at most 6,000 encoded characters                |
-| Matching catalog                        | At most 200,000 items and 64 MiB of retained serialized metadata |
-| Retained personal state                 | At most 100,000 items and 32 MiB of retained serialized data     |
+| Matching catalog, per server            | At most 200,000 items and 64 MiB of retained serialized metadata |
+| Retained source personal state          | At most 100,000 items and 32 MiB of retained serialized data     |
+| Jellyfin catalog page size              | At most 500 items                                                |
+| Retained Jellyfin candidate state       | At most 200,000 items and 64 MiB of retained serialized data     |
 | Catalog cache reuse window              | 10 minutes; one catalog pinned during a job                      |
 
 Heavy source reads do not automatically retry HTTP 429, server errors, timeouts or
@@ -220,14 +290,14 @@ idle plaintext promptly. Shared in-flight readers finish before removal, and
 shutdown drains them and removes decrypted files. Failed removals remain tracked
 for a later clear/shutdown attempt; cleanup errors are sanitized, idle failures
 cannot reject an unhandled promise, and new decryptions stop until cleanup
-succeeds. Standalone
-previews retain the existing short idle cache. Personal account results are not
-cached between users.
+succeeds. Previews no longer decrypt a projection or start a history reader.
+Personal account results are not cached between users.
 
-Each destination catalog now builds one matching index for both history and
-playlist planning. New-account snapshot previews reuse their existing shared
-metadata catalog and index; existing accounts still read their own Jellyfin
-state. A matching plan retains at most 200,000 ambiguous candidate references.
+Each approved job builds one neutral destination matching index for both history
+and playlist candidate selection. Each account receives fresh access-scoped data
+only for its candidates, and final history and playlist planning share that
+account's matching index. A matching plan retains at most 200,000 ambiguous
+candidate references.
 Over-limit plans fail rather than drop candidates or guess a match. Item workers
 yield every 250 processed items so large already-merged histories remain
 cancelable. Fresh pre-write Jellyfin checks and the four-worker ceiling remain.
@@ -245,8 +315,8 @@ These are local component measurements, not an end-to-end migration estimate or
 a memory benchmark. Strategies use the same cache settings and final bounded
 JavaScript sort; sequential runs can benefit from filesystem caches. Backup
 creation, decryption, subprocess startup, matching and Jellyfin API work are
-excluded. Every destination account still requires its permission-scoped catalog
-read, and every potential change still needs fresh state before a write. Those
+excluded. Every destination account still requires permission-scoped candidate
+reads, and every potential change still needs fresh state before a write. Those
 network operations can dominate total duration; higher write concurrency is not
 assumed safe. Verified full-backup history imports are available as described in
 [the plugin guide](emby-plugin-backups.md). They use the same local projection,
@@ -264,10 +334,36 @@ Events exclude credentials, tokens, request URLs, query strings, account and ite
 identifiers, titles, paths, playback positions and response bodies. A logging
 failure must not change admission, cancellation or migration results.
 
+Jellyfin catalog and candidate-page events report operation, outcome, page latency
+and item count. Service totals add completed pages, cumulative items, read
+HTTP attempts (including retries), accumulated read duration and metadata-cache hits. Canceled and
+failed reads are reported without upstream response bodies. These counters cover destination
+preparation reads, not a complete playback-impact metric or every write. They
+follow the same exclusions for credentials and personal playback details.
+
+## Local destination request reduction
+
+On October 15, 2026, `npm run benchmark:destination` exercised the production
+catalog reader, metadata cache, candidate selection, explicit-ID reader and merge
+planner with an injected in-memory transport. It used 100,000 synthetic catalog
+items and 100 users with 200 relevant items each. It observed 201 catalog reads
+(including the final empty page), 200 account-state reads, 100 cache hits and
+20,000 successful matches. No changes were proposed against the newer synthetic
+destination activity. The previous full per-user migration traversal would require
+20,000 catalog requests for this fixture, excluding its separate preview pass.
+The new 401 requests represent about 98% fewer reads in this scenario.
+
+One local run took 1.843 seconds for the synthetic pipeline. This excludes backup
+I/O, encryption, network latency and destination writes; it does not estimate
+production duration, memory peaks or playback impact. The benchmark accepts no
+production inputs and cannot contact media servers. Run it again to measure code
+changes against the same bounded fixture.
+
 Automated validation uses mocked large catalogs and isolated synthetic fixtures.
 It covers bounded duplicate catalog work, page and payload limits, clamped
 pagination, unexpected/repeated IDs, state that filtered queries miss, cache scope
-and failure handling, preserved Jellyfin activity, and cancellation during
+and failure handling, candidate access filtering and identity changes, playlist-only
+members, preserved Jellyfin activity, and cancellation during
 admission, idle waits, active reads and timeouts. The workload governor's tests use
 an injected clock/sleeper where appropriate; they do not establish production
 throughput or identify Emby's internal contention mechanism.

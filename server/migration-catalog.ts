@@ -17,6 +17,7 @@ export class MigrationCatalogCache {
       clock?: () => number;
       ttlMs?: number;
       hit?: (items: number) => void;
+      label?: 'source' | 'destination';
     } = {},
   ) {}
 
@@ -39,7 +40,9 @@ export class MigrationCatalogCache {
       // Service serializes live migrations. Reject conflicting builds rather than
       // retain multiple large indexes or launch work for an obsolete connection.
       if (this.pending.key !== key)
-        throw new MediaError('Another source catalog is being prepared. Wait and retry.');
+        throw new MediaError(
+          `Another ${this.options.label ?? 'source'} catalog is being prepared. Wait and retry.`,
+        );
       this.options.hit?.(0);
       return this.pending.value;
     }
@@ -54,7 +57,7 @@ export class MigrationCatalogCache {
         let bytes = 0;
         if (items.length > 200_000)
           throw new MediaError(
-            'The source matching catalog exceeds the supported item limit. Use a saved snapshot.',
+            `The ${this.options.label ?? 'source'} matching catalog exceeds the supported item limit.`,
           );
         for (const item of items) {
           if (Object.hasOwn(item, 'UserData'))
@@ -62,7 +65,7 @@ export class MigrationCatalogCache {
           bytes += Buffer.byteLength(JSON.stringify(item));
           if (bytes > 64 * 1024 * 1024)
             throw new MediaError(
-              'The source matching catalog exceeds the supported memory budget. Use a saved snapshot.',
+              `The ${this.options.label ?? 'source'} matching catalog exceeds the supported memory budget.`,
             );
           for (const value of Object.values(item))
             if (value && typeof value === 'object') Object.freeze(value);

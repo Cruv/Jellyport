@@ -6,6 +6,7 @@ import {
   MAX_CATALOG_BYTES,
   MAX_CATALOG_ITEMS,
   projectCatalogItem,
+  isObject,
   type ClientFactory,
   type MediaItem,
 } from './media.js';
@@ -91,12 +92,36 @@ function current(value: DestinationCatalogResult): boolean {
     Date.parse(value.finished_at) <= Date.now() + 60_000
   );
 }
-function neutralItems(value: unknown): MediaItem[] {
+function neutralItems(value: unknown, trustedMembership = false): MediaItem[] {
   if (!Array.isArray(value) || value.length > MAX_CATALOG_ITEMS)
     throw new ServiceError('The saved Jellyfin catalog returned too many matching candidates.');
   let bytes = 2;
   return value.map((raw) => {
     const item = projectCatalogItem(raw);
+    if (trustedMembership && isObject(raw) && Object.hasOwn(raw, 'JellyportLibraryConfigHash')) {
+      if (
+        typeof raw.JellyportLibraryConfigHash !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(raw.JellyportLibraryConfigHash)
+      )
+        throw new ServiceError(
+          'The saved Jellyfin library configuration is invalid. Import again.',
+        );
+      item.JellyportLibraryConfigHash = raw.JellyportLibraryConfigHash;
+    }
+    // Only the authenticated private projection worker can supply this reserved
+    // membership field. Remote DTO projectors deliberately never copy it.
+    if (trustedMembership && isObject(raw) && Object.hasOwn(raw, 'JellyportLibraryIds')) {
+      const ids = raw.JellyportLibraryIds;
+      if (
+        !Array.isArray(ids) ||
+        item.JellyportLibraryConfigHash === undefined ||
+        ids.length > 1000 ||
+        ids.some((id) => typeof id !== 'string' || !/^[a-f0-9]{32}$/.test(id)) ||
+        new Set(ids).size !== ids.length
+      )
+        throw new ServiceError('The saved Jellyfin library membership is invalid. Import again.');
+      item.JellyportLibraryIds = [...ids] as string[];
+    }
     bytes += Buffer.byteLength(JSON.stringify(item)) + 1;
     if (bytes > MAX_CATALOG_BYTES)
       throw new ServiceError(
@@ -342,6 +367,7 @@ export class DestinationCatalogs {
         value.bytes !== stored.bytes ||
         value.items !== stored.items ||
         value.keys !== stored.keys ||
+        value.projection_format !== stored.projection_format ||
         !sameBinding(value.binding, stored.binding) ||
         !sameBinding(value.binding, { url: settings.jellyfin_url, server_id: serverId, version }) ||
         !(await this.completeFile(value)) ||
@@ -417,6 +443,7 @@ export class DestinationCatalogs {
           { operation: 'destination_read', path, source: neutral, mappings },
           combined,
         ),
+        true,
       );
     } finally {
       entry.users--;
@@ -461,7 +488,14 @@ export class DestinationCatalogs {
             )
               this.state.last_error =
                 'The Jellyfin backup is older than the last imported catalog.';
-            else if (previous?.backup_fingerprint === value.backup_fingerprint)
+            else if (previous && previous.projection_format! > value.projection_format!)
+              this.state.last_error =
+                'The snapshot helper produced an older Jellyfin catalog format. Update the helper and import again.';
+            else if (
+              previous &&
+              previous.backup_fingerprint === value.backup_fingerprint &&
+              previous.projection_format === value.projection_format
+            )
               this.state.last_error = null;
             else {
               this.state.generations.unshift(value);

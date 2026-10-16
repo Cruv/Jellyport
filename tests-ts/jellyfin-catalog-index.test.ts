@@ -27,6 +27,34 @@ function fixture(items: MediaItem[]): string {
   database.close();
   return path;
 }
+function membership(
+  path: string,
+  items: Array<{ id: string; root: string }>,
+  roots: Array<{ id: string; known: number }>,
+  libraries: Array<{ id: string; root: string }>,
+) {
+  const database = new DatabaseSync(path);
+  database.exec(`CREATE TABLE catalog_membership(version INTEGER NOT NULL PRIMARY KEY) STRICT;
+    INSERT INTO catalog_membership VALUES(1);
+    CREATE TABLE catalog_item_roots(id TEXT PRIMARY KEY,root_id TEXT NOT NULL) STRICT;
+    CREATE TABLE catalog_roots(id TEXT PRIMARY KEY,path TEXT NOT NULL,known INTEGER NOT NULL) STRICT;
+    CREATE TABLE catalog_library_roots(library_id TEXT NOT NULL,root_id TEXT NOT NULL,PRIMARY KEY(library_id,root_id)) STRICT, WITHOUT ROWID;
+    CREATE INDEX catalog_library_root_lookup ON catalog_library_roots(root_id,library_id);
+    CREATE TABLE catalog_library_config(library_id TEXT PRIMARY KEY,locations TEXT NOT NULL) STRICT;`);
+  for (const item of items)
+    database.prepare('INSERT INTO catalog_item_roots VALUES(?,?)').run(item.id, item.root);
+  for (const root of roots)
+    database
+      .prepare('INSERT INTO catalog_roots VALUES(?,?,?)')
+      .run(root.id, '/synthetic/root', root.known);
+  for (const library of libraries)
+    database.prepare('INSERT INTO catalog_library_roots VALUES(?,?)').run(library.id, library.root);
+  for (const id of new Set(libraries.map((library) => library.id)))
+    database
+      .prepare('INSERT INTO catalog_library_config VALUES(?,?)')
+      .run(id, JSON.stringify(['/synthetic/root']));
+  database.close();
+}
 const movie = (value: number, provider = String(value)): MediaItem => ({
   Id: id(value),
   Type: 'Movie',
@@ -40,6 +68,87 @@ afterEach(() => {
 });
 
 describe('disk-backed Jellyfin catalog index', () => {
+  it('adds trusted membership hints only from the strict neutral v2 projection tables', async () => {
+    const items = [movie(1), movie(2), movie(3), movie(4)];
+    const path = fixture(items);
+    membership(
+      path,
+      [
+        { id: id(1), root: id(100) },
+        { id: id(2), root: id(101) },
+        { id: id(3), root: id(999) },
+      ],
+      [
+        { id: id(100), known: 1 },
+        { id: id(101), known: 0 },
+      ],
+      [
+        { id: id(200), root: id(100) },
+        { id: id(201), root: id(100) },
+        { id: id(202), root: id(101) },
+      ],
+    );
+    await buildJellyfinCatalogIndex(path);
+    const candidates = await readJellyfinCatalogCandidates(path, items);
+    expect(candidates.find((item) => item.Id === id(1))?.JellyportLibraryIds).toEqual([
+      id(200),
+      id(201),
+    ]);
+    for (const number of [2, 3, 4])
+      expect(candidates.find((item) => item.Id === id(number))).not.toHaveProperty(
+        'JellyportLibraryIds',
+      );
+    await expect(
+      readJellyfinCatalogCandidates(path, items, [], {
+        maxBytes: Buffer.byteLength(JSON.stringify(items)),
+      }),
+    ).rejects.toThrow('account size');
+  });
+  it('keeps legacy v1 catalogs readable with unknown membership', async () => {
+    const path = fixture([movie(1)]);
+    await buildJellyfinCatalogIndex(path);
+    const database = new DatabaseSync(path, { readOnly: true });
+    expect(database.prepare('SELECT version FROM catalog_index').get()?.version).toBe(1);
+    database.close();
+    expect(await readJellyfinCatalogCandidates(path, [movie(1)])).toEqual([movie(1)]);
+  });
+  it('rejects partial or unsupported membership schemas and malformed reserved metadata', async () => {
+    const partial = fixture([movie(1)]);
+    const database = new DatabaseSync(partial);
+    database.exec(
+      'CREATE TABLE catalog_membership(version INTEGER NOT NULL PRIMARY KEY) STRICT; INSERT INTO catalog_membership VALUES(1);',
+    );
+    database.close();
+    await expect(buildJellyfinCatalogIndex(partial)).rejects.toThrow('invalid');
+    const spoofed = fixture([{ ...movie(1), JellyportLibraryIds: [id(200)] }]);
+    await expect(buildJellyfinCatalogIndex(spoofed)).rejects.toThrow('invalid');
+    const spoofedHash = fixture([{ ...movie(1), JellyportLibraryConfigHash: 'a'.repeat(64) }]);
+    await expect(buildJellyfinCatalogIndex(spoofedHash)).rejects.toThrow('invalid');
+    const invalid = fixture([movie(1)]);
+    membership(
+      invalid,
+      [{ id: id(1), root: id(100) }],
+      [{ id: id(100), known: 2 }],
+      [{ id: id(200), root: id(100) }],
+    );
+    await buildJellyfinCatalogIndex(invalid);
+    await expect(readJellyfinCatalogCandidates(invalid, [movie(1)])).rejects.toThrow('invalid');
+  });
+
+  it('requires valid complete library configuration before trusting v2 membership', async () => {
+    const path = fixture([movie(1)]);
+    membership(
+      path,
+      [{ id: id(1), root: id(100) }],
+      [{ id: id(100), known: 1 }],
+      [{ id: id(200), root: id(100) }],
+    );
+    await buildJellyfinCatalogIndex(path);
+    const database = new DatabaseSync(path);
+    database.exec('DROP TABLE catalog_library_config;');
+    database.close();
+    await expect(readJellyfinCatalogCandidates(path, [movie(1)])).rejects.toThrow('invalid');
+  });
   it('unions provider, series and path candidates before final matching and retains series dependencies', async () => {
     const source: MediaItem = {
       Id: 'source-episode',

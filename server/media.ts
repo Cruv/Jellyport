@@ -1,4 +1,8 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import {
+  jellyfinLibraryConfigHash,
+  type JellyfinLibraryConfigEntry,
+} from './jellyfin-library-membership.js';
 import { MediaError } from './errors.js';
 import type { MediaReadOperation, MediaWorkload } from './media-workload.js';
 
@@ -29,6 +33,10 @@ export interface MediaItem extends JsonObject {
   SeriesId?: string;
   Path?: string;
   UserData?: { Played?: boolean; [key: string]: unknown };
+  /** Trusted backup-only membership. Never projected from a remote media DTO. */
+  JellyportLibraryIds?: string[];
+  /** Neutral library configuration binding for the trusted membership projection. */
+  JellyportLibraryConfigHash?: string;
 }
 export interface MediaPlaylist extends MediaItem {
   Name: string;
@@ -89,7 +97,7 @@ export type ClientFactory = (url: string, apiKey: string, kind?: MediaKind) => M
 export type FetchTransport = (url: string, init: RequestInit) => Promise<Response>;
 export interface DestinationReadEvent {
   event: 'destination_read';
-  operation: 'catalog' | 'user_views' | 'user_state';
+  operation: 'catalog' | 'user_views' | 'user_access' | 'user_state';
   outcome: 'completed' | 'failed' | 'canceled';
   duration_ms: number;
   items: number;
@@ -137,9 +145,17 @@ export const MAX_MIGRATION_STATE_BYTES = 32 * 1024 * 1024;
 /** The reusable destination identities no longer describe the current library. */
 export class CatalogChangedError extends MediaError {}
 const MAX_STATE_BATCH_IDS = 100;
+export const MAX_DESTINATION_BATCH_IDS = 170;
 const MAX_ENCODED_BATCH_IDS = 6000;
-/** User views are small access boundaries, never another recursive catalog crawl. */
-export const MAX_DESTINATION_VIEWS = 64;
+/** Bound per-item access checks; unresolved large catalogs require a fresh saved index. */
+export const MAX_DESTINATION_ACCESS_CHECKS = 2048;
+const DESTINATION_ACCESS_DEADLINE_MS = 60_000;
+const MAX_DESTINATION_LIBRARY_IDS = 1000;
+interface DestinationAccessBudget {
+  checks: number;
+  deadline?: number;
+}
+
 const playableTypes = new Set([
   'Movie',
   'Episode',
@@ -1084,11 +1100,214 @@ export class MediaClient implements MediaAPI {
     return items;
   }
 
+  /** Apply current folder policy without assuming explicit-ID queries enforce it. */
+  private async destinationAccessibleIds(
+    userId: string,
+    candidates: MediaItem[],
+    memberships: Map<string, string[] | undefined>,
+    hashes: Set<string>,
+    budget: DestinationAccessBudget,
+  ): Promise<Set<string>> {
+    await this.yieldRead();
+    const user = this.validUser(
+      await this.destinationRead('user_access', async (onAttempt) =>
+        this.object(
+          await this.request(
+            'GET',
+            `Users/${this.id(userId)}`,
+            undefined,
+            undefined,
+            true,
+            undefined,
+            {
+              onAttempt,
+            },
+          ),
+        ),
+      ),
+    );
+    const normalize = (value: string) =>
+      /^(?:[a-f0-9]{32}|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12})$/i.test(value)
+        ? value.replaceAll('-', '').toLowerCase()
+        : value;
+    if (normalize(user.Id) !== normalize(userId) || !isObject(user.Policy))
+      throw new MediaError('Jellyfin returned invalid destination library access policy.');
+    const policy = user.Policy;
+    if (typeof policy.EnableAllFolders !== 'boolean')
+      throw new MediaError('Jellyfin returned invalid destination library access policy.');
+    const policyIds = (value: unknown) => {
+      if (value === undefined || value === null) return new Set<string>();
+      if (
+        !Array.isArray(value) ||
+        value.length > MAX_DESTINATION_LIBRARY_IDS ||
+        value.some((id) => !itemIdentifier(id))
+      )
+        throw new MediaError('Jellyfin returned invalid destination library access policy.');
+      return new Set(value.map((id: string) => normalize(id)));
+    };
+    const enabled = policyIds(policy.EnabledFolders);
+    const blocked = policyIds(policy.BlockedMediaFolders);
+    const liveConfiguration = await this.destinationRead('user_access', async (onAttempt) => ({
+      Items: await this.request(
+        'GET',
+        'Library/VirtualFolders',
+        undefined,
+        undefined,
+        true,
+        undefined,
+        { onAttempt },
+      ),
+    }));
+    if (
+      !Array.isArray(liveConfiguration.Items) ||
+      liveConfiguration.Items.length > MAX_DESTINATION_LIBRARY_IDS
+    )
+      throw new MediaError('Jellyfin library configuration could not be validated.');
+    const configuration = liveConfiguration.Items.map((folder) => {
+      if (!isObject(folder))
+        throw new MediaError('Jellyfin library configuration could not be validated.');
+      return { id: folder.ItemId, locations: folder.Locations } as JellyfinLibraryConfigEntry;
+    });
+    const currentHash = jellyfinLibraryConfigHash(configuration);
+    if ([...hashes].some((hash) => hash !== currentHash))
+      throw new CatalogChangedError(
+        'Jellyfin library configuration changed since the matching backup. Import a fresh Jellyfin matching backup before migrating. No item updates were started.',
+      );
+    const allowed = new Set<string>();
+    const exceptions: MediaItem[] = [];
+    for (const candidate of candidates) {
+      const libraries = memberships.get(candidate.Id);
+      // Empty membership is emitted only when the saved index proves that the item
+      // has no associated library. A missing field remains unresolved, never empty.
+      const permitted =
+        libraries !== undefined &&
+        (!libraries.length ||
+          libraries.some((id) =>
+            blocked.size
+              ? !blocked.has(normalize(id))
+              : policy.EnableAllFolders || enabled.has(normalize(id)),
+          ));
+      if (permitted) allowed.add(candidate.Id);
+      else exceptions.push(candidate);
+    }
+    const confirmed = await this.destinationProbeAccess(userId, exceptions, budget);
+    for (const id of confirmed) allowed.add(id);
+    return allowed;
+  }
+
+  private async destinationProbeAccess(
+    userId: string,
+    exceptions: MediaItem[],
+    budget: DestinationAccessBudget,
+    onAccessible?: (candidate: MediaItem, signal: AbortSignal) => Promise<void>,
+  ): Promise<Set<string>> {
+    const allowed = new Set<string>();
+    if (budget.checks + exceptions.length > MAX_DESTINATION_ACCESS_CHECKS)
+      throw new MediaError(
+        'Too many destination items need individual access checks. Import a fresh Jellyfin matching backup with library membership metadata before migrating. No item updates were started.',
+      );
+    budget.checks += exceptions.length;
+    if (!exceptions.length) return allowed;
+    budget.deadline ??= performance.now() + DESTINATION_ACCESS_DEADLINE_MS;
+
+    // A snapshot's library association can be stale. Confirm predicted denials as
+    // well as unknown memberships with the exact same target-scoped item lookup
+    // used by the write endpoint. The UserData GET avoids on-demand metadata refresh.
+    const phase = new AbortController();
+    const signal = AbortSignal.any([this.controller.signal, phase.signal]);
+    let failure: unknown;
+    let failed = false;
+    const fail = (error: unknown) => {
+      if (failed) return;
+      failed = true;
+      failure = error;
+      phase.abort();
+    };
+    const timer = setTimeout(
+      () =>
+        fail(
+          new MediaError(
+            'Destination access checks exceeded the 60-second safety limit. Import a fresh Jellyfin matching backup and retry. No item updates were started.',
+          ),
+        ),
+      Math.max(0, budget.deadline - performance.now()),
+    );
+    timer.unref();
+    let next = 0;
+    const worker = async () => {
+      try {
+        while (!failed) {
+          const candidate = exceptions[next++];
+          if (!candidate) return;
+          await this.yieldRead(signal);
+          let data: JsonObject;
+          try {
+            data = await this.destinationRead(
+              'user_access',
+              async (onAttempt) =>
+                this.object(
+                  await this.request(
+                    'GET',
+                    `UserItems/${this.id(candidate.Id)}/UserData`,
+                    { userId },
+                    undefined,
+                    true,
+                    undefined,
+                    {
+                      signal,
+                      onAttempt,
+                    },
+                  ),
+                ),
+              signal,
+            );
+          } catch (error) {
+            if (signal.aborted) throw error;
+            if (!(error instanceof MediaError) || error.statusCode !== 404) throw error;
+            // Confirmed unavailable IDs are not sent through the permissive batch API.
+            continue;
+          }
+          const normalize = (value: string) =>
+            /^(?:[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})$/i.test(
+              value,
+            )
+              ? value.replaceAll('-', '').toLowerCase()
+              : value;
+          if (
+            typeof data.Played !== 'boolean' ||
+            (data.ItemId !== undefined &&
+              (typeof data.ItemId !== 'string' ||
+                normalize(data.ItemId) !== normalize(candidate.Id)))
+          )
+            throw new MediaError('Jellyfin returned invalid destination access-check state.');
+          await onAccessible?.(candidate, signal);
+          allowed.add(candidate.Id);
+        }
+      } catch (error) {
+        fail(
+          this.controller.signal.aborted
+            ? new MediaError('Jellyfin migration read was canceled.')
+            : error,
+        );
+      }
+    };
+    try {
+      // Abort active transports and drain every worker before returning on failure.
+      await Promise.allSettled(Array.from({ length: Math.min(4, exceptions.length) }, worker));
+      if (failed) throw failure;
+      if (signal.aborted) throw new MediaError('Jellyfin migration read was canceled.');
+      return allowed;
+    } finally {
+      clearTimeout(timer);
+      phase.abort();
+    }
+  }
+
   /**
-   * Explicit-ID queries alone omit Jellyfin's library-view access boundary. Intersect
-   * each bounded batch with every view this account can access instead. Recursive
-   * scopes the supplied IDs beneath that view; it never enumerates its catalog.
-   * Missing IDs are deleted or unavailable, never permission to write them.
+   * Jellyfin accepts explicit IDs without recursive enumeration or a name sort.
+   * Supply the entire bounded batch as Limit. Presentation grouping may omit an
+   * accessible version, so confirm omissions with bounded exact access checks and
+   * singleton identity reads before treating them as unavailable.
    */
   async destinationItems(userId: string, candidates: MediaItem[]): Promise<MediaItem[]> {
     if (this.kind !== 'jellyfin')
@@ -1097,6 +1316,8 @@ export class MediaClient implements MediaAPI {
     if (!Array.isArray(candidates) || candidates.length > MAX_CATALOG_ITEMS)
       throw new MediaError('Invalid destination candidate catalog.');
     const identifiers = new Set<string>();
+    const memberships = new Map<string, string[] | undefined>();
+    const hashes = new Set<string>();
     let catalogBytes = 0;
     for (let index = 0; index < candidates.length; index++) {
       if (index % 1000 === 0) await this.yieldRead();
@@ -1104,49 +1325,48 @@ export class MediaClient implements MediaAPI {
       if (identifiers.has(item.Id))
         throw new MediaError('The destination candidate catalog contains duplicate identifiers.');
       identifiers.add(item.Id);
-      catalogBytes += Buffer.byteLength(JSON.stringify(item));
+      const libraries = candidates[index]!.JellyportLibraryIds;
+      const hash = candidates[index]!.JellyportLibraryConfigHash;
+      if (
+        libraries !== undefined &&
+        (!Array.isArray(libraries) ||
+          libraries.length > MAX_DESTINATION_LIBRARY_IDS ||
+          libraries.some((id) => typeof id !== 'string' || !/^[a-f0-9]{32}$/i.test(id)) ||
+          new Set(libraries.map((id) => id.toLowerCase())).size !== libraries.length)
+      )
+        throw new MediaError(
+          'The destination candidate catalog contains invalid library membership metadata.',
+        );
+      if (
+        hash !== undefined &&
+        hash !== null &&
+        (typeof hash !== 'string' || !/^[a-f0-9]{64}$/i.test(hash))
+      )
+        throw new MediaError(
+          'The destination candidate catalog contains invalid library configuration metadata.',
+        );
+      const boundHash = typeof hash === 'string' ? hash.toLowerCase() : undefined;
+      if (libraries !== undefined && boundHash) hashes.add(boundHash);
+      memberships.set(item.Id, libraries === undefined || !boundHash ? undefined : [...libraries]);
+      catalogBytes +=
+        Buffer.byteLength(JSON.stringify(item)) +
+        (libraries === undefined ? 0 : Buffer.byteLength(JSON.stringify(libraries))) +
+        (boundHash ? boundHash.length : 0);
       if (catalogBytes > MAX_CATALOG_BYTES)
         throw new MediaError('The destination candidate catalog exceeds the supported size.');
     }
     if (!candidates.length) return [];
-    await this.yieldRead();
-    const viewData = await this.destinationRead('user_views', async (onAttempt) => {
-      const params = { userId, includeHidden: 'true', includeExternalContent: 'true' };
-      try {
-        return this.object(
-          await this.request('GET', 'UserViews', params, undefined, true, undefined, {
-            onAttempt,
-          }),
-        );
-      } catch (error) {
-        // Older Jellyfin versions expose the same user-scoped operation at this URL.
-        // This is a read-only route fallback, never an unscoped catalog fallback.
-        if (!(error instanceof MediaError) || error.statusCode !== 404) throw error;
-        return this.object(
-          await this.request(
-            'GET',
-            `Users/${this.id(userId)}/Views`,
-            { includeHidden: 'true', includeExternalContent: 'true' },
-            undefined,
-            true,
-            undefined,
-            { onAttempt },
-          ),
-        );
-      }
-    });
-    if (!Array.isArray(viewData.Items) || viewData.Items.length > MAX_DESTINATION_VIEWS)
-      throw new MediaError(
-        'Jellyfin returned an invalid or excessive destination library view list.',
-      );
-    const views: string[] = [];
-    const viewIds = new Set<string>();
-    for (const value of viewData.Items) {
-      if (!isObject(value) || !itemIdentifier(value.Id) || viewIds.has(value.Id))
-        throw new MediaError('Jellyfin returned invalid or repeated destination library views.');
-      viewIds.add(value.Id);
-      views.push(value.Id);
-    }
+    const budget: DestinationAccessBudget = { checks: 0 };
+    const accessible = await this.destinationAccessibleIds(
+      userId,
+      candidates,
+      memberships,
+      hashes,
+      budget,
+    );
+    candidates = candidates.filter((item) => accessible.has(item.Id));
+    // Every supplied membership binding was checked against one fresh server hash.
+    const membershipHash = hashes.values().next().value;
     const identity = (item: MediaItem) =>
       JSON.stringify([
         item.Type,
@@ -1160,39 +1380,50 @@ export class MediaClient implements MediaAPI {
         ),
       ]);
     const items: MediaItem[] = [];
-    const returned = new Map<string, MediaItem>();
+    const returned = new Set<string>();
+    const missing: MediaItem[] = [];
     let retainedBytes = 0;
-    // Do not guess media types from CollectionType: mixed libraries, linked content
-    // and custom views can legitimately contain several supported item types.
-    // Views are refreshed on every invocation, including independent readback.
-    for (const viewId of views) {
-      for (let offset = 0; offset < candidates.length;) {
-        const batch: MediaItem[] = [];
-        while (offset < candidates.length && batch.length < MAX_STATE_BATCH_IDS) {
-          const candidate = candidates[offset]!;
-          const ids = [...batch.map((item) => item.Id), candidate.Id].join(',');
-          let encodedLength: number;
-          try {
-            encodedLength = encodeURIComponent(ids).length;
-          } catch {
-            throw new MediaError('Invalid destination candidate identifiers.');
-          }
-          if (encodedLength > MAX_ENCODED_BATCH_IDS && batch.length) break;
-          if (encodedLength > MAX_ENCODED_BATCH_IDS)
-            throw new MediaError('A destination candidate identifier exceeds the supported size.');
-          batch.push(candidate);
-          offset++;
-        }
-        await this.yieldRead();
-        const data = await this.destinationRead('user_state', async (onAttempt) =>
+    const retain = (value: unknown, candidate: MediaItem) => {
+      if (
+        !isObject(value) ||
+        !itemIdentifier(value.Id) ||
+        value.Id !== candidate.Id ||
+        returned.has(value.Id)
+      )
+        throw new MediaError('Jellyfin returned unexpected or repeated destination identifiers.');
+      if (!isObject(value.UserData))
+        throw new MediaError('Jellyfin returned destination state without a valid data object.');
+      const fresh = projectMigrationItem(value);
+      const cached = projectCatalogItem(candidate);
+      if (identity(fresh) !== identity(cached))
+        throw new CatalogChangedError(
+          'Jellyfin catalog identities changed. Refresh the destination catalog and retry.',
+        );
+      // Derived series IDs come from the neutral catalog; the caller checks their
+      // parent dependencies. Remote DTOs cannot introduce trusted membership hints.
+      if (cached.SeriesProviderIds && !fresh.SeriesProviderIds)
+        fresh.SeriesProviderIds = { ...cached.SeriesProviderIds };
+      const libraries = memberships.get(fresh.Id);
+      if (libraries !== undefined) {
+        fresh.JellyportLibraryIds = [...libraries];
+        fresh.JellyportLibraryConfigHash = membershipHash!;
+      }
+      retainedBytes += Buffer.byteLength(JSON.stringify(fresh));
+      if (items.length >= MAX_CATALOG_ITEMS || retainedBytes > MAX_CATALOG_BYTES)
+        throw new MediaError('Jellyfin destination state exceeds the supported migration size.');
+      returned.add(fresh.Id);
+      items.push(fresh);
+    };
+    const readBatch = async (batch: MediaItem[], signal?: AbortSignal) =>
+      this.destinationRead(
+        'user_state',
+        async (onAttempt) =>
           this.object(
             await this.request(
               'GET',
-              `Users/${this.id(userId)}/Items`,
+              'Users/' + this.id(userId) + '/Items',
               {
                 Ids: batch.map((item) => item.Id).join(','),
-                ParentId: viewId,
-                Recursive: 'true',
                 Fields: 'ProviderIds,Path',
                 EnableUserData: 'true',
                 EnableImages: 'false',
@@ -1202,57 +1433,63 @@ export class MediaClient implements MediaAPI {
               undefined,
               true,
               undefined,
-              { onAttempt },
+              { onAttempt, signal },
             ),
           ),
-        );
-        if (!Array.isArray(data.Items) || data.Items.length > batch.length)
-          throw new MediaError('Jellyfin returned an invalid destination candidate page.');
-        const allowed = new Map(batch.map((item) => [item.Id, item]));
-        const seen = new Set<string>();
-        for (const value of data.Items) {
-          if (
-            !isObject(value) ||
-            !itemIdentifier(value.Id) ||
-            !allowed.has(value.Id) ||
-            seen.has(value.Id)
-          )
-            throw new MediaError(
-              'Jellyfin returned unexpected or repeated destination identifiers.',
-            );
-          if (!isObject(value.UserData))
-            throw new MediaError(
-              'Jellyfin returned destination state without a valid data object.',
-            );
-          const fresh = projectMigrationItem(value);
-          const cached = projectCatalogItem(allowed.get(value.Id)!);
-          if (identity(fresh) !== identity(cached))
-            throw new CatalogChangedError(
-              'Jellyfin catalog identities changed. Refresh the destination catalog and retry.',
-            );
-          // Derived series IDs are supplied by the neutral catalog, not this DTO.
-          // The caller validates their parent series dependencies before matching.
-          if (cached.SeriesProviderIds && !fresh.SeriesProviderIds)
-            fresh.SeriesProviderIds = { ...cached.SeriesProviderIds };
-          seen.add(value.Id);
-          const previous = returned.get(fresh.Id);
-          if (previous) {
-            if (JSON.stringify(previous.UserData) !== JSON.stringify(fresh.UserData))
-              throw new MediaError(
-                'Jellyfin returned conflicting destination state across accessible library views. Review and retry.',
-              );
-            continue;
-          }
-          retainedBytes += Buffer.byteLength(JSON.stringify(fresh));
-          if (items.length >= MAX_CATALOG_ITEMS || retainedBytes > MAX_CATALOG_BYTES)
-            throw new MediaError(
-              'Jellyfin destination state exceeds the supported migration size.',
-            );
-          items.push(fresh);
-          returned.set(fresh.Id, fresh);
+        signal,
+      );
+    for (let offset = 0; offset < candidates.length;) {
+      const batch: MediaItem[] = [];
+      while (offset < candidates.length && batch.length < MAX_DESTINATION_BATCH_IDS) {
+        const candidate = candidates[offset]!;
+        const ids = [...batch.map((item) => item.Id), candidate.Id].join(',');
+        let encodedLength: number;
+        try {
+          encodedLength = encodeURIComponent(ids).length;
+        } catch {
+          throw new MediaError('Invalid destination candidate identifiers.');
         }
+        if (encodedLength > MAX_ENCODED_BATCH_IDS && batch.length) break;
+        if (encodedLength > MAX_ENCODED_BATCH_IDS)
+          throw new MediaError('A destination candidate identifier exceeds the supported size.');
+        batch.push(candidate);
+        offset++;
       }
+      await this.yieldRead();
+      const data = await readBatch(batch);
+      if (!Array.isArray(data.Items) || data.Items.length > batch.length)
+        throw new MediaError('Jellyfin returned an invalid destination candidate page.');
+      const allowed = new Map(batch.map((item) => [item.Id, item]));
+      const seen = new Set<string>();
+      for (const value of data.Items) {
+        if (
+          !isObject(value) ||
+          !itemIdentifier(value.Id) ||
+          !allowed.has(value.Id) ||
+          seen.has(value.Id)
+        )
+          throw new MediaError('Jellyfin returned unexpected or repeated destination identifiers.');
+        retain(value, allowed.get(value.Id)!);
+        seen.add(value.Id);
+      }
+      for (const candidate of batch) if (!seen.has(candidate.Id)) missing.push(candidate);
+      if (budget.checks + missing.length > MAX_DESTINATION_ACCESS_CHECKS)
+        throw new MediaError(
+          'Jellyfin omitted too many explicitly requested items to recover safely. Import a fresh Jellyfin matching backup and review the catalog before migrating. No item updates were started.',
+        );
     }
+    // Explicit-ID requests can group linked versions by presentation identity.
+    // A missing DTO is not evidence of deletion or denied access. Check the same
+    // item lookup as the write endpoint, then isolate an accessible version from
+    // grouping with a one-ID request. Both phases share one exception budget.
+    await this.destinationProbeAccess(userId, missing, budget, async (candidate, signal) => {
+      const data = await readBatch([candidate], signal);
+      if (!Array.isArray(data.Items) || data.Items.length !== 1)
+        throw new MediaError(
+          'Jellyfin confirmed item access but omitted its explicitly requested identity. Review the destination catalog before migrating. No item updates were started.',
+        );
+      retain(data.Items[0], candidate);
+    });
     return items;
   }
 

@@ -10,8 +10,9 @@ import {
   type MediaItem,
 } from './media.js';
 import { ServiceError } from './errors.js';
+import { jellyfinLibraryConfigHash } from './jellyfin-library-membership.js';
 
-const INDEX_VERSION = 1;
+const INDEX_VERSION = 2;
 const MAX_PROJECTION_ITEMS = 2_000_000;
 const MAX_PROJECTION_BYTES = 8 * 1024 ** 3;
 const MAX_ITEM_BYTES = 256 * 1024;
@@ -131,6 +132,68 @@ function itemRow(row: Record<string, unknown>): MediaItem {
     throw invalid();
   return item;
 }
+function membershipSchema(database: DatabaseSync): boolean {
+  const names = [
+    'catalog_membership',
+    'catalog_item_roots',
+    'catalog_roots',
+    'catalog_library_roots',
+    'catalog_library_config',
+  ];
+  const present = names.filter((name) =>
+    database.prepare('SELECT 1 FROM sqlite_master WHERE name=?').get(name),
+  );
+  if (!present.length) return false; // A persisted v1 projection remains readable without hints.
+  if (present.length !== names.length) throw invalid();
+  requireTable(database, 'catalog_membership', [['version', 'INTEGER', 1]]);
+  requireTable(database, 'catalog_item_roots', [
+    ['id', 'TEXT', 1],
+    ['root_id', 'TEXT', 0],
+  ]);
+  requireTable(database, 'catalog_roots', [
+    ['id', 'TEXT', 1],
+    ['path', 'TEXT', 0],
+    ['known', 'INTEGER', 0],
+  ]);
+  requireTable(database, 'catalog_library_roots', [
+    ['library_id', 'TEXT', 1],
+    ['root_id', 'TEXT', 2],
+  ]);
+  requireTable(database, 'catalog_library_config', [
+    ['library_id', 'TEXT', 1],
+    ['locations', 'TEXT', 0],
+  ]);
+  const marker = database.prepare('SELECT version FROM catalog_membership LIMIT 2').all();
+  if (marker.length !== 1 || marker[0]!.version !== 1) throw invalid();
+  return true;
+}
+function libraryConfigHash(database: DatabaseSync): string {
+  if (
+    database
+      .prepare(
+        'SELECT 1 FROM catalog_library_roots l WHERE NOT EXISTS (SELECT 1 FROM catalog_library_config c WHERE c.library_id=l.library_id) LIMIT 1',
+      )
+      .get()
+  )
+    throw invalid();
+  const entries = database
+    .prepare(
+      'SELECT library_id,substr(locations,1,1048577) AS locations FROM catalog_library_config ORDER BY library_id LIMIT 1001',
+    )
+    .all();
+  if (entries.length > 1000) throw invalid();
+  return jellyfinLibraryConfigHash(
+    entries.map((row) => {
+      if (
+        typeof row.library_id !== 'string' ||
+        typeof row.locations !== 'string' ||
+        Buffer.byteLength(row.locations) > 1024 * 1024
+      )
+        throw invalid();
+      return { id: row.library_id, locations: JSON.parse(row.locations) as string[] };
+    }),
+  );
+}
 function keys(item: MediaItem, mappings: PathMapping[] = [], source = false): string[] {
   const values = catalogCandidateKeys(item, mappings, source);
   if (
@@ -154,6 +217,8 @@ export async function buildJellyfinCatalogIndex(
   try {
     check(options.signal);
     database = databaseAt(path, false);
+    const membership = membershipSchema(database);
+    if (membership) libraryConfigHash(database);
     database.exec(`BEGIN IMMEDIATE;
       DROP TABLE IF EXISTS catalog_keys;
       DROP TABLE IF EXISTS catalog_index;
@@ -180,7 +245,7 @@ export async function buildJellyfinCatalogIndex(
     check(options.signal);
     database
       .prepare('INSERT INTO catalog_index(version,rows,keys) VALUES (?,?,?)')
-      .run(INDEX_VERSION, rows, count);
+      .run(membership ? INDEX_VERSION : 1, rows, count);
     database.exec('COMMIT');
     observe(options.onProgress, { rows, keys: count, elapsed_ms: performance.now() - started });
     check(options.signal);
@@ -254,7 +319,7 @@ export async function readJellyfinCatalogCandidates(
     const marker = database.prepare('SELECT version,rows,keys FROM catalog_index LIMIT 2').all();
     if (
       marker.length !== 1 ||
-      marker[0]!.version !== INDEX_VERSION ||
+      ![1, INDEX_VERSION].includes(Number(marker[0]!.version)) ||
       !Number.isSafeInteger(marker[0]!.rows) ||
       Number(marker[0]!.rows) < 0 ||
       Number(marker[0]!.rows) > MAX_PROJECTION_ITEMS ||
@@ -263,6 +328,16 @@ export async function readJellyfinCatalogCandidates(
       Number(marker[0]!.keys) > MAX_PROJECTION_ITEMS * MAX_KEYS_PER_ITEM
     )
       throw invalid();
+    const membership = marker[0]!.version === INDEX_VERSION;
+    if (membership && !membershipSchema(database)) throw invalid();
+    const configHash = membership ? libraryConfigHash(database) : undefined;
+    const libraryMembership = membership
+      ? database.prepare(`
+      SELECT r.known,l.library_id FROM catalog_item_roots i
+      JOIN catalog_roots r ON r.id=i.root_id
+      LEFT JOIN catalog_library_roots l ON l.root_id=r.id
+      WHERE i.id=? LIMIT 1001`)
+      : undefined;
     database.exec(`CREATE TEMP TABLE requested_keys(key TEXT NOT NULL PRIMARY KEY) STRICT, WITHOUT ROWID;
       CREATE TEMP TABLE selected_ids(id TEXT NOT NULL PRIMARY KEY) STRICT, WITHOUT ROWID;
       CREATE TEMP TABLE parent_ids(id TEXT NOT NULL PRIMARY KEY) STRICT, WITHOUT ROWID;`);
@@ -284,6 +359,22 @@ export async function readJellyfinCatalogCandidates(
       if (parent && itemRow(row).Type !== 'Series') throw invalid();
       if (!Number(selected.run(row.id).changes)) return;
       const item = itemRow(row);
+      if (libraryMembership) {
+        const roots = libraryMembership.all(item.Id);
+        if (roots.length > 1000 || roots.some((root) => ![0, 1].includes(Number(root.known))))
+          throw invalid();
+        // Missing/conflicting associations stay unknown. An empty TopParentId
+        // alone cannot establish standalone access, ownership or visibility.
+        if (
+          roots.length &&
+          roots.every((root) => root.known === 1 && typeof root.library_id === 'string')
+        ) {
+          const ids = roots.map((root) => String(root.library_id)).sort();
+          if (ids.some((id) => !/^[a-f0-9]{32}$/.test(id))) throw invalid();
+          item.JellyportLibraryIds = ids;
+          item.JellyportLibraryConfigHash = configHash;
+        }
+      }
       retainedBytes += Buffer.byteLength(JSON.stringify(item)) + (items.length ? 1 : 0);
       if (items.length >= maximum || retainedBytes > bytesMaximum)
         throw new ServiceError(

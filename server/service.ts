@@ -2656,9 +2656,22 @@ export class Service {
         };
         const verification = result.data.verification;
         try {
-          const candidates = [...expectations.values()].map((values) => values[0]!.item);
-          const ids = new Set(candidates.map((item) => item.Id));
           const byId = new Map(targetItems.map((item) => [item.Id, item]));
+          const candidates = [...expectations.values()].map((values) => {
+            const item = values[0]!.item;
+            const trusted = byId.get(item.Id);
+            const membership = trusted?.JellyportLibraryIds;
+            return membership === undefined
+              ? item
+              : {
+                  ...item,
+                  JellyportLibraryIds: [...membership],
+                  ...(trusted?.JellyportLibraryConfigHash
+                    ? { JellyportLibraryConfigHash: trusted.JellyportLibraryConfigHash }
+                    : {}),
+                };
+          });
+          const ids = new Set(candidates.map((item) => item.Id));
           for (const item of [...candidates]) {
             const parent = item.SeriesId ? byId.get(item.SeriesId) : undefined;
             if (parent && item.SeriesProviderIds && !ids.has(parent.Id)) {

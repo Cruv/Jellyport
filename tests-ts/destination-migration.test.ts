@@ -381,6 +381,35 @@ describe('destination catalog reuse and bounded user history', () => {
     });
   });
 
+  it('retains trusted library membership for independent readback without trusting remote fields', async () => {
+    const fixture = setup(1);
+    const read = fixture.destination.getMockImplementation()!;
+    const membership = ['a'.repeat(32)];
+    const JellyportLibraryConfigHash = 'b'.repeat(64);
+    fixture.destination.mockImplementationOnce(async (id, candidates) =>
+      (await read(id, candidates)).map((item) => ({
+        ...item,
+        JellyportLibraryIds: membership,
+        JellyportLibraryConfigHash,
+      })),
+    );
+    const job = await finish(await fixture.migrate());
+    expect(job.status).toBe('completed');
+    expect(fixture.destination).toHaveBeenCalledTimes(2);
+    expect(fixture.destination.mock.calls[1]![1]).toEqual([
+      expect.objectContaining({
+        Id: '1',
+        JellyportLibraryIds: membership,
+        JellyportLibraryConfigHash,
+      }),
+    ]);
+    expect(job.results[0]!.data!.verification).toMatchObject({
+      verified: 1,
+      missing: 0,
+      mismatched: 0,
+    });
+  });
+
   it('stops the batch after a failed catalog build and retries from a new build later', async () => {
     const fixture = setup(2);
     fixture.catalog.mockRejectedValueOnce(new MediaError('Synthetic destination unavailable.'));
@@ -425,8 +454,20 @@ describe('destination catalog reuse and bounded user history', () => {
       fixture.destination.mockImplementationOnce(async (id, candidates) => {
         const returned = await read(id, candidates);
         const client = new MediaClient('http://synthetic.invalid', 'fixture-key', 'jellyfin', {
-          transport: async () =>
-            Response.json({
+          transport: async (url) => {
+            const path = new URL(url).pathname;
+            if (path === '/Library/VirtualFolders') return Response.json([]);
+            if (path === `/Users/${id}`)
+              return Response.json({
+                Id: id,
+                Name: 'fixture-target',
+                Policy: { EnableAllFolders: true, EnabledFolders: [], BlockedMediaFolders: [] },
+              });
+            if (path.startsWith('/UserItems/'))
+              return path === '/UserItems/series-3/UserData' && condition === 'unavailable'
+                ? new Response(null, { status: 404 })
+                : Response.json({ Played: false });
+            return Response.json({
               Items: returned.flatMap((item) =>
                 item.Id !== 'series-3'
                   ? [item]
@@ -434,7 +475,8 @@ describe('destination catalog reuse and bounded user history', () => {
                     ? []
                     : [{ ...item, ProviderIds: { Tvdb: 'changed' } }],
               ),
-            }),
+            });
+          },
         });
         try {
           return await client.destinationItems(id, candidates);

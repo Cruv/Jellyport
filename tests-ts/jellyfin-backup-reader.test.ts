@@ -6,6 +6,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { crc32, deflateRawSync } from 'node:zlib';
 import { afterEach, describe, expect, it } from 'vitest';
 import { importJellyfinBackupCatalog } from '../server/jellyfin-backup-reader.js';
+import {
+  buildJellyfinCatalogIndex,
+  readJellyfinCatalogCandidates,
+} from '../server/jellyfin-catalog-index.js';
+import { jellyfinLibraryConfigHash } from '../server/jellyfin-library-membership.js';
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -164,7 +169,14 @@ describe('Jellyfin backup catalog reader', () => {
       projectedItems: 2,
     });
     expect(projected(source.output)).toEqual({
-      tables: ['catalog_items'],
+      tables: [
+        'catalog_item_roots',
+        'catalog_items',
+        'catalog_library_config',
+        'catalog_library_roots',
+        'catalog_membership',
+        'catalog_roots',
+      ],
       items: [
         {
           Id: apiId(1),
@@ -193,6 +205,158 @@ describe('Jellyfin backup catalog reader', () => {
     expect((await stat(source.output)).mode & 0o777).toBe(0o600);
     expect((await readFile(source.output)).includes(Buffer.from('never-project'))).toBe(false);
   });
+
+  it('projects exact neutral physical-root memberships without retaining a parent graph or collection settings', async () => {
+    const root = item(100, 'MediaBrowser.Controller.Entities.Folder', {
+      Path: '/synthetic/root',
+      ParentId: id(900),
+    });
+    const collection = item(200, 'MediaBrowser.Controller.Entities.CollectionFolder', {
+      Path: '/synthetic/virtual',
+      Data: JSON.stringify({
+        PhysicalFolderIds: [apiId(100)],
+        PhysicalLocationsList: ['/synthetic/virtual', '/synthetic/root'],
+        PrivateSetting: 'never-project-membership-secret',
+      }),
+    });
+    const source = await fixture([
+      root,
+      collection,
+      item(1, undefined, { TopParentId: id(100) }),
+      item(2, undefined, { TopParentId: null }),
+      item(3, undefined, { TopParentId: id(999) }),
+    ]);
+    await importJellyfinBackupCatalog(source.archive, source.output);
+    await buildJellyfinCatalogIndex(source.output);
+    const candidates = await readJellyfinCatalogCandidates(
+      source.output,
+      projected(source.output).items,
+    );
+    expect(candidates.find((item) => item.Id === apiId(1))?.JellyportLibraryIds).toEqual([
+      apiId(200),
+    ]);
+    expect(candidates.find((item) => item.Id === apiId(1))?.JellyportLibraryConfigHash).toBe(
+      jellyfinLibraryConfigHash([{ id: apiId(200), locations: ['/synthetic/root'] }]),
+    );
+    expect(candidates.find((item) => item.Id === apiId(2))).not.toHaveProperty(
+      'JellyportLibraryIds',
+    );
+    expect(candidates.find((item) => item.Id === apiId(3))).not.toHaveProperty(
+      'JellyportLibraryIds',
+    );
+    expect(
+      (await readFile(source.output)).includes(Buffer.from('never-project-membership-secret')),
+    ).toBe(false);
+    const database = new DatabaseSync(source.output, { readOnly: true });
+    expect(
+      database
+        .prepare('PRAGMA table_info(catalog_item_roots)')
+        .all()
+        .map((row) => row.name),
+    ).toEqual(['id', 'root_id']);
+    expect(database.prepare('SELECT version FROM catalog_index').get()?.version).toBe(2);
+    database.close();
+  });
+
+  it('keeps inconsistent cached physical IDs and locations unknown instead of guessing a library', async () => {
+    const source = await fixture([
+      item(100, 'MediaBrowser.Controller.Entities.Folder', { Path: '/synthetic/root-a' }),
+      item(101, 'MediaBrowser.Controller.Entities.Folder', { Path: '/synthetic/root-b' }),
+      item(200, 'MediaBrowser.Controller.Entities.CollectionFolder', {
+        Path: '/synthetic/virtual',
+        Data: JSON.stringify({
+          PhysicalFolderIds: [apiId(100)],
+          PhysicalLocationsList: ['/synthetic/virtual', '/synthetic/root-b'],
+        }),
+      }),
+      item(1, undefined, { TopParentId: id(100) }),
+      item(2, undefined, { TopParentId: id(101) }),
+    ]);
+    await importJellyfinBackupCatalog(source.archive, source.output);
+    await buildJellyfinCatalogIndex(source.output);
+    const candidates = await readJellyfinCatalogCandidates(
+      source.output,
+      projected(source.output).items,
+    );
+    expect(candidates.every((item) => !Object.hasOwn(item, 'JellyportLibraryIds'))).toBe(true);
+  });
+
+  it.each([
+    ['/Synthetic/Root', '/synthetic/root', true],
+    ['/synthetic/café', '/synthetic/café', true],
+    ['/synthetic/Ä', '/synthetic/ä', false],
+  ])(
+    'handles verified ASCII case changes while leaving unverified Unicode case unknown',
+    async (rootPath, location, known) => {
+      const source = await fixture([
+        item(100, 'MediaBrowser.Controller.Entities.Folder', { Path: rootPath }),
+        item(200, 'MediaBrowser.Controller.Entities.CollectionFolder', {
+          Path: '/synthetic/Virtual',
+          Data: JSON.stringify({
+            PhysicalFolderIds: [apiId(100)],
+            PhysicalLocationsList: ['/SYNTHETIC/VIRTUAL', location],
+          }),
+        }),
+        item(1, undefined, { TopParentId: id(100) }),
+      ]);
+      await importJellyfinBackupCatalog(source.archive, source.output);
+      await buildJellyfinCatalogIndex(source.output);
+      const [candidate] = await readJellyfinCatalogCandidates(
+        source.output,
+        projected(source.output).items,
+      );
+      if (known) {
+        expect(candidate?.JellyportLibraryIds).toEqual([apiId(200)]);
+        expect(candidate?.JellyportLibraryConfigHash).toBe(
+          jellyfinLibraryConfigHash([{ id: apiId(200), locations: [String(location)] }]),
+        );
+      } else expect(candidate).not.toHaveProperty('JellyportLibraryIds');
+    },
+  );
+
+  it('leaves ASCII case-colliding physical paths unknown even when one cached ID matches', async () => {
+    const source = await fixture([
+      item(100, 'MediaBrowser.Controller.Entities.Folder', { Path: '/synthetic/Root' }),
+      item(101, 'MediaBrowser.Controller.Entities.Folder', { Path: '/synthetic/root' }),
+      item(200, 'MediaBrowser.Controller.Entities.CollectionFolder', {
+        Path: '/synthetic/virtual',
+        Data: JSON.stringify({
+          PhysicalFolderIds: [apiId(100)],
+          PhysicalLocationsList: ['/synthetic/virtual', '/SYNTHETIC/ROOT'],
+        }),
+      }),
+      item(1, undefined, { TopParentId: id(100) }),
+      item(2, undefined, { TopParentId: id(101) }),
+    ]);
+    await importJellyfinBackupCatalog(source.archive, source.output);
+    await buildJellyfinCatalogIndex(source.output);
+    const candidates = await readJellyfinCatalogCandidates(
+      source.output,
+      projected(source.output).items,
+    );
+    expect(candidates.every((item) => !Object.hasOwn(item, 'JellyportLibraryIds'))).toBe(true);
+  });
+
+  it.each([
+    { PhysicalFolderIds: ['not-an-id'], PhysicalLocationsList: ['/synthetic/root'] },
+    { PhysicalFolderIds: [apiId(100), apiId(100)], PhysicalLocationsList: ['/synthetic/root'] },
+    { PhysicalFolderIds: [apiId(100)], PhysicalLocationsList: ['/synthetic/\u0000root'] },
+    { PhysicalFolderIds: [apiId(100)] },
+  ])(
+    'rejects unsupported or malformed physical-membership fields without publishing a projection',
+    async (data) => {
+      const source = await fixture([
+        item(1),
+        item(200, 'MediaBrowser.Controller.Entities.CollectionFolder', {
+          Data: JSON.stringify(data),
+        }),
+      ]);
+      await expect(importJellyfinBackupCatalog(source.archive, source.output)).rejects.toThrow(
+        'invalid catalog',
+      );
+      await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
 
   it('supports every migration media type without guessing CLR suffixes', async () => {
     const types = [
@@ -249,6 +413,7 @@ describe('Jellyfin backup catalog reader', () => {
     ],
     ['invalid item ID', [item(1, undefined, { Id: 'invalid-private-id' })], []],
     ['invalid numbering', [item(1, undefined, { IndexNumber: -1 })], []],
+    ['invalid top parent', [item(1, undefined, { TopParentId: 'invalid-private-parent' })], []],
     [
       'unknown provider item',
       [item(1)],

@@ -128,7 +128,21 @@ export interface ItemIssue {
   source?: { Name?: string };
   candidate_ids?: string[];
 }
+export interface DestinationCatalogMetadata {
+  id: string;
+  items: number;
+  keys: number;
+  bytes: number;
+  server_version: string;
+  backup_engine_version: string;
+  backup_created_at: string;
+  imported_at: string;
+  import_elapsed_ms: number;
+  expires_at: string;
+}
 export interface JobResult {
+  destination_catalog?: DestinationCatalogMetadata;
+  timing?: { elapsed_ms: number; phase_ms: Record<string, number> };
   source_catalog?: { captured_at: string; items: number };
   source_snapshot?: SourceSnapshotMetadata;
   username?: string;
@@ -153,6 +167,14 @@ export interface JobResult {
   error?: string;
 }
 export interface MigrationDetails {
+  verification?: {
+    checked: number;
+    verified: number;
+    preserved_newer: number;
+    missing: number;
+    mismatched: number;
+    unsupported_fields: number;
+  };
   items_updated: number;
   favorites: number;
   resume_positions: number;
@@ -181,7 +203,9 @@ export interface JobProgress {
     | 'preparing_account'
     | 'indexing_target'
     | 'reading_target'
+    | 'matching'
     | 'transferring_history'
+    | 'verifying_history'
     | 'transferring_playlists'
     | 'delivering_credentials';
   items_processed?: number;
@@ -248,6 +272,9 @@ export interface SourceSnapshotStatus {
   records: SourceSnapshotMetadata[];
 }
 export interface Job {
+  destination_catalog_id?: string;
+  elapsed_ms?: number;
+  queue_ms?: number;
   id: string;
   kind: string;
   status: string;

@@ -3,6 +3,10 @@ import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { snapshotProcess } from './snapshot-process.js';
 import {
+  processDestinationCatalogRequest,
+  recoverDestinationCatalogHelper,
+} from './destination-catalog-helper.js';
+import {
   CAPTURE_DEADLINE,
   SNAPSHOT_VERSION,
   encryptDatabase,
@@ -20,6 +24,7 @@ import {
 
 const directory = process.env.JELLYPORT_SNAPSHOT_DIR;
 const workDirectory = process.env.JELLYPORT_SNAPSHOT_WORK_DIR;
+const jellyfinBackups = process.env.JELLYPORT_JELLYFIN_BACKUP_DIR;
 const captureMethod = snapshotCaptureMethod(process.env.JELLYPORT_SNAPSHOT_METHOD);
 const source =
   captureMethod === 'plugin_backup'
@@ -63,6 +68,7 @@ const heartbeat = setInterval(() => {
           version: 1,
           emby_version: SNAPSHOT_VERSION,
           capture_method: captureMethod,
+          jellyfin_catalog_enabled: !!jellyfinBackups,
           updated_at: new Date().toISOString(),
         },
         key,
@@ -88,6 +94,7 @@ while (!stopping) {
     const key = await snapshotKey(directory);
     if (!recovered) {
       await recoverSnapshotHelper(directory, key);
+      await recoverDestinationCatalogHelper(directory, key);
       recovered = true;
     }
     await writeEnvelope(
@@ -96,12 +103,24 @@ while (!stopping) {
         version: 1,
         emby_version: SNAPSHOT_VERSION,
         capture_method: captureMethod,
+        jellyfin_catalog_enabled: !!jellyfinBackups,
         updated_at: new Date().toISOString(),
       },
       key,
     );
     for (const name of await readdir(directory)) {
       if (stopping) break;
+      if (
+        await processDestinationCatalogRequest(
+          name,
+          directory,
+          workDirectory,
+          jellyfinBackups,
+          key,
+          controller.signal,
+        )
+      )
+        continue;
       if (!name.endsWith('.request') || !snapshotId.test(name.slice(0, -8))) continue;
       const id = name.slice(0, -8),
         path = join(directory, name);

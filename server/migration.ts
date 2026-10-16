@@ -169,6 +169,14 @@ export interface SourceSnapshot {
   warnings: string[];
 }
 export interface MigrationDetails {
+  verification?: {
+    checked: number;
+    verified: number;
+    preserved_newer: number;
+    missing: number;
+    mismatched: number;
+    unsupported_fields: number;
+  };
   items_updated: number;
   favorites: number;
   resume_positions: number;
@@ -291,6 +299,7 @@ export async function migrateItemState(
     concurrency?: number;
     progress?: (processed: number, total: number, updated: number) => void;
     migration_scope?: MigrationScope;
+    expectation?: (target: MediaItem, patch: MediaUserDataPatch, unsupported: string[]) => void;
   } = {},
 ): Promise<number> {
   const concurrency = options.concurrency ?? 4;
@@ -349,6 +358,7 @@ export async function migrateItemState(
       // a fresh destination read, so later Jellyfin activity wins immediately before a write.
       if (!Object.keys(mergeUserData(match.source, target, scope)).length) {
         missingDate(match.source, target);
+        options.expectation?.(target, {}, []);
         return false;
       }
       if (capabilities.userData && jellyfin.userData)
@@ -356,6 +366,16 @@ export async function migrateItemState(
       guard();
       const patch = mergeUserData(match.source, target, scope);
       missingDate(match.source, target);
+      const unsupported =
+        capabilities.userData && jellyfin.updateUserData
+          ? []
+          : Object.keys(patch).filter(
+              (key) =>
+                (!['Played', 'IsFavorite'].includes(key) &&
+                  !(key === 'LastPlayedDate' && patch.Played === true)) ||
+                (key === 'IsFavorite' && !jellyfin.markFavorite),
+            );
+      options.expectation?.(target, patch, unsupported);
       if (!Object.keys(patch).length) return false;
       if (capabilities.userData && jellyfin.updateUserData) {
         if (!jellyfin.userData)

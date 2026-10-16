@@ -181,6 +181,36 @@ function mappedPath(item: MediaItem, mappings: Array<[string, string]>): string 
     }
   return value;
 }
+function normalizedMappings(pathMappings: PathMapping[]): Array<[string, string]> {
+  return pathMappings
+    .flatMap((mapping) => {
+      const sourcePath = path(mapping.source),
+        targetPath = path(mapping.target);
+      return sourcePath && targetPath ? [[sourcePath, targetPath] as [string, string]] : [];
+    })
+    .sort((a, b) => b[0].length - a[0].length);
+}
+
+/** Identity buckets for a disk-backed candidate union. Final access-scoped matching is unchanged. */
+export function catalogCandidateKeys(
+  item: MediaItem,
+  pathMappings: PathMapping[] = [],
+  source = false,
+): string[] {
+  const type = kind(item);
+  if (!supportedTypes.has(type)) return [];
+  const keys = new Set<string>();
+  if (type !== 'season')
+    for (const [provider, value] of providerEntries(item, 'ProviderIds'))
+      keys.add(JSON.stringify(['provider', type, provider, value]));
+  const numbers = seriesNumbers(item);
+  if (numbers)
+    for (const [provider, value] of providerEntries(item, 'SeriesProviderIds'))
+      keys.add(JSON.stringify(['series', type, provider, value, ...numbers]));
+  const value = source ? mappedPath(item, normalizedMappings(pathMappings)) : path(item.Path);
+  if (value) keys.add(JSON.stringify(['path', type, value]));
+  return [...keys];
+}
 function compatible(source: MediaItem, target: MediaItem): boolean {
   if (kind(source) !== kind(target)) return false;
   const fields = ['ProviderIds'];
@@ -232,13 +262,7 @@ export function createMatcher(
     const value = path(item.Path);
     if (value) add(pathIndex, [type, value], index);
   });
-  const mappings = pathMappings
-    .flatMap((mapping) => {
-      const sourcePath = path(mapping.source),
-        targetPath = path(mapping.target);
-      return sourcePath && targetPath ? [[sourcePath, targetPath] as [string, string]] : [];
-    })
-    .sort((a, b) => b[0].length - a[0].length);
+  const mappings = normalizedMappings(pathMappings);
   const match = (source: MediaItem[]): MatchPlan => {
     const result: MatchPlan = { matches: [], unmatched: [], ambiguous: [] };
     let retainedCandidates = 0;

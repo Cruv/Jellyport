@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'rea
 import { Callout, Heading, Icon } from './components';
 import AdminAlertsPanel from './AdminAlertsPanel';
 import SourceSnapshotsPanel from './SourceSnapshotsPanel';
+import DestinationCatalogPanel from './DestinationCatalogPanel';
 import {
   safeUrl,
   defaultMembershipTiers,
@@ -855,6 +856,7 @@ export default function SettingsPage({
         </div>
       </form>
       <SourceSnapshotsPanel api={api} notify={notify} demo={demo} />
+      <DestinationCatalogPanel api={api} notify={notify} demo={demo} />
       {tested && (
         <div className="connection-test-results">
           <section className="panel">

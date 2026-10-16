@@ -781,6 +781,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     reply.code(202).send(await service.sourceSnapshots.refresh()),
   );
   app.delete('/api/source-snapshots', noSnapshotBody, async () => service.sourceSnapshots.clear());
+  app.get('/api/destination-catalog', async () => service.destinationSnapshots.status());
+  app.post('/api/destination-catalog/refresh', noSnapshotBody, async (_request, reply) =>
+    reply.code(202).send(await service.destinationSnapshots.refresh()),
+  );
+  app.delete('/api/destination-catalog', noSnapshotBody, async () =>
+    service.destinationSnapshots.clear(),
+  );
   app.get('/api/discord/admin-alerts', async () => ({
     ...service.adminAlerts.status(store.settings()),
     connected: bot.status().connected,

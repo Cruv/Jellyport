@@ -169,7 +169,7 @@ export function projectCatalogItem(value: unknown): MediaItem {
     throw new MediaError('The media server returned invalid catalog identifiers.');
   const item: MediaItem = { Id: value.Id };
   for (const [field, maximum] of [
-    ['Name', 2048],
+    ['Name', 8192],
     ['Type', 64],
     ['Path', 16_384],
     ['SeriesId', 128],

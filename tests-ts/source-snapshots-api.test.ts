@@ -379,3 +379,46 @@ it('rejects malformed snapshot selection and incomplete pins before execution st
   expect(preview).not.toHaveBeenCalled();
   expect(migrate).not.toHaveBeenCalled();
 });
+
+it('protects saved destination catalog status and mutations with admin revalidation and CSRF', async () => {
+  const { app, headers, revoke } = await setup();
+  const manager = app.jellyport.service.destinationSnapshots;
+  const state = await manager.status();
+  const refresh = vi.spyOn(manager, 'refresh').mockResolvedValue(state);
+  const clear = vi.spyOn(manager, 'clear').mockResolvedValue(state);
+  expect((await app.inject('/api/destination-catalog')).statusCode).toBe(401);
+  for (const [method, url] of [
+    ['POST', '/api/destination-catalog/refresh'],
+    ['DELETE', '/api/destination-catalog'],
+  ] as const) {
+    expect(
+      (await app.inject({ method, url, headers: { cookie: headers.cookie } })).statusCode,
+    ).toBe(403);
+    expect(
+      (await app.inject({ method, url, headers, payload: { unexpected: 'private' } })).statusCode,
+    ).toBe(422);
+  }
+  expect(refresh).not.toHaveBeenCalled();
+  expect(clear).not.toHaveBeenCalled();
+  expect(
+    (await app.inject({ method: 'GET', url: '/api/destination-catalog', headers })).json(),
+  ).toMatchObject({ configured: false, record: null });
+  expect(
+    (await app.inject({ method: 'POST', url: '/api/destination-catalog/refresh', headers }))
+      .statusCode,
+  ).toBe(202);
+  expect(
+    (await app.inject({ method: 'DELETE', url: '/api/destination-catalog', headers })).statusCode,
+  ).toBe(200);
+  refresh.mockClear();
+  clear.mockClear();
+  revoke();
+  for (const [method, url] of [
+    ['GET', '/api/destination-catalog'],
+    ['POST', '/api/destination-catalog/refresh'],
+    ['DELETE', '/api/destination-catalog'],
+  ] as const)
+    expect((await app.inject({ method, url, headers })).statusCode).toBe(401);
+  expect(refresh).not.toHaveBeenCalled();
+  expect(clear).not.toHaveBeenCalled();
+});

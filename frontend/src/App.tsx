@@ -1281,6 +1281,13 @@ function DialogContent({
           <Status value={job.status} />
         </div>
         <JobProgressDetails job={job} />
+        {job.elapsed_ms !== undefined && (
+          <p className="subtle text-small">
+            Total elapsed: {(job.elapsed_ms / 1000).toFixed(1)} seconds, including preparation,
+            queue and verification. Preparation/queue: {((job.queue_ms ?? 0) / 1000).toFixed(1)}{' '}
+            seconds.
+          </p>
+        )}
         {activeJob(job) && (
           <p className="subtle text-small mt-15">
             You can cancel queued or running work. Changes already applied to media accounts are
@@ -1300,6 +1307,22 @@ function DialogContent({
               </p>
             )}
             {result.source_snapshot && <SourceSnapshotNote snapshot={result.source_snapshot} />}
+            {result.destination_catalog && (
+              <p className="subtle text-small">
+                Jellyfin matching backup: {date(result.destination_catalog.backup_created_at)} ·{' '}
+                {num(result.destination_catalog.items)} catalog items. Shared import:{' '}
+                {(result.destination_catalog.import_elapsed_ms / 1000).toFixed(1)} seconds. Account
+                activity was read and verified live.
+              </p>
+            )}
+            {result.timing && (
+              <p className="subtle text-small">
+                Account work: {(result.timing.elapsed_ms / 1000).toFixed(1)} seconds.{' '}
+                {Object.entries(result.timing.phase_ms)
+                  .map(([phase, ms]) => `${phase.replaceAll('_', ' ')}: ${(ms / 1000).toFixed(1)}s`)
+                  .join(' · ')}
+              </p>
+            )}
             {result.source_catalog && (
               <p className="subtle text-small">
                 Matching catalog collected {date(result.source_catalog.captured_at)} ·{' '}
@@ -1363,6 +1386,15 @@ function DialogContent({
                 </>
               )}
             </div>
+            {result.data?.verification && (
+              <p className="subtle text-small">
+                Independent history verification: {num(result.data.verification.verified)} verified
+                · {num(result.data.verification.preserved_newer)} newer Jellyfin activity preserved
+                · {num(result.data.verification.missing)} missing ·{' '}
+                {num(result.data.verification.mismatched)} mismatched ·{' '}
+                {num(result.data.verification.unsupported_fields)} unsupported fields.
+              </p>
+            )}
             {result.data?.warnings.map((warning, index) => (
               <div className="error-block" key={index}>
                 {warning}

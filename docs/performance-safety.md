@@ -7,6 +7,31 @@ projections may retain broader fields for format compatibility; only matching
 metadata and played flags drive the current transfer. Historical investigations
 and measurements below retain their original inputs and limitations.
 
+
+## Played-only production trial — 2026-10-16
+
+A representative heavy history on version 0.16.0 took **136.3 seconds** from
+queueing through independent readback. Shared preparation was reported separately:
+about 63 seconds to import the Emby plugin backup and 280.9 seconds to import the
+Jellyfin matching catalog (194,633 items). Per-user phases were source extraction
+0.6 s, provisioning 0.4 s, candidate reads 11.8 s, matching 0.6 s, writes 114.4 s,
+and independent verification 8.5 s. Timings are rounded.
+
+The run met the five-minute time limit and missed the two-minute target. It was
+**partial**, not a correctness acceptance: 20,597 played flags verified, 12 matched
+items mismatched after HTTP 500/404 responses, 635 source items were ambiguous,
+and 1,719 orphan history entries had no remaining source library item. Failures
+were reported rather than converted to success. A Jellyfin metadata provider-key
+collision explained one deterministic HTTP 500; HTTP 404 causes still needed
+item-specific diagnosis. No access check was bypassed.
+
+Version 0.16.1 adds bounded administrator-only failed-item diagnostics and aggregate
+write/checkpoint timings. It raises destination write concurrency from four to six
+and limits observational progress saves to once per second plus a final flush.
+Account creation uncertainty journals remain immediate. These are optimization
+changes requiring a new production trial; they do not establish a new timing or
+correctness result on their own. Current migrations transfer played flags only.
+
 ## Incident evidence and limits of attribution
 
 On October 8, 2026, the installed Jellyport revision
@@ -182,8 +207,9 @@ deadline, including reads, waits and metadata preparation. Failure or cancellati
 discards the partial index. These destination limits do not relax Emby's separate
 five-second deadline or source governor. Explicit-ID account reads retain their
 30-second deadline and at most three attempts for HTTP 429/503, with each retry
-delay capped at two seconds. Reads do not fan out. The existing ceiling of four
-workers for independent destination item transfers is unchanged. Cold collection
+delay capped at two seconds. Reads do not fan out. That release kept a four-worker ceiling for independent destination item
+transfers. Current played-only writes use at most six workers; account jobs remain
+serialized and no mutation is retried automatically. Cold collection
 still costs database work; sharing it removes repeated per-account work.
 
 Both the neutral catalog and each account's retained candidate result are bounded
@@ -367,7 +393,7 @@ and reuses that account's matching index. A matching plan retains at most 200,00
 candidate references.
 Over-limit plans fail rather than drop candidates or guess a match. Item workers
 yield every 250 processed items so large already-merged histories remain
-cancelable. Fresh pre-write Jellyfin checks and the four-worker ceiling remain.
+cancelable. Fresh access-scoped Jellyfin candidate checks remain. Played-only destination writes have a six-worker ceiling; account jobs stay serialized and workers drain before cancellation releases locks.
 
 The following benchmark measurements predate the played-only scope and describe
 local component work, not current end-to-end throughput.

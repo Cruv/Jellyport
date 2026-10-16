@@ -91,7 +91,11 @@ export interface JobStats {
 }
 export interface JobResult extends Partial<JobStats> {
   destination_catalog?: DestinationCatalogMetadata;
-  timing?: { elapsed_ms: number; phase_ms: Record<string, number> };
+  timing?: {
+    elapsed_ms: number;
+    phase_ms: Record<string, number>;
+    checkpoints?: { count: number; total_duration_ms: number; max_duration_ms: number };
+  };
   source_catalog?: { captured_at: string; items: number };
   source_snapshot?: SnapshotMetadata;
   username: string;
@@ -2174,7 +2178,11 @@ export class Service {
     destinationContext: DestinationCatalogContext,
   ): Promise<void> {
     const accountStarted = performance.now();
-    const timing = { elapsed_ms: 0, phase_ms: {} as Record<string, number> };
+    const timing = {
+      elapsed_ms: 0,
+      phase_ms: {} as Record<string, number>,
+      checkpoints: { count: 0, total_duration_ms: 0, max_duration_ms: 0 },
+    };
     let phaseStarted = accountStarted;
     let previousPhase: string | undefined;
     const recordPhase = () => {
@@ -2562,13 +2570,21 @@ export class Service {
         });
         this.save(job);
         const expectations = new Map<string, VerificationExpectation[]>();
-        let pendingWrites = 0;
-        let lastCheckpoint = Date.now();
+        let lastCheckpoint = performance.now();
         const checkpoint = (force = false) => {
-          if (force || pendingWrites >= 20 || Date.now() - lastCheckpoint >= 1000) {
+          const started = performance.now();
+          // Progress is observational. Bound full-job persistence independently of
+          // write throughput; account uncertainty journals remain immediate.
+          if (force || started - lastCheckpoint >= 1000) {
             this.save(job);
-            pendingWrites = 0;
-            lastCheckpoint = Date.now();
+            const duration = performance.now() - started;
+            timing.checkpoints.count++;
+            timing.checkpoints.total_duration_ms += duration;
+            timing.checkpoints.max_duration_ms = Math.max(
+              timing.checkpoints.max_duration_ms,
+              duration,
+            );
+            lastCheckpoint = performance.now();
           }
         };
         try {
@@ -2578,9 +2594,7 @@ export class Service {
             plan,
             result.data,
             guard,
-            () => {
-              pendingWrites++;
-            },
+            () => {},
             {
               migration_scope: scope,
               expectation: (target, patch, unsupported) => {

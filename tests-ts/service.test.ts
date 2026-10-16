@@ -904,7 +904,7 @@ describe('account migration and subscription safety', () => {
     expect(store.account('casey')?.remote_id).toBe(job.results[0]?.target_user_id);
   });
 
-  it('checkpoints live history counts in batches and flushes them before completing a user', async () => {
+  it('bounds observational history checkpoints to time rather than write count and flushes completion', async () => {
     const catalog = Array.from({ length: 64 }, (_, index) => ({
       Id: `bulk-${index}`,
       Name: `Movie ${index}`,
@@ -925,14 +925,19 @@ describe('account migration and subscription safety', () => {
       snapshots.push(structuredClone(job));
       originalSave(job);
     });
-    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.now());
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(performance.now());
     try {
       const job = await finish(await service.migrateUsers(['e-river']));
       expect(job.status).toBe('completed');
       expect(job.results[0]?.applied).toBe(64);
       const history = snapshots.filter((entry) => entry.progress.phase === 'transferring_history');
-      expect(history.length).toBeGreaterThanOrEqual(4);
-      expect(history.length).toBeLessThan(10);
+      expect(history).toHaveLength(3); // Two phase-entry saves and one final flush.
+      expect(history.filter((entry) => Number(entry.progress.items_processed) > 0)).toHaveLength(1);
+      expect(job.results[0]?.timing?.checkpoints).toEqual({
+        count: 1,
+        total_duration_ms: 0,
+        max_duration_ms: 0,
+      });
       expect(history.at(-1)?.progress).toMatchObject({
         processed: 0,
         total: 1,

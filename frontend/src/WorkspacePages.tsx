@@ -9,7 +9,6 @@ import {
   type Api,
   type DiscordMember,
   type Job,
-  type MigrationScope,
   type Notify,
   type Overview,
   type Page,
@@ -33,7 +32,7 @@ export function OverviewPage({
     <>
       <Heading
         title="Everyone’s next chapter."
-        description="Bring your users, their progress, and your community over to Jellyfin."
+        description="Bring your users, watched status, and your community over to Jellyfin."
         eyebrow="YOUR MIGRATION WORKSPACE"
         actions={
           <>
@@ -136,7 +135,7 @@ export function OverviewPage({
                   page: 'migrate' as Page,
                   icon: 'migrate',
                   title: 'Migrate existing users',
-                  text: 'Bring progress, favorites and playlists.',
+                  text: 'Bring played status into Jellyfin.',
                 },
                 {
                   page: 'accounts' as Page,
@@ -168,10 +167,10 @@ export function OverviewPage({
           </section>
           <section className="panel">
             <div className="panel-body">
-              <h3>Your users. Their progress.</h3>
+              <h3>Your users. Their watched history.</h3>
               <p className="muted text-small mt-9">
                 Preview the match before you migrate. Existing Jellyfin activity is preserved as
-                Emby progress, favorites and playlists are added.
+                Emby watched flags are added.
               </p>
               <div className="flow">
                 <div className="flow-node">
@@ -217,8 +216,6 @@ export function MigratePage({
   search,
   setSearch,
   preview,
-  migrationScope,
-  setMigrationScope,
   useSnapshots,
   setUseSnapshots,
   busy,
@@ -231,8 +228,6 @@ export function MigratePage({
   search: string;
   setSearch: (value: string) => void;
   preview: () => void;
-  migrationScope: MigrationScope;
-  setMigrationScope: (scope: MigrationScope) => void;
   useSnapshots: boolean;
   setUseSnapshots: (value: boolean) => void;
   busy: boolean;
@@ -252,11 +247,7 @@ export function MigratePage({
     <>
       <Heading
         title="Migrate users"
-        description={
-          migrationScope === 'watched_only'
-            ? 'Bring watched status into Jellyfin while preserving watched items from either server. Set name exceptions in User mappings.'
-            : 'Bring Emby progress, favorites and playlists into Jellyfin. Set name exceptions in User mappings.'
-        }
+        description="Bring played status into Jellyfin while preserving played items from either server. Set name exceptions in User mappings."
         actions={
           <button
             id="preview-migration"
@@ -271,24 +262,11 @@ export function MigratePage({
           </button>
         }
       />
-      <div className="field mb-17">
-        <label htmlFor="migration-scope">Migration data</label>
-        <select
-          id="migration-scope"
-          aria-describedby="migration-scope-help"
-          value={migrationScope}
-          onChange={(event) => setMigrationScope(event.target.value as MigrationScope)}
-          disabled={busy}
-        >
-          <option value="complete">Complete migration</option>
-          <option value="watched_only">Watched-only</option>
-        </select>
-        <small id="migration-scope-help">
-          {migrationScope === 'watched_only'
-            ? 'Copies watched flags and original playback dates when safe. Other imported personal data is skipped; new accounts still use your account role or template defaults.'
-            : 'Copies watch history, favorites, playlists, and supported personal data while preserving newer Jellyfin activity.'}
-        </small>
-      </div>
+      <p className="muted text-small mb-17">
+        Only played or unplayed status is migrated. Existing Jellyfin resume positions and other
+        personal state stay unchanged. New accounts still use your account role or template
+        defaults.
+      </p>
       <div className="field mb-17">
         <label className="check-label">
           <input
@@ -303,10 +281,10 @@ export function MigratePage({
         </label>
         <small id="migration-snapshot-help">
           Previews check accounts and backup freshness without scanning libraries; matching and
-          selected personal data are read only after approval. Migrations pause between source
-          requests to protect playback. Saved snapshots must cover every selected account and be
-          current enough; missing or expired snapshots stop the preview. File copies provide
-          best-effort saved history.
+          played flags are read only after approval. Migrations pause between source requests to
+          protect playback. Saved snapshots must cover every selected account and be current enough;
+          missing or expired snapshots stop the preview. File copies provide best-effort saved
+          history.
         </small>
       </div>
       <div className="steps">

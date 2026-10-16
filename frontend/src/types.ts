@@ -217,7 +217,11 @@ export interface JobProgress {
   catalog_last_page_ms?: number;
   catalog_cache_hit?: boolean;
 }
-export type MigrationScope = 'complete' | 'watched_only';
+export type MigrationScope = 'watched_only';
+/** Older recorded jobs and API responses may still describe the previous broader scope. */
+export type HistoricalMigrationScope = MigrationScope | 'complete';
+/** Complete describes database capture contents, not the fields a migration imports. */
+export type SnapshotCaptureScope = 'complete' | 'watched_only';
 export interface SourceSnapshotMetadata {
   source_type?: 'sqlite_online_backup' | 'file_copy' | 'plugin_backup';
   backup_created_at?: string;
@@ -236,7 +240,7 @@ export interface SourceSnapshotMetadata {
   source_server_version: string;
   source_user_id: string;
   source_username: string;
-  scope: MigrationScope;
+  scope: SnapshotCaptureScope;
   started_at: string;
   finished_at: string;
   expires_at: string;
@@ -251,7 +255,7 @@ export interface SourceSnapshotConfig {
   hour: number;
   minute: number;
   time_zone: string;
-  scope: MigrationScope;
+  scope: SnapshotCaptureScope;
   revision: string;
 }
 export interface SourceSnapshotStatus {
@@ -285,7 +289,7 @@ export interface Job {
   results?: JobResult[];
   error?: string;
   progress?: number | JobProgress;
-  migration_scope?: MigrationScope;
+  migration_scope?: HistoricalMigrationScope;
   cancel_requested?: boolean;
 }
 export interface Overview {
@@ -322,7 +326,7 @@ export interface PreviewUser {
 }
 export interface Preview {
   users: PreviewUser[];
-  migration_scope?: MigrationScope;
+  migration_scope?: HistoricalMigrationScope;
   source_snapshot_ids?: Record<string, string>;
 }
 export interface PreviewTask {

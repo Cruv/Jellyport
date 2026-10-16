@@ -9,7 +9,7 @@ const flush = async () => {
 afterEach(() => vi.useRealTimers());
 
 it.each([undefined, 'complete', 'watched_only'] as const)(
-  'passes the selected migration scope (%s) to its isolated asynchronous runner',
+  'narrows selected migration scope %s to watched-only in its isolated runner',
   async (scope) => {
     const run = vi.fn(async (_ids: string[], controls: { migration_scope: MigrationScope }) => ({
       scope: controls.migration_scope,
@@ -21,10 +21,10 @@ it.each([undefined, 'complete', 'watched_only'] as const)(
       await flush();
       expect(run).toHaveBeenCalledWith(
         ['source'],
-        expect.objectContaining({ migration_scope: scope ?? 'complete' }),
+        expect.objectContaining({ migration_scope: 'watched_only' }),
       );
       expect(tasks.get('owner', 'config', task.id)?.preview).toEqual({
-        scope: scope ?? 'complete',
+        scope: 'watched_only',
       });
       expect(tasks.get('other-owner', 'config', task.id)).toBeUndefined();
       expect(tasks.cancel('other-owner', task.id)).toBe(false);

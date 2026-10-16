@@ -304,7 +304,7 @@ export function JobsTable({
                 <strong>
                   {job.migration_scope === 'watched_only' &&
                   ['migrate', 'migration'].includes(job.kind)
-                    ? 'Watched-only migration'
+                    ? 'Played-status migration'
                     : names[job.kind] || job.kind || 'Account operation'}
                 </strong>
                 <small>
@@ -418,12 +418,19 @@ export function JobProgressDetails({ job }: { job: Job }) {
   const running = activeJob(job);
   const elapsed = jobElapsed(job);
   const phases = {
-    reading_source: 'Reading Emby library',
+    reading_source:
+      job.migration_scope === 'watched_only' ? 'Reading Emby played flags' : 'Reading Emby library',
     preparing_account: 'Preparing Jellyfin account',
     indexing_target: 'Preparing shared Jellyfin matching index',
-    reading_target: 'Reading Jellyfin account history',
+    reading_target:
+      job.migration_scope === 'watched_only'
+        ? 'Reading Jellyfin played status'
+        : 'Reading Jellyfin account history',
     matching: 'Matching media identities',
-    verifying_history: 'Verifying Jellyfin watch history',
+    verifying_history:
+      job.migration_scope === 'watched_only'
+        ? 'Verifying Jellyfin played status'
+        : 'Verifying Jellyfin watch history',
     transferring_history:
       job.migration_scope === 'watched_only'
         ? 'Migrating watched status'
@@ -504,7 +511,8 @@ export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetad
     return (
       <p className="subtle text-small">
         Saved Emby plugin backup · Emby {snapshot.source_server_version} ·{' '}
-        {snapshot.scope === 'watched_only' ? 'watched-only' : 'complete'} · backed up{' '}
+        {snapshot.scope === 'watched_only' ? 'played-status capture' : 'complete database capture'}{' '}
+        · backed up{' '}
         {snapshot.backup_created_at
           ? new Date(snapshot.backup_created_at).toLocaleString()
           : 'at an unavailable time'}
@@ -515,9 +523,9 @@ export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetad
   return (
     <p className="subtle text-small">
       Saved Emby snapshot{fileCopy ? ' · File copy' : ''} · Emby {snapshot.source_server_version} ·{' '}
-      {snapshot.scope === 'watched_only' ? 'watched-only' : 'complete'} · captured{' '}
-      {new Date(snapshot.finished_at).toLocaleString()}. {fileCopy ? 'Copy' : 'Read'} window:{' '}
-      {new Date(snapshot.started_at).toLocaleString()} –{' '}
+      {snapshot.scope === 'watched_only' ? 'played-status capture' : 'complete database capture'} ·
+      captured {new Date(snapshot.finished_at).toLocaleString()}. {fileCopy ? 'Copy' : 'Read'}{' '}
+      window: {new Date(snapshot.started_at).toLocaleString()} –{' '}
       {new Date(snapshot.finished_at).toLocaleString()}. Activity after this window is not included.
       {fileCopy &&
         ' Live file copies are not transactional; some history may be missing or inconsistent even when validation passes.'}

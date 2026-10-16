@@ -178,7 +178,7 @@ describe('account migration and subscription safety', () => {
     },
   );
 
-  it('defers source playlist reads until the approved migration reads their contents', async () => {
+  it('never reads or copies source playlists during previews or approved watched migration', async () => {
     servers.playlists['e-river'] = [
       {
         Id: 'source-list',
@@ -212,13 +212,14 @@ describe('account migration and subscription safety', () => {
     expect(playlists).not.toHaveBeenCalled();
     expect(entries).not.toHaveBeenCalled();
     const job = await finish(await service.migrateUsers(['e-river']));
-    expect(entries).toHaveBeenCalledWith('source-list', 'e-river');
-    expect(job.results[0]?.data?.playlists_created).toBe(1);
-    expect(servers.playlists['j-river']?.[0]?.items).toEqual(['2', '1']);
+    expect(playlists).not.toHaveBeenCalled();
+    expect(entries).not.toHaveBeenCalled();
+    expect(job.results[0]?.data?.playlists_created).toBe(0);
+    expect(servers.playlists['j-river']).toBeUndefined();
   });
 
   it.each(['unavailable', 'unsupported', 'over limit'])(
-    'defers playlist warnings until approved migration when source playlists are %s',
+    'ignores source playlist availability when playlists are %s',
     async (condition) => {
       const entries = vi.fn(async () => []);
       service.clientFactory = (...args) => {
@@ -244,14 +245,10 @@ describe('account migration and subscription safety', () => {
       expect(JSON.stringify(preview)).not.toContain('private upstream credential');
       expect(entries).not.toHaveBeenCalled();
       const job = await finish(await service.migrateUsers(['e-river']));
-      expect(job.results[0]?.source_playlists).toBe(condition === 'over limit' ? 500 : 0);
-      expect(job.results[0]?.data?.warnings).toContain(
-        condition === 'unsupported'
-          ? 'This source client cannot read playlists.'
-          : condition === 'over limit'
-            ? 'Only the first 500 source playlists were read. Remaining playlists were skipped.'
-            : 'Source playlists could not be read; library data can still migrate.',
-      );
+      expect(job.status).toBe('completed');
+      expect(job.results[0]?.source_playlists).toBe(0);
+      expect(job.results[0]?.data?.warnings).toEqual([]);
+      expect(entries).not.toHaveBeenCalled();
       expect(JSON.stringify(job)).not.toContain('private upstream credential');
     },
   );
@@ -540,83 +537,86 @@ describe('account migration and subscription safety', () => {
     expect(servers.played['j-river']).toEqual(new Set(['1', '2', '3']));
     expect(store.takeCredentials(job.id)).toEqual([]);
   });
-  it('quick migration reads only watched source items and preserves all unrelated destination data', async () => {
-    servers.userData['e-river'] = {
-      '2': {
-        IsFavorite: true,
-        PlayCount: 8,
-        PlaybackPositionTicks: 700,
-        Rating: 9,
-        Likes: false,
-        LastPlayedDate: '2026-10-06T12:00:00.000Z',
-      },
-      '3': { IsFavorite: true, PlaybackPositionTicks: 1000 },
-    };
-    servers.userData['j-river'] = {
-      '2': {
+  it.each([undefined, 'complete', 'watched_only'] as const)(
+    'normalizes scope %s to played flags and preserves all unrelated destination data',
+    async (requestedScope) => {
+      servers.userData['e-river'] = {
+        '2': {
+          IsFavorite: true,
+          PlayCount: 8,
+          PlaybackPositionTicks: 700,
+          Rating: 9,
+          Likes: false,
+          LastPlayedDate: '2026-10-09T12:00:00.000Z',
+        },
+        '3': { IsFavorite: true, PlaybackPositionTicks: 1000 },
+      };
+      servers.userData['j-river'] = {
+        '2': {
+          PlaybackPositionTicks: 800,
+          PlayCount: 2,
+          Rating: 4,
+          LastPlayedDate: '2026-10-07T12:00:00.000Z',
+        },
+      };
+      const watchedReads = vi.fn();
+      const excluded = vi.fn(async () => {
+        throw new Error('Quick migration must not import this data.');
+      });
+      const patches: unknown[] = [];
+      service.clientFactory = (...args) => {
+        const client = servers.factory(...args);
+        if (args[2] === 'emby') {
+          const original = client.migrationItems!.bind(client);
+          client.catalogItems = async () =>
+            (await original()).map(({ UserData: _state, ...item }) => item as MediaItem);
+          client.migrationState = async (id, _catalog, scope) => {
+            watchedReads(id, scope);
+            return (await original(id)).filter((item) => item.UserData?.Played === true);
+          };
+          client.watchedItems = excluded;
+          client.migrationItems = excluded;
+          client.playlists = excluded;
+          client.playlistItems = excluded;
+          client.userImage = excluded;
+        } else {
+          const update = client.updateUserData!.bind(client);
+          client.updateUserData = async (...parameters) => {
+            patches.push(parameters[2]);
+            await update(...parameters);
+          };
+          client.createPlaylist = excluded;
+          client.setConfiguration = excluded;
+          client.setUserImage = excluded;
+        }
+        return client;
+      };
+      const preview = await service.preview(['e-river'], { migration_scope: requestedScope });
+      expect(preview.migration_scope).toBe('watched_only');
+      expect(preview.users[0]?.stats).toBeNull();
+      expect(preview.users[0]?.history_deferred).toBe(true);
+      expect(watchedReads).not.toHaveBeenCalled();
+      const job = await finish(
+        await service.migrateUsers(['e-river'], {}, undefined, requestedScope),
+      );
+      expect(job.status).toBe('completed');
+      expect(job.migration_scope).toBe('watched_only');
+      expect(job.results[0]?.applied).toBe(1);
+      expect(watchedReads.mock.calls).toEqual([['e-river', 'watched_only']]);
+      expect(excluded).not.toHaveBeenCalled();
+      expect(patches).toEqual([{ Played: true }]);
+      expect(servers.userData['j-river']?.['2']).toEqual({
+        Played: true,
         PlaybackPositionTicks: 800,
         PlayCount: 2,
         Rating: 4,
         LastPlayedDate: '2026-10-07T12:00:00.000Z',
-      },
-    };
-    const watchedReads = vi.fn();
-    const excluded = vi.fn(async () => {
-      throw new Error('Quick migration must not import this data.');
-    });
-    const patches: unknown[] = [];
-    service.clientFactory = (...args) => {
-      const client = servers.factory(...args);
-      if (args[2] === 'emby') {
-        const original = client.migrationItems!.bind(client);
-        client.catalogItems = async () =>
-          (await original()).map(({ UserData: _state, ...item }) => item as MediaItem);
-        client.migrationState = async (id, _catalog, scope) => {
-          watchedReads(id, scope);
-          return (await original(id)).filter((item) => item.UserData?.Played === true);
-        };
-        client.watchedItems = excluded;
-        client.migrationItems = excluded;
-        client.playlists = excluded;
-        client.playlistItems = excluded;
-        client.userImage = excluded;
-      } else {
-        const update = client.updateUserData!.bind(client);
-        client.updateUserData = async (...parameters) => {
-          patches.push(parameters[2]);
-          await update(...parameters);
-        };
-        client.createPlaylist = excluded;
-        client.setConfiguration = excluded;
-        client.setUserImage = excluded;
-      }
-      return client;
-    };
-    const preview = await service.preview(['e-river'], { migration_scope: 'watched_only' });
-    expect(preview.migration_scope).toBe('watched_only');
-    expect(preview.users[0]?.stats).toBeNull();
-    expect(preview.users[0]?.history_deferred).toBe(true);
-    expect(watchedReads).not.toHaveBeenCalled();
-    const job = await finish(
-      await service.migrateUsers(['e-river'], {}, undefined, 'watched_only'),
-    );
-    expect(job.status).toBe('completed');
-    expect(job.migration_scope).toBe('watched_only');
-    expect(job.results[0]?.applied).toBe(1);
-    expect(watchedReads.mock.calls).toEqual([['e-river', 'watched_only']]);
-    expect(excluded).not.toHaveBeenCalled();
-    expect(patches).toEqual([{ Played: true }]);
-    expect(servers.userData['j-river']?.['2']).toEqual({
-      Played: true,
-      PlaybackPositionTicks: 800,
-      PlayCount: 2,
-      Rating: 4,
-      LastPlayedDate: '2026-10-07T12:00:00.000Z',
-    });
-    expect(servers.userData['j-river']?.['3']).toBeUndefined();
-  });
+      });
+      expect(servers.userData['j-river']?.['3']).toBeUndefined();
+    },
+  );
 
-  it('quick new accounts keep normal defaults and can import the remaining data in a later complete migration', async () => {
+  it('new accounts keep template defaults and legacy complete requests never import other personal data', async () => {
     servers.users.emby[2]!.Configuration = { AudioLanguagePreference: 'spa' };
     servers.images['e-sam'] = { contentType: 'image/png', data: new Uint8Array([137, 80]) };
     servers.userData['e-sam'] = { '1': { IsFavorite: true, PlaybackPositionTicks: 500 } };
@@ -630,45 +630,47 @@ describe('account migration and subscription safety', () => {
     expect(servers.images[target.Id]).toBeUndefined();
     expect(servers.userData[target.Id]?.['1']).toBeUndefined();
     expect(store.takeCredentials(quick.id)).toHaveLength(1);
-    const complete = await finish(await service.migrateUsers(['e-sam']));
-    expect(complete.migration_scope).toBe('complete');
+    const complete = await finish(await service.migrateUsers(['e-sam'], {}, undefined, 'complete'));
+    expect(complete.migration_scope).toBe('watched_only');
     expect(complete.results[0]?.created).toBe(false);
-    expect(servers.userData[target.Id]?.['1']).toMatchObject({
-      IsFavorite: true,
-      PlaybackPositionTicks: 500,
-    });
+    expect(servers.userData[target.Id]?.['1']).toBeUndefined();
+    expect(target.Configuration).toEqual(servers.users.jellyfin[0]!.Configuration);
+    expect(servers.images[target.Id]).toBeUndefined();
     expect(store.takeCredentials(complete.id)).toEqual([]);
   });
 
-  it('retains watched-only scope in a durable unstarted job across a store restart', async () => {
-    await service.stop();
-    const timestamp = new Date().toISOString();
-    const queued: Job = {
-      id: 'durable-quick-job',
-      kind: 'migrate',
-      status: 'queued',
-      created_at: timestamp,
-      updated_at: timestamp,
-      migration_scope: 'watched_only',
-      progress: { processed: 0, total: 1 },
-      results: [],
-    };
-    servers.userData['e-river'] = { '3': { IsFavorite: true } };
-    store.saveQueuedJob(
-      queued,
-      [{ source_user_id: 'e-river', migration_scope: 'watched_only' }],
-      store.settings(),
-    );
-    store.close();
-    store = new Store(directory);
-    service = new Service(store, { clientFactory: servers.factory });
-    await service.start();
-    const job = await finish(queued);
-    expect(job.status).toBe('completed');
-    expect(job.migration_scope).toBe('watched_only');
-    expect(job.results[0]?.data?.favorites).toBe(0);
-    expect(servers.userData['j-river']?.['3']).toBeUndefined();
-  });
+  it.each([undefined, 'complete', 'watched_only'] as const)(
+    'narrows durable legacy scope %s to watched-only across a store restart',
+    async (legacyScope) => {
+      await service.stop();
+      const timestamp = new Date().toISOString();
+      const queued: Job = {
+        id: 'durable-quick-job',
+        kind: 'migrate',
+        status: 'queued',
+        created_at: timestamp,
+        updated_at: timestamp,
+        migration_scope: legacyScope,
+        progress: { processed: 0, total: 1 },
+        results: [],
+      };
+      servers.userData['e-river'] = { '3': { IsFavorite: true } };
+      store.saveQueuedJob(
+        queued,
+        [{ source_user_id: 'e-river', migration_scope: legacyScope }],
+        store.settings(),
+      );
+      store.close();
+      store = new Store(directory);
+      service = new Service(store, { clientFactory: servers.factory });
+      await service.start();
+      const job = await finish(queued);
+      expect(job.status).toBe('completed');
+      expect(job.migration_scope).toBe('watched_only');
+      expect(job.results[0]?.data?.favorites).toBe(0);
+      expect(servers.userData['j-river']?.['3']).toBeUndefined();
+    },
+  );
 
   it('rejects unknown migration scopes before any reads or queued mutations', async () => {
     const reads = vi.fn();
@@ -678,10 +680,10 @@ describe('account migration and subscription safety', () => {
     };
     await expect(
       service.preview(['e-river'], { migration_scope: 'unknown' as never }),
-    ).rejects.toThrow('Choose complete or watched-only');
+    ).rejects.toThrow('Only watched-status migration');
     await expect(
       service.migrateUsers(['e-river'], {}, undefined, 'unknown' as never),
-    ).rejects.toThrow('Choose complete or watched-only');
+    ).rejects.toThrow('Only watched-status migration');
     expect(reads).not.toHaveBeenCalled();
     expect(store.jobs()).toEqual([]);
   });
@@ -743,7 +745,7 @@ describe('account migration and subscription safety', () => {
         .mockImplementation(async (selected, userId, selectedScope) => {
           expect(selected.id).toBe(approved);
           expect(userId).toBe('e-river');
-          expect(selectedScope).toBe(scope);
+          expect(selectedScope).toBe('watched_only');
           return structuredClone(sourceItems);
         });
       const forbiddenSourceReads = vi.fn(async () => {
@@ -791,11 +793,12 @@ describe('account migration and subscription safety', () => {
       expect(items).toHaveBeenCalledTimes(1);
       expect(select.mock.calls.map((call) => call[3])).toEqual([undefined, approved, approved]);
       expect(forbiddenSourceReads).not.toHaveBeenCalled();
-      expect(freshTargetReads).toHaveBeenCalledWith('j-river', '2');
+      expect(freshTargetReads).not.toHaveBeenCalled();
       expect(servers.played['j-river']).toEqual(new Set(['1', '2']));
       expect(store.takeCredentials(job.id)).toEqual([]);
-      if (scope === 'complete') expect(sourcePlaylists).toHaveBeenCalled();
-      else expect(sourcePlaylists).not.toHaveBeenCalled();
+      expect(preview.migration_scope).toBe('watched_only');
+      expect(job.migration_scope).toBe('watched_only');
+      expect(sourcePlaylists).not.toHaveBeenCalled();
     },
   );
 
@@ -944,7 +947,7 @@ describe('account migration and subscription safety', () => {
           'preparing_account',
           'reading_target',
           'transferring_history',
-          'transferring_playlists',
+          'verifying_history',
         ]),
       );
       expect(job.progress).toEqual({ processed: 1, total: 1 });
@@ -1255,7 +1258,7 @@ describe('account migration and subscription safety', () => {
       store.settings(),
     );
   }
-  it('migrates favorites, resume position, counts, ratings and original dates across playable and container types', async () => {
+  it('imports only played flags while excluding resume, favorites, dates, counts and container-only state', async () => {
     servers.media.push(
       { Id: 'series', Type: 'Series', Name: 'Continuing show', ProviderIds: { Tvdb: '100' } },
       {
@@ -1284,37 +1287,30 @@ describe('account migration and subscription safety', () => {
     expect(preview.users[0]?.history_deferred).toBe(true);
     const job = await finish(await service.migrateUsers(['e-sam']));
     expect(job.results[0]).toMatchObject({
-      source_items: 4,
+      source_items: 1,
       source_played: 1,
-      source_favorites: 3,
-      source_resume: 1,
+      source_favorites: 0,
+      source_resume: 0,
     });
     expect(job.status).toBe('completed');
     const target = servers.users.jellyfin.find((user) => user.Name === 'sam')!;
-    expect(servers.userData[target.Id]?.['1']).toMatchObject({
-      IsFavorite: true,
-      PlaybackPositionTicks: 300_000_000,
-      PlayCount: 5,
-      LastPlayedDate: '2026-10-07T01:00:00.000Z',
-      Likes: false,
-      Rating: 7.5,
-    });
-    expect(servers.userData[target.Id]?.['3']?.LastPlayedDate).toBe('2023-03-14T18:00:00.000Z');
-    expect(servers.userData[target.Id]?.series?.IsFavorite).toBe(true);
-    expect(servers.userData[target.Id]?.season?.IsFavorite).toBe(true);
+    expect(servers.userData[target.Id]?.['1']).toBeUndefined();
+    expect(servers.userData[target.Id]?.['3']).toEqual({ Played: true });
+    expect(servers.userData[target.Id]?.series).toBeUndefined();
+    expect(servers.userData[target.Id]?.season).toBeUndefined();
     expect(job.results[0]?.data).toMatchObject({
-      favorites: 3,
-      resume_positions: 1,
-      play_counts: 2,
-      last_played_dates: 2,
-      ratings: 1,
+      favorites: 0,
+      resume_positions: 0,
+      play_counts: 0,
+      last_played_dates: 0,
+      ratings: 0,
       failed_items: 0,
     });
     const repeat = await finish(await service.migrateUsers(['e-sam']));
     expect(repeat.results[0]?.applied).toBe(0);
     expect(repeat.results[0]?.data?.items_updated).toBe(0);
   });
-  it('copies only portable preferences and the avatar for newly created accounts', async () => {
+  it('uses only Jellyfin template preferences for new accounts and never copies the source avatar', async () => {
     servers.users.emby[2]!.Policy = { IsAdministrator: true, EnableAllFolders: false };
     servers.users.emby[2]!.Configuration = {
       AudioLanguagePreference: 'spa',
@@ -1331,23 +1327,12 @@ describe('account migration and subscription safety', () => {
     const job = await finish(await service.migrateUsers(['e-sam']));
     const target = servers.users.jellyfin.find((user) => user.Name === 'sam')!;
     expect(target.Policy).toEqual(servers.users.jellyfin[0]!.Policy);
-    expect(target.Configuration).toMatchObject({
-      AudioLanguagePreference: 'spa',
-      SubtitleMode: 'Always',
-      EnableNextEpisodeAutoPlay: true,
-      DisplayMissingEpisodes: false,
-    });
+    expect(target.Configuration).toEqual(servers.users.jellyfin[0]!.Configuration);
     expect(target.Configuration).not.toHaveProperty('OrderedViews');
     expect(target.Configuration).not.toHaveProperty('private_token');
-    expect(servers.images[target.Id]).toEqual(picture);
-    expect(job.results[0]?.data?.avatar).toBe(true);
-    expect(job.results[0]?.data?.preferences).toEqual(
-      expect.arrayContaining([
-        'AudioLanguagePreference',
-        'SubtitleMode',
-        'EnableNextEpisodeAutoPlay',
-      ]),
-    );
+    expect(servers.images[target.Id]).toBeUndefined();
+    expect(job.results[0]?.data?.avatar).toBe(false);
+    expect(job.results[0]?.data?.preferences).toEqual([]);
     expect(JSON.stringify(job)).not.toContain('private-source-config-secret');
   });
   it('preserves existing preferences, avatar, favorites, ratings and newer Jellyfin playback progress', async () => {
@@ -1390,7 +1375,7 @@ describe('account migration and subscription safety', () => {
     });
     expect(job.results[0]?.data).toMatchObject({ avatar: false, preferences: [] });
   });
-  it('imports private playlists with order and duplicates while preserving existing playlists and preventing repeated imports', async () => {
+  it('preserves existing playlists without importing any source playlists on migration or rerun', async () => {
     servers.playlists['e-river'] = [
       {
         Id: 'source-playlist',
@@ -1403,23 +1388,17 @@ describe('account migration and subscription safety', () => {
     servers.playlists['j-river'] = [
       { Id: 'existing', Name: 'Favorites', Type: 'Playlist', MediaType: 'Video', items: ['3'] },
     ];
+    const before = structuredClone(servers.playlists['j-river']);
     const job = await finish(await service.migrateUsers(['e-river']));
-    expect(job.status).toBe('partial');
-    const lists = servers.playlists['j-river']!;
-    expect(lists).toHaveLength(2);
-    expect(lists[0]?.items).toEqual(['3']);
-    expect(lists[1]).toMatchObject({
-      IsPublic: false,
-      OwnerUserId: 'j-river',
-      items: ['2', '1', '2'],
-    });
+    expect(job.status).toBe('completed');
+    expect(servers.playlists['j-river']).toEqual(before);
     expect(job.results[0]?.data).toMatchObject({
-      playlists_created: 1,
-      playlist_items_added: 3,
-      playlist_items_skipped: 1,
+      playlists_created: 0,
+      playlist_items_added: 0,
+      playlist_items_skipped: 0,
     });
     const repeat = await finish(await service.migrateUsers(['e-river']));
-    expect(servers.playlists['j-river']).toHaveLength(2);
+    expect(servers.playlists['j-river']).toEqual(before);
     expect(repeat.results[0]?.data?.playlists_created).toBe(0);
   });
   it('uses explicit mappings for unusual source names, pins created target IDs and does not DM a label', async () => {
@@ -1643,8 +1622,8 @@ describe('account migration and subscription safety', () => {
     service.clientFactory = (...args) => {
       const client = servers.factory(...args);
       if (args[2] === 'jellyfin') {
-        const original = client.userData!.bind(client);
-        client.userData = async (...parameters) => {
+        const original = client.destinationItems!.bind(client);
+        client.destinationItems = async (...parameters) => {
           const data = await original(...parameters);
           if (!changed) {
             changed = true;

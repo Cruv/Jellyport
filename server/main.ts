@@ -954,7 +954,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             request.cookies[COOKIE]!,
             previewContext(),
             request.body.source_user_ids,
-            request.body.migration_scope ?? 'complete',
+            'watched_only',
             request.body.use_snapshots ?? false,
           ),
         );
@@ -999,7 +999,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             request.body.source_user_ids,
             request.body.discord_recipients,
             request.body.mapping_revisions,
-            request.body.migration_scope ?? 'complete',
+            'watched_only',
             request.body.source_snapshot_ids,
           ),
         );

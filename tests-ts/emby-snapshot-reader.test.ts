@@ -236,17 +236,61 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
     ]);
   });
 
-  it('projects watched-only playable state and original dates without excluded fields', () => {
+  it('projects only watched playable flags and matching metadata without excluded fields', () => {
     const f = fixture();
     f.state(13, 3, { played: 1 }); // Derived container flags must not become watched item writes.
     f.database.close();
     expect(
       readSnapshotItems(f.path, alice, identities, 'watched_only').map((item) => item.UserData),
-    ).toEqual([
-      { Played: true, LastPlayedDate: '2025-02-03T04:05:06.000Z' },
-      { Played: true, LastPlayedDate: '2024-06-07T08:09:10.000Z' },
+    ).toEqual([{ Played: true }, { Played: true }]);
+    expect(readSnapshotItems(f.path, alice, identities, 'watched_only')).toMatchObject([
+      { Id: '10', Path: '/media/10', ProviderIds: { Tmdb: '987654321', Imdb: 'tt999999991' } },
+      { Id: '13', Type: 'Episode', SeriesProviderIds: { Tvdb: '987654323', Tmdb: '987654324' } },
     ]);
+    expect(
+      readSnapshotItems(f.path, alice, identities, 'watched_only').every(
+        (item) => !Object.hasOwn(item, 'RunTimeTicks'),
+      ),
+    ).toBe(true);
     expect(readSnapshotItems(f.path, bob, identities, 'watched_only')).toEqual([]);
+  });
+
+  it.each([
+    ['LastPlayedDateInt', -1],
+    ['LastPlayedDateInt', 9_223_372_036_854_775_807n],
+    ['playCount', -1],
+    ['isFavorite', 2],
+    ['playbackPositionTicks', -1],
+    ['rating', 11],
+  ] as const)('ignores excluded %s=%s while still reading valid played flags', (field, value) => {
+    const f = fixture();
+    f.database
+      .prepare(`UPDATE UserDatas SET ${field}=? WHERE UserDataKeyId=8 AND userId=2`)
+      .run(value);
+    f.database.close();
+    const history = readSnapshotHistory(f.path, alice, identities, 'watched_only');
+    expect(history.items.map((item) => item.UserData)).toEqual([
+      { Played: true },
+      { Played: true },
+    ]);
+    expect(history.diagnostics.invalid_resume_positions).toBe(0);
+    // The complete compatibility reader retains its former validation behavior.
+    if (field === 'playbackPositionTicks')
+      expect(
+        readSnapshotHistory(f.path, alice, identities).diagnostics.invalid_resume_positions,
+      ).toBe(1);
+    else expect(() => readSnapshotHistory(f.path, alice, identities)).toThrow('invalid format');
+  });
+
+  it('does not read or validate runtime when migrating only watched flags', () => {
+    const f = fixture();
+    f.database.exec('UPDATE MediaItems SET RunTimeTicks=-1 WHERE Id=10');
+    f.database.close();
+    expect(readSnapshotHistory(f.path, alice, identities, 'watched_only').items[0]).toMatchObject({
+      Id: '10',
+      UserData: { Played: true },
+    });
+    expect(() => readSnapshotHistory(f.path, alice, identities)).toThrow('invalid format');
   });
 
   it('preserves edition rows sharing one data key and includes verified media kinds', () => {

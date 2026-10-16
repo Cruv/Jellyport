@@ -182,7 +182,7 @@ describe('playback-conscious migration orchestration', () => {
       if (args[2] === 'emby') {
         client.catalogItems = catalogReads;
         client.migrationState = async (id, metadata, scope) => {
-          stateReads.push({ id, catalog: metadata, scope: scope ?? 'complete' });
+          stateReads.push({ id, catalog: metadata, scope: scope ?? 'watched_only' });
           if (advanceDuringFirstUser) {
             clock += 600_001;
             advanceDuringFirstUser = false;
@@ -207,9 +207,9 @@ describe('playback-conscious migration orchestration', () => {
     expect(initial.status).toBe('completed');
     expect(catalogReads).toHaveBeenCalledTimes(1);
     expect(stateReads.map((call) => call.id)).toEqual(['e-river', 'e-sam']);
-    expect(stateReads.every((call) => call.scope === 'complete' && call.catalog === catalog)).toBe(
-      true,
-    );
+    expect(
+      stateReads.every((call) => call.scope === 'watched_only' && call.catalog === catalog),
+    ).toBe(true);
     expect(catalog!.every((item) => !Object.hasOwn(item, 'UserData'))).toBe(true);
     expect(Object.isFrozen(catalog)).toBe(true);
     expect(initial.results.map((result) => result.source_catalog?.items)).toEqual([
@@ -220,19 +220,13 @@ describe('playback-conscious migration orchestration', () => {
     );
     expect(JSON.stringify(initial).length).toBeLessThan(30_000);
     expect(servers.userData['j-river']?.['1']).toMatchObject({
-      IsFavorite: true,
       PlaybackPositionTicks: 900,
       PlayCount: 10,
       LastPlayedDate: '2026-10-07T12:00:00.000Z',
     });
     expect(servers.played['j-river']!.has('1')).toBe(true);
     const sam = servers.users.jellyfin.find((user) => user.Name === 'sam')!;
-    expect(servers.userData[sam.Id]?.['2']).toMatchObject({
-      Played: true,
-      IsFavorite: true,
-      PlayCount: 3,
-      LastPlayedDate: '2026-10-05T12:00:00.000Z',
-    });
+    expect(servers.userData[sam.Id]?.['2']).toEqual({ Played: true });
 
     // A separate job refreshes the expired metadata once, then the next job shares it.
     expect((await finish(await service.migrateUsers(['e-river']))).status).toBe('completed');

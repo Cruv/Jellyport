@@ -10,10 +10,8 @@ import {
   readMigrationSource,
   statePlan,
   migrateItemState,
-  migratePlaylists,
   migrationDetails,
   migrationWarning,
-  portableConfiguration,
   type MigrationDetails,
   type MigrationScope,
   type SourceSnapshot,
@@ -27,7 +25,6 @@ import {
   type MediaItem,
   type MediaKind,
   type MediaUser,
-  type MediaUserImage,
   type DestinationReadEvent,
   type CatalogProgress,
 } from './media.js';
@@ -293,9 +290,10 @@ export function now(): string {
   return new Date().toISOString();
 }
 function migrationScope(value: unknown): MigrationScope {
-  if (value === undefined || value === 'complete') return 'complete';
-  if (value === 'watched_only') return value;
-  throw new ServiceError('Choose complete or watched-only migration.');
+  // Accept old persisted/API selections without allowing their former broad writes.
+  if (value === undefined || value === 'complete' || value === 'watched_only')
+    return 'watched_only';
+  throw new ServiceError('Only watched-status migration is supported.');
 }
 export function generatePassword(): string {
   const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
@@ -578,8 +576,7 @@ export class Service {
     source: MediaItem[],
     target: MediaItem[],
     settings: Settings,
-    sourcePlaylists = 0,
-    scope: MigrationScope = 'complete',
+    scope: MigrationScope = 'watched_only',
     preparedMatcher?: PreparedMatcher,
   ): [MatchPlan, JobStats] {
     const playable = new Set([
@@ -608,21 +605,9 @@ export class Service {
             match.source.UserData?.Played === true && match.target.UserData?.Played === true,
         ).length,
         source_items: plan.matches.length + plan.unmatched.length + plan.ambiguous.length,
-        source_favorites:
-          scope === 'watched_only'
-            ? 0
-            : source.filter((item) => item.UserData?.IsFavorite === true).length,
-        source_resume:
-          scope === 'watched_only'
-            ? 0
-            : source.filter(
-                (item) =>
-                  playable.has(item.Type ?? '') &&
-                  typeof item.UserData?.PlaybackPositionTicks === 'number' &&
-                  Number.isSafeInteger(item.UserData.PlaybackPositionTicks) &&
-                  item.UserData.PlaybackPositionTicks > 0,
-              ).length,
-        source_playlists: sourcePlaylists,
+        source_favorites: 0,
+        source_resume: 0,
+        source_playlists: 0,
       },
     ];
   }
@@ -828,8 +813,8 @@ export class Service {
               discord_username: mapping?.discord_username ?? null,
               warnings: [
                 snapshot
-                  ? 'Saved history is available. Preview checks account identity and backup freshness only. Exact history counts, matching details and playlists are deferred until approval; results report unmatched and ambiguous items. Approval uses this backup generation and a shared Jellyfin matching catalog.'
-                  : 'Live preview checks account identity only. Complete history, favorites, resume positions, playlists and matching details are read after approval; results report unmatched and ambiguous items. Shared matching catalogs are reused during the job, so library changes after collection require another migration.',
+                  ? 'Saved history is available. Preview checks account identity and backup freshness only. Exact watched-status counts and matching details are deferred until approval; results report unmatched and ambiguous items. Approval uses this backup generation and a shared Jellyfin matching catalog.'
+                  : 'Live preview checks account identity only. Played flags and matching details are read after approval; results report unmatched and ambiguous items. Shared matching catalogs are reused during the job, so library changes after collection require another migration.',
                 ...(snapshot ? snapshotHistoryWarnings(snapshot.diagnostics) : []),
                 ...(!target && template.accountRole
                   ? [
@@ -1825,6 +1810,11 @@ export class Service {
   }
   private queue(kind: string, requests: JobRequest[], requestedAt?: string): Job {
     if (this.stopping) throw new ServiceError('The app is stopping. Retry after it restarts.');
+    requests = requests.map((request) =>
+      request.source_user_id
+        ? { ...request, migration_scope: migrationScope(request.migration_scope) }
+        : request,
+    );
     const timestamp = now();
     const job: Job = {
       id: randomUUID().replaceAll('-', ''),
@@ -1843,9 +1833,7 @@ export class Service {
             ),
           }
         : {}),
-      ...(kind === 'migrate'
-        ? { migration_scope: requests[0]?.migration_scope ?? 'complete' }
-        : {}),
+      ...(kind === 'migrate' ? { migration_scope: 'watched_only' } : {}),
       ...(kind === 'membership'
         ? { membership_discord_user_id: requests[0]?.discord_user_id ?? undefined }
         : {}),
@@ -2084,7 +2072,7 @@ export class Service {
           settings,
           info.Id,
           info.Version,
-          [...eligible, ...source.playlists.flatMap((playlist) => playlist.items)],
+          eligible,
           settings.path_mappings,
           this.jobControllers.get(job.id)?.signal,
         );
@@ -2135,12 +2123,8 @@ export class Service {
         this.save(job);
         context.matcher ??= createMatcher(context.value.items, settings.path_mappings);
         context.byId ??= new Map(context.value.items.map((item) => [item.Id, item]));
-        // Eligibility is identical to the final state plan. Playlist members need matching
-        // even when they have never been watched or favorited.
-        candidates = context.matcher.candidates([
-          ...eligible,
-          ...source.playlists.flatMap((playlist) => playlist.items),
-        ]);
+        // Reuse exactly the same played-item eligibility as the final state plan.
+        candidates = context.matcher.candidates(eligible);
         const ids = new Set(candidates.map((item) => item.Id));
         // Derived episode/season identifiers depend on their series. Read that small
         // dependency set too so cached series-provider edits cannot authorize a match.
@@ -2203,7 +2187,6 @@ export class Service {
     const scope = migrationScope(request.migration_scope);
     let source: SourceSnapshot | null = null;
     let savedMetadata: SnapshotMetadata | undefined;
-    let avatar: MediaUserImage | null = null;
     let mapping = this.requestMapping(request, settings);
     let destinationId: string | null = null;
     let username: string;
@@ -2407,28 +2390,6 @@ export class Service {
     if (source) {
       result.data = migrationDetails();
       for (const warning of source.warnings) migrationWarning(result.data, warning);
-      // Read optional profile data before creating an account. It never enters persisted jobs.
-      if (
-        scope === 'complete' &&
-        (!currentTarget || this.store.account(username)?.status === 'provisioning')
-      )
-        await this.withClient(
-          settings,
-          'emby',
-          async (emby) => {
-            this.checkJobStopped(job);
-            if (!emby.userImage) return;
-            try {
-              avatar = await emby.userImage(source!.user.Id);
-            } catch {
-              migrationWarning(
-                result.data!,
-                'The source profile picture could not be read. Other account data can still migrate.',
-              );
-            }
-          },
-          this.jobControllers.get(job.id)?.signal,
-        );
     }
     guard();
     job.results.push(result);
@@ -2552,39 +2513,6 @@ export class Service {
         );
       }
       if (source && result.data) {
-        if (created && scope === 'complete') {
-          if (template.accountRole)
-            result.data.preferences = Object.keys(template.accountRole.parameters.configuration);
-          const preferences = portableConfiguration(
-            source.user.Configuration,
-            template.Configuration,
-          );
-          if (!template.accountRole && preferences.copied.length) {
-            guard();
-            try {
-              await jellyfin.setConfiguration(target.Id, preferences.configuration);
-              result.data.preferences = preferences.copied;
-            } catch {
-              migrationWarning(
-                result.data,
-                'Playback preferences could not be copied. The template configuration was preserved.',
-              );
-            }
-          }
-          if (avatar && jellyfin.setUserImage) {
-            guard();
-            try {
-              await jellyfin.setUserImage(target.Id, avatar);
-              result.data.avatar = true;
-            } catch {
-              migrationWarning(
-                result.data,
-                'The profile picture could not be copied. Other account data can still migrate.',
-              );
-            }
-          } else if (avatar)
-            migrationWarning(result.data, 'This Jellyfin client cannot copy profile pictures.');
-        }
         guard();
         phase('reading_target');
         const targetItems = await this.destinationItemsFor(
@@ -2600,14 +2528,7 @@ export class Service {
         if (destinationContext.metadata) result.destination_catalog = destinationContext.metadata;
         phase('matching');
         const matcher = createMatcher(targetItems, settings.path_mappings);
-        const [plan, stats] = this.plan(
-          source.items,
-          targetItems,
-          settings,
-          source.playlists.length,
-          scope,
-          matcher,
-        );
+        const [plan, stats] = this.plan(source.items, targetItems, settings, scope, matcher);
         Object.assign(result, stats);
         result.unmatched_items = plan.unmatched.slice(0, 200).map((item) => {
           const summary = previewItemSummary(item);
@@ -2683,7 +2604,7 @@ export class Service {
           );
         } finally {
           // Workers have drained before this final checkpoint. Only observational job
-          // updates are batched; account and playlist uncertainty journals stay immediate.
+          // updates are batched; account uncertainty journals stay immediate.
           checkpoint(true);
         }
         guard();
@@ -2752,22 +2673,6 @@ export class Service {
           );
         }
         this.save(job);
-        if (scope === 'complete') {
-          phase('transferring_playlists');
-          await migratePlaylists(
-            this.store,
-            settings,
-            source.user.Id,
-            target.Id,
-            source.playlists,
-            targetItems,
-            jellyfin,
-            result.data,
-            guard,
-            () => this.save(job),
-            matcher,
-          );
-        }
         guard();
       }
       if (recipient && password)
@@ -2859,6 +2764,15 @@ export class Service {
     this.save(job);
     let releaseSnapshots: (() => Promise<void>) | undefined;
     try {
+      // Durable jobs from older releases may still request "complete". Narrow them
+      // before any source extraction or account mutation and report the actual scope.
+      requests = requests.map((request) =>
+        request.source_user_id
+          ? { ...request, migration_scope: migrationScope(request.migration_scope) }
+          : request,
+      );
+      if (job.kind === 'migrate') job.migration_scope = 'watched_only';
+      this.save(job);
       this.checkJobStopped(job);
       this.assertConnections(settings);
       releaseSnapshots = this.sourceSnapshots.retainForJob(

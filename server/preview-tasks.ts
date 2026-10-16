@@ -42,7 +42,7 @@ export class PreviewTasks<T> {
     owner: string,
     context: string,
     ids: string[],
-    migrationScope: MigrationScope = 'complete',
+    migrationScope: MigrationScope = 'watched_only',
     useSnapshots = false,
   ): PreviewTask<T> {
     if (!['complete', 'watched_only'].includes(migrationScope))
@@ -94,7 +94,7 @@ export class PreviewTasks<T> {
       .then(() => {
         entry.controller.signal.throwIfAborted();
         return this.run([...ids], {
-          migration_scope: migrationScope,
+          migration_scope: 'watched_only',
           use_snapshots: useSnapshots,
           signal: entry.controller.signal,
           progress: (processed, total) => {

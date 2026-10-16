@@ -41,6 +41,22 @@ describe('Migration item progress and timing', () => {
     expect(screen.queryByText(/Migrating watch history and favorites/)).toBeNull();
     expect(screen.getByText('20 of 100 matched items checked · 10 updated')).toBeTruthy();
   });
+  it.each([
+    ['reading_source', 'Reading Emby played flags'],
+    ['reading_target', 'Reading Jellyfin played status'],
+    ['verifying_history', 'Verifying Jellyfin played status'],
+  ] as const)('labels current %s work as played status only', (phase, label) => {
+    render(
+      <JobProgressDetails
+        job={{
+          ...running,
+          migration_scope: 'watched_only',
+          progress: { phase, processed: 0, total: 1 },
+        }}
+      />,
+    );
+    expect(screen.getByText(label, { exact: false })).toBeTruthy();
+  });
   it('separates account progress from checked and updated history items', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-08T12:19:24Z'));

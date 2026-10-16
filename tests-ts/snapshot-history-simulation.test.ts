@@ -10,6 +10,7 @@ import {
 } from '../server/emby-snapshot-reader.js';
 import { createMatcher } from '../server/matching.js';
 import { migrateItemState, migrationDetails, statePlan } from '../server/migration.js';
+import { captureExpectation, evaluateExpectation } from '../server/migration-verification.js';
 import type { MediaAPI, MediaItem, MediaUserDataPatch } from '../server/media.js';
 import { DEFAULT_SETTINGS } from '../server/types.js';
 
@@ -47,14 +48,14 @@ describe('completed-backup history migration simulation', () => {
       database = undefined;
       projectLibrary(raw, projected);
       const id = '11'.repeat(16);
-      const history = readSnapshotHistory(projected, id, { [id]: 2 });
+      const history = readSnapshotHistory(projected, id, { [id]: 2 }, 'watched_only');
       expect(history.diagnostics).toEqual({
-        unsupported_state_items: 1,
-        invalid_resume_positions: 1,
+        unsupported_state_items: 0,
+        invalid_resume_positions: 0,
         invalid_display_names: 1,
         orphan_state_items: 1,
       });
-      expect(snapshotHistoryWarnings(history.diagnostics)).toHaveLength(4);
+      expect(snapshotHistoryWarnings(history.diagnostics)).toHaveLength(2);
       const target: MediaItem[] = history.items.map((item) => {
         const { UserData: _state, ...metadata } = item;
         return {
@@ -67,10 +68,10 @@ describe('completed-backup history migration simulation', () => {
         history.items,
         target,
         DEFAULT_SETTINGS,
-        'complete',
+        'watched_only',
         createMatcher(target),
       );
-      expect(plan.matches).toHaveLength(4);
+      expect(plan.matches).toHaveLength(1);
       expect(plan.ambiguous).toEqual([]);
       expect(plan.unmatched).toEqual([]);
       const newer: MediaUserDataPatch = {
@@ -91,6 +92,7 @@ describe('completed-backup history migration simulation', () => {
         userData: async (_user: string, item: string) => ({ ...state.get(item) }),
         updateUserData: write,
       } as unknown as MediaAPI;
+      const expectations: ReturnType<typeof captureExpectation>[] = [];
       const details = migrationDetails();
       await migrateItemState(
         client,
@@ -99,19 +101,25 @@ describe('completed-backup history migration simulation', () => {
         details,
         () => {},
         () => {},
+        { expectation: (item, patch) => expectations.push(captureExpectation(item, patch)) },
       );
       expect(details.failed_items).toBe(0);
-      expect(write).toHaveBeenCalledTimes(3);
+      expect(write).toHaveBeenCalledTimes(1);
+      expect(write).toHaveBeenCalledWith('synthetic-destination', 'destination-1', {
+        Played: true,
+      });
       expect(state.get('destination-1')).toEqual({
         Played: true,
-        PlayCount: 4,
-        IsFavorite: true,
-        LastPlayedDate: '2025-02-03T04:05:06.000Z',
         PlaybackPositionTicks: 456789012,
       });
       expect(state.get('destination-2')).toEqual(newer);
-      expect(state.get('destination-3')).toEqual({ IsFavorite: true });
-      expect(state.get('destination-4')).toEqual({ IsFavorite: true });
+      expect(state.has('destination-3')).toBe(false);
+      expect(state.has('destination-4')).toBe(false);
+      expect(expectations).toHaveLength(1);
+      const observed = { ...plan.matches[0]!.target, UserData: state.get('destination-1') };
+      expect(evaluateExpectation(expectations[0]!, observed).status).toBe('verified');
+      // A rerun obtains current access-scoped candidate flags, never reuses old state.
+      plan.matches[0]!.target.UserData = { ...state.get('destination-1') };
       write.mockClear();
       await migrateItemState(
         client,

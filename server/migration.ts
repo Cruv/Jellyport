@@ -65,9 +65,6 @@ export function mergeUserData(
     if (!playable.has(source.Type ?? '') || from.Played !== true || to.Played === true)
       return patch;
     patch.Played = true;
-    const sourceDate = playedDate(from.LastPlayedDate),
-      targetDate = playedDate(to.LastPlayedDate);
-    if (sourceDate && (!targetDate || sourceDate > targetDate)) patch.LastPlayedDate = sourceDate;
     return patch;
   }
   if (from.IsFavorite === true && to.IsFavorite !== true) patch.IsFavorite = true;
@@ -303,7 +300,8 @@ export async function migrateItemState(
   } = {},
 ): Promise<number> {
   const concurrency = options.concurrency ?? 4;
-  const scope = options.migration_scope ?? 'complete';
+  // Historical jobs and clients may still send "complete". The public migration
+  // writer always transfers only additive played flags, irrespective of that value.
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4)
     throw new ServiceError('Migration concurrency must be between 1 and 4.');
   stopped();
@@ -311,17 +309,15 @@ export async function migrateItemState(
   try {
     if (jellyfin.migrationCapabilities) capabilities = await jellyfin.migrationCapabilities();
   } catch {
+    stopped();
     migrationWarning(
       details,
-      'Jellyfin capabilities could not be verified. Only legacy watched and favorite updates will be attempted.',
+      'Jellyfin partial user-data support could not be verified. Watched flags were not changed.',
     );
   }
-  if (scope === 'watched_only' && !capabilities.userData)
-    migrationWarning(
-      details,
-      'This older Jellyfin version uses its watched-item endpoint, which may update playback dates, counts or resume state. Jellyfin 10.9 or newer is required to preserve those fields precisely.',
-    );
   let applied = 0;
+  const confirmedPlayed = new Set<string>();
+  const attemptedTargets = new Set<string>();
   let processed = 0;
   let reportedUpdated = 0;
   let fatal = false;
@@ -341,89 +337,37 @@ export async function migrateItemState(
     }
   };
   guard();
-  const missingDate = (source: MediaItem, target: MediaItem) => {
-    if (
-      source.Type === 'Episode' &&
-      source.UserData?.Played === true &&
-      !playedDate(source.UserData.LastPlayedDate) &&
-      !playedDate(target.UserData?.LastPlayedDate)
-    )
-      details.history_dates_missing++;
-  };
   const apply = async (match: MatchPlan['matches'][number]): Promise<boolean> => {
     guard();
     try {
+      if (!playable.has(match.source.Type ?? '') || match.source.UserData?.Played !== true)
+        return false;
       const target = { ...match.target };
-      // Already merged snapshots need no remote reads or writes. Potential changes still use
-      // a fresh destination read, so later Jellyfin activity wins immediately before a write.
-      if (!Object.keys(mergeUserData(match.source, target, scope)).length) {
-        missingDate(match.source, target);
+      if (confirmedPlayed.has(target.Id)) target.UserData = { ...target.UserData, Played: true };
+      const patch = mergeUserData(match.source, target, 'watched_only');
+      // The access-scoped candidate batch supplied fresh flags. Setting only true is
+      // additive and idempotent, so individual chronology reads are unnecessary.
+      // The caller independently re-reads all matched flags after workers drain.
+      if (!Object.keys(patch).length) {
+        confirmedPlayed.add(target.Id);
         options.expectation?.(target, {}, []);
         return false;
       }
-      if (capabilities.userData && jellyfin.userData)
-        target.UserData = await jellyfin.userData(userId, target.Id);
+      const supported = capabilities.userData && !!jellyfin.updateUserData;
+      options.expectation?.(target, patch, supported ? [] : ['Played']);
+      if (!supported)
+        throw new ServiceError(
+          'Watched-flag updates require Jellyfin’s partial user-data API. Legacy watched endpoints were not used because they can change resume positions, dates and counts.',
+        );
+      if (attemptedTargets.has(target.Id))
+        throw new ServiceError(
+          'An earlier played-flag update for this destination had an unverified outcome. No duplicate mutation was sent.',
+        );
       guard();
-      const patch = mergeUserData(match.source, target, scope);
-      missingDate(match.source, target);
-      const unsupported =
-        capabilities.userData && jellyfin.updateUserData
-          ? []
-          : Object.keys(patch).filter(
-              (key) =>
-                (!['Played', 'IsFavorite'].includes(key) &&
-                  !(key === 'LastPlayedDate' && patch.Played === true)) ||
-                (key === 'IsFavorite' && !jellyfin.markFavorite),
-            );
-      options.expectation?.(target, patch, unsupported);
-      if (!Object.keys(patch).length) return false;
-      if (capabilities.userData && jellyfin.updateUserData) {
-        if (!jellyfin.userData)
-          throw new ServiceError(
-            'Fresh Jellyfin user data is required before detailed migration updates.',
-          );
-        guard();
-        await jellyfin.updateUserData(userId, target.Id, patch);
-        if (patch.Played) applied++;
-        if (patch.IsFavorite) details.favorites++;
-        if (patch.PlaybackPositionTicks !== undefined) details.resume_positions++;
-        if (patch.PlayCount !== undefined) details.play_counts++;
-        if (patch.LastPlayedDate) details.last_played_dates++;
-        if (patch.Likes !== undefined || patch.Rating !== undefined) details.ratings++;
-      } else {
-        let changed = false;
-        if (patch.Played) {
-          const date = playedDate(match.source.UserData?.LastPlayedDate);
-          guard();
-          await jellyfin.markPlayed(userId, target.Id, date);
-          applied++;
-          changed = true;
-          if (!date)
-            migrationWarning(
-              details,
-              'This older Jellyfin version records its current date when a watched item has no source playback date. Next Up ordering may differ.',
-            );
-        }
-        if (patch.IsFavorite && jellyfin.markFavorite) {
-          guard();
-          await jellyfin.markFavorite(userId, target.Id);
-          details.favorites++;
-          changed = true;
-        }
-        if (
-          Object.keys(patch).some(
-            (key) =>
-              !['Played', 'IsFavorite'].includes(key) &&
-              !(key === 'LastPlayedDate' && patch.Played === true),
-          ) ||
-          (patch.IsFavorite && !jellyfin.markFavorite)
-        )
-          migrationWarning(
-            details,
-            'This Jellyfin version/client supports limited user data. Upgrade to Jellyfin 10.9 or newer for resume positions, counts, dates and ratings.',
-          );
-        if (!changed) return false;
-      }
+      attemptedTargets.add(target.Id);
+      await jellyfin.updateUserData!(userId, target.Id, { Played: true });
+      confirmedPlayed.add(target.Id);
+      applied++;
       details.items_updated++;
       saved();
       return true;
@@ -477,11 +421,6 @@ export async function migrateItemState(
   // their account mutation lock without leaving remote writes running behind it.
   await Promise.allSettled(Array.from({ length: Math.min(concurrency, groups.length) }, worker));
   if (fatal) throw fatalError;
-  if (details.history_dates_missing)
-    migrationWarning(
-      details,
-      'Some watched episodes have no original playback date. Their watched flags are copied, but Jellyfin Next Up may omit these series.',
-    );
   return applied;
 }
 

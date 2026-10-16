@@ -39,8 +39,8 @@ invalid newest archive rather than silently using an older one.
 2. Preview a user or batch with saved Emby history, inspect account identities and
    mappings, then approve. Preview is lightweight; detailed matching is deferred.
    Approval pins the current destination catalog across that job.
-3. Wait for history updates, independent history readback and playlist verification
-   to finish. Inspect per-user unmatched, ambiguous, failed and verification counts.
+3. Wait for played-state updates and independent played-state readback to finish.
+   Inspect per-user unmatched, ambiguous, failed and verification counts.
    A **partial** migration is not complete, even if all HTTP requests succeeded.
 4. Record total job elapsed time, each account's timing and phase breakdown, shared
    preprocessing time and bulk wall time. For one user, total job time includes
@@ -58,8 +58,7 @@ unique; provider relationships and supported media types are checked. JSON strin
 are streamed and catalog/index storage is disk-backed. The archive must remain a
 regular, unchanged file through import and fingerprinting. No raw archive entries
 are extracted to paths, and no authentication/user-history tables are parsed.
-The projection contains only matching metadata, names and runtime needed for safe
-merging; it is encrypted in the shared directory and temporarily decrypted only in
+The projection contains only allowlisted matching metadata, names and runtime; it is encrypted in the shared directory and temporarily decrypted only in
 private application storage. Protect exchange, work and application directories.
 
 This archive manifest lacks a server ID. The administrator's trusted read-only

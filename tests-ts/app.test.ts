@@ -285,7 +285,7 @@ it('validates account and migration request shapes without coercion', async () =
   ).toBe(422);
 });
 it.each(['complete', 'watched_only'] as const)(
-  'runs %s history preview outside the HTTP request and isolates polling and cancellation by session',
+  'normalizes %s preview to watched-only while isolating asynchronous polling and cancellation by session',
   async (migrationScope) => {
     const app = await setup();
     const headers = await login(app);
@@ -298,7 +298,7 @@ it.each(['complete', 'watched_only'] as const)(
         await new Promise<void>((_resolve, reject) =>
           signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
         );
-        return { users: [], mode: 'merge', migration_scope: migrationScope };
+        return { users: [], mode: 'merge', migration_scope: 'watched_only' };
       });
     const response = await app.inject({
       method: 'POST',
@@ -313,7 +313,7 @@ it.each(['complete', 'watched_only'] as const)(
     expect(preview).toHaveBeenCalledOnce();
     expect(preview).toHaveBeenCalledWith(
       ['e-alex'],
-      expect.objectContaining({ migration_scope: migrationScope }),
+      expect.objectContaining({ migration_scope: 'watched_only' }),
     );
     const url = `/api/migrations/preview/${task.id}`;
     expect((await app.inject({ url, headers })).json().status).toBe('running');
@@ -334,11 +334,11 @@ it.each(['complete', 'watched_only'] as const)(
   },
 );
 it.each([
-  [undefined, 'complete'],
-  ['complete', 'complete'],
+  [undefined, 'watched_only'],
+  ['complete', 'watched_only'],
   ['watched_only', 'watched_only'],
 ] as const)(
-  'passes migration scope %s to asynchronous preview and queued migration',
+  'normalizes incoming scope %s to watched-only for asynchronous preview and queued migration',
   async (scope, expected) => {
     const app = await setup();
     const headers = await login(app);
@@ -398,7 +398,7 @@ it('discards ready history previews when integration settings change', async () 
   vi.spyOn(app.jellyport.service, 'preview').mockResolvedValue({
     users: [],
     mode: 'merge',
-    migration_scope: 'complete',
+    migration_scope: 'watched_only',
   });
   const started = await app.inject({
     method: 'POST',

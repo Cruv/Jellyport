@@ -163,7 +163,7 @@ assert.equal(previewTask.status, 'ready', 'Background history matching must fini
 assert.deepEqual(previewTask.progress, { processed: 3, total: 3 });
 const preview = previewTask.preview;
 assert.equal(preview.mode, 'merge');
-assert.equal(preview.migration_scope, 'complete');
+assert.equal(preview.migration_scope, 'watched_only');
 assert.equal(preview.users.length, 3);
 assert(
   preview.users.every((user) => user.history_deferred === true && user.stats === null),
@@ -194,6 +194,7 @@ assert.equal(
 );
 const job = await request('/api/migrations', 'POST', {
   source_user_ids: users.emby.map((user) => user.Id),
+  migration_scope: 'complete',
 });
 let finished;
 for (let attempt = 0; attempt < 100; attempt++) {
@@ -205,16 +206,44 @@ assert.equal(finished.status, 'partial');
 assert.equal(finished.progress.processed, 3);
 assert(!JSON.stringify(finished).includes('password'));
 assert(finished.results.every((result) => result.data && Array.isArray(result.data.warnings)));
-assert(finished.results.some((result) => result.data.last_played_dates > 0));
+for (const result of finished.results) {
+  for (const field of [
+    'favorites',
+    'resume_positions',
+    'play_counts',
+    'last_played_dates',
+    'ratings',
+    'playlists_created',
+    'playlist_items_added',
+  ])
+    assert.equal(result.data[field], 0, `Played-state migration must not change ${field}.`);
+  assert.deepEqual(result.data.preferences, []);
+  assert.equal(result.data.avatar, false);
+  const verification = result.data.verification;
+  assert(
+    verification.checked > 0,
+    'Every demo account must have independent played-state readback.',
+  );
+  assert.equal(verification.checked, result.matched);
+  assert.equal(verification.verified, verification.checked);
+  assert.equal(verification.missing, 0);
+  assert.equal(verification.mismatched, 0);
+  assert.equal(verification.unsupported_fields, 0);
+  assert.equal(result.data.failed_items, 0);
+}
 const credentials = await request(`/api/jobs/${job.id}/credentials`, 'POST');
 assert.equal(credentials.credentials.length, 2);
 assert((await request(`/api/jobs/${job.id}/credentials`, 'POST')).credentials.length === 0);
-assert.equal(finished.migration_scope, 'complete');
+assert.equal(
+  finished.migration_scope,
+  'watched_only',
+  'Legacy complete requests must normalize to played-state migration.',
+);
 assert(Number.isFinite(Date.parse(finished.started_at)));
 assert(Number.isFinite(Date.parse(finished.finished_at)));
 let quickPreview = await request('/api/migrations/preview', 'POST', {
   source_user_ids: ['e-river'],
-  migration_scope: 'watched_only',
+  migration_scope: 'complete',
 });
 for (let attempt = 0; attempt < 100 && quickPreview.status === 'running'; attempt++) {
   await delay(100);
@@ -240,6 +269,10 @@ assert.equal(quickFinished.results[0].applied, 0, 'Watched-only reruns must skip
 assert.equal(quickFinished.results[0].data.items_updated, 0);
 assert.equal(quickFinished.results[0].data.resume_positions, 0);
 assert.equal(quickFinished.results[0].data.playlists_created, 0);
+assert.equal(quickFinished.results[0].data.verification.checked, 2);
+assert.equal(quickFinished.results[0].data.verification.verified, 2);
+assert.equal(quickFinished.results[0].data.verification.missing, 0);
+assert.equal(quickFinished.results[0].data.verification.mismatched, 0);
 assert.equal((await request(`/api/jobs/${quick.id}/credentials`, 'POST')).credentials.length, 0);
 await request('/api/logout', 'POST');
 assert.equal(
@@ -261,5 +294,5 @@ assert.equal(
   401,
 );
 console.log(
-  'Container smoke passed: React assets, authentication/CSRF, private history review, complete bulk migration, watched-only scope and no-op reruns, preserved accounts, timestamps, and one-time credentials.',
+  'Container smoke passed: React assets, authentication/CSRF, private history review, played-state bulk migration and independent readback, normalized legacy scope, no-op reruns, preserved accounts, and one-time credentials.',
 );

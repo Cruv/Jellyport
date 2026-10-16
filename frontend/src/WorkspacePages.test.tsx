@@ -94,6 +94,67 @@ describe('Account page request lifecycle', () => {
     expect(notify).not.toHaveBeenCalled();
   });
 
+  it('submits account creation only once while pending and clears the username after success', async () => {
+    let finish!: (value: Job) => void;
+    const api = vi.fn(
+      async () =>
+        new Promise<Job>((resolve) => {
+          finish = resolve;
+        }),
+    ) as Api;
+    const { created, notify } = page(api);
+    const username = screen.getByLabelText('Username') as HTMLInputElement;
+    fireEvent.change(username, { target: { value: '  Child  ' } });
+    const form = username.closest('form')!;
+    fireEvent.submit(form);
+    // A repeated form submit must be guarded independently of the disabled button.
+    fireEvent.submit(form);
+    expect(api).toHaveBeenCalledTimes(1);
+    expect(api).toHaveBeenCalledWith(
+      '/api/accounts',
+      expect.objectContaining({ body: { username: 'Child', discord_user_id: undefined } }),
+    );
+    expect(
+      (screen.getByRole('button', { name: 'Creating account…' }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    await act(async () => finish(job));
+    expect(created).toHaveBeenCalledExactlyOnceWith(job);
+    expect(notify).toHaveBeenCalledExactlyOnceWith('Account creation started.');
+    expect(username.value).toBe('');
+  });
+
+  it('preserves account input after a failed request and allows one explicit retry', async () => {
+    const api = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Synthetic service unavailable.'))
+      .mockResolvedValueOnce(job) as Api;
+    const { created, notify } = page(api);
+    const username = screen.getByLabelText('Username') as HTMLInputElement;
+    fireEvent.change(username, { target: { value: 'Child' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create account' }));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith('Synthetic service unavailable.', true),
+    );
+    expect(created).not.toHaveBeenCalled();
+    expect(username.value).toBe('Child');
+    expect(api).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Create account' }));
+    await waitFor(() => expect(created).toHaveBeenCalledExactlyOnceWith(job));
+    expect(api).toHaveBeenCalledTimes(2);
+    expect(username.value).toBe('');
+  });
+
+  it('rejects whitespace-only account names before sending a request', () => {
+    const api = vi.fn() as Api;
+    const { created } = page(api);
+    const username = screen.getByLabelText('Username');
+    fireEvent.change(username, { target: { value: '   ' } });
+    fireEvent.submit(username.closest('form')!);
+    expect(api).not.toHaveBeenCalled();
+    expect(created).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(username);
+  });
+
   it('ignores a deferred recovery result after leaving the page', async () => {
     let finish!: (value: Job) => void;
     const recovery: Recovery = {
@@ -122,6 +183,49 @@ describe('Account page request lifecycle', () => {
     await act(async () => finish(job));
     expect(created).not.toHaveBeenCalled();
     expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('discards a pending inspection if the account name changes and requires a new inspection', async () => {
+    let finish!: (value: Recovery) => void;
+    const api = vi
+      .fn()
+      .mockImplementationOnce(
+        async () =>
+          new Promise<Recovery>((resolve) => {
+            finish = resolve;
+          }),
+      )
+      .mockResolvedValueOnce({
+        username: 'River',
+        eligible: false,
+        reason: 'No tracked incomplete creation.',
+      }) as Api;
+    const { created } = page(api);
+    const username = screen.getByLabelText('Account to inspect');
+    fireEvent.change(username, { target: { value: 'Child' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect account' }));
+    fireEvent.input(username, { target: { value: 'River' } });
+    await act(async () =>
+      finish({
+        username: 'Child',
+        eligible: true,
+        target_user_id: 'jf-child',
+        reason: 'Tracked incomplete creation.',
+      }),
+    );
+    expect(screen.queryByText('Child · Eligible for recovery')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Recover account' })).toBeNull();
+    expect(created).not.toHaveBeenCalled();
+    expect(api).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect account' }));
+    await screen.findByText('River · Recovery unavailable');
+    expect(api).toHaveBeenLastCalledWith(
+      '/api/accounts/recovery?username=River',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(screen.queryByRole('button', { name: 'Recover account' })).toBeNull();
+    expect(screen.queryByRole('checkbox')).toBeNull();
   });
 });
 
@@ -184,6 +288,53 @@ describe('Workspace navigation and migration controls', () => {
       (screen.getByRole('checkbox', { name: 'Use saved Emby snapshot' }) as HTMLInputElement)
         .disabled,
     ).toBe(true);
+  });
+
+  it('deselects only visible migration users and retains hidden selections without mutating the input', () => {
+    const selected = new Set(['source-one', 'source-two', 'source-hidden']);
+    const select = vi.fn();
+    const props = {
+      users: {
+        emby: [
+          { Id: 'source-one', Name: 'CrewOne' },
+          { Id: 'source-two', Name: 'CrewTwo' },
+          { Id: 'source-hidden', Name: 'Family' },
+        ],
+        jellyfin: [],
+      },
+      overview,
+      selected,
+      select,
+      search: '  cReW  ',
+      setSearch: vi.fn(),
+      preview: vi.fn(),
+      useSnapshots: true,
+      setUseSnapshots: vi.fn(),
+      busy: false,
+      navigate: vi.fn(),
+    };
+    const { rerender } = render(<MigratePage {...props} />);
+    const all = screen.getByRole('checkbox', {
+      name: 'Select all visible Emby users',
+    }) as HTMLInputElement;
+    expect(all.checked).toBe(true);
+    fireEvent.click(all);
+    expect(select).toHaveBeenLastCalledWith(new Set(['source-hidden']));
+    expect([...selected]).toEqual(['source-one', 'source-two', 'source-hidden']);
+    expect(screen.queryByRole('checkbox', { name: 'Select Family' })).toBeNull();
+
+    rerender(<MigratePage {...props} selected={new Set(['source-one', 'source-hidden'])} />);
+    expect(all.checked).toBe(false);
+    expect(all.indeterminate).toBe(true);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select CrewOne' }));
+    expect(select).toHaveBeenLastCalledWith(new Set(['source-hidden']));
+
+    rerender(<MigratePage {...props} search="no matches" />);
+    expect(screen.getByText('No matching users')).toBeTruthy();
+    expect(props.preview).not.toHaveBeenCalled();
+    expect(select).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole('button', { name: 'Clear selection' }));
+    expect(select).toHaveBeenLastCalledWith(new Set());
   });
 
   it('opens the selected operation from the activity table', () => {

@@ -36,7 +36,11 @@ describe('documentation-only workflow scope', () => {
     'frontend/src/App.tsx',
     'tests-ts/media.test.ts',
     'scripts/check-docs.mjs',
+    'scripts/browser-demo.mjs',
     '.github/workflows/ci.yml',
+    'playwright.config.ts',
+    'e2e/workspace.spec.ts',
+    'e2e/fixtures.ts',
     'package.json',
     'package-lock.json',
     'Dockerfile',
@@ -103,6 +107,41 @@ describe('documentation-only workflow scope', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+});
+
+describe('browser regression checks gate the required runtime job', () => {
+  const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const testJob = workflow.match(/\n  test:\n([\s\S]*?)\n  docker:/)?.[1];
+  if (!testJob) throw new Error('Required runtime test job must be present.');
+  const steps = testJob.split(/^      - /m).slice(1);
+
+  function namedStep(name: string) {
+    const matching = steps.filter((step) => step.startsWith(`name: ${name}\n`));
+    expect(matching, `${name} must occur exactly once in the required test job`).toHaveLength(1);
+    return matching[0];
+  }
+
+  it('runs Chromium interface checks on Node 24 after the build and before the success marker', () => {
+    expect(testJob).toContain('node: [22, 24]');
+    const install = namedStep('Install browser for interface regression tests');
+    const browser = namedStep('Run desktop and mobile interface regression tests');
+    const marker = namedStep('Runtime checks passed');
+    expect(install).toContain('        run: npx playwright install --with-deps chromium\n');
+    expect(browser).toContain('        run: npm run test:e2e\n');
+    for (const step of [install, browser]) {
+      expect(step).toContain(
+        "        if: needs.scope.outputs.docs_only != 'true' && matrix.node == 24\n",
+      );
+      expect(step).not.toMatch(/continue-on-error|\|\|\s*true|always\(\)|set\s+\+e/);
+    }
+    expect(marker).toContain("        if: needs.scope.outputs.docs_only != 'true'\n");
+    expect(marker).not.toMatch(/continue-on-error|always\(\)/);
+    const buildIndex = steps.findIndex((step) => step.startsWith('run: npm run build\n'));
+    expect(buildIndex).toBeGreaterThanOrEqual(0);
+    expect(steps.indexOf(install)).toBeGreaterThan(buildIndex);
+    expect(steps.indexOf(browser)).toBeGreaterThan(steps.indexOf(install));
+    expect(steps.indexOf(marker)).toBeGreaterThan(steps.indexOf(browser));
   });
 });
 
@@ -254,6 +293,22 @@ describe('image publication requires actual runtime validation', () => {
     expect(result.log).toContain('Only the current main commit');
     expect(result.output).toBe('');
   });
+
+  it.each(['workflow_run', 'workflow_dispatch'])(
+    'rejects %s publication after browser checks fail in the required Node 24 job',
+    (event) => {
+      const checkedJobs = structuredClone(jobs);
+      checkedJobs[1].conclusion = 'failure';
+      checkedJobs[1].steps.push({
+        name: 'Run desktop and mobile interface regression tests',
+        conclusion: 'failure',
+      });
+      // A successful marker cannot override the required job's failure.
+      const result = verify({ event, checkedJobs });
+      expect(result.status).toBe(1);
+      expect(result.output).toBe('');
+    },
+  );
 
   it.each([
     'missing-marker',

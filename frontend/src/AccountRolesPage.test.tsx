@@ -138,6 +138,99 @@ afterEach(() => {
 });
 
 describe('Account roles', () => {
+  it('blocks assignment and application while the role editor has unsaved changes', async () => {
+    const { requests } = page();
+    await selectRole();
+    fireEvent.click(screen.getByRole('checkbox', { name: /^alex/ }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^Permissions/ }));
+    expect(screen.getByRole('button', { name: 'Review changes' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    fireEvent.change(screen.getByLabelText('Role name'), { target: { value: 'Unsaved crew' } });
+    expect(screen.getByRole('button', { name: 'Assign role' })).toHaveProperty('disabled', true);
+    expect(screen.getByRole('button', { name: 'Review changes' })).toHaveProperty('disabled', true);
+    expect(
+      screen.getByText(
+        'Save your changes or reload the saved role before assigning or applying it.',
+      ),
+    ).toBeTruthy();
+    expect(mutations(requests)).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reload saved role' }));
+    expect(screen.getByLabelText('Role name')).toHaveProperty('value', role.name);
+    expect(screen.getByRole('checkbox', { name: /^alex/ })).toHaveProperty('checked', true);
+    expect(screen.getByRole('checkbox', { name: /^Permissions/ })).toHaveProperty('checked', false);
+    expect(screen.getByRole('button', { name: 'Assign role' })).toHaveProperty('disabled', false);
+    expect(screen.getByRole('button', { name: 'Review changes' })).toHaveProperty('disabled', true);
+    expect(mutations(requests)).toHaveLength(0);
+  });
+
+  it('cancels an application review and queues only the subsequently reviewed setting groups', async () => {
+    const { requests, created } = page();
+    await selectRole();
+    fireEvent.click(screen.getByRole('checkbox', { name: /^alex/ }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^Permissions/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review changes' }));
+    expect(within(screen.getByRole('dialog')).getByText('Permissions')).toBeTruthy();
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(mutations(requests)).toHaveLength(0);
+    expect(created).not.toHaveBeenCalled();
+    expect(screen.getByRole('checkbox', { name: /^alex/ })).toHaveProperty('checked', true);
+
+    fireEvent.click(screen.getByRole('checkbox', { name: /^Permissions/ }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^Home and display preferences/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review changes' }));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).queryByText('Permissions')).toBeNull();
+    expect(within(dialog).getByText('Home and display preferences')).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Apply settings' }));
+    await waitFor(() => expect(created).toHaveBeenCalledWith(queued));
+    expect(mutations(requests)).toHaveLength(1);
+    expect(mutations(requests)[0]).toMatchObject({
+      path: '/api/account-roles/apply',
+      options: {
+        method: 'POST',
+        body: {
+          role_id: role.id,
+          role_revision: role.revision,
+          user_ids: ['jellyfin-alex'],
+          sections: ['display'],
+        },
+      },
+    });
+  });
+
+  it('selects and clears only filtered accounts while retaining hidden selections for assignment', async () => {
+    const { requests, notify } = page();
+    await selectRole();
+    fireEvent.click(screen.getByRole('checkbox', { name: /^alex/ }));
+    fireEvent.change(screen.getByLabelText('Find Jellyfin accounts'), { target: { value: 'sam' } });
+    expect(screen.queryByRole('checkbox', { name: /^alex/ })).toBeNull();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select up to 100 visible accounts' }));
+    expect(screen.getByText('2 selected')).toBeTruthy();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select up to 100 visible accounts' }));
+    expect(screen.getByText('1 selected')).toBeTruthy();
+    expect(screen.getByRole('checkbox', { name: /^sam/ })).toHaveProperty('checked', false);
+    fireEvent.click(screen.getByRole('button', { name: 'Assign role' }));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith(
+        'Role assigned. Use Review changes to update Jellyfin settings.',
+      ),
+    );
+    expect(mutations(requests)).toHaveLength(1);
+    expect(mutations(requests)[0]).toMatchObject({
+      path: '/api/account-roles/assign',
+      options: {
+        body: { role_id: role.id, role_revision: role.revision, user_ids: ['jellyfin-alex'] },
+      },
+    });
+    fireEvent.change(screen.getByLabelText('Find Jellyfin accounts'), { target: { value: '' } });
+    expect(screen.getByRole('checkbox', { name: /^alex/ })).toHaveProperty('checked', true);
+    expect(screen.getByRole('checkbox', { name: /^sam/ })).toHaveProperty('checked', false);
+  });
+
   it('distinguishes saved role settings from unsaved edits and provides an ordered account-update workflow', async () => {
     const { requests } = page();
     await selectRole();

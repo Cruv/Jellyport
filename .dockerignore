@@ -13,6 +13,9 @@ __pycache__
 node_modules
 dist
 coverage
+e2e
+playwright-report
+test-results
 tests
 tests-ts
 docs

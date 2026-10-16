@@ -54,6 +54,112 @@ afterEach(() => {
 });
 
 describe('Manual user mappings', () => {
+  it('cancels removal without losing the mapping draft or changing a server account', async () => {
+    const { requests, refresh } = page([mapping]);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit mapping for Mr. Complex Name !' }));
+    fireEvent.change(screen.getByLabelText(/Discord username/), {
+      target: { value: 'corrected.discord.label' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Remove mapping for Mr. Complex Name !' }));
+    const dialog = screen.getByRole('dialog');
+    expect(
+      within(dialog).getByText(/The Emby and Jellyfin accounts and their data are preserved/),
+    ).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(requests).toHaveLength(0);
+    expect(refresh).not.toHaveBeenCalled();
+    expect(screen.getByLabelText(/Discord username/)).toHaveProperty(
+      'value',
+      'corrected.discord.label',
+    );
+    expect(screen.getByLabelText('Jellyfin destination')).toHaveProperty('value', 'jf-simple');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save mapping' }));
+    await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    expect(requests).toEqual([
+      {
+        path: '/api/user-mappings',
+        options: {
+          method: 'POST',
+          body: {
+            id: mapping.id,
+            source_user_id: mapping.source_user_id,
+            target_user_id: mapping.target_user_id,
+            discord_username: 'corrected.discord.label',
+            discord_user_id: null,
+          },
+        },
+      },
+    ]);
+  });
+
+  it('keeps a rejected mapping draft available for an explicit retry', async () => {
+    const api = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('The destination account is already linked.'))
+      .mockResolvedValueOnce(mapping) as Api;
+    const { refresh, notify } = page([], api);
+    fireEvent.change(screen.getByLabelText('Emby account'), { target: { value: 'emby-alex' } });
+    fireEvent.change(screen.getByLabelText('New Jellyfin username'), {
+      target: { value: 'NewAlex' },
+    });
+    fireEvent.change(screen.getByLabelText(/Discord username/), {
+      target: { value: 'alex.discord' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save mapping' }));
+    expect(await screen.findByRole('alert')).toHaveProperty(
+      'textContent',
+      'The destination account is already linked.',
+    );
+    expect(refresh).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+    expect(api).toHaveBeenCalledOnce();
+    expect(screen.getByLabelText('Emby account')).toHaveProperty('value', 'emby-alex');
+    expect(screen.getByLabelText('New Jellyfin username')).toHaveProperty('value', 'NewAlex');
+    expect(screen.getByLabelText(/Discord username/)).toHaveProperty('value', 'alex.discord');
+
+    fireEvent.change(screen.getByLabelText('New Jellyfin username'), {
+      target: { value: 'UnlinkedAlex' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save mapping' }));
+    await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    expect(api).toHaveBeenCalledTimes(2);
+    expect(api).toHaveBeenLastCalledWith('/api/user-mappings', {
+      method: 'POST',
+      body: {
+        source_user_id: 'emby-alex',
+        target_user_id: null,
+        target_username: 'UnlinkedAlex',
+        discord_username: 'alex.discord',
+        discord_user_id: null,
+      },
+    });
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByLabelText('Emby account')).toHaveProperty('value', '');
+  });
+
+  it('removes only the confirmed association and clears its selected editor after success', async () => {
+    const { requests, refresh, notify } = page([mapping]);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit mapping for Mr. Complex Name !' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Remove mapping for Mr. Complex Name !' }));
+    expect(requests).toHaveLength(0);
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove mapping' }),
+    );
+    await waitFor(() => expect(refresh).toHaveBeenCalledOnce());
+    expect(requests).toEqual([
+      { path: '/api/user-mappings/mapping-1', options: { method: 'DELETE' } },
+    ]);
+    expect(notify).toHaveBeenCalledWith(
+      'User mapping removed. The server accounts were preserved.',
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByLabelText('Emby account')).toHaveProperty('value', '');
+    expect(screen.getByLabelText('Jellyfin destination')).toHaveProperty('value', '');
+    expect(screen.getByLabelText(/Discord username/)).toHaveProperty('value', '');
+  });
+
   it('keeps the selected saved mapping and its unsaved draft state visible beside the editor', () => {
     const { api } = page([mapping]);
     expect(screen.getByRole('heading', { level: 1, name: 'User mappings' })).toBeTruthy();

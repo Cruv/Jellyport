@@ -292,6 +292,7 @@ export function MigratePage({
       <div className="field mb-17">
         <label className="check-label">
           <input
+            className="checkbox"
             type="checkbox"
             checked={useSnapshots}
             onChange={(event) => setUseSnapshots(event.target.checked)}

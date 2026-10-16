@@ -851,6 +851,7 @@ th.compact {
 }
 .checkbox {
   appearance: none;
+  flex-shrink: 0;
   width: 15px;
   height: 15px;
   background: var(--bg);
@@ -975,13 +976,18 @@ th.compact {
   color: var(--text);
   font-weight: 500;
 }
+.check-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .field label .optional {
   color: var(--subtle);
   font-size: 11px;
   font-weight: 400;
   margin-left: 5px;
 }
-.field input,
+.field input:not([type='checkbox']),
 .field select,
 .field textarea {
   width: 100%;
@@ -994,7 +1000,7 @@ th.compact {
   font-size: 12px;
   min-height: 40px;
 }
-.field input:focus,
+.field input:not([type='checkbox']):focus,
 .field select:focus,
 .field textarea:focus {
   border-color: var(--purple-strong);

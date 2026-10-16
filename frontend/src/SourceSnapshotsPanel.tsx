@@ -296,6 +296,7 @@ export default function SourceSnapshotsPanel({
           >
             <label className="check-label">
               <input
+                className="checkbox"
                 type="checkbox"
                 checked={draft.enabled}
                 onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}

@@ -199,7 +199,7 @@ describe('complimentary and standalone account access', () => {
       username: 'Jim',
       requireMembership: false,
     });
-    expect(bot.delivered[0]!.password).toHaveLength(24);
+    expect(bot.delivered[0]!.password).toHaveLength(12);
     expect(JSON.stringify(job)).not.toContain(bot.delivered[0]!.password);
     expect(store.takeCredentials(job.id)).toEqual([]);
   });
@@ -292,7 +292,7 @@ describe('complimentary and standalone account access', () => {
     const credentials = store.takeCredentials(job.id);
     expect(credentials).toHaveLength(1);
     expect(credentials[0]?.username).toBe('Jim');
-    expect(credentials[0]?.password).toHaveLength(24);
+    expect(credentials[0]?.password).toHaveLength(12);
     expect(JSON.stringify(job)).not.toContain(credentials[0]!.password);
     expect(store.takeCredentials(job.id)).toEqual([]);
   });

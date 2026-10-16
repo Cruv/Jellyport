@@ -1,4 +1,6 @@
 import { DEFAULT_MEMBERSHIP_TIERS, type MembershipTier } from './memberships.js';
+import { DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE } from './credential-message.js';
+import { DEFAULT_PASSWORD_LENGTH, DEFAULT_PASSWORD_EXCLUDE_AMBIGUOUS } from './credentials.js';
 
 export interface PathMapping {
   source: string;
@@ -10,6 +12,9 @@ export interface Settings {
   jellyfin_url: string;
   jellyfin_api_key: string;
   jellyfin_public_url: string;
+  password_length?: number;
+  password_exclude_ambiguous?: boolean;
+  credential_message_template?: string;
   template_user_id: string;
   default_role_id?: string;
   path_mappings: PathMapping[];
@@ -38,6 +43,9 @@ export const DEFAULT_SETTINGS: Settings = {
   jellyfin_url: '',
   jellyfin_api_key: '',
   jellyfin_public_url: '',
+  password_length: DEFAULT_PASSWORD_LENGTH,
+  password_exclude_ambiguous: DEFAULT_PASSWORD_EXCLUDE_AMBIGUOUS,
+  credential_message_template: DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
   template_user_id: '',
   default_role_id: '',
   path_mappings: [],

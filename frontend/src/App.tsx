@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { version as appVersion } from '../../package.json';
 import {
+  DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
+  renderCredentialMessage,
+} from '../../server/credential-message';
+import {
   Callout,
   Empty,
   Icon,
@@ -61,6 +65,21 @@ const pages: Record<Page, { title: string; icon: string }> = {
   activity: { title: 'Activity', icon: 'activity' },
   settings: { title: 'Settings', icon: 'settings' },
 };
+
+function accountMessage(credential: Credential): string {
+  if (credential.message) return credential.message;
+  // Older retained credentials predate configurable messages. Never use a newly edited template.
+  try {
+    return renderCredentialMessage(DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE, {
+      username: credential.username,
+      password: credential.password,
+      server_url: credential.server_url || 'Not configured',
+    });
+  } catch {
+    // Keep legacy secrets recoverable even if their original values fail newer validation.
+    return `Username: ${credential.username}\nPassword: ${credential.password}${credential.server_url ? `\nJellyfin: ${credential.server_url}` : ''}`;
+  }
+}
 type Dialog =
   | { kind: 'preview'; preview: Preview; previewId: string; reviewElapsedMs?: number }
   | { kind: 'job'; job: Job }
@@ -1642,10 +1661,12 @@ function DialogContent({
                     )}
                   </dd>
                 </dl>
+                <p className="credential-message-label">Message for the account holder</p>
+                <pre className="credential-message">{accountMessage(credential)}</pre>
                 <button
                   className="btn btn-small btn-quiet"
                   onClick={() => {
-                    const text = `Username: ${credential.username}\nPassword: ${credential.password}${credential.server_url ? `\nJellyfin: ${credential.server_url}` : ''}`;
+                    const text = accountMessage(credential);
                     if (!navigator.clipboard?.writeText) {
                       notify(
                         'Clipboard access is unavailable. Select and copy the credential text manually.',

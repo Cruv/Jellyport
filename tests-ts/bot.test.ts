@@ -27,6 +27,7 @@ import {
 } from '../server/bot.js';
 import type { Settings } from '../server/types.js';
 import type { UserMapping } from '../server/user-mappings.js';
+import { accountCredentialMessage, discordCredentialContent } from '../server/credentials.js';
 
 function member(
   id = '22',
@@ -980,6 +981,55 @@ describe('Bot lifecycle and commands', () => {
 });
 
 describe('Private credential delivery and membership', () => {
+  it('delivers the captured plain account message without using changed settings or interpreting Markdown', async () => {
+    const { manager, recipient } = await fixture({
+      credential_message_template: 'Changed {username}: {password} at {server_url}',
+    });
+    const message = accountCredentialMessage(
+      {
+        credential_message_template:
+          'Ahoy, {username}!\nVisit {server_url}\nPassword: {password}\n@everyone',
+        jellyfin_public_url: 'https://jellyfin.example.test',
+      },
+      '[river](https://evil.example)',
+      'aBC23Def45GH',
+    );
+    await manager.sendCredentials(
+      '22',
+      '[river](https://evil.example)',
+      'aBC23Def45GH',
+      'https://jellyfin.example.test',
+      true,
+      message,
+    );
+    expect(recipient.send).toHaveBeenCalledExactlyOnceWith({
+      content: discordCredentialContent(message),
+      allowedMentions: { parse: [], repliedUser: false },
+      flags: MessageFlags.SuppressEmbeds,
+    });
+    const content = recipient.send.mock.calls[0]![0] as { content: string };
+    expect(content.content).toContain('\\[river');
+    expect(content.content).not.toContain('Changed');
+  });
+
+  it.each(['x'.repeat(2001), 'private\u0000', 'private\r'])(
+    'refuses invalid prepared message without sending it',
+    async (message) => {
+      const { manager, recipient } = await fixture();
+      await expect(
+        manager.sendCredentials(
+          '22',
+          'river',
+          'aBC23Def45GH',
+          'https://jellyfin.example.test',
+          true,
+          message,
+        ),
+      ).rejects.toThrow('Credentials could not be formatted for delivery.');
+      expect(recipient.send).not.toHaveBeenCalled();
+    },
+  );
+
   it('delivers complimentary credentials without a paid role while requiring a human guild member', async () => {
     const { manager, guild } = await fixture();
     const family = member('22', 'family', { roles: [] });

@@ -1,4 +1,5 @@
-import { randomInt, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
+import { generatePassword, accountCredentialMessage } from './credentials.js';
 import { MediaError, ServiceError } from './errors.js';
 import {
   caseFold,
@@ -67,6 +68,7 @@ import { MigrationCatalogCache, type MigrationCatalog } from './migration-catalo
 import { snapshotHistoryWarnings } from './emby-snapshot-reader.js';
 
 export { ServiceError } from './errors.js';
+export { generatePassword } from './credentials.js';
 export interface JobRequest {
   source_snapshot_id?: string;
   migration_scope?: MigrationScope;
@@ -238,6 +240,7 @@ export interface BotAdapter {
     password: string,
     url: string,
     requireMembership?: boolean,
+    message?: string,
   ): Promise<void>;
   listTagRoles?(): Promise<{
     roles: Array<{ id: string; name: string; manageable: boolean }>;
@@ -341,21 +344,6 @@ function migrationScope(value: unknown): MigrationScope {
   if (value === undefined || value === 'complete' || value === 'watched_only')
     return 'watched_only';
   throw new ServiceError('Only watched-status migration is supported.');
-}
-export function generatePassword(): string {
-  const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
-    lower = 'abcdefghijklmnopqrstuvwxyz',
-    digits = '0123456789',
-    symbols = '!@#%+_-';
-  const all = upper + lower + digits + symbols;
-  const choose = (values: string) => values[randomInt(values.length)]!;
-  const chars = [choose(upper), choose(lower), choose(digits), choose(symbols)];
-  for (let i = 0; i < 20; i++) chars.push(choose(all));
-  for (let i = chars.length - 1; i > 0; i--) {
-    const other = randomInt(i + 1);
-    [chars[i], chars[other]] = [chars[other]!, chars[i]!];
-  }
-  return chars.join('');
 }
 export function validateUsername(username: string): string {
   if (
@@ -2038,6 +2026,11 @@ export class Service {
         );
     }
     let password: string | null = null;
+    const preparedPassword = (value: string) => {
+      // Reject an unusable configured message before any account/password mutation.
+      accountCredentialMessage(settings, username, value);
+      return value;
+    };
     if (recoverTargetId) {
       if (
         !target ||
@@ -2049,7 +2042,7 @@ export class Service {
         throw new ServiceError(
           'Recovery target changed. Inspect the account again; no password was reset.',
         );
-      password = generatePassword();
+      password = preparedPassword(this.store.accountPassword(local) ?? generatePassword(settings));
       this.store.saveAccount(username, target.Id, 'provisioning', password);
       await roleGuard();
       await jellyfin.setPassword(target.Id, password);
@@ -2058,7 +2051,9 @@ export class Service {
       if (recoverTargetId) {
         /* Explicit inspected recovery already reset this tracked account. */
       } else if (local && local.remote_id === target.Id && local.status === 'provisioning') {
-        password = this.store.accountPassword(local) ?? generatePassword();
+        password = preparedPassword(
+          this.store.accountPassword(local) ?? generatePassword(settings),
+        );
         await roleGuard();
         await jellyfin.setPassword(target.Id, password);
       } else if (allowExisting) return [target, false, null];
@@ -2071,7 +2066,7 @@ export class Service {
         throw new ServiceError(
           'An earlier creation request had an uncertain outcome. Inspect Jellyfin before retrying this username.',
         );
-      password = generatePassword();
+      password = preparedPassword(generatePassword(settings));
       await roleGuard();
       // Persist before the POST: a process exit between sending the request and receiving
       // its response must require inspection, rather than replaying account creation.
@@ -2504,8 +2499,9 @@ export class Service {
       Object.assign(result, { created, target_user_id: target.Id });
       destinationId = target.Id;
       const publicUrl = settings.jellyfin_public_url || settings.jellyfin_url;
+      const message = password ? accountCredentialMessage(settings, username, password) : undefined;
       if (password) {
-        this.store.saveCredentials(job.id, username, password, publicUrl);
+        this.store.saveCredentials(job.id, username, password, publicUrl, message);
         this.store.saveAccount(username, target.Id, 'ready');
       }
       guard();
@@ -2838,6 +2834,7 @@ export class Service {
             password,
             publicUrl,
             this.recipientRequiresSubscription(recipient),
+            message,
           );
           result.discord_delivery = 'sent';
           this.store.deleteCredentials(job.id, username);

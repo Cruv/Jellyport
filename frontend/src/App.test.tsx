@@ -545,6 +545,43 @@ describe('React account safeguards', () => {
     expect(screen.queryByText('one-time-secret')).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
   });
+  it('shows and copies the captured message as plain text and clears it on close', async () => {
+    const message =
+      '<img src=x onerror=alert(1)>\nWelcome, alex!\nPassword: one-time-secret\nhttps://jellyfin.example';
+    responses['/api/jobs/job-1/credentials'] = {
+      credentials: [
+        {
+          username: 'alex',
+          password: 'one-time-secret',
+          server_url: 'https://jellyfin.example',
+          message,
+        },
+      ],
+    };
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    const previous = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
+    try {
+      await openJob();
+      fireEvent.click(screen.getByRole('button', { name: 'Reveal new credentials' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Reveal credentials' }));
+      await screen.findByText('one-time-secret');
+      const dialog = screen.getByRole('dialog');
+      expect(dialog.querySelector('.credential-message')?.textContent).toBe(message);
+      expect(dialog.querySelector('img')).toBeNull();
+      expect(writeText).not.toHaveBeenCalled();
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Copy credentials' }));
+      expect(writeText).toHaveBeenCalledExactlyOnceWith(message);
+      expect(localStorage.length).toBe(0);
+      expect(sessionStorage.length).toBe(0);
+      fireEvent.click(screen.getByRole('button', { name: 'Done' }));
+      expect(screen.queryByText(message)).toBeNull();
+      expect(screen.queryByRole('dialog')).toBeNull();
+    } finally {
+      if (previous) Object.defineProperty(navigator, 'clipboard', previous);
+      else Reflect.deleteProperty(navigator, 'clipboard');
+    }
+  });
   it('does not display late credential responses after the dialog is closed', async () => {
     await openJob();
     fireEvent.click(screen.getByRole('button', { name: 'Reveal new credentials' }));

@@ -1,6 +1,8 @@
 import { ServiceError } from './errors.js';
 import { DEFAULT_SETTINGS, type Settings } from './types.js';
 import { validateMembershipTiers } from './memberships.js';
+import { validateCredentialMessageTemplate } from './credential-message.js';
+import { validatePasswordOptions, validateCredentialMessageOptions } from './credentials.js';
 export const SECRET_FIELDS = ['emby_api_key', 'jellyfin_api_key', 'discord_bot_token'] as const;
 const snowflake = /^[0-9]{5,22}$/;
 const control = /[\x00-\x1f]/;
@@ -17,8 +19,14 @@ export function validateSettings(input: unknown): asserts input is Settings {
       throw new ServiceError(`${key} must be a boolean.`);
     if (typeof defaultValue === 'string' && (typeof value !== 'string' || value.length > 4096))
       throw new ServiceError(`${key} must be a string of at most 4096 characters.`);
-    if (typeof value === 'string' && control.test(value))
+    if (typeof value === 'string' && key !== 'credential_message_template' && control.test(value))
       throw new ServiceError('Settings cannot contain control characters.');
+  }
+  validatePasswordOptions(settings);
+  try {
+    validateCredentialMessageTemplate(settings.credential_message_template);
+  } catch (error) {
+    throw new ServiceError((error as Error).message);
   }
   for (const key of ['emby_url', 'jellyfin_url', 'jellyfin_public_url']) {
     if (!settings[key]) continue;
@@ -39,6 +47,7 @@ export function validateSettings(input: unknown): asserts input is Settings {
       );
     }
   }
+  validateCredentialMessageOptions(settings);
   for (const key of [
     'discord_guild_id',
     'discord_admin_role_id',

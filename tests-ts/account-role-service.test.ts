@@ -253,7 +253,7 @@ describe('saved role provisioning and controlled account updates', () => {
     });
     const credentials = store.takeCredentials(job.id);
     expect(credentials).toHaveLength(1);
-    expect(credentials[0]?.password).toHaveLength(24);
+    expect(credentials[0]?.password).toHaveLength(12);
     expect(JSON.stringify(job)).not.toContain(credentials[0]?.password);
   });
   it('lets default role preferences win over Emby preferences on new migrated accounts', async () => {

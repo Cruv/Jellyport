@@ -882,6 +882,7 @@ it('keeps server tokens, saved secrets and the session cookie out of ordinary AP
     'fixture-member',
     'private-member-password',
     'https://jellyfin.example',
+    'Private welcome: private-member-password',
   );
   const secrets = [
     'test-token',
@@ -889,6 +890,7 @@ it('keeps server tokens, saved secrets and the session cookie out of ordinary AP
     'private-emby-key',
     'private-discord-token',
     'private-member-password',
+    'Private welcome: private-member-password',
     'testing-password-long',
   ];
   const anonymous = await app.inject('/api/session');
@@ -934,9 +936,11 @@ it('keeps server tokens, saved secrets and the session cookie out of ordinary AP
       username: 'fixture-member',
       password: 'private-member-password',
       server_url: 'https://jellyfin.example',
+      message: 'Private welcome: private-member-password',
     },
   ]);
-  for (const secret of secrets.filter((secret) => secret !== 'private-member-password'))
+  expect(revealed.headers['cache-control']).toContain('no-store');
+  for (const secret of secrets.filter((secret) => !secret.includes('private-member-password')))
     expect(revealed.body).not.toContain(secret);
   expect(
     (

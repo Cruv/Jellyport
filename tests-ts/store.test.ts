@@ -213,6 +213,56 @@ describe('persistent operational state', () => {
       store.close();
     }
   });
+  it('retains the captured account message encrypted across restart and settings changes', () => {
+    const path = directory();
+    let store = new Store(path);
+    const message = 'Welcome aboard, member!\nPassword: synthetic-secret\nhttps://jellyfin.example';
+    store.saveCredentials(
+      'job-message',
+      'member',
+      'synthetic-secret',
+      'https://jellyfin.example',
+      message,
+    );
+    const encrypted = store.db.prepare('SELECT encrypted FROM credentials').get()!.encrypted;
+    expect(Buffer.from(encrypted as Uint8Array).toString()).not.toContain(message);
+    store.saveSettings({
+      ...store.settings(),
+      credential_message_template: 'Changed {username} {password} {server_url}',
+    });
+    store.close();
+    store = new Store(path);
+    try {
+      expect(store.takeCredentials('job-message')).toEqual([
+        {
+          username: 'member',
+          password: 'synthetic-secret',
+          server_url: 'https://jellyfin.example',
+          message,
+        },
+      ]);
+      expect(store.takeCredentials('job-message')).toEqual([]);
+      store.saveCredentials(
+        'expired-message',
+        'member',
+        'synthetic-secret',
+        'https://jellyfin.example',
+        message,
+      );
+      store.db.prepare('UPDATE credentials SET expires=0').run();
+      expect(store.takeCredentials('expired-message')).toEqual([]);
+      expect(store.db.prepare('SELECT COUNT(*) AS count FROM credentials').get()!.count).toBe(0);
+    } finally {
+      store.close();
+    }
+    for (const file of ['jellyport.db', 'jellyport.db-wal', 'jellyport.db-shm']) {
+      try {
+        expect(readFileSync(join(path, file)).includes(Buffer.from(message))).toBe(false);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+  });
   it('keeps full Unicode case folding and prevents conflicting identity links', () => {
     const store = new Store(directory());
     try {

@@ -142,7 +142,7 @@ export function Icon({ name }: { name: string }) {
 }
 export function Loading({ children = 'Loading…' }: { children?: ReactNode }) {
   return (
-    <div className="loading">
+    <div className="loading" role="status">
       <span className="spinner" />
       {children}
     </div>
@@ -210,7 +210,7 @@ export function Callout({
       <Icon name={icon} />
       <div>
         <strong>{title}</strong>
-        <p>{children}</p>
+        <div className="callout-copy">{children}</div>
       </div>
     </div>
   );

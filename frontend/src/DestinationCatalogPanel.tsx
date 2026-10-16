@@ -177,11 +177,16 @@ export default function DestinationCatalogPanel({
     (!Number.isFinite(Date.parse(record.expires_at)) || Date.parse(record.expires_at) <= now);
   const usable = !!record && !expired && status?.usable !== false;
   return (
-    <section className="panel mt-18" aria-label="Saved Jellyfin matching catalog">
+    <section className="panel" aria-label="Saved Jellyfin matching catalog">
       <div className="panel-header">
-        <div>
-          <h2>Saved Jellyfin matching catalog</h2>
-          <p>Import matching metadata from a completed Jellyfin database backup.</p>
+        <div className="setting-heading">
+          <span className="server-icon jellyfin">
+            <Icon name="jellyfin" />
+          </span>
+          <div>
+            <h3>Saved Jellyfin matching catalog</h3>
+            <p>Import matching metadata from a completed Jellyfin database backup.</p>
+          </div>
         </div>
       </div>
       <div className="panel-body form-stack">
@@ -238,7 +243,7 @@ export default function DestinationCatalogPanel({
             {status.last_error}
           </p>
         )}
-        <div role="status" aria-live="polite">
+        <div className="status-summary form-stack" role="status" aria-live="polite">
           <strong>
             {status?.running
               ? 'Importing Jellyfin backup…'
@@ -299,7 +304,7 @@ export default function DestinationCatalogPanel({
             </table>
           </div>
         )}
-        <div className="button-row">
+        <div className="form-actions">
           <button
             className="btn btn-quiet"
             type="button"
@@ -310,20 +315,20 @@ export default function DestinationCatalogPanel({
             {loading ? 'Refreshing catalog status…' : 'Refresh catalog status'}
           </button>
           <button
-            className="btn btn-primary"
-            type="button"
-            onClick={() => void change('import')}
-            disabled={demo || !!busy || !status?.configured || !status.available || status.running}
-          >
-            {busy === 'import' ? 'Starting import…' : 'Import latest Jellyfin backup'}
-          </button>
-          <button
             className="btn btn-quiet"
             type="button"
             onClick={() => void change('clear')}
             disabled={demo || !!busy || !record || !!status?.running}
           >
             {busy === 'clear' ? 'Clearing catalog…' : 'Clear matching catalog'}
+          </button>
+          <button
+            className="btn btn-primary"
+            type="button"
+            onClick={() => void change('import')}
+            disabled={demo || !!busy || !status?.configured || !status.available || status.running}
+          >
+            {busy === 'import' ? 'Starting import…' : 'Import latest Jellyfin backup'}
           </button>
         </div>
         {demo && (

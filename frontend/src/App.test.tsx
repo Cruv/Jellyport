@@ -172,7 +172,7 @@ afterEach(() => {
 });
 async function openJob() {
   render(<App />);
-  await screen.findByText('Everyone’s next chapter.');
+  await screen.findByRole('heading', { name: 'Overview', level: 1 });
   fireEvent.click(screen.getByRole('button', { name: 'View operation details' }));
   return screen.findByRole('dialog');
 }
@@ -357,7 +357,7 @@ describe('React account safeguards', () => {
     fireEvent.click(
       within(screen.getByRole('navigation')).getByRole('button', { name: 'Overview' }),
     );
-    await screen.findByText('Everyone’s next chapter.');
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
     expect(signal?.aborted).toBe(true);
     await act(async () =>
       release(
@@ -488,7 +488,7 @@ describe('React account safeguards', () => {
   it('opens account role management from the main navigation', async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Account roles' }));
-    await screen.findByText('Set the experience once.');
+    await screen.findByRole('heading', { name: 'Account roles', level: 1 });
     await screen.findByText('Create an account role');
     expect(requests.some((request) => request.path === '/api/account-roles')).toBe(true);
   });
@@ -614,9 +614,9 @@ describe('React account safeguards', () => {
       target_user_id: 'jf-alex',
     };
     render(<App />);
-    await screen.findByText('Everyone’s next chapter.');
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
     fireEvent.click(screen.getByRole('button', { name: 'Create account' }));
-    await screen.findByText('Welcome someone new.');
+    await screen.findByRole('heading', { name: 'Create account', level: 1 });
     fireEvent.click(screen.getByText('Recover an interrupted account creation'));
     fireEvent.change(screen.getByLabelText('Account to inspect'), { target: { value: 'alex' } });
     fireEvent.click(screen.getByRole('button', { name: 'Inspect account' }));
@@ -724,9 +724,9 @@ describe('React account safeguards', () => {
     responses['/api/subscriptions'] = { events: [event] };
     responses['/api/subscriptions/event-1/apply'] = { ...event, status: 'applied' };
     render(<App />);
-    await screen.findByText('Everyone’s next chapter.');
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
     fireEvent.click(screen.getByRole('button', { name: 'Subscriptions' }));
-    await screen.findByText('Membership, connected.');
+    await screen.findByRole('heading', { name: 'Subscriptions', level: 1 });
     fireEvent.click(screen.getByRole('button', { name: 'Review' }));
     const dialog = await screen.findByRole('dialog');
     expect(
@@ -832,7 +832,7 @@ describe('React account safeguards', () => {
     expect(screen.queryByText('late-private-user')).toBeNull();
     expect(screen.queryByText('late-private-password')).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(screen.queryByText('Everyone’s next chapter.')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Overview', level: 1 })).toBeNull();
     expect(screen.getByRole('alert').textContent).toContain(
       'server sign-out could not be confirmed',
     );
@@ -860,7 +860,7 @@ describe('React account safeguards', () => {
     await waitFor(() =>
       expect(screen.getByRole('alert').textContent).toBe('Incorrect credentials.'),
     );
-    expect(screen.queryByText('Everyone’s next chapter.')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Overview', level: 1 })).toBeNull();
     expect(screen.queryByText('<script>bad()</script>')).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
   });
@@ -907,7 +907,7 @@ describe('React account safeguards', () => {
       truncated: false,
     };
     render(<App />);
-    await screen.findByText('Everyone’s next chapter.');
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
     fireEvent.click(
       within(screen.getByRole('navigation')).getByRole('button', { name: 'Migrate users' }),
     );
@@ -1381,7 +1381,7 @@ describe('React account safeguards', () => {
       (request) => request.path === '/api/migrations/preview/preview-task-1',
     )!;
     fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
-    await screen.findByText('Every move, recorded.');
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
     expect(poll.options?.signal?.aborted).toBe(true);
     const cancelled = requests.find(
       (request) =>
@@ -1420,7 +1420,7 @@ describe('React account safeguards', () => {
       requests.find((request) => request.path === '/api/migrations/preview')?.options?.signal,
     ).toBeUndefined();
     fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
-    await screen.findByText('Every move, recorded.');
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
     expect(requests.some((request) => request.options?.method === 'DELETE')).toBe(false);
     await act(async () => {
       release({ ok: true, status: 202, json: async () => runningPreviewTask } as Response);
@@ -1903,8 +1903,46 @@ describe('React account safeguards', () => {
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
-    await screen.findByText('Every move, recorded.');
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  });
+  it('keeps keyboard focus in open mobile navigation and restores it on dismissal', async () => {
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    expect(screen.getByRole('link', { name: 'Skip to content' }).getAttribute('href')).toBe(
+      '#workspace-content',
+    );
+    const toggle = screen.getByRole('button', { name: 'Toggle navigation' });
+    expect(toggle.getAttribute('aria-controls')).toBe('workspace-navigation');
+    fireEvent.click(toggle);
+    const first = screen.getByRole('button', { name: 'Overview' });
+    const last = screen.getByRole('button', { name: 'Sign out' });
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(last);
+    fireEvent.keyDown(window, { key: 'Tab' });
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(toggle);
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole('button', { name: 'Close navigation' }));
+    expect(document.activeElement).toBe(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  });
+  it('opens a bookmarked settings section and clears its anchor when navigating elsewhere', async () => {
+    const original = window.location.href;
+    window.history.replaceState(null, '', '#settings-accounts');
+    try {
+      render(<App />);
+      await screen.findByRole('heading', { name: 'Settings', level: 1 });
+      expect(screen.getByRole('navigation', { name: 'Settings sections' })).toBeTruthy();
+      fireEvent.click(screen.getByRole('button', { name: 'Overview' }));
+      await screen.findByRole('heading', { name: 'Overview', level: 1 });
+      expect(window.location.hash).toBe('');
+    } finally {
+      window.history.replaceState(null, '', original);
+    }
   });
 });
 
@@ -1991,7 +2029,7 @@ describe('Jellyfin administrator sign-in and setup', () => {
     fireEvent.change(password, { target: { value: 'https-admin-password' } });
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
     expect(password.value).toBe('');
-    await screen.findByText('Everyone’s next chapter.');
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
     const login = requests.find((request) => request.path === '/api/login')!;
     expect(JSON.parse(String(login.options?.body))).toEqual({
       username: 'jellyfin-admin',
@@ -2043,7 +2081,7 @@ describe('Jellyfin administrator sign-in and setup', () => {
     fireEvent.change(password, { target: { value: 'my-jellyfin-password!' } });
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
     expect(password.value).toBe('');
-    await screen.findByText('Everyone’s next chapter.');
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
     expect(screen.getByText('jellyfin-admin')).toBeTruthy();
     const login = requests.find((request) => request.path === '/api/login')!;
     expect(JSON.parse(String(login.options?.body))).toEqual({
@@ -2129,7 +2167,7 @@ describe('Jellyfin administrator sign-in and setup', () => {
       target: { value: 'admin-login-password' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
-    await screen.findByText('Everyone’s next chapter.');
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
     const login = requests.find((request) => request.path === '/api/login')!;
     expect(JSON.parse(String(login.options?.body))).toEqual({
       username: 'admin',
@@ -2210,9 +2248,9 @@ describe('Jellyfin administrator sign-in and setup', () => {
     };
     responses['/api/auth/service-key'] = responses['/api/settings'];
     render(<App />);
-    await screen.findByText('Everyone’s next chapter.');
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
-    await screen.findByText('Set your course.');
+    await screen.findByRole('heading', { name: 'Settings', level: 1 });
     const server = document.querySelector<HTMLInputElement>('#setting-jellyfin_url')!;
     expect(server.readOnly).toBe(true);
     expect(document.querySelector('#setting-jellyfin_api_key')).toBeNull();
@@ -2338,7 +2376,7 @@ describe('Jellyfin administrator sign-in and setup', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Replace Jellyfin API key' }));
     expect(keyField.value).toBe('');
     await screen.findByText('Jellyfin did not accept that API key.');
-    expect(screen.getByText('Set your course.')).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Settings', level: 1 })).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Sign in' })).toBeNull();
     expect((screen.getByLabelText('Replacement Jellyfin API key') as HTMLInputElement).value).toBe(
       '',

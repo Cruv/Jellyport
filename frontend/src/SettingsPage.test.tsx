@@ -5,7 +5,13 @@ import SettingsPage from './SettingsPage';
 import { DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE } from '../../server/credential-message';
 import type { Api, ApiOptions, Settings } from './types';
 
-vi.mock('./SourceSnapshotsPanel', () => ({ default: () => null }));
+vi.mock('./SourceSnapshotsPanel', () => ({
+  default: () => (
+    <form aria-label="Backup import schedule">
+      <button type="submit">Save import schedule</button>
+    </form>
+  ),
+}));
 vi.mock('./DestinationCatalogPanel', () => ({ default: () => null }));
 vi.mock('./AdminAlertsPanel', () => ({ default: () => null }));
 
@@ -54,6 +60,64 @@ function submit() {
 }
 
 afterEach(cleanup);
+
+describe('Settings layout and navigation', () => {
+  it('keeps unsaved connection and account fields mounted when navigating sections', async () => {
+    const p = page();
+    expect(screen.getByRole('heading', { name: 'Settings', level: 1 })).toBeTruthy();
+    const navigation = screen.getByRole('navigation', { name: 'Settings sections' });
+    const media = screen.getByRole('region', { name: 'Media servers' });
+    const accounts = screen.getByRole('region', { name: 'Account defaults' });
+    const access = screen.getByRole('region', { name: 'Discord & access' });
+    const history = screen.getByRole('region', { name: 'Saved history' });
+    expect(within(media).getByRole('heading', { name: 'Emby · source server' })).toBeTruthy();
+    expect(within(accounts).getByLabelText('Fallback template user')).toBeTruthy();
+    expect(within(accounts).getByLabelText('Default account role')).toBeTruthy();
+    expect(within(access).getByLabelText('Enable Discord bot')).toBeTruthy();
+    const sourceUrl = within(media).getAllByLabelText('Server URL')[0];
+    fireEvent.change(sourceUrl, { target: { value: 'https://source.example.test' } });
+    fireEvent.change(within(accounts).getByLabelText('Generated password length'), {
+      target: { value: '18' },
+    });
+    for (const [name, target] of [
+      ['Account defaults', accounts],
+      ['Discord & access', access],
+      ['Saved history', history],
+      ['Media servers', media],
+    ] as const) {
+      const link = within(navigation).getByRole('link', { name });
+      expect(link.getAttribute('href')).toBe(`#${target.id}`);
+      fireEvent.click(link);
+    }
+    expect(sourceUrl.isConnected).toBe(true);
+    expect((sourceUrl as HTMLInputElement).value).toBe('https://source.example.test');
+    expect((screen.getByLabelText('Generated password length') as HTMLInputElement).value).toBe(
+      '18',
+    );
+    expect(p.requests.filter((request) => request.options?.method)).toHaveLength(0);
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(
+      p.requests.find((request) => request.options?.method === 'PUT')?.options?.body,
+    ).toMatchObject({
+      emby_url: 'https://source.example.test',
+      password_length: 18,
+    });
+  });
+
+  it('keeps the independent backup schedule outside the main settings save form', () => {
+    page();
+    const settingsForm = screen.getByRole('button', { name: 'Save settings' }).closest('form');
+    const schedule = screen.getByRole('form', { name: 'Backup import schedule' });
+    expect(settingsForm?.contains(schedule)).toBe(false);
+    expect(
+      within(screen.getByRole('region', { name: 'Saved history' }))
+        .getByRole('button', { name: 'Save import schedule' })
+        .closest('form'),
+    ).toBe(schedule);
+    expect(screen.getByText(/Import actions and schedules save independently/)).toBeTruthy();
+  });
+});
 
 describe('New account password and message settings', () => {
   it('defaults older settings to 12 characters, ambiguous-character exclusion, and a fictional preview', async () => {

@@ -335,10 +335,10 @@ export default function AccountRolesPage({
   }
 
   return (
-    <>
+    <div className="page-stack">
       <Heading
-        title="Set the experience once."
-        description="Save permissions and preferences as Jellyport roles, then apply selected groups when you choose."
+        title="Account roles"
+        description="Save reusable permissions and preferences, then review changes before applying them."
         actions={
           <button
             className="btn"
@@ -372,52 +372,56 @@ export default function AccountRolesPage({
           text="Refresh to try again."
         />
       ) : (
-        <div className="stack roles-page">
+        <div className="content-grid roles-page">
           <section className="panel">
             <div className="panel-header">
               <div>
                 <h2>{role ? 'Edit saved role' : 'Create an account role'}</h2>
                 <p>Copy from another account whenever you want to revise the defaults.</p>
               </div>
-              <span className="server-icon jellyfin">
-                <Icon name="settings" />
+              <span className={`status${stale || dirty ? ' warn' : ''}`}>
+                {stale
+                  ? 'Needs refresh'
+                  : dirty
+                    ? 'Unsaved changes'
+                    : role
+                      ? 'Saved role'
+                      : 'New role'}
               </span>
             </div>
             <div className="panel-body">
               <form className="form-stack" onSubmit={save}>
-                <div className="field-row">
-                  <div className="field">
-                    <label htmlFor="roles-saved">Saved role</label>
-                    <select
-                      id="roles-saved"
-                      value={roleId}
-                      disabled={busy}
-                      onChange={(event) => selectRole(event.target.value)}
-                    >
-                      <option value="">Create a new role</option>
-                      {roles.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.name}
-                          {item.id === defaultRoleId ? ' (default)' : ''}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="field">
-                    <label htmlFor="roles-name">Role name</label>
-                    <input
-                      id="roles-name"
-                      value={name}
-                      maxLength={64}
-                      required
-                      disabled={busy}
-                      autoComplete="off"
-                      onChange={(event) => {
-                        setName(event.target.value);
-                        setDirty(true);
-                      }}
-                    />
-                  </div>
+                <div className="field">
+                  <label htmlFor="roles-saved">Saved role</label>
+                  <select
+                    id="roles-saved"
+                    value={roleId}
+                    disabled={busy}
+                    onChange={(event) => selectRole(event.target.value)}
+                  >
+                    <option value="">Create a new role</option>
+                    {roles.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name}
+                        {item.id === defaultRoleId ? ' (default)' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="field">
+                  <label htmlFor="roles-name">Role name</label>
+                  <input
+                    id="roles-name"
+                    value={name}
+                    maxLength={64}
+                    required
+                    disabled={busy}
+                    autoComplete="off"
+                    onChange={(event) => {
+                      setName(event.target.value);
+                      setDirty(true);
+                    }}
+                  />
                 </div>
                 <div className="roles-import-row">
                   <div className="field">
@@ -468,7 +472,7 @@ export default function AccountRolesPage({
                     </ul>
                   </div>
                 )}
-                <p className="roles-help">
+                <p className="section-note roles-help">
                   Copies shared server-backed Home settings used by Jellyfin Web and compatible
                   TV/mobile apps. Device-local options stay with each client.
                 </p>
@@ -517,7 +521,7 @@ export default function AccountRolesPage({
                 {role &&
                   (role.id === defaultRoleId ||
                     assignments.some((assignment) => assignment.role_id === role.id)) && (
-                    <p className="roles-help">
+                    <p className="section-note roles-help">
                       Unassign this role and change the default in Settings before removing it.
                     </p>
                   )}
@@ -527,24 +531,28 @@ export default function AccountRolesPage({
           <section className="panel">
             <div className="panel-header">
               <div>
-                <h2>Manage existing accounts</h2>
-                <p>Assign a saved role, then review the setting groups you want to apply.</p>
+                <h2>Apply to existing accounts</h2>
+                <p>Select accounts, assign this role, and review the settings to update.</p>
               </div>
-              <span className="roles-count">{selectedTargets.length} selected</span>
+              <span className="status">{selectedTargets.length} selected</span>
             </div>
             <div className="panel-body form-stack">
               {!role && (
-                <p className="roles-help">Select or save a role above to assign it to accounts.</p>
+                <p className="section-note roles-help">
+                  Select or save a role in the editor to assign it to accounts.
+                </p>
               )}
               {dirty && role && (
-                <p className="roles-help">
+                <p className="section-note roles-help">
                   Save your changes or reload the saved role before assigning or applying it.
                 </p>
               )}
+              <h3>1. Choose accounts</h3>
               <div className="field">
                 <label htmlFor="roles-user-search">Find Jellyfin accounts</label>
                 <input
                   id="roles-user-search"
+                  type="search"
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
                   autoComplete="off"
@@ -623,7 +631,7 @@ export default function AccountRolesPage({
                   )}
                 </div>
               ) : (
-                <p className="roles-help">
+                <p className="section-note roles-help">
                   No eligible Jellyfin accounts. Administrators, disabled accounts, and the template
                   account are excluded.
                 </p>
@@ -636,7 +644,8 @@ export default function AccountRolesPage({
                   </button>
                 )}
               </div>
-              <div className="roles-assignment-actions">
+              <h3>2. Assign the saved role</h3>
+              <div className="toolbar roles-assignment-actions">
                 <button
                   className="btn"
                   disabled={busy || !readyRole || !selectedTargets.length}
@@ -656,8 +665,9 @@ export default function AccountRolesPage({
                 >
                   Unassign role
                 </button>
-                <small>Assignment alone does not change Jellyfin settings.</small>
               </div>
+              <p className="section-note">Assignment alone does not change Jellyfin settings.</p>
+              <h3>3. Choose settings to update</h3>
               <fieldset className="roles-section-picker" disabled={busy || !readyRole}>
                 <legend>Setting groups to apply</legend>
                 {sections.map((section) => (
@@ -682,7 +692,7 @@ export default function AccountRolesPage({
                   </label>
                 ))}
               </fieldset>
-              <p className="roles-help">
+              <p className="section-note roles-help">
                 Include Account preferences to also copy library order, Home library visibility, and
                 Latest Media preferences.
               </p>
@@ -695,7 +705,7 @@ export default function AccountRolesPage({
                         assignment.user_id === user.Id && assignment.role_id === roleId,
                     ),
                 ) && (
-                  <p className="roles-help">
+                  <p className="section-note roles-help">
                     Assign this role to every selected account before applying settings.
                   </p>
                 )}
@@ -763,7 +773,7 @@ export default function AccountRolesPage({
               ))}
             </ul>
           </div>
-          <p className="roles-help">
+          <p className="section-note roles-help">
             Client-local settings cannot be controlled by a role. You can track per-account results
             in Activity.
           </p>
@@ -781,7 +791,7 @@ export default function AccountRolesPage({
               <button className="btn" disabled={busy} onClick={() => setRemoving(null)}>
                 Cancel
               </button>
-              <button className="btn btn-primary" disabled={busy} onClick={remove}>
+              <button className="btn btn-danger" disabled={busy} onClick={remove}>
                 Remove role
               </button>
             </>
@@ -795,6 +805,6 @@ export default function AccountRolesPage({
           <p>This removes the saved role. Jellyfin accounts and their settings are preserved.</p>
         </Modal>
       )}
-    </>
+    </div>
   );
 }

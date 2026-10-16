@@ -138,6 +138,23 @@ afterEach(() => {
 });
 
 describe('Account roles', () => {
+  it('distinguishes saved role settings from unsaved edits and provides an ordered account-update workflow', async () => {
+    const { requests } = page();
+    await selectRole();
+    expect(screen.getByRole('heading', { level: 1, name: 'Account roles' })).toBeTruthy();
+    expect(screen.getByText('Saved role', { selector: 'span' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '1. Choose accounts' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '2. Assign the saved role' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: '3. Choose settings to update' })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Role name'), { target: { value: 'Updated role' } });
+    expect(screen.getByText('Unsaved changes', { selector: 'span' })).toBeTruthy();
+    expect(screen.queryByText('Saved role', { selector: 'span' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Reload saved role' }));
+    expect(screen.getByText('Saved role', { selector: 'span' })).toBeTruthy();
+    expect(screen.getByLabelText('Role name')).toHaveProperty('value', role.name);
+    expect(mutations(requests)).toHaveLength(0);
+  });
+
   it('copies supported settings into a new saved role without changing Jellyfin accounts', async () => {
     const { requests, notify, created } = page();
     await screen.findByLabelText('Saved role');

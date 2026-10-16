@@ -227,26 +227,21 @@ export default function MembershipsPage({
   return (
     <>
       <Heading
-        title="One membership, every entitled account."
-        description="Manage paid and complimentary accounts for each Discord owner."
+        title="Memberships"
+        description="Manage paid and complimentary access, account allowances, and each Discord owner’s linked accounts."
         actions={
           <button className="btn" onClick={() => void reload()} disabled={busy || loading}>
             <Icon name="refresh" /> Refresh
           </button>
         }
       />
-      <Callout icon="shield" title="Account access is reviewed before changing.">
-        New accounts receive the default account role and their own generated password, delivered
-        privately to the Discord owner. Downgrades disable extra accounts and preserve their data.
-        Upgrades can restore those same accounts when Jellyport disabled them. Complimentary access
-        is managed by you and is exempt from subscription cancellation and renewal automation.
-      </Callout>
+
       {error && !review && (
         <div className="error-block" role="alert">
           {error}
         </div>
       )}
-      <div className="stack">
+      <div className="page-stack">
         <section className="panel">
           <div className="panel-header">
             <div>
@@ -257,26 +252,8 @@ export default function MembershipsPage({
               <Icon name="discord" />
             </span>
           </div>
-          <div className="panel-body">
+          <div className="panel-body form-layout">
             <form className="form-stack" onSubmit={showReview}>
-              <div className="field">
-                <label htmlFor="membership-access-mode">Access policy</label>
-                <select
-                  id="membership-access-mode"
-                  value={accessMode}
-                  disabled={busy || loading}
-                  onChange={(event) =>
-                    setAccessMode(event.target.value as 'subscription' | 'complimentary')
-                  }
-                >
-                  <option value="subscription">Subscription managed</option>
-                  <option value="complimentary">Complimentary · admin managed</option>
-                </select>
-                <small>
-                  Use complimentary access for family and other non-paying Discord members. Users
-                  without Discord can have independent accounts from Create account.
-                </small>
-              </div>
               <DiscordMemberPicker
                 api={api}
                 value={member}
@@ -284,52 +261,72 @@ export default function MembershipsPage({
                 disabled={busy || loading}
                 allowInactive={accessMode === 'complimentary'}
               />
-              {accessMode === 'subscription' ? (
+              <div className="field-row">
                 <div className="field">
-                  <label htmlFor="membership-tier">Membership tier</label>
+                  <label htmlFor="membership-access-mode">Access policy</label>
                   <select
-                    id="membership-tier"
-                    value={tierId}
-                    onChange={(event) => setTierId(event.target.value)}
+                    id="membership-access-mode"
+                    value={accessMode}
                     disabled={busy || loading}
-                    required
+                    onChange={(event) =>
+                      setAccessMode(event.target.value as 'subscription' | 'complimentary')
+                    }
                   >
-                    {!tiers.some((item) => item.id === tierId) && (
-                      <option value="">Select a configured tier</option>
-                    )}
-                    {tiers.map((item) => (
-                      <option key={item.id} value={item.id}>
-                        {item.name} · {item.account_limit}{' '}
-                        {item.account_limit === 1 ? 'account' : 'accounts'}
-                      </option>
-                    ))}
+                    <option value="subscription">Subscription managed</option>
+                    <option value="complimentary">Complimentary · admin managed</option>
                   </select>
                   <small>
-                    Tier names, trusted subscription plan names, and account limits can be changed
-                    in Settings.
+                    Use complimentary access for family and other non-paying Discord members. Users
+                    without Discord can have independent accounts from Create account.
                   </small>
                 </div>
-              ) : (
-                <div className="field">
-                  <label htmlFor="complimentary-allowance">Complimentary account allowance</label>
-                  <select
-                    id="complimentary-allowance"
-                    value={complimentaryLimit}
-                    disabled={busy || loading}
-                    onChange={(event) => setComplimentaryLimit(Number(event.target.value))}
-                  >
-                    {[1, 2, 3].map((count) => (
-                      <option key={count} value={count}>
-                        {count} {count === 1 ? 'account' : 'accounts'}
-                      </option>
-                    ))}
-                  </select>
-                  <small>
-                    Billing events do not disable these accounts. Save this policy to protect
-                    existing accounts without creating or changing any accounts.
-                  </small>
-                </div>
-              )}
+                {accessMode === 'subscription' ? (
+                  <div className="field">
+                    <label htmlFor="membership-tier">Membership tier</label>
+                    <select
+                      id="membership-tier"
+                      value={tierId}
+                      onChange={(event) => setTierId(event.target.value)}
+                      disabled={busy || loading}
+                      required
+                    >
+                      {!tiers.some((item) => item.id === tierId) && (
+                        <option value="">Select a configured tier</option>
+                      )}
+                      {tiers.map((item) => (
+                        <option key={item.id} value={item.id}>
+                          {item.name} · {item.account_limit}{' '}
+                          {item.account_limit === 1 ? 'account' : 'accounts'}
+                        </option>
+                      ))}
+                    </select>
+                    <small>
+                      Tier names, trusted subscription plan names, and account limits can be changed
+                      in Settings.
+                    </small>
+                  </div>
+                ) : (
+                  <div className="field">
+                    <label htmlFor="complimentary-allowance">Complimentary account allowance</label>
+                    <select
+                      id="complimentary-allowance"
+                      value={complimentaryLimit}
+                      disabled={busy || loading}
+                      onChange={(event) => setComplimentaryLimit(Number(event.target.value))}
+                    >
+                      {[1, 2, 3].map((count) => (
+                        <option key={count} value={count}>
+                          {count} {count === 1 ? 'account' : 'accounts'}
+                        </option>
+                      ))}
+                    </select>
+                    <small>
+                      Billing events do not disable these accounts. Save this policy to protect
+                      existing accounts without creating or changing any accounts.
+                    </small>
+                  </div>
+                )}
+              </div>
               {member && tier && (
                 <div className="support-note">
                   <strong>
@@ -360,6 +357,26 @@ export default function MembershipsPage({
                 </button>
               </div>
             </form>
+            <aside className="form-stack" aria-label="Membership access guidance">
+              <Callout icon="shield" title="Account access is reviewed before changing.">
+                New accounts receive the default account role and their own generated password,
+                delivered privately to the Discord owner. Downgrades disable extra accounts and
+                preserve their data. Upgrades can restore those same accounts when Jellyport
+                disabled them. Complimentary access is managed by you and is exempt from
+                subscription cancellation and renewal automation.
+              </Callout>
+              <div className="section-note">
+                <h3>Choose the action you need</h3>
+                <p>
+                  <strong>Save access policy</strong> updates how membership events are handled
+                  without changing media accounts.
+                </p>
+                <p>
+                  <strong>Review membership update</strong> checks the account slots before you
+                  queue creation, migration, or access changes.
+                </p>
+              </div>
+            </aside>
           </div>
         </section>
         <section className="panel">

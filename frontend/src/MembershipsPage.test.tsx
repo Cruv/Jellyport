@@ -73,6 +73,24 @@ afterEach(() => {
 });
 
 describe('Discord membership account allowances', () => {
+  it('pairs the member editor with access guidance while keeping policy and provisioning actions distinct', async () => {
+    const p = page();
+    expect(screen.getByRole('heading', { name: 'Memberships', level: 1 })).toBeTruthy();
+    await screen.findByText('Give each member their account allowance.');
+    const guidance = screen.getByRole('complementary', { name: 'Membership access guidance' });
+    expect(within(guidance).getByText(/without changing media accounts/)).toBeTruthy();
+    expect(within(guidance).getByText(/checks the account slots before/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Save access policy' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(screen.getByRole('button', { name: 'Review membership update' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(mutations(p.requests)).toHaveLength(0);
+  });
+
   it('reviews approved mapping names before provisioning a member whose server username was simplified', async () => {
     const mapped = ['SimplifiedJim', 'FamilyJim'].map((username, index) => ({
       id: `mapping-${index + 1}`,

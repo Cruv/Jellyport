@@ -29,11 +29,10 @@ export function OverviewPage({
 }: Common & { overview: Overview; refresh: () => void }) {
   const ready = data.connections.emby.connected && data.connections.jellyfin.connected;
   return (
-    <>
+    <div className="page-stack">
       <Heading
-        title="Everyone’s next chapter."
-        description="Bring your users, watched status, and your community over to Jellyfin."
-        eyebrow="YOUR MIGRATION WORKSPACE"
+        title="Overview"
+        description="Check your servers, manage accounts, and review recent operations."
         actions={
           <>
             <button className="btn btn-quiet" onClick={refresh}>
@@ -63,7 +62,7 @@ export function OverviewPage({
             count: data.counts.emby_users,
             icon: 'users',
             color: 'mint',
-            note: 'Ready for their next chapter',
+            note: 'Accounts on your source server',
           },
           {
             label: 'Jellyfin users',
@@ -92,13 +91,13 @@ export function OverviewPage({
           </div>
         ))}
       </div>
-      <div className="dashboard-grid">
+      <div className="form-layout">
         <div className="stack">
           <section className="panel">
             <div className="panel-header">
               <div>
                 <h2>Server connections</h2>
-                <p>Your migration route, at a glance.</p>
+                <p>Connection status for your media servers and Discord bot.</p>
               </div>
               <button className="btn btn-small btn-quiet" onClick={() => navigate('settings')}>
                 Manage
@@ -110,7 +109,7 @@ export function OverviewPage({
             <div className="panel-header">
               <div>
                 <h2>Recent activity</h2>
-                <p>A record of every move.</p>
+                <p>Your latest migrations and account changes.</p>
               </div>
               <button className="text-button" onClick={() => navigate('activity')}>
                 View all
@@ -127,7 +126,7 @@ export function OverviewPage({
         <div className="stack">
           <section className="panel">
             <div className="panel-header">
-              <h2>Make the next move</h2>
+              <h2>Account management</h2>
             </div>
             <div className="quick-actions">
               {[
@@ -140,8 +139,8 @@ export function OverviewPage({
                 {
                   page: 'accounts' as Page,
                   icon: 'userPlus',
-                  title: 'Create a fresh account',
-                  text: 'A warm welcome for a new member.',
+                  title: 'Create an account',
+                  text: 'Apply your saved account defaults.',
                 },
                 {
                   page: 'subscriptions' as Page,
@@ -166,46 +165,24 @@ export function OverviewPage({
             </div>
           </section>
           <section className="panel">
-            <div className="panel-body">
-              <h3>Your users. Their watched history.</h3>
-              <p className="muted text-small mt-9">
+            <div className="panel-header">
+              <h2>Migration safeguards</h2>
+            </div>
+            <div className="panel-body form-stack">
+              <p className="section-note">
                 Preview the match before you migrate. Existing Jellyfin activity is preserved as
                 Emby watched flags are added.
               </p>
-              <div className="flow">
-                <div className="flow-node">
-                  <span className="server-icon emby">
-                    <Icon name="emby" />
-                  </span>
-                  Emby
-                </div>
-                <span className="flow-line" />
-                <div className="flow-node">
-                  <span className="server-icon jellyfin">
-                    <Icon name="jellyfin" />
-                  </span>
-                  Jellyfin
-                </div>
-                <span className="flow-line" />
-                <div className="flow-node">
-                  <span className="server-icon discord">
-                    <Icon name="discord" />
-                  </span>
-                  Discord
-                </div>
+              <div>
+                <span className={`status ${ready ? 'good' : ''}`}>
+                  {ready ? 'Servers are ready' : 'Configure servers to begin'}
+                </span>
               </div>
-              <span className={`status ${ready ? 'good' : ''}`}>
-                {ready ? 'Servers are ready' : 'Configure servers to begin'}
-              </span>
             </div>
           </section>
         </div>
       </div>
-      <div className="footer-note">
-        <Icon name="shield" />
-        Self-hosted. Your servers, your community.
-      </div>
-    </>
+    </div>
   );
 }
 export function MigratePage({
@@ -244,10 +221,10 @@ export function MigratePage({
       all.current.indeterminate = selectedVisible > 0 && selectedVisible < filtered.length;
   }, [selectedVisible, filtered.length]);
   return (
-    <>
+    <div className="page-stack">
       <Heading
         title="Migrate users"
-        description="Bring played status into Jellyfin while preserving played items from either server. Set name exceptions in User mappings."
+        description="Select Emby accounts, review the migration, and add their played status to Jellyfin."
         actions={
           <button
             id="preview-migration"
@@ -262,33 +239,8 @@ export function MigratePage({
           </button>
         }
       />
-      <p className="muted text-small mb-17">
-        Only played or unplayed status is migrated. Existing Jellyfin resume positions and other
-        personal state stay unchanged. New accounts still use your account role or template
-        defaults.
-      </p>
-      <div className="field mb-17">
-        <label className="check-label">
-          <input
-            className="checkbox"
-            type="checkbox"
-            checked={useSnapshots}
-            onChange={(event) => setUseSnapshots(event.target.checked)}
-            disabled={busy}
-            aria-describedby="migration-snapshot-help"
-          />
-          Use saved Emby snapshot
-        </label>
-        <small id="migration-snapshot-help">
-          Previews check accounts and backup freshness without scanning libraries; matching and
-          played flags are read only after approval. Migrations pause between source requests to
-          protect playback. Saved snapshots must cover every selected account and be current enough;
-          missing or expired snapshots stop the preview. File copies provide best-effort saved
-          history.
-        </small>
-      </div>
-      <div className="steps">
-        <span className="step active">
+      <div className="steps" aria-label="Migration steps">
+        <span className="step active" aria-current="step">
           <span className="step-number">1</span>Select users
         </span>
         <span className="step-separator" />
@@ -309,7 +261,7 @@ export function MigratePage({
           before starting a migration.
         </Callout>
       )}
-      <div className="migration-layout">
+      <div className="form-layout">
         <section className="panel">
           <div className="panel-header">
             <div>
@@ -430,25 +382,64 @@ export function MigratePage({
             </button>
           </div>
         </section>
-        <aside className="panel aside-panel">
-          <div className="panel-body">
-            <span className="server-icon jellyfin mb-17">
-              <Icon name="shield" />
-            </span>
-            <h3>What comes along</h3>
-            <ul>
-              <li>The same username</li>
-              <li>Played status for matched movies and episodes</li>
-              <li>Saved account defaults for new accounts</li>
-              <li>A generated password for each new account</li>
-            </ul>
-          </div>
-          <div className="aside-footer">
-            Existing accounts keep their passwords. Unmatched items are reported for review.
-          </div>
+        <aside className="stack">
+          <section className="panel">
+            <div className="panel-header">
+              <h2>Migration settings</h2>
+            </div>
+            <div className="panel-body form-stack">
+              <div className="field">
+                <label className="check-label">
+                  <input
+                    className="checkbox"
+                    type="checkbox"
+                    checked={useSnapshots}
+                    onChange={(event) => setUseSnapshots(event.target.checked)}
+                    disabled={busy}
+                    aria-describedby="migration-snapshot-help"
+                  />
+                  Use saved Emby snapshot
+                </label>
+                <small id="migration-snapshot-help">
+                  Previews check accounts and backup freshness without scanning libraries; matching
+                  and played flags are read only after approval. Migrations pause between source
+                  requests to protect playback. Saved snapshots must cover every selected account
+                  and be current enough; missing or expired snapshots stop the preview. File copies
+                  provide best-effort saved history.
+                </small>
+              </div>
+              <p className="section-note">
+                Set username exceptions in{' '}
+                <button className="text-button" onClick={() => navigate('mappings')}>
+                  User mappings
+                </button>
+                .
+              </p>
+            </div>
+          </section>
+          <section className="panel aside-panel">
+            <div className="panel-header">
+              <h2>What is migrated</h2>
+            </div>
+            <div className="panel-body">
+              <p>
+                Only played or unplayed status is migrated. Existing Jellyfin resume positions and
+                other personal state stay unchanged.
+              </p>
+              <ul>
+                <li>The same username, or your saved user mapping</li>
+                <li>Played status for matched movies and episodes</li>
+                <li>Saved account defaults for new accounts</li>
+                <li>A generated password for each new account</li>
+              </ul>
+            </div>
+            <div className="aside-footer">
+              Existing accounts keep their passwords. Unmatched items are reported for review.
+            </div>
+          </section>
         </aside>
       </div>
-    </>
+    </div>
   );
 }
 export function AccountsPage({
@@ -591,9 +582,9 @@ export function AccountsPage({
     }
   }
   return (
-    <>
+    <div className="page-stack">
       <Heading
-        title="Welcome someone new."
+        title="Create account"
         description="Create a Jellyfin account with your saved defaults and a secure generated password."
       />
       {!ready && (
@@ -605,11 +596,11 @@ export function AccountsPage({
           .
         </Callout>
       )}
-      <div className="section-grid">
+      <div className="form-layout">
         <section className="panel">
           <div className="panel-header">
             <div>
-              <h2>Create a fresh account</h2>
+              <h2>Account details</h2>
               <p>For new members, family, and children without an Emby account.</p>
             </div>
             <span className="server-icon jellyfin">
@@ -648,16 +639,18 @@ export function AccountsPage({
                 id="account-discord"
                 inputName="discord_user_id"
               />
-              <p className="subtle text-small">
-                {overview.connections.discord.connected
-                  ? 'Jellyport will privately message this member with their credentials.'
-                  : 'Connect your Discord bot in Settings to enable private account delivery.'}
-              </p>
-              <p className="subtle text-small">
-                Leave Discord blank for an independent, admin-managed account with no subscription
-                requirement. For non-paying Discord members, save complimentary access in
-                Memberships first.
-              </p>
+              <div className="form-stack">
+                <p className="section-note">
+                  {overview.connections.discord.connected
+                    ? 'Jellyport will privately message this member with their credentials.'
+                    : 'Connect your Discord bot in Settings to enable private account delivery.'}
+                </p>
+                <p className="section-note">
+                  Leave Discord blank for an independent, admin-managed account with no subscription
+                  requirement. For non-paying Discord members, save complimentary access in
+                  Memberships first.
+                </p>
+              </div>
               <ManualDiscordId id="account-manual-discord" disabled={!!busy || !!accountMember} />
               <Callout
                 icon="key"
@@ -679,7 +672,7 @@ export function AccountsPage({
         <aside className="stack">
           <section className="panel">
             <div className="panel-header">
-              <h2>Ready from day one</h2>
+              <h2>Account defaults and delivery</h2>
             </div>
             <div className="panel-body">
               {[
@@ -721,104 +714,106 @@ export function AccountsPage({
           <Icon name="refresh" />
           Recover an interrupted account creation
         </summary>
-        <p className="muted text-small">
-          If a creation request timed out after reaching Jellyfin, inspect the resulting account
-          before retrying. Recovery is available only for an incomplete creation tracked by
-          Jellyport.
-        </p>
-        <form
-          onSubmit={inspect}
-          onInput={() => {
-            recoveryVersion.current++;
-            setRecovery(null);
-            setApproved(false);
-          }}
-        >
-          <div className="field-row">
-            <div className="field">
-              <label htmlFor="recovery-username">Account to inspect</label>
-              <input
-                id="recovery-username"
-                name="username"
-                value={recoveryUsername}
-                onChange={(event) => setRecoveryUsername(event.target.value)}
-                required
-                maxLength={64}
-                placeholder="Exact Jellyfin username"
-                autoComplete="off"
+        <div className="panel-body">
+          <p className="section-note">
+            If a creation request timed out after reaching Jellyfin, inspect the resulting account
+            before retrying. Recovery is available only for an incomplete creation tracked by
+            Jellyport.
+          </p>
+          <form
+            onSubmit={inspect}
+            onInput={() => {
+              recoveryVersion.current++;
+              setRecovery(null);
+              setApproved(false);
+            }}
+          >
+            <div className="field-row">
+              <div className="field">
+                <label htmlFor="recovery-username">Account to inspect</label>
+                <input
+                  id="recovery-username"
+                  name="username"
+                  value={recoveryUsername}
+                  onChange={(event) => setRecoveryUsername(event.target.value)}
+                  required
+                  maxLength={64}
+                  placeholder="Exact Jellyfin username"
+                  autoComplete="off"
+                />
+              </div>
+              <DiscordMemberPicker
+                api={api}
+                value={recoveryMember}
+                onChange={(member) => {
+                  recoveryVersion.current++;
+                  setRecovery(null);
+                  setApproved(false);
+                  setRecoveryMember(member);
+                }}
+                suggestedQuery={recoveryUsername}
+                disabled={!!busy}
+                label="Recovery Discord member (optional)"
+                id="recovery-discord"
+                inputName="discord_user_id"
               />
             </div>
-            <DiscordMemberPicker
-              api={api}
-              value={recoveryMember}
-              onChange={(member) => {
-                recoveryVersion.current++;
-                setRecovery(null);
-                setApproved(false);
-                setRecoveryMember(member);
-              }}
-              suggestedQuery={recoveryUsername}
-              disabled={!!busy}
-              label="Recovery Discord member (optional)"
-              id="recovery-discord"
-              inputName="discord_user_id"
-            />
-          </div>
-          <ManualDiscordId id="recovery-manual-discord" disabled={!!busy || !!recoveryMember} />
-          <div className="form-actions">
-            <button className="btn btn-quiet" type="submit" disabled={!!busy}>
-              {busy === 'inspect' ? <span className="spinner" /> : <Icon name="search" />}
-              {busy === 'inspect' ? 'Inspecting…' : 'Inspect account'}
-            </button>
-          </div>
-        </form>
-        <div className="recovery-result" aria-live="polite">
-          {recovery && (
-            <>
-              <Callout
-                icon={recovery.eligible ? 'warning' : 'info'}
-                warning={recovery.eligible}
-                title={`${recovery.username} · ${recovery.eligible ? 'Eligible for recovery' : 'Recovery unavailable'}`}
-              >
-                {recovery.reason}
-                {recovery.target_user_id && (
-                  <span className="recovery-target mono">
-                    Jellyfin account ID: {recovery.target_user_id}
-                  </span>
-                )}
-              </Callout>
-              {recovery.eligible && (
-                <>
-                  <label className="approval-check">
-                    <input
-                      type="checkbox"
-                      className="checkbox"
-                      checked={approved}
-                      onChange={(event) => setApproved(event.target.checked)}
-                    />
-                    <span>
-                      I inspected this Jellyfin account and approve a new password and account
-                      defaults.
+            <ManualDiscordId id="recovery-manual-discord" disabled={!!busy || !!recoveryMember} />
+            <div className="form-actions">
+              <button className="btn btn-quiet" type="submit" disabled={!!busy}>
+                {busy === 'inspect' ? <span className="spinner" /> : <Icon name="search" />}
+                {busy === 'inspect' ? 'Inspecting…' : 'Inspect account'}
+              </button>
+            </div>
+          </form>
+          <div className="recovery-result" aria-live="polite">
+            {recovery && (
+              <>
+                <Callout
+                  icon={recovery.eligible ? 'warning' : 'info'}
+                  warning={recovery.eligible}
+                  title={`${recovery.username} · ${recovery.eligible ? 'Eligible for recovery' : 'Recovery unavailable'}`}
+                >
+                  {recovery.reason}
+                  {recovery.target_user_id && (
+                    <span className="recovery-target mono">
+                      Jellyfin account ID: {recovery.target_user_id}
                     </span>
-                  </label>
-                  <div className="form-actions">
-                    <button
-                      className="btn btn-danger"
-                      type="button"
-                      onClick={recover}
-                      disabled={!approved || !!busy}
-                    >
-                      {busy === 'recover' && <span className="spinner" />}
-                      {busy === 'recover' ? 'Recovering…' : 'Recover account'}
-                    </button>
-                  </div>
-                </>
-              )}
-            </>
-          )}
+                  )}
+                </Callout>
+                {recovery.eligible && (
+                  <>
+                    <label className="approval-check">
+                      <input
+                        type="checkbox"
+                        className="checkbox"
+                        checked={approved}
+                        onChange={(event) => setApproved(event.target.checked)}
+                      />
+                      <span>
+                        I inspected this Jellyfin account and approve a new password and account
+                        defaults.
+                      </span>
+                    </label>
+                    <div className="form-actions">
+                      <button
+                        className="btn btn-danger"
+                        type="button"
+                        onClick={recover}
+                        disabled={!approved || !!busy}
+                      >
+                        {busy === 'recover' && <span className="spinner" />}
+                        {busy === 'recover' ? 'Recovering…' : 'Recover account'}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </>
+            )}
+          </div>
         </div>
       </details>
-    </>
+    </div>
   );
 }
 function ManualDiscordId({ id, disabled }: { id: string; disabled: boolean }) {
@@ -850,9 +845,9 @@ export function ActivityPage({
 }: Common & { jobs: Job[]; refresh: () => void }) {
   const count = jobs.filter(activeJob).length;
   return (
-    <>
+    <div className="page-stack">
       <Heading
-        title="Every move, recorded."
+        title="Activity"
         description="Review migrations, new accounts, and any items that need your attention."
         actions={
           <button className="btn btn-quiet" onClick={refresh}>
@@ -871,7 +866,9 @@ export function ActivityPage({
                 : 'Open an operation to see its results and account delivery.'}
             </p>
           </div>
-          <span className="status">{num(jobs.length)} operations</span>
+          <span className="status">
+            {num(jobs.length)} {jobs.length === 1 ? 'operation' : 'operations'}
+          </span>
         </div>
         <JobsTable jobs={jobs} openJob={openJob} migrate={() => navigate('migrate')} />
         <div className="table-footer">
@@ -879,7 +876,7 @@ export function ActivityPage({
           <span>Credentials are available through an explicit, one-time reveal.</span>
         </div>
       </section>
-    </>
+    </div>
   );
 }
 export function SubscriptionsPage({
@@ -904,9 +901,9 @@ export function SubscriptionsPage({
     expire: 'Access expired',
   };
   return (
-    <>
+    <div className="page-stack">
       <Heading
-        title="Membership, connected."
+        title="Subscriptions"
         description="Review trusted Discord membership events before making account changes."
         actions={
           <>
@@ -920,7 +917,7 @@ export function SubscriptionsPage({
           </>
         }
       />
-      <Callout icon="shield" title="You stay in control.">
+      <Callout icon="shield" title="Review before applying account changes">
         Automatic creation and disabling are off by default. A subscription cancellation and an
         access expiration can be handled separately in Settings.
       </Callout>
@@ -958,7 +955,11 @@ export function SubscriptionsPage({
                     </td>
                     <td>
                       <span>{names[event.action] || event.action}</span>
-                      <small>{event.source || 'Discord'}</small>
+                      <small>
+                        {event.source === 'mee6_message'
+                          ? 'MEE6 announcement'
+                          : event.source || 'Discord'}
+                      </small>
                       {event.action === 'subscribe' &&
                         event.source === 'mee6_message' &&
                         event.detail && <small>Plan: {event.detail}</small>}
@@ -975,14 +976,14 @@ export function SubscriptionsPage({
                     <td className="nowrap">{date(event.created_at)}</td>
                     <td className="right nowrap">
                       {['pending', 'failed'].includes(event.status) ? (
-                        <>
+                        <div className="row-actions">
                           <button
                             className="btn btn-small btn-quiet"
                             disabled={busy}
                             onClick={() => ignore(event)}
                           >
                             Ignore
-                          </button>{' '}
+                          </button>
                           <button
                             className="btn btn-small btn-primary"
                             disabled={busy}
@@ -990,7 +991,7 @@ export function SubscriptionsPage({
                           >
                             Review
                           </button>
-                        </>
+                        </div>
                       ) : event.job_id ? (
                         <button
                           className="btn btn-small btn-quiet"
@@ -1019,6 +1020,6 @@ export function SubscriptionsPage({
           </Empty>
         )}
       </section>
-    </>
+    </div>
   );
 }

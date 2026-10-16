@@ -200,8 +200,8 @@ export default function SourceSnapshotsPanel({
                 : 'Emby can keep running while a consistent SQLite online backup is captured.'}
             </>
           )}{' '}
-          This avoids a full library scan through Emby’s API. Database captures support both
-          complete and watched-only migrations.
+          This avoids a full library scan through Emby’s API. Migrations use only played flags from
+          the captured database.
         </p>
         {hasPluginBackups && (
           <Callout icon="info" title="Backup age stays with the original backup.">
@@ -334,7 +334,7 @@ export default function SourceSnapshotsPanel({
               Scheduling starts off. Times use the time zone shown here, supplied by the server.{' '}
               {pluginBackup
                 ? 'Schedule imports after Emby’s backup task finishes. This does not change Emby’s backup schedule.'
-                : 'Each capture includes data for both migration scopes.'}
+                : 'Each capture supplies played flags for migration.'}
             </small>
             {draft.revision !== status.config.revision && (
               <p className="error-block">
@@ -440,14 +440,14 @@ export default function SourceSnapshotsPanel({
                             : record.source_type === 'sqlite_online_backup'
                               ? 'SQLite online backup'
                               : record.scope === 'watched_only'
-                                ? 'Watched-only data'
-                                : 'Complete data'}
+                                ? 'Played-status capture'
+                                : 'Complete database capture'}
                       </strong>
                       {record.source_type && (
                         <small>
                           {record.scope === 'watched_only'
-                            ? 'Watched-only migration data'
-                            : 'Complete migration data'}
+                            ? 'Played-status capture'
+                            : 'Complete database capture'}
                         </small>
                       )}
                       <small>{Math.ceil(record.bytes / 1024).toLocaleString()} KiB</small>

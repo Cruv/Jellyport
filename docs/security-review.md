@@ -5,6 +5,13 @@ findings retain the dates and inputs of those checks; they are not current scan
 results. Current verification and publication procedures are in
 [development](development.md).
 
+The current migration scope has since narrowed to played flags only. It uses modern
+partial-field writes and independent played-state readback, preserving unrelated
+destination values. Resume, counts, dates, favorites, playlists, Emby preferences
+and images are no longer transferred. Legacy broad-scope request/job values are
+normalized to played-only; legacy watched endpoints are not used. Older versioned
+sections below describe historical behavior and their original review evidence.
+
 This review covers Jellyport's TypeScript server, React interface, Jellyfin authentication and first-run setup, persistence, account and Discord ownership checks, Docker configuration, dependencies, and GitHub release workflows. It includes the hardening changes described below.
 
 The work consists of ordinary code review, defensive regression tests with synthetic data, and passive dependency, image, secret, and workflow checks. Tests use application injection and controlled local fixtures. No deployed NAS, real media-server accounts, Discord guild, MEE6 membership, Stripe account, or Portainer instance was targeted. Dependency registries, image registries, and public security advisories were consulted for passive checks. This is a focused review, not an independent penetration-test certification or a guarantee that every vulnerability has been found.

@@ -249,14 +249,21 @@ it('keeps demonstration snapshot status readable and refuses every real mutation
   expect(app.jellyport.store.jobs()).toHaveLength(0);
 });
 
-it.each([undefined, false, true])(
-  'forwards snapshot preview selection %s and preserves the default live read',
-  async (useSnapshots) => {
+it.each(
+  [undefined, false, true].flatMap((useSnapshots) =>
+    [undefined, 'complete', 'watched_only'].map((migrationScope) => ({
+      useSnapshots,
+      migrationScope,
+    })),
+  ),
+)(
+  'narrows preview scope $migrationScope with snapshot selection $useSnapshots to watched-only',
+  async ({ useSnapshots, migrationScope }) => {
     const { app, headers } = await setup();
     const preview = vi.spyOn(app.jellyport.service, 'preview').mockResolvedValue({
       users: [],
       mode: 'merge',
-      migration_scope: 'complete',
+      migration_scope: 'watched_only',
     });
     const started = await app.inject({
       method: 'POST',
@@ -265,6 +272,7 @@ it.each([undefined, false, true])(
       payload: {
         source_user_ids: ['fixture-source'],
         ...(useSnapshots === undefined ? {} : { use_snapshots: useSnapshots }),
+        ...(migrationScope === undefined ? {} : { migration_scope: migrationScope }),
       },
     });
     expect(started.statusCode).toBe(202);
@@ -272,51 +280,54 @@ it.each([undefined, false, true])(
     expect(preview).toHaveBeenCalledWith(
       ['fixture-source'],
       expect.objectContaining({
-        migration_scope: 'complete',
+        migration_scope: 'watched_only',
         use_snapshots: useSnapshots ?? false,
       }),
     );
   },
 );
 
-it('forwards only the exact approved snapshot generations to queued migration', async () => {
-  const { app, headers } = await setup();
-  const migrate = vi.spyOn(app.jellyport.service, 'migrateUsers').mockResolvedValue({
-    id: 'fixture-job',
-    kind: 'migration',
-    status: 'queued',
-    created_at: '2026-10-08T12:00:00.000Z',
-    updated_at: '2026-10-08T12:00:00.000Z',
-    progress: { processed: 0, total: 2 },
-    results: [],
-  });
-  const source_snapshot_ids = {
-    'fixture-source-a': '7d1a6301-8c1c-4c1c-a1b1-b2139d712b80',
-    'fixture-source-b': '99b59955-98ea-453d-9d25-a2b3f3cbac0b',
-  };
-  const discord_recipients = { 'fixture-source-a': '123456789' };
-  const mapping_revisions = { 'fixture-source-a': 'fixture-revision', 'fixture-source-b': null };
-  const response = await app.inject({
-    method: 'POST',
-    url: '/api/migrations',
-    headers,
-    payload: {
-      source_user_ids: ['fixture-source-a', 'fixture-source-b'],
-      migration_scope: 'watched_only',
-      source_snapshot_ids,
+it.each([undefined, 'complete', 'watched_only'] as const)(
+  'forwards approved snapshot generations with legacy scope %s narrowed to watched-only',
+  async (migrationScope) => {
+    const { app, headers } = await setup();
+    const migrate = vi.spyOn(app.jellyport.service, 'migrateUsers').mockResolvedValue({
+      id: 'fixture-job',
+      kind: 'migration',
+      status: 'queued',
+      created_at: '2026-10-08T12:00:00.000Z',
+      updated_at: '2026-10-08T12:00:00.000Z',
+      progress: { processed: 0, total: 2 },
+      results: [],
+    });
+    const source_snapshot_ids = {
+      'fixture-source-a': '7d1a6301-8c1c-4c1c-a1b1-b2139d712b80',
+      'fixture-source-b': '99b59955-98ea-453d-9d25-a2b3f3cbac0b',
+    };
+    const discord_recipients = { 'fixture-source-a': '123456789' };
+    const mapping_revisions = { 'fixture-source-a': 'fixture-revision', 'fixture-source-b': null };
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/migrations',
+      headers,
+      payload: {
+        source_user_ids: ['fixture-source-a', 'fixture-source-b'],
+        ...(migrationScope === undefined ? {} : { migration_scope: migrationScope }),
+        source_snapshot_ids,
+        discord_recipients,
+        mapping_revisions,
+      },
+    });
+    expect(response.statusCode).toBe(202);
+    expect(migrate).toHaveBeenCalledExactlyOnceWith(
+      ['fixture-source-a', 'fixture-source-b'],
       discord_recipients,
       mapping_revisions,
-    },
-  });
-  expect(response.statusCode).toBe(202);
-  expect(migrate).toHaveBeenCalledExactlyOnceWith(
-    ['fixture-source-a', 'fixture-source-b'],
-    discord_recipients,
-    mapping_revisions,
-    'watched_only',
-    source_snapshot_ids,
-  );
-});
+      'watched_only',
+      source_snapshot_ids,
+    );
+  },
+);
 
 it('rejects malformed snapshot selection and incomplete pins before execution starts', async () => {
   const { app, headers } = await setup();

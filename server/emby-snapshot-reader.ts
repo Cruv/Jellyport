@@ -356,12 +356,14 @@ export function readSnapshotHistory(
   const maxBytes = integer(limits.maxBytes ?? MAX_USER_BYTES, 1, MAX_USER_BYTES);
   return withDatabase(path, (database) => {
     validateLibrary(database);
+    // A watched-only read needs identity metadata and one boolean. Do not fetch or
+    // validate excluded personal state: a bad old timestamp cannot invalidate a flag.
     const query = database.prepare(`
       SELECT m.Id,m.type,substr(m.Path,1,8193) AS Path,substr(m.Name,1,1025) AS Name,
         substr(m.ProviderIds,1,16385) AS ProviderIds,m.SeriesId,m.IndexNumber,
-        m.ParentIndexNumber,m.IndexNumberEnd,m.RunTimeTicks,
-        substr(s.ProviderIds,1,16385) AS SeriesProviderIds,
-        ud.played,ud.playCount,ud.isFavorite,ud.playbackPositionTicks,ud.LastPlayedDateInt,ud.rating
+        m.ParentIndexNumber,m.IndexNumberEnd,
+        substr(s.ProviderIds,1,16385) AS SeriesProviderIds,ud.played
+        ${scope === 'complete' ? ',m.RunTimeTicks,ud.playCount,ud.isFavorite,ud.playbackPositionTicks,ud.LastPlayedDateInt,ud.rating' : ''}
       FROM UserDatas ud CROSS JOIN MediaItems m ON m.UserDataKeyId=ud.UserDataKeyId
       LEFT JOIN MediaItems s ON s.Id=m.SeriesId AND s.type=6
       WHERE ud.userId=? AND ${scope === 'watched_only' ? 'played=1' : `(${personalState})`}
@@ -408,10 +410,10 @@ export function readSnapshotHistory(
             throw invalid();
           data.Rating = row.rating;
         }
-      }
-      if (row.LastPlayedDateInt !== null) {
-        const seconds = integer(row.LastPlayedDateInt, 0, 253_402_300_799);
-        data.LastPlayedDate = new Date(seconds * 1000).toISOString();
+        if (row.LastPlayedDateInt !== null) {
+          const seconds = integer(row.LastPlayedDateInt, 0, 253_402_300_799);
+          data.LastPlayedDate = new Date(seconds * 1000).toISOString();
+        }
       }
       const item: MediaItem = { Id: String(integer(row.Id, 1)), Type: type, UserData: data };
       let name: string | undefined;
@@ -430,8 +432,10 @@ export function readSnapshotHistory(
       if (providers) item.ProviderIds = providers;
       if (seriesProviders) item.SeriesProviderIds = seriesProviders;
       if (row.SeriesId !== null) item.SeriesId = String(integer(row.SeriesId, 1));
-      for (const key of ['IndexNumber', 'ParentIndexNumber', 'IndexNumberEnd', 'RunTimeTicks'])
+      for (const key of ['IndexNumber', 'ParentIndexNumber', 'IndexNumberEnd'])
         if (row[key] !== null) item[key] = integer(row[key]);
+      if (scope === 'complete' && row.RunTimeTicks !== null)
+        item.RunTimeTicks = integer(row.RunTimeTicks);
       bytes += Buffer.byteLength(JSON.stringify(item)) + (items.length ? 1 : 0);
       if (bytes > maxBytes)
         throw new ServiceError('This Emby snapshot exceeds the supported per-user history size.');

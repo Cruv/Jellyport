@@ -271,7 +271,8 @@ describe('saved role provisioning and controlled account updates', () => {
     expect(created.Configuration).toMatchObject(parameters.configuration);
     expect(servers.played[created.Id]?.size).toBeGreaterThan(0);
     expect(service.roles.getAssignment(created.Id, store.settings())?.role_id).toBe(saved.id);
-    expect(job.results[0]?.data?.preferences).toEqual(Object.keys(parameters.configuration));
+    expect(job.results[0]?.data?.preferences).toEqual([]);
+    expect(job.results[0]?.role_sections).toEqual(['policy', 'configuration', 'display']);
     expect(calls.filter((call) => call.method === 'setConfiguration')).toHaveLength(1);
   });
   it('provisions all ten shared Home sections and TV layout from a saved role without a template', async () => {

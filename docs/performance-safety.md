@@ -1,5 +1,12 @@
 # Migration workload and playback safety
 
+Current migration transfers **played / unplayed flags only**. It never clears an
+existing Jellyfin played flag and does not import resume positions, counts, dates,
+favorites, ratings, playlists, source preferences or profile images. Backup
+projections may retain broader fields for format compatibility; only matching
+metadata and played flags drive the current transfer. Historical investigations
+and measurements below retain their original inputs and limitations.
+
 ## Incident evidence and limits of attribution
 
 On October 8, 2026, the installed Jellyport revision
@@ -50,8 +57,7 @@ An approved live migration separates two kinds of source information:
    again for each preview and account.
 2. **Fresh account state.** For each account, `/Users/{id}/Items` reads explicit
    batches of catalog `Ids`. These requests omit recursive enumeration, media-type
-   filtering, name sorting and total counts. They request user state and Emby's
-   explicit playback count/date fields. The API may omit deleted or inaccessible
+   filtering, name sorting and total counts. They request user state; only played playable items are retained for migration. The API may omit deleted or inaccessible
    IDs. Unexpected or repeated IDs and changed item types fail the read.
 
 The in-process metadata cache is bound to the source URL, API key, server identity
@@ -78,8 +84,8 @@ and BaseItemProviders into an allowlisted SQLite projection with disk indexes.
 The web service receives an encrypted neutral catalog, never the original archive.
 Each account loads only indexed identity candidates and their series dependencies;
 all candidate IDs and identity fields are checked through fresh user-scoped API
-reads before matching. Detailed updates still recheck activity immediately before
-writing, and independent batched readback verifies intended history afterward.
+reads before matching. Played updates still recheck activity immediately before
+writing, and independent batched readback verifies intended played flags afterward.
 A successful HTTP update alone is not evidence of completed migration.
 
 Set `JELLYPORT_JELLYFIN_CATALOG_MODE=backup` on the web service so the first startup
@@ -98,13 +104,13 @@ have five-minute deadlines; cancellation kills and reaps the worker. Decryption 
 shared per generation with bounded idle retention, not repeated per account.
 No live media-server database is modified or opened by this import.
 
-The independent readback retains pre-write expectations, including no-op matches
-and multiple source editions mapping to one target. It checks watched flags,
-favorites, counts, dates, resume positions and supported ratings. A strictly newer
-Jellyfin playback date can explain changed resume state; a same-date ignored resume
-write cannot pass. Missing, mismatched or unsupported fields make the result partial.
-Playlists retain their existing private-copy and independent content verification.
-Unmatched and ambiguous identities remain explicit and are never guessed.
+The independent readback retains pre-write played-state expectations, including
+no-op matches and multiple source editions mapping to one target. Missing,
+mismatched or unsupported played values make the result partial. Writes use only
+`Played: true` through the modern partial-field API, preserving unrelated destination
+state. The legacy watched endpoint is not used because it can alter counts, dates
+or resume state. Unmatched and ambiguous identities remain explicit and are never
+guessed.
 
 Job elapsed time covers the server migration request, including preflight validation,
 queue admission, final verification and completion. Browser/network overhead is
@@ -191,11 +197,15 @@ fallback to a full per-user destination crawl when a bound or validation fails.
 and its [watched-state model](https://github.com/luigi311/JellyPlex-Watched/blob/1741166ee439a97d936a0e3a3d39fec4500dd757/src/watched.py#L39)
 inform the separation of reusable matching metadata from account activity. That
 project still enumerates destination libraries; it is not a drop-in solution to
-this bottleneck. Its narrower state model and played/resume filters
-cannot replace Jellyport's Complete semantics, particularly unplayed counts,
-date-only history, dislikes, ratings and playlist members.
+this bottleneck. Jellyport now limits transfer to played flags; resume filters and
+other personal-state transfer are outside its scope. Any future filtered-query
+optimization still needs behavior checks for identity, access and pagination.
 
-## Why complete state is not a union of three filters
+## Historical complete-state filter investigation
+
+This section records the earlier broad-state design. Current migration uses played
+flags only; the observations remain evidence about API behavior, not a claim that
+counts, dates, favorites or resume positions are still migrated.
 
 The API behavior was checked using an isolated official Emby 4.10.1.0 container,
 synthetic accounts, and twenty synthetic movies. No production server was used.
@@ -215,17 +225,16 @@ than assuming every documented filter has the required semantics.
 | An unplayed item with a positive play count/date, and a date-only item, were absent from played/favorite/resumable filtered results.                   | Those filters cannot replace complete account-state reads.                                                                   |
 | Multiple filters behaved as AND; likes/dislikes filters did not select the intended subset.                                                            | The implementation does not depend on an unverified filter union.                                                            |
 
-Complete live-source migration therefore examines state for every source catalog
-ID, then retains only supported personal state. A saved source uses the private
-indexed projection instead. This preserves watched status, play counts,
-timestamps, resume positions, favorites, likes/dislikes and supported ratings,
-including a false like and a zero rating. Container favorites and ratings remain
-eligible; derived container playback totals remain excluded as before.
+The earlier Complete live-source migration examined every source catalog ID,
+retaining supported personal state; saved sources used the private indexed
+projection instead. It covered watched status, counts, dates, resume, favorites,
+likes/dislikes and ratings, including false likes and zero ratings. Container
+favorites and ratings were eligible; derived playback totals were excluded.
+Those broader transfer semantics are no longer supported.
 
-Complete migration still reads playlist definitions and entries, and preserves
-the existing private-copy and duplicate-entry behavior. New-account preferences
-and supported avatars retain their existing behavior. Watched-only remains an
-explicit user choice; it does not silently become the complete mode.
+That historical Complete path also read playlists, account preferences and avatars.
+Current migration no longer reads or transfers those groups; Jellyfin roles and
+templates still provide new-account defaults independently.
 
 Jellyfin matching and account access remain destination-scoped. Potential detailed
 state writes still refresh Jellyfin's current user data immediately before the
@@ -277,8 +286,7 @@ hold prevents an immediate manual retry from creating more upstream overlap.
 
 The byte limits measure retained serialized payloads, **not** a hard process RSS
 limit. JavaScript objects, response buffers, sets and matching indexes also use
-memory. Source playlists also have a 32 MiB per-read and aggregate retained
-serialized-payload budget, alongside 500-playlist/100,000-entry limits. Pages are
+memory. Current migration does not read source playlists. Pages are
 validated and retained data is bounded incrementally so a
 large library does not become an unlimited object array. Limit failures require
 review or a saved snapshot; they do not trigger a fallback to the old full
@@ -323,18 +331,16 @@ default when the helper method is omitted. Both have the capture deadline and
 retention/size limits documented in [deployment](docker-deployment.md#optional-local-emby-snapshots--0120).
 
 Saved history does not make the entire migration offline. Current source identity
-still comes through the API; Complete mode also obtains supported account
-configuration, profile images and playlist metadata/entries live. Jellyfin access
-and destination state remain live. Neither capture method makes these separate
+still comes through the API. Emby preferences, profile images and playlists are
+not read for transfer. Jellyfin access and destination state remain live. Neither capture method makes these separate
 databases and API responses one consistent transaction.
 
 ## Local snapshot performance
 
-The local history reader starts with one user's indexed meaningful state and
-looks up matching catalog rows by key. New private projections use a partial
-index covering watched flags, positive counts, favorites, resume positions,
-playback dates and ratings, including zero ratings. Every original projected
-state row remains in the database; older full-index projections still work.
+The local history reader selects one user's played playable items and looks up
+matching catalog rows by key. Existing private projections can contain broader
+allowlisted meaningful state and partial indexes covering it. Those formats remain
+readable without enabling broader transfer; older full-index projections still work.
 These indexes belong only to Jellyport's private projection, never Emby's live
 database or its backup files.
 
@@ -355,14 +361,16 @@ cannot reject an unhandled promise, and new decryptions stop until cleanup
 succeeds. Previews no longer decrypt a projection or start a history reader.
 Personal account results are not cached between users.
 
-Each approved job builds one neutral destination matching index for both history
-and playlist candidate selection. Each account receives fresh access-scoped data
-only for its candidates, and final history and playlist planning share that
-account's matching index. A matching plan retains at most 200,000 ambiguous
+Each approved job builds one neutral destination matching index for played-state
+candidates. Each account receives fresh access-scoped data only for its candidates
+and reuses that account's matching index. A matching plan retains at most 200,000 ambiguous
 candidate references.
 Over-limit plans fail rather than drop candidates or guess a match. Item workers
 yield every 250 processed items so large already-merged histories remain
 cancelable. Fresh pre-write Jellyfin checks and the four-worker ceiling remain.
+
+The following benchmark measurements predate the played-only scope and describe
+local component work, not current end-to-end throughput.
 
 Run `npm run benchmark:snapshots` for an opt-in, synthetic-only benchmark. It
 accepts no production paths or URLs, generates 100,000 catalog items and 500,000

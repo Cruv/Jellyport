@@ -97,7 +97,7 @@ describe('source cooldown and destination job isolation', () => {
     expect(governor().snapshot().calls).toBe(1);
   });
 
-  it('stops before provisioning when a source playlist rejection opens the circuit', async () => {
+  it('stops before provisioning when a watched-state rejection opens the circuit', async () => {
     const originalUsers = structuredClone(servers.users.jellyfin);
     const originalHistory = structuredClone(servers.played);
     const states = vi.fn(),
@@ -107,10 +107,11 @@ describe('source cooldown and destination job isolation', () => {
     service.clientFactory = (...args) => {
       const client = factory(...args);
       if (args[2] === 'emby') {
-        const state = client.migrationState!.bind(client);
         client.migrationState = async (...parameters) => {
           states(parameters[0]);
-          return state(...parameters);
+          return governor().read('user_state', async () => {
+            throw new MediaError('Synthetic source rejected watched state.', 503);
+          });
         };
         client.playlists = async () => {
           playlists();
@@ -136,11 +137,11 @@ describe('source cooldown and destination job isolation', () => {
     };
     const job = await finish(await service.migrateUsers(['e-sam', 'e-alex']));
     expect(job.status).toBe('failed');
-    expect(job.error).toContain('No destination changes were started');
+    expect(job.error).toContain('Synthetic source rejected watched state');
     expect(job.progress.processed).toBe(0);
     expect(job.results).toHaveLength(1);
     expect(states.mock.calls).toEqual([['e-sam']]);
-    expect(playlists).toHaveBeenCalledTimes(1);
+    expect(playlists).not.toHaveBeenCalled();
     expect(mutations).not.toHaveBeenCalled();
     expect(servers.users.jellyfin).toEqual(originalUsers);
     expect(servers.played).toEqual(originalHistory);

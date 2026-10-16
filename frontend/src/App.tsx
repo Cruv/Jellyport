@@ -35,7 +35,6 @@ import {
   type ApiOptions,
   type Credential,
   type Job,
-  type MigrationScope,
   type Overview,
   type Page,
   type Preview,
@@ -113,7 +112,6 @@ export default function App() {
   overviewRef.current = overview;
   const [events, setEvents] = useState<SubscriptionEvent[]>([]);
   const [selected, setSelected] = useState(new Set<string>());
-  const [migrationScope, setMigrationScope] = useState<MigrationScope>('complete');
   const [useSnapshots, setUseSnapshots] = useState(false);
   const [sourceDefaults, setSourceDefaults] = useState<'loading' | 'ready' | 'error'>('loading');
   const sourceChosen = useRef(false);
@@ -182,7 +180,6 @@ export default function App() {
     setJobs([]);
     setEvents([]);
     setSelected(new Set());
-    setMigrationScope('complete');
     setUseSnapshots(false);
     sourceChosen.current = false;
     setSourceDefaults('loading');
@@ -492,7 +489,6 @@ export default function App() {
       return;
     }
     const generation = authGeneration.current;
-    const scope = migrationScope;
     const savedSource = useSnapshots;
     const controller = new AbortController();
     let taskId = '';
@@ -534,7 +530,7 @@ export default function App() {
           method: 'POST',
           body: {
             source_user_ids: [...selected],
-            migration_scope: scope,
+            migration_scope: 'watched_only',
             ...(savedSource ? { use_snapshots: true } : {}),
           },
           // Receive the task ID even if the user leaves while this short request is in flight.
@@ -580,7 +576,8 @@ export default function App() {
           kind: 'preview',
           preview: {
             ...task.preview,
-            migration_scope: task.preview.migration_scope ?? 'complete',
+            // An older preview cannot expand the scope of the explicit flags-only approval.
+            migration_scope: 'watched_only',
             ...(task.preview.source_snapshot_ids
               ? { source_snapshot_ids: { ...task.preview.source_snapshot_ids } }
               : {}),
@@ -620,7 +617,7 @@ export default function App() {
         method: 'POST',
         body: {
           source_user_ids: ids,
-          migration_scope: dialog.preview.migration_scope ?? 'complete',
+          migration_scope: 'watched_only',
           ...(dialog.preview.source_snapshot_ids
             ? { source_snapshot_ids: dialog.preview.source_snapshot_ids }
             : {}),
@@ -791,8 +788,6 @@ export default function App() {
           search={search}
           setSearch={setSearch}
           preview={preview}
-          migrationScope={migrationScope}
-          setMigrationScope={setMigrationScope}
           useSnapshots={useSnapshots}
           setUseSnapshots={chooseHistorySource}
           busy={busy.has('preview')}
@@ -1095,11 +1090,10 @@ function DialogContent({
 }) {
   if (dialog.kind === 'preview') {
     const users = dialog.preview.users;
-    const watchedOnly = dialog.preview.migration_scope === 'watched_only';
     return (
       <Modal
         title="Review your migration"
-        description={`${users.length} ${users.length === 1 ? 'user' : 'users'} selected · ${watchedOnly ? 'watched-only' : 'complete migration'}`}
+        description={`${users.length} ${users.length === 1 ? 'user' : 'users'} selected · played status only`}
         wide
         close={close}
         footer={
@@ -1120,9 +1114,11 @@ function DialogContent({
         }
       >
         <Callout icon="shield" title="Preview before you move.">
-          {watchedOnly
-            ? 'Watched-only combines watched flags from either server and keeps original playback dates when safe. Imported favorites, resume positions, ratings, play counts, playlists, profile pictures, and preferences are skipped. New accounts still use your account role or template defaults. Unmatched and ambiguous items are skipped.'
-            : 'Watched flags and favorites are combined. Newer Jellyfin progress stays intact, and playlists become private copies. Unmatched and ambiguous items are skipped.'}
+          Played flags from either server are preserved. Only played or unplayed status is migrated;
+          resume positions, playback dates, play counts, favorites, playlists, ratings, profile
+          images, and preferences are not imported. Existing Jellyfin personal state stays
+          unchanged. New accounts still use your account role or template defaults. Unmatched and
+          ambiguous items appear in the results and are not changed.
         </Callout>
         {dialog.preview.source_snapshot_ids && (
           <Callout icon="info" title="Saved Emby data selected.">
@@ -1151,17 +1147,6 @@ function DialogContent({
                   {[
                     { value: user.stats.source_played, label: 'Played in Emby', color: '' },
                     { value: user.stats.matched, label: 'Matched to Jellyfin', color: 'mint' },
-                    ...(!watchedOnly
-                      ? [
-                          {
-                            value: user.stats.source_favorites,
-                            label: 'Favorites in Emby',
-                            color: '',
-                          },
-                          { value: user.stats.source_resume, label: 'Resume positions', color: '' },
-                          { value: user.stats.source_playlists, label: 'Playlists', color: '' },
-                        ]
-                      : []),
                     {
                       value: user.stats.unmatched,
                       label: 'Unmatched',
@@ -1181,11 +1166,9 @@ function DialogContent({
                 </div>
               ) : (
                 <Callout icon="info" title="History details deferred">
-                  This lightweight review checks accounts without scanning their history.{' '}
-                  {watchedOnly
-                    ? 'Matching and watched history are read after approval.'
-                    : 'Matching, history, favorites, resume positions and playlist details are read after approval.'}{' '}
-                  Counts and item issues will appear in the migration results.
+                  This lightweight review checks accounts without scanning their history. Matching
+                  and played flags are read after approval. Counts and item issues will appear in
+                  the migration results.
                 </Callout>
               )}
               <div className="preview-user-body">
@@ -1232,6 +1215,23 @@ function DialogContent({
   }
   if (dialog.kind === 'job') {
     const job = dialog.job;
+    const historicalMigration =
+      ['migrate', 'migration'].includes(job.kind) &&
+      (job.migration_scope !== 'watched_only' ||
+        job.results?.some(
+          ({ data }) =>
+            data &&
+            (data.favorites ||
+              data.resume_positions ||
+              data.play_counts ||
+              data.last_played_dates ||
+              data.ratings ||
+              data.playlists_created ||
+              data.playlists_existing ||
+              data.playlist_items_added ||
+              data.preferences?.length ||
+              data.avatar),
+        ));
     const mayHaveCredentials =
       !activeJob(job) &&
       job.results?.some((result) => result.created && result.discord_delivery !== 'sent');
@@ -1242,7 +1242,7 @@ function DialogContent({
         }
         description={
           job.migration_scope === 'watched_only'
-            ? 'Watched-only migration. Follow account changes and review delivery results.'
+            ? 'Played-status migration. Follow account changes and review delivery results.'
             : 'Follow account changes and review delivery results.'
         }
         close={close}
@@ -1280,6 +1280,12 @@ function DialogContent({
           </div>
           <Status value={job.status} />
         </div>
+        {historicalMigration && (
+          <Callout icon="info" title="Historical migration">
+            This job used an earlier migration scope. Its recorded results may include personal data
+            that current migrations no longer import.
+          </Callout>
+        )}
         <JobProgressDetails job={job} />
         {job.elapsed_ms !== undefined && (
           <p className="subtle text-small">
@@ -1372,14 +1378,16 @@ function DialogContent({
                     <span>{num(result.data.last_played_dates)} playback dates</span>
                   )}
                   {!!result.data.ratings && <span>{num(result.data.ratings)} ratings / likes</span>}
-                  <span>{num(result.data.playlists_created)} playlists created</span>
+                  {!!result.data.playlists_created && (
+                    <span>{num(result.data.playlists_created)} playlists created</span>
+                  )}
                   {!!result.data.playlists_existing && (
                     <span>{num(result.data.playlists_existing)} playlists already imported</span>
                   )}
                   {!!result.data.playlist_items_added && (
                     <span>{num(result.data.playlist_items_added)} playlist entries</span>
                   )}
-                  {!!result.data.preferences.length && (
+                  {!!result.data.preferences?.length && (
                     <span>{result.data.preferences.length} playback preferences</span>
                   )}
                   {result.data.avatar && <span>Profile image copied</span>}
@@ -1388,9 +1396,10 @@ function DialogContent({
             </div>
             {result.data?.verification && (
               <p className="subtle text-small">
-                Independent history verification: {num(result.data.verification.verified)} verified
-                · {num(result.data.verification.preserved_newer)} newer Jellyfin activity preserved
-                · {num(result.data.verification.missing)} missing ·{' '}
+                Independent {job.migration_scope === 'watched_only' ? 'played-status' : 'history'}{' '}
+                verification: {num(result.data.verification.verified)} verified ·{' '}
+                {num(result.data.verification.preserved_newer)} newer Jellyfin activity preserved ·{' '}
+                {num(result.data.verification.missing)} missing ·{' '}
                 {num(result.data.verification.mismatched)} mismatched ·{' '}
                 {num(result.data.verification.unsupported_fields)} unsupported fields.
               </p>

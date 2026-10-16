@@ -7,17 +7,14 @@ import {
   USER_DATA_FIELDS,
 } from '../server/migration-verification.js';
 
-const before = '2025-01-01T00:00:00.000Z';
-const imported = '2026-01-01T00:00:00.000Z';
-const after = '2026-01-01T00:00:01.000Z';
-const data: MediaUserDataPatch = {
+const personal: MediaUserDataPatch = {
   Played: true,
   IsFavorite: true,
   Likes: false,
+  Rating: 8,
   PlaybackPositionTicks: 40,
   PlayCount: 5,
-  LastPlayedDate: imported,
-  Rating: 8,
+  LastPlayedDate: '2026-01-01T00:00:00Z',
 };
 const item = (
   UserData: MediaUserDataPatch = {},
@@ -31,245 +28,148 @@ const item = (
   ...overrides,
 });
 
-describe('capturing bounded migration expectations', () => {
-  it('preserves all seven existing detailed fields for a no-op match', () => {
-    const expected = captureExpectation(item(data), {});
-    expect(expected.state).toEqual(data);
-    expect(Object.keys(expected.state).sort()).toEqual([...USER_DATA_FIELDS].sort());
-    expect(evaluateExpectation(expected, item(data))).toEqual({
-      status: 'verified',
-      fields: [],
-      unsupported_fields: [],
-    });
-  });
+describe('watched-flag expectations', () => {
+  it.each([undefined, 'watched_only', 'complete'] as const)(
+    'captures only Played even for legacy scope %s',
+    (scope) => {
+      const expected = captureExpectation(item(personal), {}, scope);
+      expect(expected.state).toEqual({ Played: true });
+      expect(USER_DATA_FIELDS).toEqual(['Played']);
+      expect(expected.item.UserData).toBeUndefined();
+    },
+  );
 
-  it('overlays intended fields on the fresh state without retaining labels or DTO data', () => {
+  it('overlays the intended flag and retains matching identity without labels or unrelated DTO data', () => {
     const target = item(
-      { ...data, LastPlayedDate: before },
-      { Name: 'Private label', RunTimeTicks: 1000, Unrelated: { token: 'synthetic-private' } },
+      { ...personal, Played: false },
+      { Name: 'Private label', RunTimeTicks: 1000, Unrelated: { token: 'synthetic-secret' } },
     );
-    const expected = captureExpectation(target, {
-      PlaybackPositionTicks: 60,
-      LastPlayedDate: imported,
-    });
-    expect(expected.state).toEqual({ ...data, PlaybackPositionTicks: 60 });
+    const expected = captureExpectation(target, { Played: true });
+    expect(expected.state).toEqual({ Played: true });
     expect(expected.item).toEqual({
       Id: target.Id,
       Type: target.Type,
       Path: target.Path,
       ProviderIds: target.ProviderIds,
     });
-    expect(JSON.stringify(expected.item)).not.toContain('Private label');
-    expect(JSON.stringify(expected.item)).not.toContain('synthetic-private');
-    target.UserData!.PlaybackPositionTicks = 99;
-    target.ProviderIds!.Tmdb = 'different';
-    expect(expected.state.PlaybackPositionTicks).toBe(60);
-    expect(expected.item.ProviderIds).toEqual({ Tmdb: '123', Imdb: 'tt456' });
+    target.ProviderIds!.Tmdb = 'changed';
+    expect(expected.item.ProviderIds?.Tmdb).toBe('123');
+    expect(JSON.stringify(expected)).not.toContain('Private label');
+    expect(JSON.stringify(expected)).not.toContain('synthetic-secret');
   });
 
-  it('preserves false Likes, zero rating and an intentional cleared resume position', () => {
-    const expected = captureExpectation(item(data), {
-      Likes: false,
+  it('accounts for excluded attempted fields without adopting their values', () => {
+    const expected = captureExpectation(item(personal), {
+      Played: true,
       Rating: 0,
-      PlaybackPositionTicks: 0,
+      LastPlayedDate: 'private-date',
+      UnknownFlag: 'private-value',
+      'bad\nfield': 'private-value',
     });
-    expect(expected.state).toMatchObject({ Likes: false, Rating: 0, PlaybackPositionTicks: 0 });
-    expect(evaluateExpectation(expected, item(expected.state)).status).toBe('verified');
-  });
-
-  it('keeps watched-only verification within the selected migration scope', () => {
-    const expected = captureExpectation(item(data), {}, 'watched_only');
-    expect(expected.state).toEqual({ Played: true, LastPlayedDate: imported });
-    expect(
-      evaluateExpectation(expected, item({ Played: true, LastPlayedDate: imported })).status,
-    ).toBe('verified');
-  });
-
-  it.each([
-    'Series',
-    'Season',
-    'MusicAlbum',
-    'MusicArtist',
-    'Photo',
-    'PhotoAlbum',
-    'BoxSet',
-    'Playlist',
-  ])(
-    'verifies personal favorites and ratings rather than derived container activity for %s',
-    (Type) => {
-      const expected = captureExpectation(item(data, { Type }), {});
-      expect(expected.state).toEqual({ IsFavorite: true, Likes: false, Rating: 8 });
-      expect(
-        evaluateExpectation(expected, item({ IsFavorite: true, Likes: false, Rating: 8 }, { Type }))
-          .status,
-      ).toBe('verified');
-    },
-  );
-
-  it('accounts explicitly for unsupported attempted fields without retaining their values', () => {
-    const expected = captureExpectation(item(data), {
-      UnsupportedFlag: 'private-value',
-      PlayedPercentage: 20,
-    });
-    expect(expected.unsupported_fields).toEqual(['UnsupportedFlag', 'PlayedPercentage']);
-    expect(expected.state).toEqual(data);
-    const result = evaluateExpectation(expected, item(data));
-    expect(result).toEqual({
-      status: 'verified',
-      fields: [],
-      unsupported_fields: ['UnsupportedFlag', 'PlayedPercentage'],
-    });
+    expect(expected.state).toEqual({ Played: true });
+    expect(expected.unsupported_fields).toEqual([
+      'Rating',
+      'LastPlayedDate',
+      'UnknownFlag',
+      '(invalid field name)',
+    ]);
     expect(JSON.stringify(expected)).not.toContain('private-value');
-    expect(JSON.stringify(result)).not.toContain('target-id');
+    expect(JSON.stringify(expected)).not.toContain('private-date');
   });
 
-  it('accounts for attempted out-of-scope or derived fields and sanitizes unknown field names', () => {
-    const expected = captureExpectation(item(data, { Type: 'Series' }), {
-      PlaybackPositionTicks: 10,
-      'bad\nfield': 'private',
-    });
-    expect(expected.unsupported_fields).toEqual(['PlaybackPositionTicks', '(invalid field name)']);
-    expect(expected.state.PlaybackPositionTicks).toBeUndefined();
-    expect(
-      captureExpectation(item(data), { IsFavorite: true }, 'watched_only').unsupported_fields,
-    ).toEqual(['IsFavorite']);
-  });
-
-  it.each([
-    { Played: 'true' },
-    { PlaybackPositionTicks: -1 },
-    { PlaybackPositionTicks: Number.MAX_SAFE_INTEGER + 1 },
-    { PlayCount: 2_147_483_648 },
-    { LastPlayedDate: 'invalid date' },
-    { Rating: 11 },
-  ])('rejects invalid intended state instead of falsely verifying it (%j)', (patch) => {
-    expect(() => captureExpectation(item(), patch as MediaUserDataPatch)).toThrow(ServiceError);
-  });
-
-  it('normalizes equal date representations', () => {
-    const expected = captureExpectation(item(), { LastPlayedDate: '2025-12-31T19:00:00-05:00' });
-    expect(expected.state.LastPlayedDate).toBe(imported);
-    expect(evaluateExpectation(expected, item({ LastPlayedDate: imported })).status).toBe(
-      'verified',
+  it.each(['true', 1, {}, []])('rejects an invalid intended Played value (%j)', (Played) => {
+    expect(() => captureExpectation(item(), { Played } as MediaUserDataPatch)).toThrow(
+      ServiceError,
     );
+  });
+
+  it('rejects oversized verification patches', () => {
+    expect(() =>
+      captureExpectation(
+        item(),
+        Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`Unknown${index}`, true])),
+      ),
+    ).toThrow(ServiceError);
   });
 });
 
-describe('independent history readback', () => {
-  it('catches the equal-date regression when a date applies but its resume position is ignored', () => {
-    const expected = captureExpectation(
-      item({ LastPlayedDate: before, PlaybackPositionTicks: 5 }),
-      {
-        LastPlayedDate: imported,
-        PlaybackPositionTicks: 40,
-      },
-    );
-    expect(
-      evaluateExpectation(expected, item({ LastPlayedDate: imported, PlaybackPositionTicks: 5 })),
-    ).toEqual({
+describe('independent watched-flag readback', () => {
+  it('detects a silently ignored flag after an acknowledged write', () => {
+    const expected = captureExpectation(item({ Played: false }), { Played: true });
+    expect(evaluateExpectation(expected, item({ Played: false }))).toEqual({
       status: 'mismatch',
-      fields: ['PlaybackPositionTicks'],
+      fields: ['Played'],
       unsupported_fields: [],
     });
   });
 
-  it('accepts strictly newer concurrent resume activity without scheduling any repair', () => {
-    const expected = captureExpectation(item(data), {});
-    expect(
-      evaluateExpectation(
-        expected,
-        item({ ...data, LastPlayedDate: after, PlaybackPositionTicks: 1, PlayCount: 6 }),
-      ),
-    ).toEqual({
-      status: 'preserved_newer',
-      fields: [],
-      unsupported_fields: [],
+  it('does not let dates or unrelated state disguise a missing played flag', () => {
+    const expected = captureExpectation(item(personal), {});
+    const observed = item({
+      Played: false,
+      IsFavorite: false,
+      Rating: 0,
+      PlayCount: 99,
+      PlaybackPositionTicks: 1,
+      LastPlayedDate: '2027-01-01T00:00:00Z',
     });
+    expect(evaluateExpectation(expected, observed).status).toBe('mismatch');
   });
 
-  it.each([undefined, null, -1, '40', Number.MAX_SAFE_INTEGER + 1])(
-    'does not treat malformed or absent resume state as a valid concurrent position (%j)',
-    (PlaybackPositionTicks) => {
-      const expected = captureExpectation(item(data), {});
-      expect(
-        evaluateExpectation(
-          expected,
-          item({ ...data, LastPlayedDate: after, PlaybackPositionTicks } as MediaUserDataPatch),
-        ),
-      ).toMatchObject({
-        status: 'mismatch',
-        fields: ['PlaybackPositionTicks'],
-      });
-    },
-  );
-
-  it('does not let a newer date conceal lost flags, lower counts or changed fill-only ratings', () => {
-    const expected = captureExpectation(item(data), {});
-    const result = evaluateExpectation(
-      expected,
-      item({
-        ...data,
-        LastPlayedDate: after,
-        PlaybackPositionTicks: 2,
-        Played: false,
-        IsFavorite: false,
-        PlayCount: 4,
-        Likes: true,
-        Rating: 9,
-      }),
-    );
-    expect(result.status).toBe('mismatch');
-    expect(result.fields).toEqual(['Played', 'IsFavorite', 'Likes', 'PlayCount', 'Rating']);
-  });
-
-  it('accepts additive destination flags and greater counts', () => {
-    const expected = captureExpectation(
-      item({ Played: false, IsFavorite: false, PlayCount: 2 }),
-      {},
-    );
-    expect(
-      evaluateExpectation(expected, item({ Played: true, IsFavorite: true, PlayCount: 4 })),
-    ).toEqual({
+  it('ignores unrelated personal-state changes when the intended flag is correct', () => {
+    const expected = captureExpectation(item(personal), {});
+    expect(evaluateExpectation(expected, item({ Played: true }))).toEqual({
       status: 'verified',
       fields: [],
       unsupported_fields: [],
     });
   });
 
-  it.each([undefined, before, 'invalid'])(
-    'rejects a missing, older or malformed date (%j)',
-    (LastPlayedDate) => {
-      const expected = captureExpectation(item(data), {});
-      expect(evaluateExpectation(expected, item({ ...data, LastPlayedDate }))).toMatchObject({
+  it('preserves a watched flag already present in Jellyfin', () => {
+    const expected = captureExpectation(item({ Played: false }), {});
+    expect(evaluateExpectation(expected, item({ Played: true })).status).toBe('verified');
+  });
+
+  it.each([undefined, null, 'false', 0])(
+    'cannot verify an expected false flag from absent or malformed state (%j)',
+    (Played) => {
+      const expected = captureExpectation(item({ Played: false }), {});
+      expect(evaluateExpectation(expected, item({ Played } as MediaUserDataPatch))).toMatchObject({
         status: 'mismatch',
-        fields: ['LastPlayedDate'],
+        fields: ['Played'],
       });
     },
   );
 
-  it('counts missing items and missing state rather than assuming defaults', () => {
-    const expected = captureExpectation(item(data), {});
-    expect(evaluateExpectation(expected).status).toBe('missing');
-    expect(evaluateExpectation(expected, { ...item(data), UserData: undefined }).status).toBe(
+  it('reports missing items and missing state instead of supplying default flags', () => {
+    const expected = captureExpectation(item(personal), {});
+    expect(evaluateExpectation(expected, { ...item(personal), UserData: undefined }).status).toBe(
       'missing',
     );
-    expect(evaluateExpectation(expected, item({}))).toMatchObject({
+    expect(evaluateExpectation(expected).status).toBe('missing');
+  });
+
+  it('still checks an unsupported played update and reports its capability loss explicitly', () => {
+    const expected = captureExpectation(item({ Played: false }), { Played: true });
+    expected.unsupported_fields = ['Played', 'Played'];
+    expect(evaluateExpectation(expected, item({ Played: false }))).toEqual({
       status: 'mismatch',
-      fields: [...USER_DATA_FIELDS],
+      fields: ['Played'],
+      unsupported_fields: ['Played'],
     });
   });
 
   it.each([
-    { Id: 'another-id' },
+    { Id: 'different' },
     { Type: 'Episode' },
-    { Path: '/synthetic/another.mkv' },
-    { ProviderIds: { Tmdb: '999' } },
-    { SeriesId: 'another-series' },
-    { IndexNumber: 2 },
     { Type: undefined },
-  ])('rejects a wrong or malformed identity even when state matches (%j)', (overrides) => {
-    const expected = captureExpectation(item(data), {});
-    expect(evaluateExpectation(expected, item(data, overrides))).toEqual({
+    { Path: '/different.mkv' },
+    { ProviderIds: { Tmdb: '999' } },
+    { SeriesId: 'different-series' },
+    { IndexNumber: 2 },
+  ])('rejects changed or malformed matching identity (%j)', (overrides) => {
+    const expected = captureExpectation(item(personal), {});
+    expect(evaluateExpectation(expected, item({ Played: true }, overrides))).toEqual({
       status: 'mismatch',
       fields: [],
       unsupported_fields: [],
@@ -277,96 +177,16 @@ describe('independent history readback', () => {
     });
   });
 
-  it('normalizes provider order and numeric identifiers without confusing identity with labels', () => {
-    const expected = captureExpectation(item(data), {});
-    const observed = item(data, {
-      Name: 'Changed label',
-      ProviderIds: { Imdb: 'tt456', Tmdb: 123 },
-    });
-    expect(evaluateExpectation(expected, observed).status).toBe('verified');
-  });
-
-  it('supports one target read with every expectation retained for sequential source editions', () => {
-    const ledger = new Map<string, ReturnType<typeof captureExpectation>[]>();
-    const initial = item({ LastPlayedDate: before, PlaybackPositionTicks: 1 });
-    ledger.set(initial.Id, [
-      captureExpectation(initial, {
-        Played: true,
-        PlayCount: 2,
-        LastPlayedDate: imported,
-        PlaybackPositionTicks: 40,
-      }),
-    ]);
-    const afterFirst = item(ledger.get(initial.Id)![0]!.state);
-    ledger
-      .get(initial.Id)!
-      .push(captureExpectation(afterFirst, { IsFavorite: true, PlayCount: 5 }));
-    expect(ledger.size).toBe(1);
-    const final = ledger.get(initial.Id)!.at(-1)!;
-    expect(final.state).toEqual({
-      Played: true,
-      IsFavorite: true,
-      PlayCount: 5,
-      LastPlayedDate: imported,
-      PlaybackPositionTicks: 40,
-    });
-    const observed = item(final.state);
+  it('normalizes provider order/numeric IDs and ignores review labels', () => {
+    const expected = captureExpectation(item(personal), {});
     expect(
-      ledger.get(initial.Id)!.map((expected) => evaluateExpectation(expected, observed).status),
-    ).toEqual(['verified', 'verified']);
-  });
-
-  it('does not lose an ignored resume write when a later source edition only changes favorites', () => {
-    const first = captureExpectation(item({ LastPlayedDate: before, PlaybackPositionTicks: 1 }), {
-      LastPlayedDate: imported,
-      PlaybackPositionTicks: 40,
-    });
-    const freshAfterIgnoredResume = item({ LastPlayedDate: imported, PlaybackPositionTicks: 1 });
-    const second = captureExpectation(freshAfterIgnoredResume, { IsFavorite: true });
-    const final = item({ ...freshAfterIgnoredResume.UserData, IsFavorite: true });
-    expect(evaluateExpectation(second, final).status).toBe('verified');
-    expect(evaluateExpectation(first, final)).toMatchObject({
-      status: 'mismatch',
-      fields: ['PlaybackPositionTicks'],
-    });
-  });
-
-  it('requires a comparable prior date before accepting a different resume as newer activity', () => {
-    const expected = captureExpectation(item({ PlaybackPositionTicks: 1 }), {
-      PlaybackPositionTicks: 40,
-    });
-    expect(
-      evaluateExpectation(expected, item({ LastPlayedDate: after, PlaybackPositionTicks: 2 })),
-    ).toMatchObject({
-      status: 'mismatch',
-      fields: ['PlaybackPositionTicks'],
-    });
-  });
-
-  it('reports known capability losses separately and never calls unsupported fields verified', () => {
-    const expected = captureExpectation(item(data), {});
-    expected.unsupported_fields = ['Rating', 'Likes', 'Rating'];
-    expect(
-      evaluateExpectation(expected, item({ ...data, Rating: undefined, Likes: undefined })),
-    ).toEqual({
-      status: 'verified',
-      fields: [],
-      unsupported_fields: ['Rating', 'Likes'],
-    });
+      evaluateExpectation(
+        expected,
+        item(
+          { Played: true },
+          { Name: 'Changed label', ProviderIds: { Imdb: 'tt456', Tmdb: 123 } },
+        ),
+      ).status,
+    ).toBe('verified');
   });
 });
-
-it.each(['Played', 'IsFavorite'] as const)(
-  'never verifies an expected false %s flag from a missing or malformed readback',
-  (field) => {
-    const expected = captureExpectation(item({ [field]: false }), {});
-    for (const value of [undefined, 'false', 0, null]) {
-      const observed = item({ [field]: value } as unknown as MediaUserDataPatch);
-      expect(evaluateExpectation(expected, observed)).toMatchObject({
-        status: 'mismatch',
-        fields: [field],
-      });
-    }
-    expect(evaluateExpectation(expected, item({ [field]: true })).status).toBe('verified');
-  },
-);

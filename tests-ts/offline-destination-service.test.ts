@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DemoServers } from '../server/demo.js';
 import { ServiceError } from '../server/errors.js';
 import type { DestinationCatalogMetadata } from '../server/destination-catalog-files.js';
-import type { MediaItem, MediaUserDataPatch } from '../server/media.js';
+import type { MediaItem } from '../server/media.js';
 import { Service, type Job } from '../server/service.js';
 import { DEFAULT_SETTINGS, Store } from '../server/store.js';
 
@@ -97,7 +97,7 @@ describe('saved Jellyfin catalog service integration and independent readback', 
       {
         ...servers.media[1]!,
         Id: 'source-episode',
-        UserData: { Played: false, LastPlayedDate: sourceDate, PlaybackPositionTicks: 50_000_000 },
+        UserData: { Played: true, LastPlayedDate: sourceDate, PlaybackPositionTicks: 50_000_000 },
       },
     ];
     if (options.duplicateEdition)
@@ -279,7 +279,7 @@ describe('saved Jellyfin catalog service integration and independent readback', 
     };
   }
 
-  it('uses the pinned offline candidate index and verifies applied watch and resume data independently', async () => {
+  it('uses the pinned offline candidate index and independently verifies only played flags', async () => {
     const fixture = setup();
     const untouched = structuredClone(servers.userData[targetId]!.unrelated);
     const job = await finish(await fixture.migrate());
@@ -298,34 +298,23 @@ describe('saved Jellyfin catalog service integration and independent readback', 
     expect(fixture.savedCandidates).toHaveBeenCalledTimes(1);
     expect(fixture.savedCandidates.mock.calls[0]![0]).toBe(catalogId);
     expect(fixture.destinationReads).toHaveBeenCalledTimes(2);
-    expect(fixture.freshReads).toHaveBeenCalledTimes(2);
-    expect(servers.userData[targetId]!['1']).toMatchObject({
-      Played: true,
-      PlayCount: 3,
-      IsFavorite: true,
-      LastPlayedDate: sourceDate,
-      PlaybackPositionTicks: 30_000_000,
-    });
-    expect(
-      await servers.factory('http://jellyfin', 'synthetic', 'jellyfin').userData!(targetId, '2'),
-    ).toMatchObject({
-      Played: false,
-      LastPlayedDate: sourceDate,
-      PlaybackPositionTicks: 50_000_000,
-    });
+    expect(fixture.freshReads).not.toHaveBeenCalled();
+    expect(fixture.writes.mock.calls.map(([, , patch]) => patch)).toEqual([
+      { Played: true },
+      { Played: true },
+    ]);
+    expect(servers.userData[targetId]!['1']).toEqual({ Played: true });
+    expect(servers.userData[targetId]!['2']).toEqual({ Played: true });
     expect(servers.userData[targetId]!.unrelated).toEqual(untouched);
   });
 
-  it('preserves activity added immediately before writing and still verifies the preserved result', async () => {
+  it('preserves activity observed in the access-scoped batch and verifies the unchanged result', async () => {
     const fixture = setup();
-    fixture.behavior.beforeFreshRead = (itemId) => {
-      if (itemId === '1')
-        servers.userData[targetId]!['1'] = {
-          Played: true,
-          PlayCount: 9,
-          LastPlayedDate: newerDate,
-          PlaybackPositionTicks: 70_000_000,
-        };
+    servers.userData[targetId]!['1'] = {
+      Played: true,
+      PlayCount: 9,
+      LastPlayedDate: newerDate,
+      PlaybackPositionTicks: 70_000_000,
     };
     const job = await finish(await fixture.migrate());
     expect(job.results[0]?.status).toBe('completed');
@@ -334,22 +323,19 @@ describe('saved Jellyfin catalog service integration and independent readback', 
       PlayCount: 9,
       LastPlayedDate: newerDate,
       PlaybackPositionTicks: 70_000_000,
-      IsFavorite: true,
     });
-    expect(fixture.writes.mock.calls.find(([, id]) => id === '1')?.[2]).toEqual({
-      IsFavorite: true,
-    });
+    expect(fixture.writes.mock.calls.some(([, id]) => id === '1')).toBe(false);
   });
 
-  it('does not treat a successful date write as proof that an ignored resume position was applied', async () => {
+  it('does not treat an accepted write as proof that ignored played flags were applied', async () => {
     const fixture = setup();
-    fixture.behavior.ignoredFields.add('PlaybackPositionTicks');
+    fixture.behavior.ignoredFields.add('Played');
     const job = await finish(await fixture.migrate());
     expect(job.results[0]).toMatchObject({
       status: 'partial',
       data: { verification: { checked: 2, mismatched: 2, verified: 0 } },
     });
-    expect(servers.userData[targetId]!['1']?.LastPlayedDate).toBe(sourceDate);
+    expect(servers.userData[targetId]!['1']?.LastPlayedDate).toBeUndefined();
     expect(servers.userData[targetId]!['1']?.PlaybackPositionTicks).toBeUndefined();
     expect(job.results[0]?.data?.warnings.join(' ')).toContain('Independent Jellyfin readback');
   });
@@ -380,21 +366,18 @@ describe('saved Jellyfin catalog service integration and independent readback', 
     );
   });
 
-  it('retains every pre-write expectation when several source editions resolve to one target', async () => {
+  it('verifies shared played expectations without importing edition counts or dates', async () => {
     const fixture = setup({ duplicateEdition: true });
-    fixture.behavior.ignoredFields.add('PlayCount');
-    fixture.behavior.afterWrite = (id) => {
-      if (id === '1') fixture.behavior.ignoredFields.delete('PlayCount');
-    };
     const job = await finish(await fixture.migrate());
-    expect(
-      (await servers.factory('http://jellyfin', 'synthetic', 'jellyfin').userData!(targetId, '1'))
-        .PlayCount,
-    ).toBe(1);
+    expect(servers.userData[targetId]!['1']?.PlayCount).toBeUndefined();
+    expect(fixture.writes.mock.calls.map(([, , patch]) => patch)).toEqual([
+      { Played: true },
+      { Played: true },
+    ]);
     expect(job.results[0]).toMatchObject({
-      status: 'partial',
+      status: 'completed',
       matched: 3,
-      data: { verification: { checked: 2, verified: 1, mismatched: 1 } },
+      data: { verification: { checked: 2, verified: 2, mismatched: 0 } },
     });
   });
 
@@ -412,19 +395,20 @@ describe('saved Jellyfin catalog service integration and independent readback', 
     expect(servers.userData[targetId]!['2']).toBeUndefined();
   });
 
-  it('reports unsupported detailed fields on a limited client and verifies a later complete retry', async () => {
+  it('refuses legacy marking endpoints with side effects and verifies a modern played-only retry', async () => {
     const fixture = setup();
     fixture.behavior.legacy = true;
     const limited = await finish(await fixture.migrate());
     expect(limited.results[0]?.status).toBe('partial');
-    expect(limited.results[0]?.data?.verification?.unsupported_fields).toBeGreaterThan(0);
+    expect(fixture.writes).not.toHaveBeenCalled();
+    expect(limited.results[0]?.data?.failed_items).toBeGreaterThan(0);
     fixture.behavior.legacy = false;
     const retry = await finish(await fixture.migrate());
     expect(retry.results[0]).toMatchObject({
       status: 'completed',
       data: { verification: { checked: 2, verified: 2, unsupported_fields: 0 } },
     });
-    expect(servers.userData[targetId]!['2']?.PlaybackPositionTicks).toBe(50_000_000);
+    expect(servers.userData[targetId]!['2']).toEqual({ Played: true });
   });
 
   it('verifies a repeat migration with zero repeated writes', async () => {

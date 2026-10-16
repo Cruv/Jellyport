@@ -208,7 +208,7 @@ describe('React account safeguards', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
     const choice = await screen.findByLabelText('Use saved Emby snapshot');
     await waitFor(() => expect(choice).toHaveProperty('checked', true));
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     await screen.findByText(
       'No completed database capture is available. Import an Emby backup first.',
@@ -850,7 +850,7 @@ describe('React account safeguards', () => {
       within(screen.getByRole('navigation')).getByRole('button', { name: 'Migrate users' }),
     );
     await screen.findByRole('checkbox', { name: 'Select all visible Emby users' });
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByText('Merge into existing account')).toBeTruthy();
@@ -869,11 +869,11 @@ describe('React account safeguards', () => {
     const request = requests.find((value) => value.path === '/api/migrations')!;
     expect(JSON.parse(String(request.options?.body))).toEqual({
       source_user_ids: ['e-alex', 'e-river'],
-      migration_scope: 'complete',
+      migration_scope: 'watched_only',
       discord_recipients: { 'e-river': '123456789012345678' },
     });
   });
-  it('shows deferred live history without invented zero counts and retains complete migration approval', async () => {
+  it('shows deferred played flags without invented zero counts and narrows legacy approval', async () => {
     prepareRunningPreview();
     responses['/api/migrations/preview'] = {
       ...readyPreviewTask,
@@ -901,11 +901,11 @@ describe('React account safeguards', () => {
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getAllByText('History details deferred')).toHaveLength(2);
     expect(
-      within(dialog).getAllByText(
-        /Matching, history, favorites, resume positions and playlist details are read after approval/,
-      ),
+      within(dialog).getAllByText(/Matching and played flags are read after approval/),
     ).toHaveLength(2);
-    expect(within(dialog).getByText(/Newer Jellyfin progress stays intact/)).toBeTruthy();
+    expect(
+      within(dialog).getByText(/Existing Jellyfin personal state stays unchanged/),
+    ).toBeTruthy();
     expect(within(dialog).queryByText('Played in Emby')).toBeNull();
     expect(within(dialog).queryByText('Matched to Jellyfin')).toBeNull();
     expect(within(dialog).queryByText('Unmatched')).toBeNull();
@@ -918,7 +918,7 @@ describe('React account safeguards', () => {
       JSON.parse(
         String(requests.find((request) => request.path === '/api/migrations')!.options?.body),
       ).migration_scope,
-    ).toBe('complete');
+    ).toBe('watched_only');
   });
 
   it('polls preview progress and only offers migration approval after the preview is ready', async () => {
@@ -937,15 +937,15 @@ describe('React account safeguards', () => {
         ),
       ),
     ).not.toHaveProperty('use_snapshots');
-    expect(screen.getByLabelText('Migration data')).toHaveProperty('value', 'complete');
-    expect(screen.getByLabelText('Migration data')).toHaveProperty('disabled', true);
+    expect(screen.queryByLabelText('Migration data')).toBeNull();
+    expect(screen.queryByRole('option', { name: 'Complete migration' })).toBeNull();
     expect(
       JSON.parse(
         String(
           requests.find((request) => request.path === '/api/migrations/preview')?.options?.body,
         ),
       ).migration_scope,
-    ).toBe('complete');
+    ).toBe('watched_only');
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.getByRole('button', { name: 'Preparing review…' })).toHaveProperty(
       'disabled',
@@ -991,7 +991,7 @@ describe('React account safeguards', () => {
     expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
   });
 
-  it('reviews watched-only data and submits the preview scope even if the page selection changes', async () => {
+  it('reviews played flags without a scope picker and excludes legacy personal-data counts', async () => {
     prepareRunningPreview();
     responses['/api/migrations/preview'] = {
       ...readyPreviewTask,
@@ -1013,13 +1013,11 @@ describe('React account safeguards', () => {
     responses['/api/migrations'] = { ...job, kind: 'migrate', migration_scope: 'watched_only' };
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
-    fireEvent.change(await screen.findByLabelText('Migration data'), {
-      target: { value: 'watched_only' },
-    });
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    expect(screen.queryByLabelText('Migration data')).toBeNull();
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText('2 users selected · watched-only')).toBeTruthy();
+    expect(within(dialog).getByText('2 users selected · played status only')).toBeTruthy();
     expect(
       within(dialog).getByText(/New accounts still use your account role or template defaults/),
     ).toBeTruthy();
@@ -1032,7 +1030,6 @@ describe('React account safeguards', () => {
       source_user_ids: ['e-alex', 'e-river'],
       migration_scope: 'watched_only',
     });
-    fireEvent.change(screen.getByLabelText('Migration data'), { target: { value: 'complete' } });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
     await waitFor(() =>
       expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
@@ -1045,30 +1042,36 @@ describe('React account safeguards', () => {
     });
   });
 
-  it('treats a legacy preview without an echoed scope as complete instead of claiming watched-only behavior', async () => {
-    prepareRunningPreview();
-    responses['/api/migrations/preview'] = readyPreviewTask;
-    responses['/api/migrations'] = { ...job, kind: 'migrate' };
-    render(<App />);
-    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
-    fireEvent.change(await screen.findByLabelText('Migration data'), {
-      target: { value: 'watched_only' },
-    });
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
-    const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText('2 users selected · complete migration')).toBeTruthy();
-    expect(within(dialog).getAllByText('Favorites in Emby')).toHaveLength(2);
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
-    await waitFor(() =>
-      expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
-    );
-    expect(
-      JSON.parse(
-        String(requests.find((request) => request.path === '/api/migrations')?.options?.body),
-      ).migration_scope,
-    ).toBe('complete');
-  });
+  it.each([undefined, 'complete'] as const)(
+    'narrows a legacy preview with scope %s to explicit played-status approval',
+    async (legacyScope) => {
+      prepareRunningPreview();
+      responses['/api/migrations/preview'] = {
+        ...readyPreviewTask,
+        preview: { ...readyPreviewTask.preview, migration_scope: legacyScope },
+      };
+      responses['/api/migrations'] = { ...job, kind: 'migrate' };
+      render(<App />);
+      fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+      expect(screen.queryByLabelText('Migration data')).toBeNull();
+      fireEvent.click(
+        await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+      const dialog = await screen.findByRole('dialog');
+      expect(within(dialog).getByText('2 users selected · played status only')).toBeTruthy();
+      expect(within(dialog).queryByText('Favorites in Emby')).toBeNull();
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
+      await waitFor(() =>
+        expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
+      );
+      expect(
+        JSON.parse(
+          String(requests.find((request) => request.path === '/api/migrations')?.options?.body),
+        ).migration_scope,
+      ).toBe('watched_only');
+    },
+  );
 
   it('pins approved saved source generations independently of a later source selection change', async () => {
     prepareRunningPreview();
@@ -1092,7 +1095,7 @@ describe('React account safeguards', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
     fireEvent.click(await screen.findByLabelText('Use saved Emby snapshot'));
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByText('Saved Emby data selected.')).toBeTruthy();
@@ -1123,7 +1126,7 @@ describe('React account safeguards', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
     fireEvent.click(await screen.findByLabelText('Use saved Emby snapshot'));
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     await screen.findByText(
       'The saved snapshot preview is incomplete. Refresh saved snapshots in Settings or choose live Emby reads.',
@@ -1144,7 +1147,7 @@ describe('React account safeguards', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
     fireEvent.click(await screen.findByLabelText('Use saved Emby snapshot'));
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     await screen.findByText('Saved Emby snapshot expired. Capture again or choose live reads.');
     expect(requests.filter((request) => request.path === '/api/migrations/preview')).toHaveLength(
@@ -1406,9 +1409,9 @@ describe('React account safeguards', () => {
       within(dialog).getByText('Mapped Emby account: Mr. Complex ! → Jellyfin: simple'),
     ).toBeTruthy();
     expect(within(dialog).getByText('Some source playlists could not be read.')).toBeTruthy();
-    expect(within(dialog).getByText('Favorites in Emby')).toBeTruthy();
-    expect(within(dialog).getByText('Resume positions')).toBeTruthy();
-    expect(within(dialog).getByText('Playlists')).toBeTruthy();
+    expect(within(dialog).queryByText('Favorites in Emby')).toBeNull();
+    expect(within(dialog).queryByText('Resume positions')).toBeNull();
+    expect(within(dialog).queryByText('Playlists')).toBeNull();
     const recipient = dialog.querySelector('input[name="complex"]') as HTMLInputElement;
     expect(recipient.value).toBe('123456789012345678');
     expect(within(dialog).getByText('@discord.original')).toBeTruthy();
@@ -1429,7 +1432,7 @@ describe('React account safeguards', () => {
       ),
     ).toEqual({
       source_user_ids: ['complex'],
-      migration_scope: 'complete',
+      migration_scope: 'watched_only',
       discord_recipients: { complex: '123456789012345678' },
       mapping_revisions: { complex: 'approved-revision' },
     });
@@ -1491,48 +1494,102 @@ describe('React account safeguards', () => {
     expect(within(dialog).getByText('In progress')).toBeTruthy();
   });
 
-  it('reports detailed migration results and escapes source names and warnings', async () => {
+  it.each([undefined, 'complete', 'watched_only'] as const)(
+    'preserves historical broad migration results with scope %s and escapes source names and warnings',
+    async (scope) => {
+      responses['/api/jobs/job-1'] = {
+        ...job,
+        kind: 'migrate',
+        migration_scope: scope,
+        status: 'partial',
+        results: [
+          {
+            username: 'simple',
+            source_username: '<script>source()</script>',
+            status: 'partial',
+            data: {
+              items_updated: 4,
+              favorites: 2,
+              resume_positions: 1,
+              play_counts: 3,
+              last_played_dates: 2,
+              ratings: 1,
+              preferences: ['SubtitleMode'],
+              avatar: true,
+              playlists_created: 1,
+              playlists_existing: 2,
+              playlist_items_added: 3,
+              playlist_items_skipped: 1,
+              playlist_duplicates_skipped: 0,
+              failed_items: 0,
+              history_dates_missing: 0,
+              warnings: ['<img src=x onerror=unsafe()>'],
+            },
+          },
+        ],
+      };
+      const dialog = await openJob();
+      expect(within(dialog).getByText('Historical migration')).toBeTruthy();
+      expect(within(dialog).getByText('4 items updated')).toBeTruthy();
+      expect(within(dialog).getByText('2 favorites')).toBeTruthy();
+      expect(within(dialog).getByText('1 resume positions')).toBeTruthy();
+      expect(within(dialog).getByText('1 playlists created')).toBeTruthy();
+      expect(within(dialog).getByText('Profile image copied')).toBeTruthy();
+      expect(
+        within(dialog).getByText('Emby: <script>source()</script> → Jellyfin: simple'),
+      ).toBeTruthy();
+      expect(within(dialog).getByText('<img src=x onerror=unsafe()>')).toBeTruthy();
+      expect(dialog.querySelector('script,img')).toBeNull();
+    },
+  );
+  it('shows played-status verification without suggesting unsupported data was migrated', async () => {
     responses['/api/jobs/job-1'] = {
       ...job,
       kind: 'migrate',
-      status: 'partial',
+      migration_scope: 'watched_only',
       results: [
         {
-          username: 'simple',
-          source_username: '<script>source()</script>',
-          status: 'partial',
+          username: 'alex',
+          status: 'migrated',
+          applied: 4,
           data: {
             items_updated: 4,
-            favorites: 2,
-            resume_positions: 1,
-            play_counts: 3,
-            last_played_dates: 2,
-            ratings: 1,
-            preferences: ['SubtitleMode'],
-            avatar: true,
-            playlists_created: 1,
-            playlists_existing: 2,
-            playlist_items_added: 3,
-            playlist_items_skipped: 1,
+            favorites: 0,
+            resume_positions: 0,
+            play_counts: 0,
+            last_played_dates: 0,
+            ratings: 0,
+            preferences: [],
+            avatar: false,
+            playlists_created: 0,
+            playlists_existing: 0,
+            playlist_items_added: 0,
+            playlist_items_skipped: 0,
             playlist_duplicates_skipped: 0,
             failed_items: 0,
             history_dates_missing: 0,
-            warnings: ['<img src=x onerror=unsafe()>'],
+            warnings: [],
+            verification: {
+              checked: 4,
+              verified: 4,
+              preserved_newer: 0,
+              missing: 0,
+              mismatched: 0,
+              unsupported_fields: 0,
+            },
           },
         },
       ],
     };
     const dialog = await openJob();
-    expect(within(dialog).getByText('4 items updated')).toBeTruthy();
-    expect(within(dialog).getByText('2 favorites')).toBeTruthy();
-    expect(within(dialog).getByText('1 resume positions')).toBeTruthy();
-    expect(within(dialog).getByText('1 playlists created')).toBeTruthy();
-    expect(within(dialog).getByText('Profile image copied')).toBeTruthy();
+    expect(within(dialog).getByText('4 played updates')).toBeTruthy();
     expect(
-      within(dialog).getByText('Emby: <script>source()</script> → Jellyfin: simple'),
+      within(dialog).getByText(/Independent played-status verification: 4 verified/),
     ).toBeTruthy();
-    expect(within(dialog).getByText('<img src=x onerror=unsafe()>')).toBeTruthy();
-    expect(dialog.querySelector('script,img')).toBeNull();
+    expect(within(dialog).queryByText('Historical migration')).toBeNull();
+    expect(within(dialog).queryByText(/playlists created/)).toBeNull();
+    expect(within(dialog).queryByText(/resume positions/)).toBeNull();
+    expect(within(dialog).queryByText(/favorites/)).toBeNull();
   });
   it('closes mobile navigation when moving to a page and dismisses private dialogs with Escape', async () => {
     const dialog = await openJob();

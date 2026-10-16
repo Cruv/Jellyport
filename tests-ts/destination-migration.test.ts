@@ -83,7 +83,7 @@ describe('destination catalog reuse and bounded user history', () => {
     for (const id of targetIds)
       servers.userData[id] = {
         '1': {
-          Played: true,
+          Played: false,
           PlayCount: 9,
           LastPlayedDate: destinationDate,
           PlaybackPositionTicks: 40_000_000,
@@ -218,6 +218,7 @@ describe('destination catalog reuse and bounded user history', () => {
       );
     return {
       sourceIds,
+      sourceItems,
       targetIds,
       pinned,
       migrate,
@@ -259,7 +260,7 @@ describe('destination catalog reuse and bounded user history', () => {
     expect(store.jobs()).toEqual([]);
   });
 
-  it('shares one catalog for 100 users and fetches only relevant history and unplayed playlist IDs', async () => {
+  it('shares one catalog for 100 users and fetches only played history candidates', async () => {
     const fixture = setup(100, 1000);
     const job = await finish(await fixture.migrate());
     expect(job.status).toBe('completed');
@@ -269,18 +270,15 @@ describe('destination catalog reuse and bounded user history', () => {
     expect(fixture.items).toHaveBeenCalledTimes(100);
     expect(fixture.fullUserCatalog).not.toHaveBeenCalled();
     expect(fixture.sourceCatalog).not.toHaveBeenCalled();
-    for (const [index, [id, candidates]] of fixture.destination.mock.calls.entries()) {
+    for (const [id, candidates] of fixture.destination.mock.calls) {
       expect(fixture.targetIds).toContain(id);
-      expect(candidates.map((item) => item.Id).sort()).toEqual(
-        index % 2 === 0 ? ['1', '2', '3'] : ['1', '3'],
-      );
+      expect(candidates.map((item) => item.Id).sort()).toEqual(['1']);
       expect(candidates.every((item) => !Object.hasOwn(item, 'UserData'))).toBe(true);
     }
     for (const targetId of fixture.targetIds) {
       expect(servers.userData[targetId]?.['1']).toEqual({
         Played: true,
         PlayCount: 9,
-        IsFavorite: true,
         LastPlayedDate: destinationDate,
         PlaybackPositionTicks: 40_000_000,
       });
@@ -295,7 +293,7 @@ describe('destination catalog reuse and bounded user history', () => {
         IsFavorite: true,
         LastPlayedDate: destinationDate,
       });
-      expect(servers.playlists[targetId]?.[0]?.items).toEqual(['2', '2']);
+      expect(servers.playlists[targetId]).toBeUndefined();
     }
     expect(fixture.writes).toHaveBeenCalledTimes(100);
     expect(fixture.writes.mock.calls.every((call) => call[1] === '1')).toBe(true);
@@ -311,7 +309,7 @@ describe('destination catalog reuse and bounded user history', () => {
     expect((await finish(await fixture.migrate())).status).toBe('completed');
     expect(fixture.catalog).toHaveBeenCalledTimes(2);
     expect(fixture.destination).toHaveBeenCalledTimes(6);
-    expect(servers.playlists[fixture.targetIds[0]!]).toHaveLength(1);
+    expect(servers.playlists[fixture.targetIds[0]!]).toBeUndefined();
   });
 
   it('checkpoints catalog progress at a bounded rate and clears it between accounts', async () => {
@@ -364,13 +362,14 @@ describe('destination catalog reuse and bounded user history', () => {
     }
   });
 
-  it('rechecks fresh activity before writing when the candidate read has older user state', async () => {
+  it('preserves newer activity with an isolated played patch even when batch flags are stale', async () => {
     const fixture = setup(1);
+    servers.userData['target-0']!['1']!.Played = true;
     fixture.destination.mockImplementationOnce(async (_id, candidates) =>
       candidates.map((item) => ({ ...item, UserData: { Played: false } })),
     );
     expect((await finish(await fixture.migrate())).status).toBe('completed');
-    expect(fixture.writes.mock.calls).toEqual([['target-0', '1', { IsFavorite: true }]]);
+    expect(fixture.writes.mock.calls).toEqual([['target-0', '1', { Played: true }]]);
     expect(servers.userData['target-0']?.['1']).toMatchObject({
       PlayCount: 9,
       LastPlayedDate: destinationDate,
@@ -421,6 +420,7 @@ describe('destination catalog reuse and bounded user history', () => {
       };
       servers.media.push({ Id: 'series-3', Type: 'Series', ProviderIds: { Tvdb: '42' } });
       const fixture = setup(2);
+      fixture.sourceItems[1]!.UserData!.Played = true;
       const read = fixture.destination.getMockImplementation()!;
       fixture.destination.mockImplementationOnce(async (id, candidates) => {
         const returned = await read(id, candidates);

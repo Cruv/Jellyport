@@ -62,24 +62,28 @@ Backup creation itself still consumes Emby resources; it was not load-tested her
 
 ## History fields and limitations
 
-The verified database layout provides watched flags, play counts, latest playback
-dates, favorites, resume ticks, ratings and matching metadata (provider IDs,
-series/episode numbering and paths). Supported upgraded column declarations and
-composite unique indexes are validated without arbitrary schema coercion.
-Negative resume values are omitted with a warning, preserving other valid state;
-they are not changed to zero. Invalid display names are omitted and reported while
-identity metadata remains unchanged. Unsupported item types and orphan state with
-no current catalog identity are reported by aggregate count rather than aborting
-all valid history or guessing a target. Deleted media cannot be reliably matched
-from a bare user-data key. Collection IDs named `Tmdb` and `TmdbCollection` are
-normalized only within the collection type, preserving contradictory-ID checks.
+The verified database layout includes played flags and matching metadata (provider
+IDs, series/episode numbering and paths). It can also contain counts, dates,
+favorites, resume ticks and ratings. Jellyport migrates **played flags only**; those
+other fields are not transferred. Existing broader encrypted projections remain
+readable for compatibility. Mid-episode and mid-movie positions are not supported.
+An unplayed source never clears a Jellyfin played flag or any unrelated personal
+state.
 
-This is a history import, not a full server restore. **Complete** migrations still
-read account preferences, supported profile images and playlist definitions/entries
-through the Emby API; destination access and Jellyfin activity remain live. The
-backup also includes playlists, but offline playlist extraction is not implemented.
-Plugin-owned reporting databases, credentials and full playback-event ledgers are
-outside this adapter. See [migration capabilities](migration-capabilities.md).
+Supported upgraded column declarations and composite unique indexes are validated
+without arbitrary schema coercion. Invalid display names are omitted and reported
+while identity metadata remains unchanged. Unsupported item types and orphan state
+with no current catalog identity produce aggregate diagnostics instead of guessing
+a target. Deleted media cannot be reliably matched from a bare user-data key.
+Collection IDs named `Tmdb` and `TmdbCollection` are normalized only within the
+collection type, preserving contradictory-ID checks.
+
+This is a played-state import, not a full server restore. Current source identity,
+destination access and Jellyfin activity remain live. Emby preferences, images and
+playlists are not read or transferred. Plugin-owned reporting databases, credentials
+and full playback-event ledgers are outside this adapter. New-account defaults
+still come from the configured Jellyfin role/template. See
+[migration capabilities](migration-capabilities.md).
 
 Local simulations use private backup copies and fake destination clients. Only
 synthetic regression fixtures enter the repository; no backup, account identity,

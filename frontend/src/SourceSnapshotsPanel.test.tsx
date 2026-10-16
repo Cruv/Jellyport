@@ -212,7 +212,7 @@ describe('Saved Emby database capture settings', () => {
     expect(screen.getByText(/no filesystem snapshot or downtime is needed/)).toBeTruthy();
     expect(screen.queryByText(/consistent SQLite online backup is captured/)).toBeNull();
     const row = screen.getByText('File copy').closest('tr')!;
-    expect(within(row).getByText('Complete migration data')).toBeTruthy();
+    expect(within(row).getByText('Complete database capture')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Capture database now' })).toHaveProperty(
       'disabled',
       false,
@@ -249,7 +249,7 @@ describe('Saved Emby database capture settings', () => {
     await screen.findByText('All Emby users');
     expect(screen.getByText('SQLite online backup')).toBeTruthy();
     expect(screen.getByText(/consistent SQLite online backup is captured/)).toBeTruthy();
-    expect(screen.getByText('Complete data')).toBeTruthy();
+    expect(screen.getByText('Complete database capture')).toBeTruthy();
     expect(screen.queryByText('File copies use best-effort history.')).toBeNull();
     expect(screen.queryByText('Scheduled file copy')).toBeNull();
     expect(screen.getByRole('button', { name: 'Capture database now' })).toHaveProperty(
@@ -306,7 +306,7 @@ describe('Saved Emby database capture settings', () => {
     expect(screen.getByLabelText('Enable daily database capture')).toHaveProperty('checked', false);
     expect(screen.getByLabelText('Time zone')).toHaveProperty('value', 'UTC');
     expect(
-      screen.getByText(/Database captures support both complete and watched-only migrations/),
+      screen.getByText(/Migrations use only played flags from the captured database/),
     ).toBeTruthy();
     fireEvent.click(screen.getByLabelText('Enable daily database capture'));
     fireEvent.change(time, { target: { value: '04:15' } });

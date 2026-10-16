@@ -1,0 +1,437 @@
+import { describe, expect, it, vi } from 'vitest';
+import { migrateItemState, migrationDetails } from '../server/migration.js';
+import {
+  captureExpectation,
+  evaluateExpectation,
+  type VerificationExpectation,
+} from '../server/migration-verification.js';
+import type { MediaAPI, MediaItem, MediaUserDataPatch } from '../server/media.js';
+import { MediaError, ServiceError } from '../server/errors.js';
+
+const media = (Id: string, UserData: MediaUserDataPatch = {}, Type = 'Movie'): MediaItem => ({
+  Id,
+  Type,
+  UserData,
+});
+const client = (overrides: Partial<MediaAPI> = {}): MediaAPI => ({
+  close: async () => {},
+  systemInfo: async () => ({ Version: '12.2' }),
+  users: async () => [],
+  user: async (Id) => ({ Id, Name: 'synthetic' }),
+  items: async () => [],
+  createUser: async (Name) => ({ Id: 'new', Name }),
+  setPassword: async () => {},
+  setPolicy: async () => {},
+  setConfiguration: async () => {},
+  markPlayed: async () => {},
+  migrationCapabilities: async () => ({
+    userData: true,
+    privatePlaylists: true,
+    playlistDuplicates: true,
+  }),
+  ...overrides,
+});
+const plan = (count: number) => ({
+  matches: Array.from({ length: count }, (_, index) => ({
+    source: media(`source-${index}`, { Played: true }),
+    target: media(`target-${index}`, { Played: false }),
+    method: 'provider',
+  })),
+  unmatched: [],
+  ambiguous: [],
+});
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+describe('strict public played-flag writer', () => {
+  it.each([undefined, 'watched_only', 'complete'] as const)(
+    'only posts Played:true and preserves every other field for scope %s',
+    async (scope) => {
+      const source = media('source', {
+        Played: true,
+        IsFavorite: true,
+        Likes: true,
+        Rating: 9,
+        PlayCount: 99,
+        PlaybackPositionTicks: 500,
+        LastPlayedDate: '2027-01-01T00:00:00Z',
+      });
+      const original = {
+        Played: false,
+        IsFavorite: false,
+        Likes: false,
+        Rating: 3,
+        PlayCount: 2,
+        PlaybackPositionTicks: 42,
+        LastPlayedDate: '2026-01-01T00:00:00Z',
+      };
+      let current = { ...original };
+      const userData = vi.fn(async () => {
+        throw new Error('Single-item chronology reads are unnecessary');
+      });
+      const updateUserData = vi.fn(
+        async (_user: string, _id: string, patch: MediaUserDataPatch) => {
+          current = { ...current, ...patch };
+        },
+      );
+      const markPlayed = vi.fn(async () => {}),
+        markFavorite = vi.fn(async () => {});
+      const details = migrationDetails();
+      const expectations: VerificationExpectation[] = [];
+      expect(
+        await migrateItemState(
+          client({ userData, updateUserData, markPlayed, markFavorite }),
+          'user',
+          {
+            matches: [{ source, target: media('target', original), method: 'provider' }],
+            unmatched: [],
+            ambiguous: [],
+          },
+          details,
+          () => {},
+          () => {},
+          {
+            migration_scope: scope,
+            expectation: (target, patch) =>
+              expectations.push(captureExpectation(target, patch, scope)),
+          },
+        ),
+      ).toBe(1);
+      expect(updateUserData).toHaveBeenCalledExactlyOnceWith('user', 'target', { Played: true });
+      expect(current).toEqual({ ...original, Played: true });
+      expect(userData).not.toHaveBeenCalled();
+      expect(markPlayed).not.toHaveBeenCalled();
+      expect(markFavorite).not.toHaveBeenCalled();
+      expect(details).toMatchObject({
+        items_updated: 1,
+        favorites: 0,
+        resume_positions: 0,
+        play_counts: 0,
+        last_played_dates: 0,
+        ratings: 0,
+        history_dates_missing: 0,
+        failed_items: 0,
+      });
+      expect(details.warnings).toEqual([]);
+      expect(expectations[0]!.state).toEqual({ Played: true });
+      expect(evaluateExpectation(expectations[0]!, media('target', current)).status).toBe(
+        'verified',
+      );
+    },
+  );
+
+  it('never unwatches existing destination activity and ignores all non-played/container-only source data', async () => {
+    const selected = plan(4);
+    selected.matches[0]!.source.UserData = {
+      Played: false,
+      IsFavorite: true,
+      PlaybackPositionTicks: 5,
+    };
+    selected.matches[0]!.target.UserData = { Played: true };
+    selected.matches[1]!.source.UserData = { Played: true };
+    selected.matches[1]!.target.UserData = { Played: true };
+    selected.matches[2]!.source.Type = 'Series';
+    selected.matches[3]!.source.Type = 'Playlist';
+    const updateUserData = vi.fn(async () => {}),
+      expectation = vi.fn();
+    const details = migrationDetails();
+    expect(
+      await migrateItemState(
+        client({ updateUserData }),
+        'user',
+        selected,
+        details,
+        () => {},
+        () => {},
+        { migration_scope: 'complete', expectation },
+      ),
+    ).toBe(0);
+    expect(updateUserData).not.toHaveBeenCalled();
+    expect(expectation).toHaveBeenCalledExactlyOnceWith(selected.matches[1]!.target, {}, []);
+    expect(details.failed_items).toBe(0);
+  });
+
+  it.each(['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'Book', 'AudioBook', 'Trailer'])(
+    'supports the played flag for %s',
+    async (Type) => {
+      const selected = plan(1);
+      selected.matches[0]!.source.Type = Type;
+      selected.matches[0]!.target.Type = Type;
+      const updateUserData = vi.fn(async () => {});
+      expect(
+        await migrateItemState(
+          client({ updateUserData }),
+          'user',
+          selected,
+          migrationDetails(),
+          () => {},
+          () => {},
+        ),
+      ).toBe(1);
+      expect(updateUserData).toHaveBeenCalledWith('user', 'target-0', { Played: true });
+    },
+  );
+
+  it.each(['legacy capability', 'missing writer', 'capability failure'] as const)(
+    'refuses unsafe updates without a legacy fallback (%s)',
+    async (condition) => {
+      const updateUserData = vi.fn(async () => {}),
+        markPlayed = vi.fn(async () => {}),
+        markFavorite = vi.fn(async () => {}),
+        expectation = vi.fn();
+      const api = client({ updateUserData, markPlayed, markFavorite });
+      if (condition === 'legacy capability')
+        api.migrationCapabilities = async () => ({
+          userData: false,
+          privatePlaylists: false,
+          playlistDuplicates: false,
+        });
+      if (condition === 'missing writer') delete api.updateUserData;
+      if (condition === 'capability failure')
+        api.migrationCapabilities = async () => {
+          throw new Error('PRIVATE_RAW_FAILURE');
+        };
+      const details = migrationDetails();
+      expect(
+        await migrateItemState(
+          api,
+          'user',
+          plan(1),
+          details,
+          () => {},
+          () => {},
+          { expectation },
+        ),
+      ).toBe(0);
+      expect(updateUserData).not.toHaveBeenCalled();
+      expect(markPlayed).not.toHaveBeenCalled();
+      expect(markFavorite).not.toHaveBeenCalled();
+      expect(details.failed_items).toBe(1);
+      expect(details.warnings.join(' ')).toContain('partial user-data');
+      expect(details.warnings.join(' ')).not.toContain('PRIVATE_RAW_FAILURE');
+      expect(expectation).toHaveBeenCalledWith(expect.anything(), { Played: true }, ['Played']);
+    },
+  );
+
+  it('deduplicates source editions to one mutation per destination and still captures every expectation', async () => {
+    const selected = plan(100);
+    selected.matches.forEach((match, index) => {
+      match.target.Id = `target-${index % 10}`;
+    });
+    const updateUserData = vi.fn(
+        async (_user: string, _id: string, _patch: MediaUserDataPatch) => {},
+      ),
+      expectation = vi.fn(),
+      progress = vi.fn();
+    const details = migrationDetails();
+    expect(
+      await migrateItemState(
+        client({ updateUserData }),
+        'user',
+        selected,
+        details,
+        () => {},
+        () => {},
+        { expectation, progress },
+      ),
+    ).toBe(10);
+    expect(updateUserData).toHaveBeenCalledTimes(10);
+    expect(new Set(updateUserData.mock.calls.map((call) => call[1])).size).toBe(10);
+    expect(expectation).toHaveBeenCalledTimes(100);
+    expect(progress).toHaveBeenLastCalledWith(100, 100, 10);
+    expect(selected.matches.every((match) => match.target.UserData?.Played === false)).toBe(true);
+  });
+
+  it('does not replay an uncertain mutation through another source edition', async () => {
+    const selected = plan(2);
+    selected.matches[1]!.target.Id = selected.matches[0]!.target.Id;
+    const updateUserData = vi.fn(async () => {
+      throw new MediaError('Jellyfin request timed out.');
+    });
+    const expectation = vi.fn(),
+      details = migrationDetails();
+    expect(
+      await migrateItemState(
+        client({ updateUserData }),
+        'user',
+        selected,
+        details,
+        () => {},
+        () => {},
+        { expectation },
+      ),
+    ).toBe(0);
+    expect(updateUserData).toHaveBeenCalledOnce();
+    expect(expectation).toHaveBeenCalledTimes(2);
+    expect(details.failed_items).toBe(2);
+    expect(details.warnings.join(' ')).toContain('No duplicate mutation was sent');
+  });
+
+  it('bounds independent mutations to four and reports every completed match', async () => {
+    let release!: () => void, started!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const writing = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let active = 0,
+      maximum = 0,
+      calls = 0;
+    const updateUserData = vi.fn(async () => {
+      active++;
+      maximum = Math.max(maximum, active);
+      if (++calls === 4) started();
+      await gate;
+      await tick();
+      active--;
+    });
+    const progress = vi.fn(),
+      saved = vi.fn();
+    const operation = migrateItemState(
+      client({ updateUserData }),
+      'user',
+      plan(8),
+      migrationDetails(),
+      () => {},
+      saved,
+      { progress },
+    );
+    await writing;
+    expect(active).toBe(4);
+    expect(calls).toBe(4);
+    release();
+    expect(await operation).toBe(8);
+    expect(maximum).toBe(4);
+    expect(active).toBe(0);
+    expect(saved).toHaveBeenCalledTimes(8);
+    expect(progress.mock.calls.map(([processed, total]) => [processed, total])).toEqual(
+      Array.from({ length: 8 }, (_, index) => [index + 1, 8]),
+    );
+    expect(progress.mock.calls.every(([processed, , updated]) => updated <= processed)).toBe(true);
+  });
+
+  it('drains an already-issued mutation before propagating a changed guard and never starts queued targets', async () => {
+    let release!: () => void, started!: () => void, guardFailed!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const writing = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const stopped = new Promise<void>((resolve) => {
+      guardFailed = resolve;
+    });
+    let changed = false,
+      settled = false;
+    const failure = new ServiceError('Synthetic mapping changed.');
+    const updateUserData = vi.fn(async () => {
+      changed = true;
+      started();
+      await gate;
+    });
+    const operation = migrateItemState(
+      client({ updateUserData }),
+      'user',
+      plan(3),
+      migrationDetails(),
+      () => {
+        if (changed) {
+          guardFailed();
+          throw failure;
+        }
+      },
+      () => {},
+      { concurrency: 2 },
+    ).finally(() => {
+      settled = true;
+    });
+    const rejected = expect(operation).rejects.toBe(failure);
+    await writing;
+    await stopped;
+    await tick();
+    expect(settled).toBe(false);
+    expect(updateUserData).toHaveBeenCalledOnce();
+    release();
+    await rejected;
+    expect(settled).toBe(true);
+  });
+
+  it('isolates an ordinary target failure while keeping accurate processed and updated counts', async () => {
+    const details = migrationDetails(),
+      progress = vi.fn();
+    const updateUserData = vi.fn(async (_user: string, id: string) => {
+      if (id === 'target-1') throw new MediaError('Jellyfin request timed out.');
+    });
+    expect(
+      await migrateItemState(
+        client({ updateUserData }),
+        'user',
+        plan(4),
+        details,
+        () => {},
+        () => {},
+        { progress },
+      ),
+    ).toBe(3);
+    expect(details).toMatchObject({ items_updated: 3, failed_items: 1 });
+    expect(progress).toHaveBeenLastCalledWith(4, 4, 3);
+    expect(details.warnings).toEqual(['Jellyfin request timed out.']);
+  });
+
+  it('yields a large already-watched history so timer cancellation can run', async () => {
+    const selected = plan(10_000);
+    selected.matches.forEach((match) => {
+      match.target.UserData = { Played: true };
+    });
+    const updateUserData = vi.fn(async () => {});
+    let canceled = false,
+      processed = 0;
+    const failure = new ServiceError('Synthetic canceled');
+    const timer = setTimeout(() => {
+      canceled = true;
+    }, 0);
+    try {
+      await expect(
+        migrateItemState(
+          client({ updateUserData }),
+          'user',
+          selected,
+          migrationDetails(),
+          () => {
+            if (canceled) throw failure;
+          },
+          () => {},
+          {
+            progress: (value) => {
+              processed = value;
+            },
+          },
+        ),
+      ).rejects.toBe(failure);
+    } finally {
+      clearTimeout(timer);
+    }
+    expect(processed).toBeGreaterThanOrEqual(250);
+    expect(processed).toBeLessThanOrEqual(1000);
+    expect(updateUserData).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 5, 1.5, NaN])(
+    'rejects invalid worker concurrency before server calls (%s)',
+    async (concurrency) => {
+      const migrationCapabilities = vi.fn();
+      await expect(
+        migrateItemState(
+          client({ migrationCapabilities }),
+          'user',
+          plan(1),
+          migrationDetails(),
+          () => {},
+          () => {},
+          { concurrency },
+        ),
+      ).rejects.toThrow('between 1 and 4');
+      expect(migrationCapabilities).not.toHaveBeenCalled();
+    },
+  );
+});

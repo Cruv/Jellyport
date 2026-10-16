@@ -3,7 +3,7 @@ import { snapshotId } from './snapshot-files.js';
 
 export const DESTINATION_CATALOG_MAX_AGE = 48 * 60 * 60_000;
 export const DESTINATION_CATALOG_DEADLINE = 5 * 60_000;
-export const DESTINATION_CATALOG_FORMAT = 1;
+export const DESTINATION_CATALOG_FORMAT = 2;
 export interface DestinationCatalogRequest {
   purpose: 'jellyfin_catalog';
   id: string;
@@ -35,6 +35,7 @@ export interface DestinationCatalogMetadata {
   imported_at: string;
   import_elapsed_ms: number;
   expires_at: string;
+  projection_format?: number;
 }
 export const destinationCatalogPrefix = (id: string) => {
   if (!snapshotId.test(id)) throw new Error('Invalid destination catalog generation.');
@@ -73,7 +74,7 @@ export function validDestinationResult(value: DestinationCatalogResult): boolean
   return !!(
     validDestinationRequest(value) &&
     value.ok === true &&
-    value.projection_format === DESTINATION_CATALOG_FORMAT &&
+    (value.projection_format === 1 || value.projection_format === DESTINATION_CATALOG_FORMAT) &&
     typeof value.bytes === 'number' &&
     Number.isSafeInteger(value.bytes) &&
     value.bytes > 0 &&
@@ -116,5 +117,6 @@ export function destinationCatalogMetadata(
     expires_at: new Date(
       Date.parse(value.backup_created_at!) + DESTINATION_CATALOG_MAX_AGE,
     ).toISOString(),
+    projection_format: value.projection_format!,
   };
 }

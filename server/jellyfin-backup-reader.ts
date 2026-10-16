@@ -9,8 +9,9 @@ import { parser, type Token } from 'stream-json/parser.js';
 import { fromFdPromise, type Entry, type ZipFile } from 'yauzl';
 import { ServiceError } from './errors.js';
 import { projectCatalogItem, type MediaItem } from './media.js';
+import { jellyfinAsciiPathKey } from './jellyfin-library-membership.js';
 
-export const JELLYFIN_BACKUP_PROJECTION_FORMAT = 'jellyfin-backup-catalog-v1';
+export const JELLYFIN_BACKUP_PROJECTION_FORMAT = 'jellyfin-backup-catalog-v2';
 const VERSION = '12.2.0.0';
 const ENGINE_VERSION = '0.2.0';
 const MAX_ARCHIVE_BYTES = 8 * 1024 ** 3;
@@ -23,6 +24,9 @@ const MAX_PROVIDER_ROWS = 10_000_000;
 const MAX_ROW_BYTES = 1024 * 1024;
 const MAX_ITEM_BYTES = 64 * 1024;
 const MAX_MANIFEST_BYTES = 1024 * 1024;
+const MAX_ROOTS = 100_000;
+const MAX_LIBRARIES = 1000;
+const MAX_LIBRARY_ROOTS = 1000;
 const MANIFEST = 'manifest.json';
 const ITEMS = 'Database/BaseItems.json';
 const PROVIDERS = 'Database/BaseItemProviders.json';
@@ -53,6 +57,7 @@ const itemFields = new Set([
   'ParentIndexNumber',
   'RunTimeTicks',
   'Data',
+  'TopParentId',
 ]);
 const providerFields = new Set(['ItemId', 'ProviderId', 'ProviderValue']);
 export interface JellyfinBackupManifest {
@@ -90,6 +95,33 @@ function identifier(value: unknown): string {
   if (typeof value !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value))
     throw invalid();
   return value.replaceAll('-', '').toLowerCase();
+}
+function rootIdentifier(value: unknown): string {
+  if (typeof value === 'string' && /^[a-f0-9]{32}$/i.test(value)) return value.toLowerCase();
+  return identifier(value);
+}
+function physicalPath(value: unknown): string {
+  if (
+    typeof value !== 'string' ||
+    !value ||
+    value.length > 16_384 ||
+    /[\u0000-\u001f\u007f]/.test(value)
+  )
+    throw invalid();
+  return value;
+}
+function physicalLocations(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > MAX_LIBRARY_ROOTS) throw invalid();
+  const paths = value.map(physicalPath);
+  if (new Set(paths).size !== paths.length) throw invalid();
+  return paths;
+}
+function physicalRoots(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length > MAX_LIBRARY_ROOTS) throw invalid();
+  const roots = value.map(rootIdentifier);
+  if (roots.some((id) => id === '0'.repeat(32)) || new Set(roots).size !== roots.length)
+    throw invalid();
+  return roots;
 }
 function unchanged(first: BigIntStats, second: BigIntStats): boolean {
   return (
@@ -455,11 +487,29 @@ export async function importJellyfinBackupCatalog(
     database.exec(`PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE; PRAGMA mmap_size=0; PRAGMA journal_mode=DELETE;
       CREATE TABLE catalog_items(id TEXT PRIMARY KEY,item TEXT NOT NULL) STRICT;
       CREATE TABLE source_ids(id TEXT PRIMARY KEY) STRICT;
+      CREATE TABLE catalog_membership(version INTEGER NOT NULL PRIMARY KEY) STRICT;
+      INSERT INTO catalog_membership VALUES(1);
+      CREATE TABLE catalog_item_roots(id TEXT PRIMARY KEY,root_id TEXT NOT NULL) STRICT;
+      CREATE TABLE catalog_roots(id TEXT PRIMARY KEY,path TEXT NOT NULL,known INTEGER NOT NULL) STRICT;
+      CREATE INDEX catalog_root_paths ON catalog_roots(path COLLATE NOCASE,id);
+      CREATE TABLE catalog_library_roots(library_id TEXT NOT NULL,root_id TEXT NOT NULL,PRIMARY KEY(library_id,root_id)) STRICT, WITHOUT ROWID;
+      CREATE INDEX catalog_library_root_lookup ON catalog_library_roots(root_id,library_id);
+      CREATE TABLE catalog_library_config(library_id TEXT PRIMARY KEY,locations TEXT NOT NULL) STRICT;
+      CREATE TABLE source_libraries(id TEXT PRIMARY KEY,path TEXT NOT NULL,roots TEXT NOT NULL,locations TEXT NOT NULL) STRICT;
       CREATE TABLE provider_keys(id TEXT NOT NULL,provider_key TEXT NOT NULL,PRIMARY KEY(id,provider_key)) STRICT;
       CREATE TABLE providers(id TEXT NOT NULL,provider_key TEXT NOT NULL,provider_value TEXT NOT NULL,PRIMARY KEY(id,provider_key)) STRICT;
       BEGIN IMMEDIATE;`);
     const insertId = database.prepare('INSERT INTO source_ids(id) VALUES(?)');
     const insertItem = database.prepare('INSERT INTO catalog_items(id,item) VALUES(?,?)');
+    const insertRoot = database.prepare('INSERT INTO catalog_roots(id,path,known) VALUES(?,?,1)');
+    const insertItemRoot = database.prepare(
+      'INSERT INTO catalog_item_roots(id,root_id) VALUES(?,?)',
+    );
+    const insertLibrary = database.prepare(
+      'INSERT INTO source_libraries(id,path,roots,locations) VALUES(?,?,?,?)',
+    );
+    let roots = 0,
+      libraries = 0;
     let transactionRows = 0;
     const checkpoint = async (phase: JellyfinBackupProgress['phase']) => {
       check(options.signal);
@@ -478,6 +528,25 @@ export async function importJellyfinBackupCatalog(
         const id = identifier(row.Id);
         insertId.run(id);
         if (typeof row.Type !== 'string') throw invalid();
+        if (
+          row.Type === 'MediaBrowser.Controller.Entities.Folder' &&
+          row.Path !== null &&
+          row.Path !== undefined
+        ) {
+          if (++roots > MAX_ROOTS) throw invalid();
+          insertRoot.run(id, physicalPath(row.Path));
+        }
+        if (row.Type === 'MediaBrowser.Controller.Entities.CollectionFolder') {
+          if (++libraries > MAX_LIBRARIES || typeof row.Data !== 'string') throw invalid();
+          const data: unknown = JSON.parse(row.Data);
+          if (!isObject(data)) throw invalid();
+          insertLibrary.run(
+            id,
+            physicalPath(row.Path),
+            JSON.stringify(physicalRoots(data.PhysicalFolderIds)),
+            JSON.stringify(physicalLocations(data.PhysicalLocationsList)),
+          );
+        }
         const type = Object.hasOwn(clrTypes, row.Type) ? clrTypes[row.Type] : undefined;
         if (!type) stats.ignoredRows++;
         else {
@@ -501,12 +570,67 @@ export async function importJellyfinBackupCatalog(
           )
             throw invalid();
           insertItem.run(id, serialized);
+          if (row.TopParentId !== null && row.TopParentId !== undefined) {
+            const root = identifier(row.TopParentId);
+            if (root !== '0'.repeat(32)) insertItemRoot.run(id, root);
+          }
         }
         await checkpoint('items');
       }),
       options,
       true,
     );
+    // Neutral collection/root metadata is sufficient for the server's library
+    // association check. Do not retain a complete parent graph or user policy.
+    // Conflicting cached IDs/locations remain unknown and use fresh API checks.
+    const rootById = database.prepare('SELECT id,path FROM catalog_roots WHERE id=?');
+    const rootsByPath = database.prepare(
+      'SELECT id FROM catalog_roots WHERE path=? COLLATE NOCASE LIMIT 1001',
+    );
+    const uncertainRoot = database.prepare('UPDATE catalog_roots SET known=0 WHERE id=?');
+    const libraryRoot = database.prepare(
+      'INSERT INTO catalog_library_roots(library_id,root_id) VALUES(?,?)',
+    );
+    const libraryConfig = database.prepare(
+      'INSERT INTO catalog_library_config(library_id,locations) VALUES(?,?)',
+    );
+    for (const row of database
+      .prepare('SELECT id,path,roots,locations FROM source_libraries ORDER BY id')
+      .iterate()) {
+      check(options.signal);
+      const ids = new Set(JSON.parse(String(row.roots)) as string[]);
+      const paths = JSON.parse(String(row.locations)) as string[];
+      // Installed 12.2.0 source (ca0f16eb): GetVirtualFolderInfo exposes shortcut
+      // targets, while CollectionFolder's cached list also includes its own
+      // virtual directory. Preserve exact configured targets for the fresh hash.
+      const effectivePaths = paths.filter(
+        (path) => jellyfinAsciiPathKey(path) !== jellyfinAsciiPathKey(String(row.path)),
+      );
+      libraryConfig.run(row.id!, JSON.stringify(effectivePaths));
+      const byPath = new Set<string>();
+      let consistent = true;
+      for (const path of effectivePaths) {
+        const matches = rootsByPath.all(path);
+        if (matches.length > MAX_LIBRARY_ROOTS) throw invalid();
+        if (matches.length !== 1) consistent = false;
+        for (const root of matches) byPath.add(String(root.id));
+      }
+      for (const id of ids) {
+        const root = rootById.get(id);
+        if (
+          !root ||
+          !effectivePaths.some(
+            (path) => jellyfinAsciiPathKey(path) === jellyfinAsciiPathKey(String(root.path)),
+          )
+        )
+          consistent = false;
+      }
+      if (ids.size !== byPath.size || [...ids].some((id) => !byPath.has(id))) consistent = false;
+      if (!consistent) {
+        for (const id of new Set([...ids, ...byPath])) uncertainRoot.run(id);
+      } else for (const id of ids) libraryRoot.run(row.id!, id);
+      await yieldTurn();
+    }
     const sourceId = database.prepare('SELECT 1 AS present FROM source_ids WHERE id=?');
     const targetId = database.prepare('SELECT 1 AS present FROM catalog_items WHERE id=?');
     const insertProviderKey = database.prepare(
@@ -598,7 +722,7 @@ export async function importJellyfinBackupCatalog(
       await yieldTurn();
     }
     database.exec(
-      'COMMIT; DROP TABLE provider_keys; DROP TABLE providers; DROP TABLE source_ids; VACUUM;',
+      'COMMIT; DROP TABLE provider_keys; DROP TABLE providers; DROP TABLE source_ids; DROP TABLE source_libraries; VACUUM;',
     );
     check(options.signal);
     if (

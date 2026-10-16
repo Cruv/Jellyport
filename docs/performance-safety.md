@@ -7,7 +7,6 @@ projections may retain broader fields for format compatibility; only matching
 metadata and played flags drive the current transfer. Historical investigations
 and measurements below retain their original inputs and limitations.
 
-
 ## Played-only production trials — 2026-10-16
 
 A representative heavy history on version 0.16.0 took **136.3 seconds** from
@@ -41,10 +40,10 @@ performance success under the five-minute threshold; it misses the two-minute
 target for the whole bulk operation. Account work was serialized:
 
 | History size | Account work | Played flags written and independently verified | Failed updates | Ambiguous source items | Orphan source history |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Heavy | 132.8 s | 20,597 | 12 | 635 | 1,719 |
-| Typical | 12.5 s | 1,801 | 0 | 12 | 38 |
-| High | 59.7 s | 9,283 | 87 | 39 | 977 |
+| ------------ | -----------: | ----------------------------------------------: | -------------: | ---------------------: | --------------------: |
+| Heavy        |      132.8 s |                                          20,597 |             12 |                    635 |                 1,719 |
+| Typical      |       12.5 s |                                           1,801 |              0 |                     12 |                    38 |
+| High         |       59.7 s |                                           9,283 |             87 |                     39 |                   977 |
 
 Account-work times exclude waiting behind earlier accounts and must not be
 presented as isolated end-to-end results. All three accounts finished within the
@@ -62,6 +61,18 @@ after acceptance, skipped the 20,597 already-verified flags and retried only the
 twelve failures; it did not rewrite the successful flags. These runs demonstrate
 live writes and repeatability, not a backup-only benchmark or a measured combined
 two-minute result.
+
+The 0.16.2 isolated heavy trial recorded **154.9 seconds** combined server work:
+0.1 seconds review preparation and 154.7 seconds accepted work, with live writes
+and independent readback. It verified 20,597 flags but retained all twelve failures.
+The ineffective view passes cost 26.6 seconds preparation and 25.9 seconds readback;
+eight writers took 100.6 seconds, versus 107.9 seconds with six in the prior fresh
+trial. This was partial performance success, not a corrected access result.
+Version 0.16.3 removes those redundant reads and returns to six writers. Its new
+neutral membership index had 100% Movie/Episode coverage in the inspected backup,
+with no unknown candidates for the three sampled histories. Final local import plus
+index construction took 60.06 seconds without API calls or writes; this is preparation
+evidence, not production migration acceptance.
 
 ## Incident evidence and limits of attribution
 
@@ -205,29 +216,41 @@ fallback, or change whether a match is ambiguous. Parent series needed to verify
 derived series identifiers are included as dependencies. Unrelated destination
 items are not read again for each account.
 
-Jellyfin account reads first obtain that user's accessible library views, then
-intersect explicit `Ids` batches of at most 100 identifiers and 6,000 encoded
-characters with each view using `ParentId` and `Recursive=true`. Explicit IDs
-bound the requested items; this does not enumerate each view's full catalog.
-No name sorting or total counts are requested. Returned items retain empty personal state so that an accessible unwatched
-item remains a valid destination. Omitted IDs are unavailable to that account,
-not implied empty state or permission to write. Unexpected/repeated IDs, invalid
-data and identity changes fail closed. Fresh metadata is checked against the
-cached identity; a preparation failure clears the cache and stops the remaining
-batch instead of repeating a failed build for every account. Final matching uses
-only the returned, account-scoped items. Updates send only the additive played
-flag. Independent readback refreshes the library views and item flags again.
+Jellyfin account reads use fresh folder permissions and a neutral saved membership
+index. The index records an item's physical root and its associated logical library
+IDs, with inconsistent or missing relationships left unknown. A candidate allowed
+by current policy receives one bounded explicit-ID metadata/state read only after
+a fresh logical-library/location fingerprint matches the saved configuration.
+Changed configuration fails before writes and requires a new matching backup;
+the same check runs during independent verification, including no-op played flags.
+Unknown or
+apparently denied candidates first receive a target-scoped UserData GET using the
+same standalone visibility check as the write endpoint. A confirmed 404 removes
+that candidate; a 200 keeps it for fresh identity validation, preserving legitimate
+items when saved membership is stale. These checks do not request on-demand metadata
+refresh. Existing template/library restrictions remain unchanged.
 
-This extra view boundary is needed because Jellyfin's explicit-ID path can return
-items outside a user's enabled libraries. The production trial exposed eleven
-such matches in an excluded library. View reads are capped at 64, item reads remain
-sequential, and duplicate IDs across views are retained once; conflicting personal
-state fails closed. There are at most `1 + views × batches` read requests per
-invocation, plus bounded read retries. Two accessible views approximately double
-the old candidate/readback call count. This cost is included in migration timing.
-Template permissions are preserved; inaccessible items may become unmatched or
-reveal another accessible identity candidate. Target writes remain authoritative:
-library-view filtering is not proof of every standalone item visibility rule.
+There are at most 2,048 exception checks per invocation, four read-only workers and
+a 60-second exception-phase deadline including retries. Exceeding the budget stops
+further checks before writes and requires a fresh membership-bearing matching
+backup. Large v1 or live catalogs without those hints can hit that limit. All workers
+abort and drain on fatal failure or cancellation. The normal metadata/state pass
+uses batches of at most 170 IDs and 6,000 encoded characters, without name sorting,
+total counts or repeated views. Independent readback refreshes policy and checks
+again. Unexpected omissions share the same exception budget: exact target-scoped
+access distinguishes a real 404 from Jellyfin version grouping, and accessible
+missing items receive a single-ID identity/state read. If that also omits the item,
+the read fails rather than silently discarding history. Destination batches use
+170 IDs within the unchanged 6,000-character URL bound; source batches remain 100.
+Aggregate `user_access` events omit user and item identities.
+
+Jellyfin's explicit-ID query alone does not enforce enabled libraries. Version
+0.16.2 attempted to intersect IDs with views, but the live trial disproved that
+assumption: the [controller clears Parent](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Api/Controllers/ItemsController.cs#L589),
+whose [setter also clears ParentId](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/MediaBrowser.Controller/Entities/InternalItemsQuery.cs#L452).
+The extra passes doubled reads without filtering inaccessible items. They were
+removed; fixtures now model that actual API behavior. The fresh access check uses
+[the same item lookup as the POST](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Api/Controllers/ItemsController.cs#L1078).
 
 The request shape was checked against Jellyfin's tagged
 [Items controller](https://github.com/jellyfin/jellyfin/blob/v10.11.6/Jellyfin.Api/Controllers/ItemsController.cs#L300),
@@ -261,7 +284,7 @@ discards the partial index. These destination limits do not relax Emby's separat
 five-second deadline or source governor. Explicit-ID account reads retain their
 30-second deadline and at most three attempts for HTTP 429/503, with each retry
 delay capped at two seconds. Reads do not fan out. That release kept a four-worker ceiling for independent destination item
-transfers. Current played-only writes use at most eight workers; account jobs remain
+transfers. Current played-only writes use at most six workers; account jobs remain
 serialized and no mutation is retried automatically. Cold collection
 still costs database work; sharing it removes repeated per-account work.
 
@@ -330,22 +353,22 @@ coverage. Destination merge behavior is covered by automated fixtures.
 
 These limits apply without server-owner tuning:
 
-| Limit                                   | Default                                                          |
-| --------------------------------------- | ---------------------------------------------------------------- |
-| Active source migration API reads       | 1 across source clients                                          |
-| Queued source read admissions           | At most 8                                                        |
-| Idle time after a source read completes | At least 500 ms                                                  |
-| Slow-response threshold                 | 2 seconds; stop the read workload and open the circuit           |
-| Source read deadline                    | 5 seconds                                                        |
-| Circuit cooldown                        | At least 5 minutes; reject queued work rather than retry it      |
-| Source catalog/playlist page size       | At most 100 items                                                |
-| IDs in a state batch                    | At most 100, and at most 6,000 encoded characters                |
-| Live matching catalog, per server       | At most 200,000 items and 64 MiB of retained serialized metadata |
-| Retained source personal state          | At most 100,000 items and 32 MiB of retained serialized data     |
-| Jellyfin catalog page size              | At most 100 items                                                |
-| Jellyfin catalog idle interval          | 100 ms between pages                                             |
-| Jellyfin catalog deadlines              | 30 seconds per page; 15 minutes for the full build                |
-| Retained Jellyfin candidate state       | At most 200,000 items and 64 MiB of retained serialized data     |
+| Limit                                   | Default                                                                                           |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Active source migration API reads       | 1 across source clients                                                                           |
+| Queued source read admissions           | At most 8                                                                                         |
+| Idle time after a source read completes | At least 500 ms                                                                                   |
+| Slow-response threshold                 | 2 seconds; stop the read workload and open the circuit                                            |
+| Source read deadline                    | 5 seconds                                                                                         |
+| Circuit cooldown                        | At least 5 minutes; reject queued work rather than retry it                                       |
+| Source catalog/playlist page size       | At most 100 items                                                                                 |
+| IDs in a state batch                    | At most 100, and at most 6,000 encoded characters                                                 |
+| Live matching catalog, per server       | At most 200,000 items and 64 MiB of retained serialized metadata                                  |
+| Retained source personal state          | At most 100,000 items and 32 MiB of retained serialized data                                      |
+| Jellyfin catalog page size              | At most 100 items                                                                                 |
+| Jellyfin catalog idle interval          | 100 ms between pages                                                                              |
+| Jellyfin catalog deadlines              | 30 seconds per page; 15 minutes for the full build                                                |
+| Retained Jellyfin candidate state       | At most 200,000 items and 64 MiB of retained serialized data                                      |
 | Catalog cache reuse window              | Source: 10 minutes from start; destination: 10 minutes from completion; each job pins its catalog |
 
 Heavy source reads do not automatically retry HTTP 429, server errors, timeouts or
@@ -446,7 +469,7 @@ and reuses that account's matching index. A matching plan retains at most 200,00
 candidate references.
 Over-limit plans fail rather than drop candidates or guess a match. Item workers
 yield every 250 processed items so large already-merged histories remain
-cancelable. Fresh access-scoped Jellyfin candidate checks remain. Played-only destination writes have an eight-worker ceiling; account jobs stay serialized and workers drain before cancellation releases locks.
+cancelable. Fresh access-scoped Jellyfin candidate checks remain. Played-only destination writes have a six-worker ceiling; account jobs stay serialized and workers drain before cancellation releases locks.
 
 The following benchmark measurements predate the played-only scope and describe
 local component work, not current end-to-end throughput.

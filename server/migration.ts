@@ -311,11 +311,11 @@ export async function migrateItemState(
     expectation?: (target: MediaItem, patch: MediaUserDataPatch, unsupported: string[]) => void;
   } = {},
 ): Promise<number> {
-  const concurrency = options.concurrency ?? 8;
+  const concurrency = options.concurrency ?? 6;
   // Historical jobs and clients may still send "complete". The public migration
   // writer always transfers only additive played flags, irrespective of that value.
-  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8)
-    throw new ServiceError('Migration concurrency must be between 1 and 8.');
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 6)
+    throw new ServiceError('Migration concurrency must be between 1 and 6.');
   // Every worker must yield before an already-merged history can starve a pending
   // cancellation timer for more than 1,000 matches across the whole pool.
   const yieldInterval = Math.min(250, Math.floor(1000 / concurrency));

@@ -298,10 +298,10 @@ describe('strict public played-flag writer', () => {
     ]);
   });
 
-  it.each([undefined, 1, 4, 6, 8])(
+  it.each([undefined, 1, 4, 6])(
     'bounds independent mutations to the chosen ceiling and reports every completed match (%s)',
     async (concurrency) => {
-      const limit = concurrency ?? 8;
+      const limit = concurrency ?? 6;
       const total = limit * 2;
       let release!: () => void, started!: () => void;
       const gate = new Promise<void>((resolve) => {
@@ -509,7 +509,7 @@ describe('strict public played-flag writer', () => {
     expect(updateUserData).not.toHaveBeenCalled();
   });
 
-  it.each([0, 9, 1.5, NaN])(
+  it.each([0, 7, 1.5, NaN])(
     'rejects invalid worker concurrency before server calls (%s)',
     async (concurrency) => {
       const migrationCapabilities = vi.fn();
@@ -523,7 +523,7 @@ describe('strict public played-flag writer', () => {
           () => {},
           { concurrency },
         ),
-      ).rejects.toThrow('between 1 and 8');
+      ).rejects.toThrow('between 1 and 6');
       expect(migrationCapabilities).not.toHaveBeenCalled();
     },
   );

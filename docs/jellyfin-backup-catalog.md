@@ -31,6 +31,14 @@ The initial adapter supports the inspected **Jellyfin 12.2.0.0 / backup engine
 The importer selects the newest canonical filename and rejects an incomplete or
 invalid newest archive rather than silently using an older one.
 
+After upgrading to 0.16.3, import the matching backup once again, even if the archive
+has not changed. Projection v2 adds neutral physical-root/library associations used
+with fresh destination permissions. The new format replaces the older projection
+of that same archive without renewing its original date. V1 projections remain
+readable, but large migrations without membership hints can exceed the bounded
+individual-access check limit and require this reimport. An outdated helper cannot
+replace a v2 projection with an older format.
+
 ## Repeatable migration and measurement
 
 1. Complete both backups and import the Emby source history and Jellyfin matching
@@ -42,10 +50,11 @@ invalid newest archive rather than silently using an older one.
 3. Wait for played-state updates and independent played-state readback to finish.
    Inspect per-user unmatched, ambiguous, failed and verification counts.
    A **partial** migration is not complete, even if all HTTP requests succeeded.
-4. Record total job elapsed time, each account's timing and phase breakdown, shared
-   preprocessing time and bulk wall time. For one user, total job time includes
-   queue/provisioning overhead. Report users exceeding five minutes individually;
-   the goal is two minutes where practical. Test writes only with authorization and
+4. Record combined review-build plus accepted-job time, each account's timing and
+   phase breakdown, shared preprocessing and bulk wall time. Human review wait is
+   excluded; queue/provisioning, live writes and readback remain included. Under two
+   minutes is the target; two to five is partial performance success. Report users
+   exceeding five minutes individually. Test writes only with authorization and
    safe users or recoverable backups. Local fake-target results are not acceptance
    evidence for a production server.
 
@@ -58,7 +67,8 @@ unique; provider relationships and supported media types are checked. JSON strin
 are streamed and catalog/index storage is disk-backed. The archive must remain a
 regular, unchanged file through import and fingerprinting. No raw archive entries
 are extracted to paths, and no authentication/user-history tables are parsed.
-The projection contains only allowlisted matching metadata, names and runtime; it is encrypted in the shared directory and temporarily decrypted only in
+The projection contains only allowlisted matching metadata, names, runtime and
+neutral library/root associations; it is encrypted in the shared directory and temporarily decrypted only in
 private application storage. Protect exchange, work and application directories.
 
 This archive manifest lacks a server ID. The administrator's trusted read-only
@@ -76,9 +86,15 @@ good generation; reimporting unchanged content does not renew its age. Clearing 
 refused while imports or jobs pin data. Retention keeps the latest two generations
 and active job pins, with at most eight; idle decrypted generations are removed.
 An expired record requires a new backup/import, not a relaxed age limit.
+Changed live library/location configuration also requires a new matching backup;
+fresh fingerprints are checked before trusting saved access hints and again during
+verification, so old already-played flags cannot silently count as accessible.
 
 Limits: 8 GiB archive and projection, two million supported projected items,
 200,000 candidates / 64 MiB per account, five-minute worker deadline. The helper's
 CPU/memory limits also apply. Reserve private work/exchange space for projection,
 index construction, encryption and temporary reads. Validation errors remain
 sanitized; no credentials, item identities or personal playback data enter logs.
+Unknown or apparently denied access checks are limited to 2,048 IDs, four read-only
+workers and 60 seconds per phase. The normal known-access path remains batched;
+there is no automatic per-item scan of a large legacy catalog.

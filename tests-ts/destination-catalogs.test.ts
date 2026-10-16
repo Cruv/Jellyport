@@ -256,6 +256,90 @@ describe('saved destination catalog manager', () => {
       stat(join(f.shared, `${destinationCatalogPrefix(duplicate.id)}.db.enc`)),
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
+  it('adopts a new projection format for the same backup without refreshing its age', async () => {
+    const f = await fixture();
+    const legacy = await f.complete({ projection_format: 1 });
+    const upgraded = await f.complete({
+      projection_format: 2,
+      backup_fingerprint: legacy.backup_fingerprint,
+      backup_created_at: legacy.backup_created_at,
+    });
+    expect((await f.manager.status()).record?.id).toBe(upgraded.id);
+    expect(await f.manager.metadata(upgraded.id, f.settings, serverId, '12.2.0')).toMatchObject({
+      projection_format: 2,
+      backup_created_at: legacy.backup_created_at,
+    });
+    await f.restart();
+    expect(f.manager.queuedSelection(f.settings)).toBe(upgraded.id);
+  });
+  it('keeps the newer projection when an outdated helper returns an older format', async () => {
+    const f = await fixture();
+    const current = await f.complete({ projection_format: 2 });
+    await f.complete({
+      projection_format: 1,
+      backup_created_at: new Date(Date.parse(current.backup_created_at!) + 1000).toISOString(),
+    });
+    expect((await f.manager.status()).record?.id).toBe(current.id);
+    expect((await f.manager.status()).last_error).toContain('older Jellyfin catalog format');
+  });
+  it('rejects a changed projection format on an already pinned generation', async () => {
+    const f = await fixture();
+    const record = await f.complete({ projection_format: 1 });
+    await writeEnvelope(
+      join(f.shared, `${destinationCatalogPrefix(record.id)}.result`),
+      { ...record, projection_format: 2 },
+      f.key,
+    );
+    await expect(read(f, record.id)).rejects.toThrow('changed or incompatible');
+    expect(worker).not.toHaveBeenCalled();
+  });
+  it('preserves only validated worker membership and strips forged source membership', async () => {
+    const f = await fixture();
+    const record = await f.complete({ projection_format: 2 });
+    const membership = ['a'.repeat(32)];
+    const JellyportLibraryConfigHash = 'b'.repeat(64);
+    worker.mockResolvedValueOnce([
+      {
+        ...item,
+        JellyportLibraryIds: membership,
+        JellyportLibraryConfigHash,
+        UserData: { Played: true },
+        Secret: 'private',
+      },
+    ]);
+    await expect(
+      read(f, record.id, [{ ...item, JellyportLibraryIds: ['forged'] }]),
+    ).resolves.toEqual([{ ...item, JellyportLibraryIds: membership, JellyportLibraryConfigHash }]);
+    expect((worker.mock.calls[0]![0] as { source: MediaItem[] }).source).toEqual([item]);
+  });
+  it.each([
+    null,
+    'not-an-array',
+    ['invalid'],
+    ['a'.repeat(32), 'a'.repeat(32)],
+    Array(1001).fill('a'.repeat(32)),
+  ])(
+    'rejects malformed worker membership before returning candidates (%j)',
+    async (JellyportLibraryIds) => {
+      const f = await fixture();
+      const record = await f.complete({ projection_format: 2 });
+      worker.mockResolvedValueOnce([
+        { ...item, JellyportLibraryIds, JellyportLibraryConfigHash: 'b'.repeat(64) },
+      ]);
+      await expect(read(f, record.id)).rejects.toThrow('library membership is invalid');
+    },
+  );
+  it.each([undefined, null, '', 'invalid', 'b'.repeat(65)])(
+    'rejects incomplete or forged configuration provenance (%j)',
+    async (JellyportLibraryConfigHash) => {
+      const f = await fixture();
+      const record = await f.complete({ projection_format: 2 });
+      worker.mockResolvedValueOnce([
+        { ...item, JellyportLibraryIds: ['a'.repeat(32)], JellyportLibraryConfigHash },
+      ]);
+      await expect(read(f, record.id)).rejects.toThrow('invalid');
+    },
+  );
   it('rejects rollback, expired and future captures while preserving the last good record', async () => {
     const f = await fixture();
     const first = await f.complete();

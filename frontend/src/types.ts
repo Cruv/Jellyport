@@ -258,11 +258,13 @@ export interface SourceSnapshotMetadata {
   backup_created_at?: string;
   backup_fingerprint?: string;
   plugin_version?: string;
+  orphan_identity_version?: 1;
   diagnostics?: {
     unsupported_state_items: number;
     invalid_resume_positions: number;
     invalid_display_names: number;
     orphan_state_items?: number;
+    recovered_orphan_state_items?: number;
   };
   schema?: string;
   id: string;

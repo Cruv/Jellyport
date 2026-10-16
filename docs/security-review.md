@@ -39,12 +39,21 @@ database-only folders without an independently verified server binding are not
 accepted. Manifest values and filenames are never executed or used as paths.
 
 Original backup time controls freshness; imports cannot renew old history or
-accumulate duplicate retained generations. Decrypted bulk-job files remain
+accumulate duplicate retained generations, except for a one-time capability upgrade
+which keeps pinned legacy generations valid. Decrypted bulk-job files remain
 private and are released when the job ends; failed removals stay tracked and
-block further decryptions until cleanup succeeds. Unmapped/orphan history and
+block further decryptions until cleanup succeeds. Unmapped/unresolved orphan history and
 invalid display/resume fields produce aggregate diagnostics, with no personal
 values in those messages. Cosmetic display errors never relax identity matching.
 Only known schema variants and enforced unique keys are accepted.
+
+Version 0.17.1 can include an adapter-owned numeric orphan-key-to-current-item
+mapping derived from exact, unique native Emby GUID identities. Raw history-key
+strings and media GUIDs remain helper-private and are not published. Recovered
+flags still require ordinary identity matching and fresh destination access checks;
+untyped numeric/provider-like keys remain unresolved. No cross-server GUID equality
+or absence from an account's accessible libraries is treated as proof of identity
+or deletion. [Recovery limits](emby-plugin-backups.md#orphan-played-history--0171)
 
 The plugin updates its full folder in place and provides no documented atomic
 completion contract. Its restore flag, settling period, stable files and

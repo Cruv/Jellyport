@@ -153,7 +153,10 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
     });
     const projected = join(f.directory, 'upgraded-projection.db');
     projectLibrary(f.path, projected);
-    expect(readSnapshotHistory(projected, alice, identities)).toEqual(expected);
+    expect(readSnapshotHistory(projected, alice, identities)).toEqual({
+      ...expected,
+      diagnostics: { ...expected.diagnostics, recovered_orphan_state_items: 0 },
+    });
   });
 
   it('reads the show name from the existing parent join for episode and season review', () => {
@@ -375,7 +378,7 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
     );
   });
 
-  it('projects history into two minimal tables while excluding raw configuration/auth data', () => {
+  it('projects history into minimal tables while excluding raw keys, GUIDs and configuration/auth data', () => {
     const f = fixture();
     f.database.exec(`
       CREATE TABLE NamedValues(Value TEXT); INSERT INTO NamedValues VALUES ('private-server-configuration');
@@ -388,7 +391,10 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
     const target = join(f.directory, 'projected.db');
     const expected = readSnapshotItems(f.path, alice, identities);
     projectLibrary(f.path, target);
-    expect(inspectLibrary(target)).toEqual(inspectLibrary(f.path));
+    expect(inspectLibrary(target)).toEqual({
+      ...inspectLibrary(f.path),
+      orphan_identity_version: 1,
+    });
     expect(readSnapshotItems(target, alice, identities)).toEqual(expected);
     const projected = new DatabaseSync(target, { readOnly: true });
     expect(
@@ -396,7 +402,7 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
         .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
         .all()
         .map((row) => row.name),
-    ).toEqual(['MediaItems', 'UserDatas']);
+    ).toEqual(['JellyportRecoveredHistory', 'MediaItems', 'UserDatas']);
     expect(
       projected
         .prepare('PRAGMA table_info(MediaItems)')
@@ -685,7 +691,7 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
       );
       expect(history.diagnostics.orphan_state_items).toBe(1);
       expect(snapshotHistoryWarnings(history.diagnostics)).toEqual([
-        '1 saved history entries no longer have a library item. They cannot be matched safely and were not migrated.',
+        '1 saved history entries have no verified media identity. They remain unresolved and were not assumed obsolete or migrated.',
       ]);
       expect(() =>
         readSnapshotHistory(projected, alice, identities, scope, {
@@ -705,6 +711,159 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
       expect(plan.join('\n')).toMatch(/JellyportMediaUserDataKey/);
     },
   );
+
+  it.each(['complete', 'watched_only'] as const)(
+    'recovers only played flags from a verified fallback GUID in %s mode',
+    (scope) => {
+      const f = fixture();
+      f.database
+        .prepare('UPDATE MediaItems SET guid=? WHERE Id=10')
+        .run(Buffer.from('67452301ab89efcd0123456789abcdef', 'hex'));
+      f.database.exec('UPDATE UserDatas SET played=0 WHERE UserDataKeyId=8 AND userId=2');
+      f.database
+        .prepare('INSERT INTO UserDataKeys2 VALUES (?,?)')
+        .run(900, '01234567-89AB-CDEF-0123-456789ABCDEF');
+      f.state(900, 2, {
+        played: 1,
+        playCount: -1,
+        rating: 100,
+        playbackPositionTicks: -1,
+        LastPlayedDateInt: -1,
+      });
+      f.state(900, 3, { played: 0 });
+      f.database.close();
+      const projected = join(f.directory, 'recovered.db');
+      projectLibrary(f.path, projected);
+      const history = readSnapshotHistory(projected, alice, identities, scope);
+      expect(history.diagnostics.recovered_orphan_state_items).toBe(1);
+      expect(history.diagnostics.orphan_state_items).toBe(0);
+      expect(history.items.filter((item) => item.Id === '10')).toHaveLength(1);
+      expect(history.items.find((item) => item.Id === '10')?.UserData).toEqual(
+        scope === 'watched_only'
+          ? { Played: true }
+          : {
+              Played: true,
+              PlayCount: 7,
+              IsFavorite: true,
+              PlaybackPositionTicks: 123456789,
+              LastPlayedDate: '2025-02-03T04:05:06.000Z',
+            },
+      );
+      expect(readSnapshotHistory(projected, bob, identities, 'watched_only').items).toEqual([]);
+      expect(snapshotHistoryWarnings(history.diagnostics)).toEqual([]);
+    },
+  );
+
+  it('preserves verified mappings when reprojecting without publishing native identity material', () => {
+    const f = fixture();
+    const key = '01234567-89ab-cdef-0123-456789abcdef';
+    const guid = Buffer.from('67452301ab89efcd0123456789abcdef', 'hex');
+    f.database.prepare('UPDATE MediaItems SET guid=? WHERE Id=10').run(guid);
+    f.database.prepare('INSERT INTO UserDataKeys2 VALUES (?,?)').run(900, key);
+    f.state(900, 2, { played: 1 });
+    f.database.close();
+    const first = join(f.directory, 'first.db'),
+      second = join(f.directory, 'second.db');
+    projectLibrary(f.path, first);
+    projectLibrary(first, second);
+    expect(inspectLibrary(second)).toEqual(inspectLibrary(first));
+    expect(readSnapshotHistory(second, alice, identities, 'watched_only')).toEqual(
+      readSnapshotHistory(first, alice, identities, 'watched_only'),
+    );
+    for (const path of [first, second]) {
+      const database = new DatabaseSync(path, { readOnly: true });
+      try {
+        expect(database.prepare('SELECT * FROM JellyportRecoveredHistory').all()).toEqual([
+          { UserDataKeyId: 900, ItemId: 10 },
+        ]);
+      } finally {
+        database.close();
+      }
+      const bytes = readFileSync(path);
+      expect(bytes.includes(Buffer.from(key))).toBe(false);
+      expect(bytes.includes(guid)).toBe(false);
+    }
+  });
+
+  it('keeps legacy projections readable without inventing recovery identities', () => {
+    const f = fixture();
+    f.database.exec('PRAGMA foreign_keys=OFF; DROP TABLE UserDataKeys2;');
+    f.state(900, 2, { played: 1 });
+    f.database.close();
+    const projected = join(f.directory, 'legacy.db');
+    projectLibrary(f.path, projected);
+    expect(inspectLibrary(projected)).not.toHaveProperty('orphan_identity_version');
+    const history = readSnapshotHistory(projected, alice, identities, 'watched_only');
+    expect(history.items.map((item) => item.Id)).toEqual(['10', '13']);
+    expect(history.diagnostics.orphan_state_items).toBe(1);
+    expect(history.diagnostics.recovered_orphan_state_items).toBeUndefined();
+  });
+
+  it.each([
+    'CREATE VIEW JellyportRecoveredHistory AS SELECT 1 AS UserDataKeyId,10 AS ItemId',
+    'CREATE TABLE JellyportRecoveredHistory(UserDataKeyId INTEGER NOT NULL PRIMARY KEY,ItemId INTEGER NOT NULL)',
+    'CREATE TABLE JellyportRecoveredHistory(UserDataKeyId INTEGER NOT NULL PRIMARY KEY,ItemId TEXT NOT NULL) STRICT',
+    'CREATE TABLE JellyportRecoveredHistory(UserDataKeyId INTEGER NOT NULL PRIMARY KEY,ItemId INTEGER NOT NULL,private TEXT) STRICT',
+    'CREATE TABLE JellyportRecoveredHistory(UserDataKeyId INTEGER NOT NULL PRIMARY KEY,ItemId INTEGER) STRICT',
+  ])('rejects a partially present or unsupported recovery schema: %s', (sql) => {
+    const f = fixture();
+    f.database.exec(sql);
+    f.database.close();
+    expect(() => inspectLibrary(f.path)).toThrow('invalid format');
+    expect(() => readSnapshotHistory(f.path, alice, identities, 'watched_only')).toThrow(
+      'invalid format',
+    );
+  });
+
+  it('bounds recovered rows and bytes and uses indexed per-user lookups without catalog scans', () => {
+    const f = fixture();
+    f.database
+      .prepare('UPDATE MediaItems SET guid=? WHERE Id=10')
+      .run(Buffer.from('67452301ab89efcd0123456789abcdef', 'hex'));
+    f.database.exec('DELETE FROM UserDatas;');
+    for (const [id, key] of [
+      [900, '0123456789abcdef0123456789abcdef'],
+      [901, '0123456789ABCDEF0123456789ABCDEF'],
+    ] as const) {
+      f.database.prepare('INSERT INTO UserDataKeys2 VALUES (?,?)').run(id, key);
+      f.state(id, 2, { played: 1 });
+    }
+    f.database.close();
+    const projected = join(f.directory, 'bounded-recovery.db');
+    projectLibrary(f.path, projected);
+    expect(() =>
+      readSnapshotHistory(projected, alice, identities, 'watched_only', { maxItems: 1 }),
+    ).toThrow('history size');
+    expect(() =>
+      readSnapshotHistory(projected, alice, identities, 'watched_only', { maxBytes: 100 }),
+    ).toThrow('history size');
+    expect(readSnapshotHistory(projected, alice, identities, 'watched_only').items).toHaveLength(1);
+    const database = new DatabaseSync(projected, { readOnly: true });
+    try {
+      const plan = database
+        .prepare(
+          `EXPLAIN QUERY PLAN SELECT m.Id FROM UserDatas ud
+        CROSS JOIN JellyportRecoveredHistory r ON r.UserDataKeyId=ud.UserDataKeyId
+        CROSS JOIN MediaItems m ON m.Id=r.ItemId WHERE ud.userId=? AND ud.played=1
+        AND NOT EXISTS(SELECT 1 FROM MediaItems native WHERE native.UserDataKeyId=ud.UserDataKeyId) LIMIT ?`,
+        )
+        .all(2, 100001)
+        .map((row) => String(row.detail))
+        .join('\n');
+      expect(plan).not.toMatch(/SCAN |TEMP B-TREE/);
+      expect(plan).toMatch(/JellyportUserDataUser/);
+      expect(plan).toMatch(/SEARCH r USING INTEGER PRIMARY KEY/);
+      expect(plan).toMatch(/SEARCH m USING INTEGER PRIMARY KEY/);
+      expect(
+        database.prepare('SELECT * FROM JellyportRecoveredHistory ORDER BY UserDataKeyId').all(),
+      ).toEqual([
+        { UserDataKeyId: 900, ItemId: 10 },
+        { UserDataKeyId: 901, ItemId: 10 },
+      ]);
+    } finally {
+      database.close();
+    }
+  });
 
   it('refuses schema replacements and never creates missing database paths', () => {
     const f = fixture();

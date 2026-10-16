@@ -303,6 +303,9 @@ export async function importPluginBackup(
       schema: inspected.adapter,
       bytes: size,
       item_count: inspected.item_count,
+      ...(inspected.orphan_identity_version === undefined
+        ? {}
+        : { orphan_identity_version: inspected.orphan_identity_version }),
       backup_created_at: manifest.created,
       backup_fingerprint: fingerprint.digest('hex'),
       plugin_version: EMBY_BACKUP_PLUGIN_VERSION,

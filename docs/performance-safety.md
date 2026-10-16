@@ -514,6 +514,14 @@ readable without enabling broader transfer; older full-index projections still w
 These indexes belong only to Jellyport's private projection, never Emby's live
 database or its backup files.
 
+Verified GUID orphan recovery builds one private disk-backed GUID lookup during
+import and publishes only numeric key-to-item mappings. Each user read joins those
+mappings through the existing user/key index and item primary keys; it does not
+scan Emby's live catalog or repeat the GUID index build for every user. Recovered
+rows share the existing 100,000-row/32 MiB per-user ceilings, including rows later
+deduplicated. Unknown keys remain aggregate unresolved diagnostics. No additional
+live source history requests or destination write workers are introduced.
+
 SQLite no longer sorts the joined history before iteration. The reader validates
 the row and serialized-byte ceilings first, then sorts the bounded result by item
 ID for deterministic matching. Native SQLite caches use an 8 MiB limit, temporary

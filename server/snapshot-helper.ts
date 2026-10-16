@@ -17,6 +17,7 @@ import {
   snapshotKey,
   snapshotCaptureMethod,
   snapshotIdentitiesMatch,
+  snapshotOrphanIdentityVersion,
   writeEnvelope,
   type CaptureRequest,
   type CaptureResult,
@@ -152,6 +153,7 @@ while (!stopping) {
           identities: Record<string, number>;
           schema: string;
           bytes: number;
+          orphan_identity_version?: 1;
         }>(
           {
             operation: 'capture',
@@ -162,6 +164,7 @@ while (!stopping) {
           },
           controller.signal,
         );
+        snapshotOrphanIdentityVersion(value.orphan_identity_version);
         if (!snapshotIdentitiesMatch(value.identities, request.user_ids, captureMethod))
           throw new Error('The mounted database does not contain the requested users.');
         if (captureMethod !== 'plugin_backup') await sourceIdentity(request.binding.server_id);

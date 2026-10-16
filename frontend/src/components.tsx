@@ -721,6 +721,10 @@ export function JobProgressDetails({ job }: { job: Job }) {
 }
 export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetadata }) {
   const fileCopy = snapshot.source_type === 'file_copy';
+  const recovered = snapshot.diagnostics?.recovered_orphan_state_items ?? 0;
+  const recoveryNote = recovered
+    ? ` ${num(recovered)} orphan history ${recovered === 1 ? 'record was' : 'records were'} reattached to verified Emby media. Duplicate played flags were merged before Jellyfin matching.`
+    : '';
   if (snapshot.source_type === 'plugin_backup')
     return (
       <p className="subtle text-small">
@@ -732,6 +736,7 @@ export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetad
           : 'at an unavailable time'}
         . Imported {new Date(snapshot.finished_at).toLocaleString()}. Activity after the backup time
         is not included; importing it again does not refresh its history.
+        {recoveryNote}
       </p>
     );
   return (
@@ -743,6 +748,7 @@ export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetad
       {new Date(snapshot.finished_at).toLocaleString()}. Activity after this window is not included.
       {fileCopy &&
         ' Live file copies are not transactional; some history may be missing or inconsistent even when validation passes.'}
+      {recoveryNote}
     </p>
   );
 }

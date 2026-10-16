@@ -150,7 +150,15 @@ async function run(request: Request): Promise<unknown> {
   const size = (await lstat(request.output)).size;
   if (size > MAX_SNAPSHOT_BYTES) throw new Error('Database too large.');
   const inspected = inspectLibrary(request.output);
-  return { identities, schema: inspected.adapter, bytes: size, item_count: inspected.item_count };
+  return {
+    identities,
+    schema: inspected.adapter,
+    bytes: size,
+    item_count: inspected.item_count,
+    ...(inspected.orphan_identity_version === undefined
+      ? {}
+      : { orphan_identity_version: inspected.orphan_identity_version }),
+  };
 }
 
 function unchanged(first: BigIntStats, second: BigIntStats): boolean {

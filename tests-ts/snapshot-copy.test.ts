@@ -115,6 +115,7 @@ describe('best-effort ordinary Emby database copies', () => {
         schema: 'emby-4.10.1.0',
         identities: { [GUID]: 1 },
         item_count: 1,
+        orphan_identity_version: 1,
       });
       expect(result.bytes).toBe((await lstat(value.output)).size);
       expect((await lstat(value.output)).mode & 0o777).toBe(0o600);
@@ -139,7 +140,7 @@ describe('best-effort ordinary Emby database copies', () => {
             .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
             .all()
             .map((row) => row.name),
-        ).toEqual(['MediaItems', 'UserDatas']);
+        ).toEqual(['JellyportRecoveredHistory', 'MediaItems', 'UserDatas']);
         expect(output.prepare('PRAGMA journal_mode').get()?.journal_mode).toBe('delete');
         expect(output.prepare('PRAGMA integrity_check').get()?.integrity_check).toBe('ok');
       } finally {

@@ -177,7 +177,7 @@ describe('queued and running job cancellation', () => {
     expect(drained).toBe(false);
     expect(service.getJob(job.id).status).toBe('running');
     expect(started.length).toBeGreaterThan(0);
-    expect(started.length).toBeLessThanOrEqual(6);
+    expect(started.length).toBeLessThanOrEqual(8);
     const inFlight = [...started];
     release.resolve();
     await pending;

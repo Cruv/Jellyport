@@ -8,7 +8,7 @@ metadata and played flags drive the current transfer. Historical investigations
 and measurements below retain their original inputs and limitations.
 
 
-## Played-only production trial — 2026-10-16
+## Played-only production trials — 2026-10-16
 
 A representative heavy history on version 0.16.0 took **136.3 seconds** from
 queueing through independent readback. Shared preparation was reported separately:
@@ -17,20 +17,51 @@ Jellyfin matching catalog (194,633 items). Per-user phases were source extractio
 0.6 s, provisioning 0.4 s, candidate reads 11.8 s, matching 0.6 s, writes 114.4 s,
 and independent verification 8.5 s. Timings are rounded.
 
-The run met the five-minute time limit and missed the two-minute target. It was
+The accepted job met the five-minute time limit and missed the two-minute target;
+review preparation was not timed, so this run alone does not prove the combined
+workflow limit. It was
 **partial**, not a correctness acceptance: 20,597 played flags verified, 12 matched
 items mismatched after HTTP 500/404 responses, 635 source items were ambiguous,
 and 1,719 orphan history entries had no remaining source library item. Failures
 were reported rather than converted to success. A Jellyfin metadata provider-key
-collision explained one deterministic HTTP 500; HTTP 404 causes still needed
-item-specific diagnosis. No access check was bypassed.
+collision explained one deterministic HTTP 500. Subsequent read-only inspection
+found that all eleven HTTP 404 items belonged to a library excluded by the trial
+account's copied template permissions. No access check was bypassed.
 
 Version 0.16.1 adds bounded administrator-only failed-item diagnostics and aggregate
 write/checkpoint timings. It raises destination write concurrency from four to six
 and limits observational progress saves to once per second plus a final flush.
-Account creation uncertainty journals remain immediate. These are optimization
-changes requiring a new production trial; they do not establish a new timing or
-correctness result on their own. Current migrations transfer played flags only.
+Account creation uncertainty journals remain immediate.
+
+A fresh three-account trial on 0.16.1 measured review readiness within **5.142
+seconds**, followed by **205.2 seconds** for the accepted job, including writes to
+live Jellyfin and independent live verification. The combined workflow took at
+most **210.342 seconds**, excluding the human review pause. This is partial
+performance success under the five-minute threshold; it misses the two-minute
+target for the whole bulk operation. Account work was serialized:
+
+| History size | Account work | Played flags written and independently verified | Failed updates | Ambiguous source items | Orphan source history |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Heavy | 132.8 s | 20,597 | 12 | 635 | 1,719 |
+| Typical | 12.5 s | 1,801 | 0 | 12 | 38 |
+| High | 59.7 s | 9,283 | 87 | 39 | 977 |
+
+Account-work times exclude waiting behind earlier accounts and must not be
+presented as isolated end-to-end results. All three accounts finished within the
+combined bulk duration above. Every run remained **Needs review** because source
+exceptions or failed verification remained; timing did not override those results.
+No live Emby catalog was scanned. Shared backup imports remained approximately
+63 seconds for Emby and 280.9 seconds for Jellyfin, outside the per-migration timer
+and reusable across accounts.
+
+An existing-account trial on 0.16.0 took 19.4 seconds after acceptance and verified
+2,938 unique played flags with no missing or mismatched matches. One unmatched
+item, 50 ambiguous items and 545 orphan history entries kept it partial. Its review
+time was not measured. A heavy existing-account rerun on 0.16.1 took 28.3 seconds
+after acceptance, skipped the 20,597 already-verified flags and retried only the
+twelve failures; it did not rewrite the successful flags. These runs demonstrate
+live writes and repeatability, not a backup-only benchmark or a measured combined
+two-minute result.
 
 ## Incident evidence and limits of attribution
 
@@ -109,8 +140,8 @@ and BaseItemProviders into an allowlisted SQLite projection with disk indexes.
 The web service receives an encrypted neutral catalog, never the original archive.
 Each account loads only indexed identity candidates and their series dependencies;
 all candidate IDs and identity fields are checked through fresh user-scoped API
-reads before matching. Played updates still recheck activity immediately before
-writing, and independent batched readback verifies intended played flags afterward.
+reads before matching. Played updates send only the additive `Played: true` field,
+and independent batched readback verifies intended played flags afterward.
 A successful HTTP update alone is not evidence of completed migration.
 
 Set `JELLYPORT_JELLYFIN_CATALOG_MODE=backup` on the web service so the first startup
@@ -137,9 +168,18 @@ state. The legacy watched endpoint is not used because it can alter counts, date
 or resume state. Unmatched and ambiguous identities remain explicit and are never
 guessed.
 
+The performance acceptance measure is **review preparation plus accepted migration
+elapsed time**. It includes history extraction, matching, writes to the live Jellyfin
+server, retries, independent live readback, preflight and queueing. Time spent by the
+administrator reading the ready review is excluded. Under two minutes is the target;
+two to five minutes is a partial performance success, not the highest-success result.
+Timing success does not turn unmatched items or failed verification into a complete
+migration. Backup-only matching benchmarks cannot establish this acceptance measure.
+
 Job elapsed time covers the server migration request, including preflight validation,
-queue admission, final verification and completion. Browser/network overhead is
-measured separately in an end-to-end trial.
+queue admission, final verification and completion. That timer alone excludes review
+preparation; older trial results without separately measured review time cannot prove
+the combined target. Browser/network overhead is measured separately in a trial.
 Per-account timings include extraction, matching, writes, retries and verification;
 shared import time and original backup dates appear separately. A bulk job's wall
 time is authoritative: individual account work does not include its wait behind
@@ -158,23 +198,36 @@ catalog builds are not published. A job retains its selected catalog even if the
 normal reuse window expires while transferring users.
 
 One matching index selects the union of all type-scoped provider, series/episode
-number and exact mapped-path candidates for eligible source history and every
-playlist entry. Lower-priority and contradictory identity candidates remain in
+number and exact mapped-path candidates for eligible played source history.
+Lower-priority and contradictory identity candidates remain in
 that union: removing an inaccessible provider match can reveal a series or path
 fallback, or change whether a match is ambiguous. Parent series needed to verify
 derived series identifiers are included as dependencies. Unrelated destination
 items are not read again for each account.
 
-Jellyfin account reads use explicit `Ids` batches of at most 100 identifiers and
-6,000 encoded characters, without recursive enumeration, name sorting or total
-counts. Returned items retain empty personal state so that an accessible unwatched
+Jellyfin account reads first obtain that user's accessible library views, then
+intersect explicit `Ids` batches of at most 100 identifiers and 6,000 encoded
+characters with each view using `ParentId` and `Recursive=true`. Explicit IDs
+bound the requested items; this does not enumerate each view's full catalog.
+No name sorting or total counts are requested. Returned items retain empty personal state so that an accessible unwatched
 item remains a valid destination. Omitted IDs are unavailable to that account,
 not implied empty state or permission to write. Unexpected/repeated IDs, invalid
 data and identity changes fail closed. Fresh metadata is checked against the
 cached identity; a preparation failure clears the cache and stops the remaining
 batch instead of repeating a failed build for every account. Final matching uses
-only the returned, account-scoped items. Potential updates still read fresh
-per-item user data immediately before applying the existing additive merge.
+only the returned, account-scoped items. Updates send only the additive played
+flag. Independent readback refreshes the library views and item flags again.
+
+This extra view boundary is needed because Jellyfin's explicit-ID path can return
+items outside a user's enabled libraries. The production trial exposed eleven
+such matches in an excluded library. View reads are capped at 64, item reads remain
+sequential, and duplicate IDs across views are retained once; conflicting personal
+state fails closed. There are at most `1 + views × batches` read requests per
+invocation, plus bounded read retries. Two accessible views approximately double
+the old candidate/readback call count. This cost is included in migration timing.
+Template permissions are preserved; inaccessible items may become unmatched or
+reveal another accessible identity candidate. Target writes remain authoritative:
+library-view filtering is not proof of every standalone item visibility rule.
 
 The request shape was checked against Jellyfin's tagged
 [Items controller](https://github.com/jellyfin/jellyfin/blob/v10.11.6/Jellyfin.Api/Controllers/ItemsController.cs#L300),
@@ -208,7 +261,7 @@ discards the partial index. These destination limits do not relax Emby's separat
 five-second deadline or source governor. Explicit-ID account reads retain their
 30-second deadline and at most three attempts for HTTP 429/503, with each retry
 delay capped at two seconds. Reads do not fan out. That release kept a four-worker ceiling for independent destination item
-transfers. Current played-only writes use at most six workers; account jobs remain
+transfers. Current played-only writes use at most eight workers; account jobs remain
 serialized and no mutation is retried automatically. Cold collection
 still costs database work; sharing it removes repeated per-account work.
 
@@ -393,7 +446,7 @@ and reuses that account's matching index. A matching plan retains at most 200,00
 candidate references.
 Over-limit plans fail rather than drop candidates or guess a match. Item workers
 yield every 250 processed items so large already-merged histories remain
-cancelable. Fresh access-scoped Jellyfin candidate checks remain. Played-only destination writes have a six-worker ceiling; account jobs stay serialized and workers drain before cancellation releases locks.
+cancelable. Fresh access-scoped Jellyfin candidate checks remain. Played-only destination writes have an eight-worker ceiling; account jobs stay serialized and workers drain before cancellation releases locks.
 
 The following benchmark measurements predate the played-only scope and describe
 local component work, not current end-to-end throughput.

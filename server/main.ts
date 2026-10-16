@@ -67,6 +67,7 @@ interface RecoveryRequest extends AccountRequest {
   target_user_id: string;
 }
 interface MigrationRequest {
+  preview_id?: string;
   source_user_ids: string[];
   discord_recipients?: Record<string, string>;
   mapping_revisions?: Record<string, string | null>;
@@ -114,6 +115,7 @@ const migrationSchema = {
   additionalProperties: false,
   required: ['source_user_ids'],
   properties: {
+    preview_id: snapshotId,
     source_user_ids: { type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: id },
     migration_scope: { type: 'string', enum: ['complete', 'watched_only'] },
     use_snapshots: { type: 'boolean' },
@@ -172,6 +174,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   }
   const service = new Service(store, { demo, clientFactory });
   const previews = new PreviewTasks((ids, controls) => service.preview(ids, controls));
+  const acceptingPreviews = new Set<string>();
   const previewContext = () =>
     createHash('sha256').update(JSON.stringify(store.settings())).digest('hex');
   const bot = new BotManager(service);
@@ -945,6 +948,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     { schema: { body: migrationSchema } },
     async (request, reply) => {
       validateSnapshotSelection(request.body);
+      if (request.body.preview_id)
+        throw new ServiceError('A preview ID can be used only when accepting a ready review.');
       if (request.body.source_snapshot_ids)
         throw new ServiceError('Start a new preview to select its source snapshots.');
       return reply
@@ -992,17 +997,71 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       validateSnapshotSelection(request.body);
       if (request.body.use_snapshots && !request.body.source_snapshot_ids)
         throw new ServiceError('Review source snapshots before starting the migration.');
-      return reply
-        .code(202)
-        .send(
-          await service.migrateUsers(
-            request.body.source_user_ids,
-            request.body.discord_recipients,
-            request.body.mapping_revisions,
-            'watched_only',
-            request.body.source_snapshot_ids,
-          ),
+      const reviewed = request.body.preview_id
+        ? previews.get(request.cookies[COOKIE]!, previewContext(), request.body.preview_id)
+        : undefined;
+      let mappingRevisions = request.body.mapping_revisions;
+      let previewTiming;
+      if (request.body.preview_id) {
+        if (
+          reviewed?.status !== 'ready' ||
+          !reviewed.preview ||
+          reviewed.finished_at === undefined ||
+          reviewed.elapsed_ms === undefined
+        )
+          throw new ServiceError(
+            'This migration review expired or is unavailable. Prepare a new review.',
+          );
+        const preview = reviewed.preview;
+        const exactRecord = (
+          expected: Record<string, string | null> | undefined,
+          actual: Record<string, string | null> | undefined,
+        ) =>
+          Object.keys(expected ?? {}).length === Object.keys(actual ?? {}).length &&
+          Object.entries(expected ?? {}).every(
+            ([key, value]) => Object.hasOwn(actual ?? {}, key) && actual![key] === value,
+          );
+        const expectedRevisions = Object.fromEntries(
+          preview.users.map((user) => [user.source_user_id, user.mapping_revision ?? null]),
         );
+        if (
+          preview.users.length !== request.body.source_user_ids.length ||
+          preview.users.some(
+            (user, index) => user.source_user_id !== request.body.source_user_ids[index],
+          ) ||
+          !exactRecord(preview.source_snapshot_ids, request.body.source_snapshot_ids) ||
+          (mappingRevisions && !exactRecord(expectedRevisions, mappingRevisions))
+        )
+          throw new ServiceError(
+            'The migration selection differs from this review. Prepare a new review.',
+          );
+        mappingRevisions = expectedRevisions;
+        previewTiming = {
+          preview_id: reviewed.id,
+          started_at: reviewed.started_at,
+          finished_at: reviewed.finished_at,
+          elapsed_ms: reviewed.elapsed_ms,
+          user_count: preview.users.length,
+        };
+      }
+      if (reviewed && acceptingPreviews.has(reviewed.id))
+        throw new ServiceError('This migration review is already being accepted.');
+      if (reviewed) acceptingPreviews.add(reviewed.id);
+      try {
+        const job = await service.migrateUsers(
+          request.body.source_user_ids,
+          request.body.discord_recipients,
+          mappingRevisions,
+          'watched_only',
+          request.body.source_snapshot_ids,
+          previewTiming,
+        );
+        // The duration is now copied into the durable job; release session-owned review data.
+        if (reviewed) previews.cancel(request.cookies[COOKIE]!, reviewed.id);
+        return reply.code(202).send(job);
+      } finally {
+        if (reviewed) acceptingPreviews.delete(reviewed.id);
+      }
     },
   );
   app.post<{ Body: AccountRequest }>(

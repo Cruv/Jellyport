@@ -672,6 +672,93 @@ describe('account migration and subscription safety', () => {
     },
   );
 
+  it('retains a trusted review duration across queue restart and adds the whole accepted job duration', async () => {
+    await service.stop();
+    const timestamp = new Date().toISOString();
+    const previewTiming = {
+      preview_id: '00000000-0000-4000-8000-000000000001',
+      started_at: '2026-10-16T00:00:00.000Z',
+      finished_at: '2026-10-16T00:00:01.234Z',
+      elapsed_ms: 1234,
+      user_count: 1,
+    };
+    const queued: Job = {
+      id: 'reviewed-durable-job',
+      kind: 'migrate',
+      status: 'queued',
+      created_at: timestamp,
+      updated_at: timestamp,
+      preview_timing: previewTiming,
+      progress: { processed: 0, total: 1 },
+      results: [],
+    };
+    store.saveQueuedJob(queued, [{ source_user_id: 'e-river' }], store.settings());
+    store.close();
+    store = new Store(directory);
+    service = new Service(store, { clientFactory: servers.factory });
+    await service.start();
+    const result = await finish(queued);
+    expect(result.status).toBe('completed');
+    expect(result.preview_timing).toEqual(previewTiming);
+    expect(result.workflow_elapsed_ms).toBe(1234 + result.elapsed_ms!);
+    expect(result.results[0]?.data?.verification?.mismatched).toBe(0);
+  });
+
+  it('copies accepted review timing so later caller mutations cannot alter durable measurements', async () => {
+    const previewTiming = {
+      preview_id: '00000000-0000-4000-8000-000000000001',
+      started_at: '2026-10-16T00:00:00.000Z',
+      finished_at: '2026-10-16T00:00:01.234Z',
+      elapsed_ms: 1234,
+      user_count: 1,
+    };
+    const queued = await service.migrateUsers(
+      ['e-river'],
+      {},
+      undefined,
+      'watched_only',
+      undefined,
+      previewTiming,
+    );
+    previewTiming.elapsed_ms = 0;
+    const result = await finish(queued);
+    expect(result.preview_timing?.elapsed_ms).toBe(1234);
+    expect(result.workflow_elapsed_ms).toBe(1234 + result.elapsed_ms!);
+  });
+
+  it.each(['jellyfin_url', 'emby_url', 'discord_enabled'] as const)(
+    'rejects a concurrent %s configuration change during asynchronous migration preflight',
+    async (field) => {
+      const bot = new FakeBot();
+      let release!: () => void;
+      const validating = vi.spyOn(bot, 'validateRecipient').mockImplementationOnce(async () => {
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      });
+      service.bot = bot;
+      const clients = vi.fn(servers.factory);
+      service.clientFactory = clients;
+      const pending = service.migrateUsers(['e-alex'], { 'e-alex': '123456789' });
+      const rejected = expect(pending).rejects.toThrow(
+        'Configuration changed during migration preparation',
+      );
+      await vi.waitFor(() => expect(validating).toHaveBeenCalledOnce());
+      store.saveSettings({
+        ...store.settings(),
+        [field]: field === 'discord_enabled' ? true : 'http://different-media-server',
+      });
+      release();
+      await rejected;
+      expect(store.jobs()).toEqual([]);
+      expect(store.queuedJobs()).toEqual([]);
+      expect(service.jobTasks.size).toBe(0);
+      expect(clients).not.toHaveBeenCalled();
+      expect(servers.users.jellyfin).toHaveLength(2);
+      expect(servers.played['j-river']).toEqual(new Set(['1']));
+    },
+  );
+
   it('rejects unknown migration scopes before any reads or queued mutations', async () => {
     const reads = vi.fn();
     service.clientFactory = (...args) => {

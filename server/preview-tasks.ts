@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { MediaError, ServiceError } from './errors.js';
 import type { MigrationScope } from './migration.js';
 
@@ -6,6 +7,9 @@ const MAX_RESULT_BYTES = 8 * 1024 * 1024;
 
 export interface PreviewTask<T> {
   id: string;
+  started_at: string;
+  finished_at?: string;
+  elapsed_ms?: number;
   status: 'running' | 'ready' | 'failed';
   progress: { processed: number; total: number };
   preview?: T;
@@ -17,6 +21,7 @@ interface Entry<T> {
   controller: AbortController;
   timer: ReturnType<typeof setTimeout>;
   value: PreviewTask<T>;
+  startedAt: number;
 }
 interface Controls {
   signal: AbortSignal;
@@ -67,6 +72,7 @@ export class PreviewTasks<T> {
     }
     const value: PreviewTask<T> = {
       id: randomUUID(),
+      started_at: new Date().toISOString(),
       status: 'running',
       progress: { processed: 0, total: ids.length },
     };
@@ -85,6 +91,7 @@ export class PreviewTasks<T> {
         this.options.deadlineMs ?? 15 * 60_000,
       ),
       value,
+      startedAt: performance.now(),
     };
     entry.timer.unref();
     this.entries.set(value.id, entry);
@@ -121,6 +128,8 @@ export class PreviewTasks<T> {
         entry.value = {
           ...entry.value,
           status: 'ready',
+          finished_at: new Date().toISOString(),
+          elapsed_ms: Math.max(0, Math.round(performance.now() - entry.startedAt)),
           preview,
           progress: { processed: ids.length, total: ids.length },
         };
@@ -166,7 +175,13 @@ export class PreviewTasks<T> {
 
   private fail(entry: Entry<T>, error: string): void {
     if (this.entries.get(entry.value.id) !== entry || entry.value.status !== 'running') return;
-    entry.value = { ...entry.value, status: 'failed', error };
+    entry.value = {
+      ...entry.value,
+      status: 'failed',
+      finished_at: new Date().toISOString(),
+      elapsed_ms: Math.max(0, Math.round(performance.now() - entry.startedAt)),
+      error,
+    };
     this.retain(entry);
   }
 

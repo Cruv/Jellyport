@@ -325,6 +325,7 @@ it.each([undefined, 'complete', 'watched_only'] as const)(
       mapping_revisions,
       'watched_only',
       source_snapshot_ids,
+      undefined,
     );
   },
 );

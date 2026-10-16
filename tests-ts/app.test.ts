@@ -85,6 +85,26 @@ async function login(app: JellyportApp) {
     'x-csrf-token': response.json().csrf_token as string,
   };
 }
+async function readyPreview(
+  app: JellyportApp,
+  headers: Awaited<ReturnType<typeof login>>,
+  sourceUserIds: string[] = ['e-alex'],
+) {
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/migrations/preview',
+    headers,
+    payload: { source_user_ids: sourceUserIds },
+  });
+  expect(response.statusCode).toBe(202);
+  const id = response.json().id as string;
+  let result;
+  await vi.waitFor(async () => {
+    result = (await app.inject({ url: `/api/migrations/preview/${id}`, headers })).json();
+    expect(result.status).toBe('ready');
+  });
+  return result!;
+}
 it('preserves authentication, CSRF, redaction, account creation and one-time credentials', async () => {
   const app = await setup();
   expect((await app.inject('/health')).statusCode).toBe(200);
@@ -369,7 +389,14 @@ it.each([
     );
     const queued = await app.inject({ method: 'POST', url: '/api/migrations', headers, payload });
     expect(queued.statusCode).toBe(202);
-    expect(migrate).toHaveBeenCalledWith(['e-alex'], undefined, undefined, expected, undefined);
+    expect(migrate).toHaveBeenCalledWith(
+      ['e-alex'],
+      undefined,
+      undefined,
+      expected,
+      undefined,
+      undefined,
+    );
   },
 );
 it('rejects unknown or coerced migration scopes before preview or queue work starts', async () => {
@@ -391,6 +418,253 @@ it('rejects unknown or coerced migration scopes before preview or queue work sta
   expect(preview).not.toHaveBeenCalled();
   expect(migrate).not.toHaveBeenCalled();
   expect(app.jellyport.store.jobs()).toHaveLength(0);
+});
+
+it('persists trusted whole-review preparation plus accepted job duration without dividing bulk review time', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const review = await readyPreview(app, headers, ['e-alex', 'e-river']);
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/migrations',
+    headers,
+    payload: { source_user_ids: ['e-alex', 'e-river'], preview_id: review.id },
+  });
+  expect(response.statusCode).toBe(202);
+  const accepted = response.json();
+  expect(accepted.preview_timing).toEqual({
+    preview_id: review.id,
+    started_at: review.started_at,
+    finished_at: review.finished_at,
+    elapsed_ms: review.elapsed_ms,
+    user_count: 2,
+  });
+  expect(accepted.workflow_elapsed_ms).toBeUndefined();
+  await app.jellyport.service.jobTasks.get(accepted.id);
+  const finished = (await app.inject({ url: `/api/jobs/${accepted.id}`, headers })).json();
+  expect(finished.workflow_elapsed_ms).toBe(review.elapsed_ms + finished.elapsed_ms);
+  expect(finished.results).toHaveLength(2);
+  expect(
+    finished.results.every(
+      (result: { data: { verification: { mismatched: number } } }) =>
+        result.data.verification.mismatched === 0,
+    ),
+  ).toBe(true);
+  expect(
+    (await app.inject({ url: `/api/migrations/preview/${review.id}`, headers })).statusCode,
+  ).toBe(404);
+  expect(
+    (
+      await app.inject({
+        method: 'POST',
+        url: '/api/migrations',
+        headers,
+        payload: { source_user_ids: ['e-alex', 'e-river'], preview_id: review.id },
+      })
+    ).statusCode,
+  ).toBe(400);
+  const directory = resources.find((resource) => resource.app === app)!.directory;
+  const persisted = new Store(directory, { demo: true });
+  try {
+    expect(persisted.job(accepted.id)?.preview_timing).toEqual(accepted.preview_timing);
+    expect(persisted.job(accepted.id)?.workflow_elapsed_ms).toBe(finished.workflow_elapsed_ms);
+  } finally {
+    persisted.close();
+  }
+});
+
+it('keeps direct migration timing explicitly separate when no trusted review is supplied', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/migrations',
+    headers,
+    payload: { source_user_ids: ['e-sam'] },
+  });
+  expect(response.statusCode).toBe(202);
+  await app.jellyport.service.jobTasks.get(response.json().id);
+  const finished = app.jellyport.store.job(response.json().id)!;
+  expect(finished.elapsed_ms).toBeGreaterThanOrEqual(0);
+  expect(finished.preview_timing).toBeUndefined();
+  expect(finished.workflow_elapsed_ms).toBeUndefined();
+});
+
+it('rejects fabricated, foreign, changed, and malformed review timing before queuing migration work', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const other = await login(app);
+  const review = await readyPreview(app, headers);
+  for (const [requestHeaders, payload, status] of [
+    [
+      headers,
+      { source_user_ids: ['e-alex'], preview_id: '00000000-0000-4000-8000-000000000000' },
+      400,
+    ],
+    [other, { source_user_ids: ['e-alex'], preview_id: review.id }, 400],
+    [headers, { source_user_ids: ['e-sam'], preview_id: review.id }, 400],
+    [
+      headers,
+      {
+        source_user_ids: ['e-alex'],
+        preview_id: review.id,
+        mapping_revisions: { 'e-alex': 'invented-revision' },
+      },
+      400,
+    ],
+    [
+      headers,
+      {
+        source_user_ids: ['e-alex'],
+        preview_id: review.id,
+        source_snapshot_ids: { 'e-alex': '00000000-0000-4000-8000-000000000000' },
+      },
+      400,
+    ],
+    [headers, { source_user_ids: ['e-alex'], preview_id: review.id, preview_elapsed_ms: 0 }, 422],
+    [
+      headers,
+      { source_user_ids: ['e-alex'], preview_id: review.id, preview_timing: { elapsed_ms: 0 } },
+      422,
+    ],
+    [headers, { source_user_ids: ['e-alex'], preview_id: 123 }, 422],
+  ] as const) {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/migrations',
+      headers: requestHeaders,
+      payload,
+    });
+    expect(response.statusCode).toBe(status);
+    expect(app.jellyport.store.jobs()).toHaveLength(0);
+  }
+});
+
+it('rejects a running review and preserves retry after accepted preflight fails', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  let release!: () => void;
+  const original = app.jellyport.service.preview.bind(app.jellyport.service);
+  const preview = vi
+    .spyOn(app.jellyport.service, 'preview')
+    .mockImplementationOnce(async (...args) => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return original(...args);
+    });
+  const started = await app.inject({
+    method: 'POST',
+    url: '/api/migrations/preview',
+    headers,
+    payload: { source_user_ids: ['e-alex'] },
+  });
+  const payload = { source_user_ids: ['e-alex'], preview_id: started.json().id };
+  expect(
+    (await app.inject({ method: 'POST', url: '/api/migrations', headers, payload })).statusCode,
+  ).toBe(400);
+  release();
+  await vi.waitFor(async () =>
+    expect(
+      (await app.inject({ url: `/api/migrations/preview/${payload.preview_id}`, headers })).json()
+        .status,
+    ).toBe('ready'),
+  );
+  const migrate = vi
+    .spyOn(app.jellyport.service, 'migrateUsers')
+    .mockRejectedValueOnce(new Error('Synthetic preflight failure'));
+  expect(
+    (await app.inject({ method: 'POST', url: '/api/migrations', headers, payload })).statusCode,
+  ).toBe(500);
+  expect(
+    (await app.inject({ url: `/api/migrations/preview/${payload.preview_id}`, headers })).json()
+      .status,
+  ).toBe('ready');
+  expect(
+    (await app.inject({ method: 'POST', url: '/api/migrations', headers, payload })).statusCode,
+  ).toBe(202);
+  migrate.mockRestore();
+  preview.mockRestore();
+});
+
+it('prevents concurrent acceptance from queuing duplicate work for the same review', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const review = await readyPreview(app, headers);
+  let release!: () => void;
+  const original = app.jellyport.service.migrateUsers.bind(app.jellyport.service);
+  const migrate = vi
+    .spyOn(app.jellyport.service, 'migrateUsers')
+    .mockImplementationOnce(async (...args) => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return original(...args);
+    });
+  const payload = { source_user_ids: ['e-alex'], preview_id: review.id };
+  const accepting = app
+    .inject({ method: 'POST', url: '/api/migrations', headers, payload })
+    .then((result) => result);
+  await vi.waitFor(() => expect(migrate).toHaveBeenCalledOnce());
+  const duplicate = await app.inject({ method: 'POST', url: '/api/migrations', headers, payload });
+  expect(duplicate.statusCode).toBe(400);
+  expect(duplicate.json().detail).toContain('already being accepted');
+  expect(migrate).toHaveBeenCalledOnce();
+  release();
+  expect((await accepting).statusCode).toBe(202);
+  expect(app.jellyport.store.jobs()).toHaveLength(1);
+  migrate.mockRestore();
+});
+
+it('requires a new review when destination configuration changes during accepted preflight', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const review = await readyPreview(app, headers);
+  let release!: () => void;
+  const validation = vi
+    .spyOn(app.jellyport.service.bot!, 'validateRecipient')
+    .mockImplementationOnce(async () => {
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+  const payload = {
+    source_user_ids: ['e-alex'],
+    preview_id: review.id,
+    discord_recipients: { 'e-alex': '123456789' },
+  };
+  const pending = app
+    .inject({ method: 'POST', url: '/api/migrations', headers, payload })
+    .then((result) => result);
+  await vi.waitFor(() => expect(validation).toHaveBeenCalledOnce());
+  app.jellyport.store.saveSettings({
+    ...app.jellyport.store.settings(),
+    jellyfin_url: 'http://different-jellyfin',
+  });
+  release();
+  const response = await pending;
+  expect(response.statusCode).toBe(400);
+  expect(response.json().detail).toContain('Prepare a new review');
+  expect(app.jellyport.store.jobs()).toEqual([]);
+  expect(
+    (await app.inject({ url: `/api/migrations/preview/${review.id}`, headers })).statusCode,
+  ).toBe(404);
+  expect(
+    (await app.inject({ method: 'POST', url: '/api/migrations', headers, payload })).statusCode,
+  ).toBe(400);
+  const refreshed = await readyPreview(app, headers);
+  expect(refreshed.id).not.toBe(review.id);
+  expect(
+    (
+      await app.inject({
+        method: 'POST',
+        url: '/api/migrations',
+        headers,
+        payload: { source_user_ids: ['e-alex'], preview_id: refreshed.id },
+      })
+    ).statusCode,
+  ).toBe(202);
+  validation.mockRestore();
 });
 it('discards ready history previews when integration settings change', async () => {
   const app = await setup(false);

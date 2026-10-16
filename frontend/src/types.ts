@@ -289,6 +289,14 @@ export interface SourceSnapshotStatus {
   records: SourceSnapshotMetadata[];
 }
 export interface Job {
+  preview_timing?: {
+    preview_id: string;
+    started_at: string;
+    finished_at: string;
+    elapsed_ms: number;
+    user_count: number;
+  };
+  workflow_elapsed_ms?: number;
   destination_catalog_id?: string;
   elapsed_ms?: number;
   queue_ms?: number;
@@ -343,6 +351,9 @@ export interface Preview {
   source_snapshot_ids?: Record<string, string>;
 }
 export interface PreviewTask {
+  started_at?: string;
+  finished_at?: string;
+  elapsed_ms?: number;
   id: string;
   status: 'running' | 'ready' | 'failed';
   progress: { processed: number; total: number };

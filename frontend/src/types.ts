@@ -179,6 +179,7 @@ export interface JobProgress {
   phase?:
     | 'reading_source'
     | 'preparing_account'
+    | 'indexing_target'
     | 'reading_target'
     | 'transferring_history'
     | 'transferring_playlists'
@@ -186,6 +187,11 @@ export interface JobProgress {
   items_processed?: number;
   items_total?: number;
   items_updated?: number;
+  catalog_pages?: number;
+  catalog_items?: number;
+  catalog_elapsed_ms?: number;
+  catalog_last_page_ms?: number;
+  catalog_cache_hit?: boolean;
 }
 export type MigrationScope = 'complete' | 'watched_only';
 export interface SourceSnapshotMetadata {

@@ -51,20 +51,23 @@ describe('bounded reusable migration catalog', () => {
       expect(MigrationCatalogCache.key(args[0], args[1], args[2], args[3])).not.toBe(key);
   });
 
-  it('retains at most one scope and rejects conflicting builds while another scope is loading', async () => {
-    const cache = new MigrationCatalogCache(),
-      pending = deferred<MediaItem[]>();
-    const loading = cache.get('one', () => pending.promise),
-      conflicting = vi.fn(async () => [item('two')]);
-    await expect(cache.get('two', conflicting)).rejects.toThrow('Another source catalog');
-    expect(conflicting).not.toHaveBeenCalled();
-    pending.resolve([item('one')]);
-    await loading;
-    expect((await cache.get('two', conflicting)).items[0]?.Id).toBe('two');
-    const rebuild = vi.fn(async () => [item('new-one')]);
-    expect((await cache.get('one', rebuild)).items[0]?.Id).toBe('new-one');
-    expect(rebuild).toHaveBeenCalledTimes(1);
-  });
+  it.each([false, true])(
+    'retains one scope and rejects conflicting builds (completion TTL %s)',
+    async (reuseTtlFromCompletion) => {
+      const cache = new MigrationCatalogCache({ reuseTtlFromCompletion }),
+        pending = deferred<MediaItem[]>();
+      const loading = cache.get('one', () => pending.promise),
+        conflicting = vi.fn(async () => [item('two')]);
+      await expect(cache.get('two', conflicting)).rejects.toThrow('Another source catalog');
+      expect(conflicting).not.toHaveBeenCalled();
+      pending.resolve([item('one')]);
+      await loading;
+      expect((await cache.get('two', conflicting)).items[0]?.Id).toBe('two');
+      const rebuild = vi.fn(async () => [item('new-one')]);
+      expect((await cache.get('one', rebuild)).items[0]?.Id).toBe('new-one');
+      expect(rebuild).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it('refreshes at the ten-minute boundary and measures age from collection start', async () => {
     let time = 0;
@@ -86,35 +89,70 @@ describe('bounded reusable migration catalog', () => {
     expect(load).toHaveBeenCalledTimes(3);
   });
 
-  it('does not republish a collection that finishes after cache invalidation', async () => {
-    const cache = new MigrationCatalogCache(),
-      pending = deferred<MediaItem[]>();
-    const old = cache.get('key', () => pending.promise);
-    cache.clear();
-    pending.resolve([item('old')]);
-    expect((await old).items[0]?.Id).toBe('old');
-    const load = vi.fn(async () => [item('current')]);
-    expect((await cache.get('key', load)).items[0]?.Id).toBe('current');
+  it('reuses a slow completed destination catalog for ten minutes without changing its capture time', async () => {
+    let time = 0;
+    const cache = new MigrationCatalogCache({
+      clock: () => time,
+      label: 'destination',
+      reuseTtlFromCompletion: true,
+    });
+    const pending = deferred<MediaItem[]>(),
+      load = vi.fn(() => pending.promise);
+    const slow = cache.get('key', load);
+    time = 600_001;
+    pending.resolve([item('slow')]);
+    const first = await slow;
+    expect(first.capturedAt).toBe(0);
+    expect(await cache.get('key', load)).toBe(first);
+    time = 1_200_000;
+    expect(await cache.get('key', load)).toBe(first);
     expect(load).toHaveBeenCalledTimes(1);
+    time = 1_200_001;
+    const refresh = vi.fn(async () => [item('fresh')]);
+    const fresh = await cache.get('key', refresh);
+    expect(fresh).not.toBe(first);
+    expect(fresh.capturedAt).toBe(time);
+    expect(fresh.items[0]?.Id).toBe('fresh');
+    expect(refresh).toHaveBeenCalledTimes(1);
   });
 
-  it('never admits partial work after a failed collection or falls back to a previous scope', async () => {
-    const cache = new MigrationCatalogCache();
-    await cache.get('old-scope', async () => [item('old')]);
-    const partial = [item('partial')],
-      failed = deferred<MediaItem[]>();
-    const first = cache.get('new-scope', () => failed.promise);
-    const rejected = expect(first).rejects.toThrow('late page failed');
-    partial.push(item('more-partial'));
-    failed.reject(new Error('late page failed'));
-    await rejected;
-    const fresh = vi.fn(async () => [item('full')]);
-    expect((await cache.get('new-scope', fresh)).items.map((entry) => entry.Id)).toEqual(['full']);
-    expect(fresh).toHaveBeenCalledTimes(1);
-    const old = vi.fn(async () => [item('rebuilt')]);
-    expect((await cache.get('old-scope', old)).items[0]?.Id).toBe('rebuilt');
-    expect(old).toHaveBeenCalledTimes(1);
-  });
+  it.each([false, true])(
+    'does not republish after cache invalidation (completion TTL %s)',
+    async (reuseTtlFromCompletion) => {
+      const cache = new MigrationCatalogCache({ reuseTtlFromCompletion }),
+        pending = deferred<MediaItem[]>();
+      const old = cache.get('key', () => pending.promise);
+      cache.clear();
+      pending.resolve([item('old')]);
+      expect((await old).items[0]?.Id).toBe('old');
+      const load = vi.fn(async () => [item('current')]);
+      expect((await cache.get('key', load)).items[0]?.Id).toBe('current');
+      expect(load).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each([false, true])(
+    'never admits partial failed work or falls back to a previous scope (completion TTL %s)',
+    async (reuseTtlFromCompletion) => {
+      const cache = new MigrationCatalogCache({ reuseTtlFromCompletion });
+      await cache.get('old-scope', async () => [item('old')]);
+      const partial = [item('partial')],
+        failed = deferred<MediaItem[]>();
+      const first = cache.get('new-scope', () => failed.promise);
+      const rejected = expect(first).rejects.toThrow('late page failed');
+      partial.push(item('more-partial'));
+      failed.reject(new Error('late page failed'));
+      await rejected;
+      const fresh = vi.fn(async () => [item('full')]);
+      expect((await cache.get('new-scope', fresh)).items.map((entry) => entry.Id)).toEqual([
+        'full',
+      ]);
+      expect(fresh).toHaveBeenCalledTimes(1);
+      const old = vi.fn(async () => [item('rebuilt')]);
+      expect((await cache.get('old-scope', old)).items[0]?.Id).toBe('rebuilt');
+      expect(old).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it.each([{}, { Played: true }, undefined])(
     'rejects any UserData property before caching and permits a clean retry (%j)',

@@ -12,7 +12,8 @@ if (process.argv.length > 2) throw new Error('This benchmark accepts no argument
 const CATALOG_ITEMS = 100_000;
 const USERS = 100;
 const ITEMS_PER_USER = 200;
-const PAGE_SIZE = 500;
+const PREVIOUS_PAGE_SIZE = 500;
+const CATALOG_PAGE_SIZE = 100;
 const fixtureStarted = performance.now();
 const fixture: MediaItem[] = Array.from({ length: CATALOG_ITEMS }, (_, index) => ({
   Id: (index + 1).toString(16).padStart(32, '0'),
@@ -28,8 +29,10 @@ let stateCalls = 0;
 let returnedCatalogItems = 0;
 let returnedStateItems = 0;
 let maxStateBatch = 0;
+let maxCatalogBatch = 0;
 let cacheHits = 0;
 const client = new MediaClient('http://synthetic.invalid', 'synthetic-benchmark-key', 'jellyfin', {
+  catalogIdleMs: 0,
   transport: async (address, options) => {
     assert.equal(options.method, 'GET', 'The benchmark must remain read-only.');
     const url = new URL(address);
@@ -39,8 +42,11 @@ const client = new MediaClient('http://synthetic.invalid', 'synthetic-benchmark-
       catalogCalls++;
       assert.equal(url.searchParams.get('EnableUserData'), 'false');
       assert.equal(url.searchParams.get('EnableTotalRecordCount'), 'false');
+      assert.equal(url.searchParams.get('CollapseBoxSetItems'), 'false');
       const start = Number(url.searchParams.get('StartIndex'));
       const limit = Number(url.searchParams.get('Limit'));
+      assert.equal(limit, CATALOG_PAGE_SIZE);
+      maxCatalogBatch = Math.max(maxCatalogBatch, limit);
       Items = fixture.slice(start, start + limit);
       returnedCatalogItems += Items.length;
     } else {
@@ -68,7 +74,10 @@ const client = new MediaClient('http://synthetic.invalid', 'synthetic-benchmark-
     return Response.json({ Items });
   },
 });
-const cache = new MigrationCatalogCache({ hit: () => cacheHits++ });
+const cache = new MigrationCatalogCache({
+  hit: () => cacheHits++,
+  reuseTtlFromCompletion: true,
+});
 const key = MigrationCatalogCache.key(
   'http://synthetic.invalid',
   'synthetic-benchmark-key',
@@ -111,13 +120,13 @@ try {
       ({ source: from, target: to }) => Object.keys(mergeUserData(from, to)).length,
     ).length;
   }
-  assert.equal(catalogCalls, CATALOG_ITEMS / PAGE_SIZE + 1);
+  assert.equal(catalogCalls, CATALOG_ITEMS / CATALOG_PAGE_SIZE + 1);
   assert.equal(stateCalls, USERS * (ITEMS_PER_USER / 100));
   assert.equal(returnedCatalogItems, CATALOG_ITEMS);
   assert.equal(returnedStateItems, USERS * ITEMS_PER_USER);
   assert.equal(cacheHits, USERS);
   assert.equal(proposedChanges, 0, 'Newer destination activity must remain unchanged.');
-  const baselinePages = USERS * Math.ceil(CATALOG_ITEMS / PAGE_SIZE);
+  const baselinePages = USERS * Math.ceil(CATALOG_ITEMS / PREVIOUS_PAGE_SIZE);
   console.log(
     JSON.stringify(
       {
@@ -132,6 +141,7 @@ try {
           destination_state_api_calls: stateCalls,
           total_api_calls: catalogCalls + stateCalls,
           metadata_items_returned: returnedCatalogItems,
+          largest_catalog_batch: maxCatalogBatch,
           user_state_items_returned: returnedStateItems,
           largest_state_batch: maxStateBatch,
           cache_hits: cacheHits,
@@ -150,7 +160,7 @@ try {
           total: Number((performance.now() - started).toFixed(1)),
         },
         limitations:
-          'Local timings do not predict production response time, memory peaks or playback impact.',
+          'Production catalog pacing is disabled for this synthetic run. Local timings do not predict production response time, memory peaks or playback impact.',
       },
       null,
       2,

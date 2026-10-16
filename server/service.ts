@@ -29,6 +29,7 @@ import {
   type MediaUser,
   type MediaUserImage,
   type DestinationReadEvent,
+  type CatalogProgress,
 } from './media.js';
 import type { Store } from './store.js';
 import type { Settings } from './types.js';
@@ -122,6 +123,7 @@ export interface Job {
     phase?:
       | 'reading_source'
       | 'preparing_account'
+      | 'indexing_target'
       | 'reading_target'
       | 'transferring_history'
       | 'transferring_playlists'
@@ -129,6 +131,11 @@ export interface Job {
     items_processed?: number;
     items_total?: number;
     items_updated?: number;
+    catalog_pages?: number;
+    catalog_items?: number;
+    catalog_elapsed_ms?: number;
+    catalog_last_page_ms?: number;
+    catalog_cache_hit?: boolean;
   };
   results: JobResult[];
   error?: string;
@@ -395,6 +402,7 @@ export class Service {
     this.destinationCatalogs = new MigrationCatalogCache({
       label: 'destination',
       hit: this.destinationCacheHit,
+      reuseTtlFromCompletion: true,
     });
     this.clientFactory =
       options.clientFactory ??
@@ -2008,6 +2016,7 @@ export class Service {
     return [target, true, password];
   }
   private async destinationItemsFor(
+    job: Job,
     source: SourceSnapshot,
     targetId: string,
     scope: MigrationScope,
@@ -2036,10 +2045,43 @@ export class Service {
         throw new ServiceError(
           'The Jellyfin destination changed during this job. Review before retrying.',
         );
+      Object.assign(job.progress, {
+        phase: 'indexing_target',
+        catalog_pages: 0,
+        catalog_items: 0,
+        catalog_elapsed_ms: 0,
+        catalog_last_page_ms: 0,
+        catalog_cache_hit: false,
+      });
+      this.save(job);
+      let lastCheckpoint = Date.now();
+      let built = false;
+      const onProgress = (value: CatalogProgress) => {
+        Object.assign(job.progress, {
+          catalog_pages: value.pages,
+          catalog_items: value.items,
+          catalog_elapsed_ms: Math.round(value.elapsed_ms),
+          catalog_last_page_ms: Math.round(value.last_page_ms),
+        });
+        if (value.pages === 1 || Date.now() - lastCheckpoint >= 1000) {
+          this.save(job);
+          lastCheckpoint = Date.now();
+        }
+      };
       if (context.value) this.destinationCacheHit(context.value.items.length);
-      else context.value = await this.destinationCatalogs.get(key, () => jellyfin.catalogItems!());
+      else
+        context.value = await this.destinationCatalogs.get(key, () => {
+          built = true;
+          return jellyfin.catalogItems!({
+            signal: this.jobControllers.get(job.id)?.signal,
+            onProgress,
+          });
+        });
       context.key = key;
       guard();
+      job.progress.catalog_cache_hit = !built;
+      job.progress.catalog_items = context.value.items.length;
+      this.save(job);
       context.matcher ??= createMatcher(context.value.items, settings.path_mappings);
       context.byId ??= new Map(context.value.items.map((item) => [item.Id, item]));
       // Eligibility is identical to the final state plan. Playlist members need matching
@@ -2059,6 +2101,8 @@ export class Service {
           candidates.push(series);
         }
       }
+      job.progress.phase = 'reading_target';
+      this.save(job);
       const items = await jellyfin.destinationItems(targetId, candidates);
       guard();
       const returned = new Set(items.map((item) => item.Id));
@@ -2478,6 +2522,7 @@ export class Service {
         guard();
         phase('reading_target');
         const targetItems = await this.destinationItemsFor(
+          job,
           source,
           target.Id,
           scope,
@@ -2768,6 +2813,11 @@ export class Service {
                 delete job.progress.items_processed;
                 delete job.progress.items_total;
                 delete job.progress.items_updated;
+                delete job.progress.catalog_pages;
+                delete job.progress.catalog_items;
+                delete job.progress.catalog_elapsed_ms;
+                delete job.progress.catalog_last_page_ms;
+                delete job.progress.catalog_cache_hit;
                 this.save(job);
               });
             if (request.source_user_id)

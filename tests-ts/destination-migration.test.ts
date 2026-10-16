@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DemoServers } from '../server/demo.js';
 import { MediaError } from '../server/errors.js';
-import { MediaClient, type MediaItem } from '../server/media.js';
+import { MediaClient, type MediaItem, type CatalogReadOptions } from '../server/media.js';
 import { Service, type Job } from '../server/service.js';
 import { DEFAULT_SETTINGS, Store } from '../server/store.js';
 
@@ -161,7 +161,7 @@ describe('destination catalog reuse and bounded user history', () => {
     const items = vi
       .spyOn(service.sourceSnapshots, 'items')
       .mockImplementation(async () => structuredClone(sourceItems));
-    const catalog = vi.fn(async () =>
+    const catalog = vi.fn(async (_options?: CatalogReadOptions) =>
       servers.media.map(({ UserData: _state, ...item }) => structuredClone(item) as MediaItem),
     );
     const destination = vi.fn(async (id: string, candidates: MediaItem[]) => {
@@ -310,6 +310,56 @@ describe('destination catalog reuse and bounded user history', () => {
     expect(fixture.catalog).toHaveBeenCalledTimes(2);
     expect(fixture.destination).toHaveBeenCalledTimes(3);
     expect(servers.playlists[fixture.targetIds[0]!]).toHaveLength(1);
+  });
+
+  it('checkpoints catalog progress at a bounded rate and clears it between accounts', async () => {
+    const fixture = setup(2, 1000);
+    const snapshots: Job[] = [];
+    const save = store.saveJob.bind(store);
+    vi.spyOn(store, 'saveJob').mockImplementation((job) => {
+      snapshots.push(structuredClone(job));
+      save(job);
+    });
+    let time = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => time);
+    const load = fixture.catalog.getMockImplementation()!;
+    fixture.catalog.mockImplementationOnce(async (options) => {
+      const items = await load();
+      for (let page = 1; page <= 11; page++) {
+        time += 100;
+        options?.onProgress?.({
+          pages: page,
+          items: Math.min(items.length, page * 100),
+          elapsed_ms: page * 100,
+          last_page_ms: 20,
+        });
+        expect(fixture.writes).not.toHaveBeenCalled();
+      }
+      return items;
+    });
+    try {
+      const job = await finish(await fixture.migrate());
+      expect(job.status).toBe('completed');
+      const cold = snapshots.filter(
+        (entry) => entry.progress.phase === 'indexing_target' && entry.progress.processed === 0,
+      );
+      expect(cold.map((entry) => entry.progress.catalog_pages)).toEqual([0, 1, 11, 11]);
+      expect(cold.at(-1)?.progress).toMatchObject({
+        catalog_items: servers.media.length,
+        catalog_elapsed_ms: 1100,
+        catalog_last_page_ms: 20,
+        catalog_cache_hit: false,
+      });
+      expect(
+        snapshots.some(
+          (entry) => entry.progress.processed === 1 && entry.progress.catalog_cache_hit === true,
+        ),
+      ).toBe(true);
+      expect(fixture.catalog).toHaveBeenCalledTimes(1);
+      expect(job.progress).toEqual({ processed: 2, total: 2 });
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it('rechecks fresh activity before writing when the candidate read has older user state', async () => {

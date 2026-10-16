@@ -420,7 +420,8 @@ export function JobProgressDetails({ job }: { job: Job }) {
   const phases = {
     reading_source: 'Reading Emby library',
     preparing_account: 'Preparing Jellyfin account',
-    reading_target: 'Reading Jellyfin library',
+    indexing_target: 'Preparing shared Jellyfin matching index',
+    reading_target: 'Reading Jellyfin account history',
     transferring_history:
       job.migration_scope === 'watched_only'
         ? 'Migrating watched status'
@@ -449,6 +450,18 @@ export function JobProgressDetails({ job }: { job: Job }) {
           )}
           {elapsed && <span>Elapsed {elapsed}</span>}
         </div>
+      )}
+      {progress?.phase === 'indexing_target' && (
+        <p className="muted text-small">
+          {progress.catalog_cache_hit
+            ? `Using cached matching index · ${num(progress.catalog_items ?? 0)} items`
+            : `${num(progress.catalog_pages ?? 0)} catalog pages · ${num(progress.catalog_items ?? 0)} items indexed`}
+          {!progress.catalog_cache_hit && (progress.catalog_pages ?? 0) === 0
+            ? ' · Waiting for the first catalog page…'
+            : !progress.catalog_cache_hit && progress.catalog_last_page_ms !== undefined
+              ? ` · Last page ${num(progress.catalog_last_page_ms)} ms`
+              : ''}
+        </p>
       )}
       {running && (
         <>

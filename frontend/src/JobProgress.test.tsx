@@ -82,7 +82,8 @@ describe('Migration item progress and timing', () => {
   it.each([
     ['reading_source', 'Reading Emby library'],
     ['preparing_account', 'Preparing Jellyfin account'],
-    ['reading_target', 'Reading Jellyfin library'],
+    ['indexing_target', 'Preparing shared Jellyfin matching index'],
+    ['reading_target', 'Reading Jellyfin account history'],
     ['transferring_history', 'Migrating watch history and favorites'],
     ['transferring_playlists', 'Migrating playlists'],
     ['delivering_credentials', 'Delivering account credentials'],
@@ -103,6 +104,64 @@ describe('Migration item progress and timing', () => {
       expect(document.querySelector('script')).toBeNull();
     },
   );
+
+  it('shows accepted catalog pages and items without inventing a percentage', () => {
+    render(
+      <JobProgressDetails
+        job={{
+          ...running,
+          progress: {
+            processed: 0,
+            total: 1,
+            phase: 'indexing_target',
+            catalog_pages: 12,
+            catalog_items: 1200,
+            catalog_last_page_ms: 230,
+          },
+        }}
+      />,
+    );
+    expect(
+      screen.getByText('12 catalog pages · 1,200 items indexed · Last page 230 ms'),
+    ).toBeTruthy();
+    expect(screen.queryByRole('progressbar', { name: 'History item progress' })).toBeNull();
+    expect(screen.queryByText(/matched items checked/)).toBeNull();
+  });
+
+  it('distinguishes waiting for the first page from reusing a cached index', () => {
+    const view = render(
+      <JobProgressDetails
+        job={{
+          ...running,
+          progress: {
+            processed: 0,
+            total: 1,
+            phase: 'indexing_target',
+            catalog_pages: 0,
+            catalog_items: 0,
+          },
+        }}
+      />,
+    );
+    expect(screen.getByText(/Waiting for the first catalog page/)).toBeTruthy();
+    view.rerender(
+      <JobProgressDetails
+        job={{
+          ...running,
+          progress: {
+            processed: 0,
+            total: 1,
+            phase: 'indexing_target',
+            catalog_pages: 0,
+            catalog_items: 100000,
+            catalog_cache_hit: true,
+          },
+        }}
+      />,
+    );
+    expect(screen.getByText('Using cached matching index · 100,000 items')).toBeTruthy();
+    expect(screen.queryByText(/Waiting for the first catalog page/)).toBeNull();
+  });
 
   it('advances checked-item progress even when no additional writes were needed', () => {
     const view = render(

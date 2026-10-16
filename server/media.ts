@@ -59,7 +59,7 @@ export interface MediaAPI {
   markPlayed(userId: string, itemId: string, datePlayed?: string): Promise<void>;
   migrationItems?(userId?: string): Promise<MediaItem[]>;
   /** Reusable identity metadata. Never includes personal state. */
-  catalogItems?(): Promise<MediaItem[]>;
+  catalogItems?(options?: CatalogReadOptions): Promise<MediaItem[]>;
   /** Complete state, read by explicit catalog IDs without a per-user library crawl. */
   migrationState?(
     userId: string,
@@ -95,10 +95,30 @@ export interface DestinationReadEvent {
   items: number;
   attempts: number;
 }
+/** Aggregate preparation progress; no credentials, account IDs or playback details. */
+export interface CatalogProgress {
+  pages: number;
+  items: number;
+  elapsed_ms: number;
+  last_page_ms: number;
+}
+export interface CatalogReadOptions {
+  signal?: AbortSignal;
+  onProgress?: (progress: CatalogProgress) => void;
+}
+interface CatalogReadContext {
+  signal: AbortSignal;
+  check(): void;
+  page(items: number, durationMs: number): void;
+}
 export interface MediaClientOptions {
   transport?: FetchTransport;
   sleep?: (milliseconds: number) => Promise<unknown>;
   timeoutMs?: number;
+  /** Idle time between successful destination catalog pages; zero is useful in synthetic tests. */
+  catalogIdleMs?: number;
+  /** One bounded destination catalog build, including matching metadata enrichment. */
+  catalogDeadlineMs?: number;
   /** Can lower the 8 MiB response ceiling for constrained deployments and tests. */
   maxResponseBytes?: number;
   /** One shared governor for all live source migration reads. */
@@ -390,6 +410,8 @@ export class MediaClient implements MediaAPI {
   private readonly sleep: (milliseconds: number) => Promise<unknown>;
   private readonly timeoutMs: number;
   private readonly maxResponseBytes: number;
+  private readonly catalogIdleMs: number;
+  private readonly catalogDeadlineMs: number;
   private readonly workload?: MediaWorkload;
   private readonly observeRead?: (event: DestinationReadEvent) => void;
   private readonly controller = new AbortController();
@@ -431,6 +453,8 @@ export class MediaClient implements MediaAPI {
     this.transport = options.transport ?? fetch;
     this.sleep = options.sleep ?? delay;
     this.timeoutMs = options.timeoutMs ?? 30_000;
+    this.catalogIdleMs = options.catalogIdleMs ?? 100;
+    this.catalogDeadlineMs = options.catalogDeadlineMs ?? 15 * 60_000;
     this.maxResponseBytes = options.maxResponseBytes ?? MAX_RESPONSE_BYTES;
     this.workload = options.workload;
     this.observeRead = options.observeRead;
@@ -438,6 +462,12 @@ export class MediaClient implements MediaAPI {
       !Number.isFinite(this.timeoutMs) ||
       this.timeoutMs <= 0 ||
       this.timeoutMs > 60_000 ||
+      !Number.isSafeInteger(this.catalogIdleMs) ||
+      this.catalogIdleMs < 0 ||
+      this.catalogIdleMs > 60_000 ||
+      !Number.isSafeInteger(this.catalogDeadlineMs) ||
+      this.catalogDeadlineMs <= 0 ||
+      this.catalogDeadlineMs > 30 * 60_000 ||
       !Number.isSafeInteger(this.maxResponseBytes) ||
       this.maxResponseBytes <= 0 ||
       this.maxResponseBytes > MAX_RESPONSE_BYTES
@@ -655,9 +685,9 @@ export class MediaClient implements MediaAPI {
     return this.validUser(await this.request('GET', `Users/${this.id(id)}`));
   }
 
-  private async yieldRead(): Promise<void> {
+  private async yieldRead(signal = this.controller.signal): Promise<void> {
     try {
-      await delay(0, undefined, { signal: this.controller.signal });
+      await delay(0, undefined, { signal });
     } catch {
       throw new MediaError(`${this.label} migration read was canceled.`);
     }
@@ -667,33 +697,37 @@ export class MediaClient implements MediaAPI {
     operation: MediaReadOperation,
     path: string,
     params: Record<string, string | number>,
+    signal = this.controller.signal,
   ): Promise<JsonObject> {
     const read = async (signal: AbortSignal, onAttempt?: () => void) =>
       this.object(
         await this.request('GET', path, params, undefined, true, undefined, {
           signal,
           retry: false,
-          timeoutMs: this.workload?.maxReadMs ?? 5000,
+          timeoutMs: this.kind === 'jellyfin' ? this.timeoutMs : (this.workload?.maxReadMs ?? 5000),
           onAttempt,
         }),
       );
     if (this.kind === 'emby' && this.workload)
       return this.workload.read(operation, read, {
-        signal: this.controller.signal,
+        signal,
         items: (data) => (Array.isArray(data.Items) ? data.Items.length : 0),
       });
     // Yield even with a synthetic immediate transport, so close() can interrupt long reads.
-    await this.yieldRead();
+    await this.yieldRead(signal);
     return this.kind === 'jellyfin'
-      ? this.destinationRead(operation === 'catalog' ? 'catalog' : 'user_state', (onAttempt) =>
-          read(this.controller.signal, onAttempt),
+      ? this.destinationRead(
+          operation === 'catalog' ? 'catalog' : 'user_state',
+          (onAttempt) => read(signal, onAttempt),
+          signal,
         )
-      : read(this.controller.signal);
+      : read(signal);
   }
 
   private async destinationRead(
     operation: DestinationReadEvent['operation'],
     read: (onAttempt: () => void) => Promise<JsonObject>,
+    signal = this.controller.signal,
   ): Promise<JsonObject> {
     const started = performance.now();
     let items = 0;
@@ -705,7 +739,7 @@ export class MediaClient implements MediaAPI {
       outcome = 'completed';
       return data;
     } finally {
-      if (this.controller.signal.aborted) outcome = 'canceled';
+      if (signal.aborted) outcome = 'canceled';
       try {
         this.observeRead?.({
           event: 'destination_read',
@@ -728,6 +762,7 @@ export class MediaClient implements MediaAPI {
     watchedOnly = false,
     catalogOnly = false,
     migrationProjection = false,
+    catalogRead?: CatalogReadContext,
   ): Promise<MediaItem[]> {
     const path = userId !== undefined ? `Users/${this.id(userId)}/Items` : 'Items';
     const items: MediaItem[] = [];
@@ -737,8 +772,18 @@ export class MediaClient implements MediaAPI {
     let retainedBytes = 0;
     if (!Number.isSafeInteger(this.pageSize) || this.pageSize < 1)
       throw new MediaError('Invalid media pagination size.');
-    const pageSize = Math.min(this.kind === 'emby' ? 100 : 500, this.pageSize);
+    const destinationCatalog = catalogOnly && this.kind === 'jellyfin';
+    const pageSize = Math.min(
+      this.kind === 'emby' || destinationCatalog ? 100 : 500,
+      this.pageSize,
+    );
     while (true) {
+      catalogRead?.check();
+      if (destinationCatalog && start > 0 && this.catalogIdleMs > 0)
+        await delay(this.catalogIdleMs, undefined, {
+          signal: catalogRead?.signal ?? this.controller.signal,
+        });
+      catalogRead?.check();
       if (migrationProjection) await this.yieldRead();
       const params = {
         IncludeItemTypes: itemTypes,
@@ -755,15 +800,23 @@ export class MediaClient implements MediaAPI {
         Limit: pageSize,
         EnableTotalRecordCount: !catalogOnly && start === 0 ? 'true' : 'false',
         ...(watchedOnly ? { IsPlayed: 'true' } : {}),
+        // Neutral Movie/Series queries otherwise trigger Jellyfin's whole-tree
+        // collection post-filtering before Limit/StartIndex are applied.
+        ...(destinationCatalog ? { CollapseBoxSetItems: 'false' } : {}),
       };
       const operation = itemTypes === 'Playlist' ? 'playlists' : userId ? 'user_state' : 'catalog';
+      const pageStarted = performance.now();
       const data =
         this.kind === 'emby' || catalogOnly
-          ? await this.readPage(operation, path, params)
+          ? await this.readPage(operation, path, params, catalogRead?.signal)
           : this.object(await this.request('GET', path, params));
       if (!Array.isArray(data.Items) || data.Items.some((item) => !isObject(item)))
         throw new MediaError(`${this.label} returned an invalid library page.`);
-      if (!data.Items.length) break;
+      catalogRead?.check();
+      if (!data.Items.length) {
+        catalogRead?.page(items.length, performance.now() - pageStarted);
+        break;
+      }
       if (data.Items.some((item) => typeof item.Id !== 'string' || !item.Id))
         throw new MediaError(`${this.label} returned library items without identifiers.`);
       if (data.Items.length > pageSize)
@@ -800,6 +853,8 @@ export class MediaClient implements MediaAPI {
         }
         seenIds.add(item.Id);
       }
+      catalogRead?.check();
+      catalogRead?.page(items.length, performance.now() - pageStarted);
       start += page.length;
       if (start > MAX_CATALOG_ITEMS)
         throw new MediaError(`${this.label} library exceeds the supported migration size.`);
@@ -837,36 +892,97 @@ export class MediaClient implements MediaAPI {
    * the API has no verified ID tie-break/cursor. Retain it only here, never on state reads.
    * Concurrent library edits can still shift OFFSET pages; repeated IDs fail closed.
    */
-  async catalogItems(): Promise<MediaItem[]> {
-    const items = await this.itemsByType(undefined, MIGRATION_ITEM_TYPES, false, false, true);
-    // Account for existing projected fields before adding any derived identities.
-    let bytes = 0;
-    for (let index = 0; index < items.length; index++) {
-      if (index % 1000 === 0) await this.yieldRead();
-      bytes += Buffer.byteLength(JSON.stringify(items[index]));
-      if (bytes > MAX_CATALOG_BYTES)
-        throw new MediaError(`${this.label} catalog exceeds the supported migration size.`);
+  async catalogItems(options: CatalogReadOptions = {}): Promise<MediaItem[]> {
+    const started = performance.now();
+    const budget = new AbortController();
+    const bounded = this.kind === 'jellyfin';
+    const signal = AbortSignal.any([
+      this.controller.signal,
+      budget.signal,
+      ...(options.signal ? [options.signal] : []),
+    ]);
+    const deadlineError = () => new MediaError('Jellyfin catalog preparation timed out.');
+    const check = () => {
+      if (
+        bounded &&
+        performance.now() - started >= this.catalogDeadlineMs &&
+        !budget.signal.aborted
+      )
+        budget.abort(deadlineError());
+      if (budget.signal.aborted) throw deadlineError();
+      if (signal.aborted) throw new MediaError(`${this.label} catalog preparation was canceled.`);
+    };
+    const timer = bounded
+      ? setTimeout(() => budget.abort(deadlineError()), this.catalogDeadlineMs)
+      : undefined;
+    timer?.unref();
+    let pages = 0;
+    const context: CatalogReadContext = {
+      signal,
+      check,
+      page: (items, durationMs) => {
+        check();
+        pages++;
+        try {
+          options.onProgress?.({
+            pages,
+            items,
+            elapsed_ms: Math.max(0, performance.now() - started),
+            last_page_ms: Math.max(0, durationMs),
+          });
+        } catch {
+          // Diagnostic observers cannot alter catalog contents or migration behavior.
+        }
+        check();
+      },
+    };
+    try {
+      check();
+      const items = await this.itemsByType(
+        undefined,
+        MIGRATION_ITEM_TYPES,
+        false,
+        false,
+        true,
+        false,
+        context,
+      );
+      // Account for existing projected fields before adding any derived identities.
+      let bytes = 0;
+      const providers = new Map<string, JsonObject>();
+      for (let index = 0; index < items.length; index++) {
+        if (index % 1000 === 0) await this.yieldRead(signal);
+        check();
+        const item = items[index]!;
+        bytes += Buffer.byteLength(JSON.stringify(item));
+        if (bytes > MAX_CATALOG_BYTES)
+          throw new MediaError(`${this.label} catalog exceeds the supported migration size.`);
+        if (item.Type === 'Series' && isObject(item.ProviderIds))
+          providers.set(item.Id, item.ProviderIds);
+      }
+      for (let index = 0; index < items.length; index++) {
+        if (index % 1000 === 0) await this.yieldRead(signal);
+        check();
+        const item = items[index]!;
+        const values = item.SeriesId ? providers.get(item.SeriesId) : undefined;
+        if (!values || item.SeriesProviderIds) continue;
+        const nextBytes =
+          bytes +
+          Buffer.byteLength(JSON.stringify({ ...item, SeriesProviderIds: values })) -
+          Buffer.byteLength(JSON.stringify(item));
+        if (nextBytes > MAX_CATALOG_BYTES)
+          throw new MediaError(`${this.label} catalog exceeds the supported migration size.`);
+        item.SeriesProviderIds = values;
+        bytes = nextBytes;
+      }
+      check();
+      return items;
+    } catch (error) {
+      check();
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    const providers = new Map(
-      items
-        .filter((item) => item.Type === 'Series' && isObject(item.ProviderIds))
-        .map((item) => [item.Id, item.ProviderIds!]),
-    );
-    for (let index = 0; index < items.length; index++) {
-      if (index % 1000 === 0) await this.yieldRead();
-      const item = items[index]!;
-      const values = item.SeriesId ? providers.get(item.SeriesId) : undefined;
-      if (!values || item.SeriesProviderIds) continue;
-      const nextBytes =
-        bytes +
-        Buffer.byteLength(JSON.stringify({ ...item, SeriesProviderIds: values })) -
-        Buffer.byteLength(JSON.stringify(item));
-      if (nextBytes > MAX_CATALOG_BYTES)
-        throw new MediaError(`${this.label} catalog exceeds the supported migration size.`);
-      item.SeriesProviderIds = values;
-      bytes = nextBytes;
-    }
-    return items;
   }
 
   async migrationState(

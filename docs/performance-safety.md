@@ -74,7 +74,8 @@ can require another migration.
 
 An approved migration collects one user-neutral Jellyfin catalog, or reuses a
 matching cached catalog, and pins it across every account in that bulk job. Its
-in-process reuse window is ten minutes from the beginning of collection. The
+in-process reuse window is ten minutes from successful completion of collection;
+the recorded capture time remains the beginning of collection. The
 cache key includes the destination URL, API key, server ID and version; changes
 invalidate reuse. Personal state never enters this cache, and incomplete or failed
 catalog builds are not published. A job retains its selected catalog even if the
@@ -108,17 +109,31 @@ forwarded without a server-side clamp in that source. Unlike the separately
 verified Emby source adapter, the Jellyfin adapter does not advance OFFSET by the
 number of visible DTOs: visibility filtering can omit entries after pagination.
 Each bounded ID batch is requested once. Exact production-version behavior has
-not been exercised by this patch; no production trial was performed.
+not been exercised by this patch. The separately approved 0.14.1 trial stopped at
+the first destination catalog page's five-second deadline before history writes.
 
-The cold Jellyfin traversal remains sequential, using documented `SortName`
-ordering, pages of at most 500 items, no total counts, and an empty page as its
-stopping condition. It can still take substantial time on a large or busy
-destination; sharing it removes repeated per-user work rather than making the
-first scan free. Catalog reads have a five-second deadline and no automatic
-retry. Explicit-ID account reads use the normal 30-second request deadline and
-at most three attempts for HTTP 429/503, with each retry delay capped at two
-seconds. Reads yield between requests and do not fan out. The existing ceiling
-of four workers for independent destination item transfers is unchanged.
+The cold Jellyfin traversal explicitly sends `CollapseBoxSetItems=false`. In
+Jellyfin's pinned [folder query implementation](https://github.com/jellyfin/jellyfin/blob/10662e75e4626be71184db950ce534ab6953be77/MediaBrowser.Controller/Entities/Folder.cs#L1131),
+an omitted flag defaults to collection collapsing for neutral Movie/Series
+queries. That activates [post-filtering](https://github.com/jellyfin/jellyfin/blob/10662e75e4626be71184db950ce534ab6953be77/MediaBrowser.Controller/Entities/Folder.cs#L874),
+which can enumerate the recursive library before applying the requested page
+limit. Disabling this supported option lets the uncollapsed query use
+[repository pagination](https://github.com/jellyfin/jellyfin/blob/10662e75e4626be71184db950ce534ab6953be77/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs#L286)
+and retains individual movies, series and collection records for matching. This
+source behavior explains a plausible cold-page bottleneck; it does not establish
+the exact production server's query plan or attribute all elapsed time to it.
+
+Collection remains sequential with documented `SortName`, at most 100 items per
+page, no total counts, and an empty page as its stopping condition. It leaves
+100 ms of cancelable idle time between pages. Jellyfin catalog pages have a
+30-second deadline and no automatic retry; the complete build has a 15-minute
+deadline, including reads, waits and metadata preparation. Failure or cancellation
+discards the partial index. These destination limits do not relax Emby's separate
+five-second deadline or source governor. Explicit-ID account reads retain their
+30-second deadline and at most three attempts for HTTP 429/503, with each retry
+delay capped at two seconds. Reads do not fan out. The existing ceiling of four
+workers for independent destination item transfers is unchanged. Cold collection
+still costs database work; sharing it removes repeated per-account work.
 
 Both the neutral catalog and each account's retained candidate result are bounded
 to 200,000 items and 64 MiB of serialized data. Candidate selection deduplicates
@@ -194,9 +209,11 @@ These limits apply without server-owner tuning:
 | IDs in a state batch                    | At most 100, and at most 6,000 encoded characters                |
 | Matching catalog, per server            | At most 200,000 items and 64 MiB of retained serialized metadata |
 | Retained source personal state          | At most 100,000 items and 32 MiB of retained serialized data     |
-| Jellyfin catalog page size              | At most 500 items                                                |
+| Jellyfin catalog page size              | At most 100 items                                                |
+| Jellyfin catalog idle interval          | 100 ms between pages                                             |
+| Jellyfin catalog deadlines              | 30 seconds per page; 15 minutes for the full build                |
 | Retained Jellyfin candidate state       | At most 200,000 items and 64 MiB of retained serialized data     |
-| Catalog cache reuse window              | 10 minutes; one catalog pinned during a job                      |
+| Catalog cache reuse window              | Source: 10 minutes from start; destination: 10 minutes from completion; each job pins its catalog |
 
 Heavy source reads do not automatically retry HTTP 429, server errors, timeouts or
 network failures. Slow responses, failures and cancellation of an active request
@@ -341,7 +358,39 @@ failed reads are reported without upstream response bodies. These counters cover
 preparation reads, not a complete playback-impact metric or every write. They
 follow the same exclusions for credentials and personal playback details.
 
-## Local destination request reduction
+Jobs distinguish shared index preparation from account history reads. During a
+cold build the interface reports accepted pages, cumulative indexed items and last
+page latency, including a waiting-for-first-page state. These are aggregate
+counters, not an estimated completion percentage. Checkpoints are persisted at
+most once per second after the first accepted page, with an additional final flush.
+Progress observers cannot change catalog acceptance or migration results.
+
+## Local destination verification
+
+On October 16, 2026, the 0.14.2 synthetic benchmark used the same 100,000-item,
+100-account fixture with safer 100-item catalog pages. It observed 1,001 catalog
+reads (including the empty terminal page), 200 account-state reads and 100 cache
+hits, with 20,000 matches and no proposed changes to newer destination activity.
+The 1,201 requests are about 94% fewer than the old 20,000-request per-user
+catalog traversal, excluding previews. Smaller pages increase request count versus
+0.14.1 while reducing each requested response's size; the collection-collapse fix
+addresses server-side work that request count alone cannot measure. The injected
+transport disabled production pacing. Its 3.102-second local pipeline timing
+excludes the normal 100 ms intervals, backup I/O, network and writes, and does not
+estimate production performance or memory peaks.
+
+A separate loopback-only official Jellyfin 10.11.10 container verified a synthetic
+20-item catalog spanning all 15 supported types. Both omitted and disabled
+collection collapsing returned the same 20 unique IDs across clamped pages of
+7, 7, 6 and 0 items, with provider IDs/paths and no neutral personal state. A
+user-scoped explicit-ID request returned all 20 accessible items with personal
+state. The fixture used an owned offline database seed, so this validates the
+request contract rather than natural library-scanner behavior. Repeated local
+container startup crashes prevented a valid 100,000-item API timing comparison;
+small warm-order timings are not a performance claim. Production's reported
+Jellyfin version remains a separate verification target.
+
+### Earlier 0.14.1 measurement
 
 On October 15, 2026, `npm run benchmark:destination` exercised the production
 catalog reader, metadata cache, candidate selection, explicit-ID reader and merge

@@ -7,7 +7,6 @@ import {
   MessageFlags,
   PermissionFlagsBits,
   SlashCommandBuilder,
-  escapeMarkdown,
   type ChatInputCommandInteraction,
   type ClientOptions,
   type Guild,
@@ -23,6 +22,11 @@ import type { UserMapping } from './user-mappings.js';
 import { DEFAULT_MEMBERSHIP_TIERS } from './memberships.js';
 import type { DiscordMemberSearchResult, DiscordMemberSummary } from './discord-members.js';
 import type { AdminAlerts } from './admin-alerts.js';
+import {
+  DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
+  renderCredentialMessage,
+} from './credential-message.js';
+import { discordCredentialContent } from './credentials.js';
 
 export class BotError extends Error {}
 class MissingMember extends BotError {}
@@ -132,19 +136,12 @@ export function parseSubscriptionMessage(content: unknown): {
   };
 }
 
-function credentialText(value: string, maximum: number): string {
-  if (typeof value !== 'string' || !value || value.length > maximum || /\p{C}/u.test(value)) {
-    throw new BotError('Credentials could not be formatted for delivery.');
-  }
-  return escapeMarkdown(value, {
-    maskedLink: true,
-    heading: true,
-    bulletedList: true,
-    numberedList: true,
-  });
-}
-
-export function credentialMessage(username: string, password: string, serverUrl: string): string {
+export function credentialMessage(
+  username: string,
+  password: string,
+  serverUrl: string,
+  template = DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
+): string {
   let valid = false;
   try {
     const url = new URL(serverUrl);
@@ -162,12 +159,13 @@ export function credentialMessage(username: string, password: string, serverUrl:
   }
   if (!valid)
     throw new BotError('Configure a valid public Jellyfin URL before sending credentials.');
-  const message =
-    'Your Jellyfin account is ready.\n\n' +
-    `Server: <${serverUrl}>\nUsername: ${credentialText(username, 256)}\nPassword: ${credentialText(password, 512)}\n\n` +
-    'Keep these credentials private. You can change your password in Jellyfin.';
-  if (message.length > 1900) throw new BotError('Credentials could not be formatted for delivery.');
-  return message;
+  try {
+    return discordCredentialContent(
+      renderCredentialMessage(template, { username, password, server_url: serverUrl }),
+    );
+  } catch {
+    throw new BotError('Credentials could not be formatted for delivery.');
+  }
 }
 
 export function jobStatusMessage(value: object): string {
@@ -950,6 +948,7 @@ export class BotManager {
     password: string,
     serverUrl: string,
     requireMembership = true,
+    message?: string,
   ): Promise<void> {
     const member = await this.fetchMember(userId);
     if (
@@ -962,11 +961,14 @@ export class BotManager {
       throw new BotError(
         'The recipient must be a human server member with the configured membership role.',
       );
-    const content = credentialMessage(
-      username,
-      password,
-      serverUrl || String(this.settings.jellyfin_public_url ?? ''),
-    );
+    const content =
+      message === undefined
+        ? credentialMessage(
+            username,
+            password,
+            serverUrl || String(this.settings.jellyfin_public_url ?? ''),
+          )
+        : discordCredentialContent(message);
     this.checkActive();
     try {
       await this.wait(
@@ -991,8 +993,9 @@ export class BotManager {
     password: string,
     serverUrl: string,
     requireMembership = true,
+    message?: string,
   ): Promise<void> {
-    return this.sendCredentials(userId, username, password, serverUrl, requireMembership);
+    return this.sendCredentials(userId, username, password, serverUrl, requireMembership, message);
   }
 
   private async adminIdentity(userId: string): Promise<GuildMember> {

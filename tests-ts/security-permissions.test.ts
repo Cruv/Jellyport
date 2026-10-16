@@ -157,7 +157,7 @@ describe('adversarial account ownership and secret storage', () => {
   it('does not persist API keys, bot tokens, generated passwords or credential plaintext in SQLite or its journals', async () => {
     const job = await finish(await service.createAccount('casey'));
     const credential = store.takeCredentials(job.id)[0]!;
-    expect(credential.password).toHaveLength(24);
+    expect(credential.password).toHaveLength(12);
     store.saveCredentials(job.id, credential.username, credential.password, credential.server_url);
     store.saveAccount('partial', 'partial-id', 'provisioning', credential.password);
     const secrets = [

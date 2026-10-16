@@ -402,6 +402,7 @@ export interface Credential {
   username: string;
   password: string;
   server_url?: string;
+  message?: string;
 }
 export interface Settings {
   emby_url: string;
@@ -412,6 +413,9 @@ export interface Settings {
   jellyfin_public_url: string;
   template_user_id: string;
   default_role_id?: string;
+  password_length?: number;
+  password_exclude_ambiguous?: boolean;
+  credential_message_template?: string;
   path_mappings: { source: string; target: string }[];
   discord_enabled: boolean;
   discord_bot_token_set: boolean;

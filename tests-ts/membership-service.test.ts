@@ -118,7 +118,7 @@ describe('multi-account Discord membership provisioning', () => {
         expect(target.Policy).toEqual(servers.users.jellyfin[0]?.Policy);
         expect(target.Configuration).toEqual(servers.users.jellyfin[0]?.Configuration);
         const delivery = bot.delivered[slot - 1]!;
-        expect(delivery.password).toHaveLength(24);
+        expect(delivery.password).toHaveLength(12);
         expect(JSON.stringify(job)).not.toContain(delivery.password);
         expect(servers.played[target.Id] ?? new Set()).toEqual(new Set());
       }

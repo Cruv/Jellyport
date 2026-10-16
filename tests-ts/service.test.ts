@@ -519,7 +519,7 @@ describe('account migration and subscription safety', () => {
     expect(alex.Policy).toEqual(servers.users.jellyfin[0]?.Policy);
     const credentials = store.takeCredentials(job.id);
     expect(credentials).toHaveLength(1);
-    expect(credentials[0]?.password).toHaveLength(24);
+    expect(credentials[0]?.password).toHaveLength(12);
     expect(store.takeCredentials(job.id)).toEqual([]);
     const repeat = await finish(await service.migrateUsers(['e-alex']));
     expect(repeat.results[0]?.created).toBe(false);
@@ -937,6 +937,7 @@ describe('account migration and subscription safety', () => {
     expect(servers.users.jellyfin[1]).toEqual(before);
   });
   it('resumes only a tracked incomplete creation and applies the template once successful', async () => {
+    store.saveSettings({ ...store.settings(), password_length: 16 });
     let failing = true;
     service.clientFactory = (...args) => {
       const client = servers.factory(...args),
@@ -949,11 +950,71 @@ describe('account migration and subscription safety', () => {
     };
     expect((await finish(await service.createAccount('casey'))).status).toBe('failed');
     expect(store.account('casey')?.status).toBe('provisioning');
+    const savedPassword = store.accountPassword(store.account('casey')!);
+    expect(savedPassword).toHaveLength(16);
+    store.saveSettings({ ...store.settings(), password_length: 64 });
     failing = false;
     const retry = await finish(await service.createAccount('casey'));
     expect(retry.status).toBe('completed');
     expect(servers.users.jellyfin.filter((user) => user.Name === 'casey')).toHaveLength(1);
-    expect(store.takeCredentials(retry.id)).toHaveLength(1);
+    const credentials = store.takeCredentials(retry.id);
+    expect(credentials).toHaveLength(1);
+    expect(credentials[0]?.password).toBe(savedPassword);
+  });
+  it('captures the configured password length and account message before account creation starts', async () => {
+    const template = 'Welcome {username}!\nSign in at {server_url}\nPassword: {password}';
+    store.saveSettings({
+      ...store.settings(),
+      password_length: 16,
+      credential_message_template: template,
+    });
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      const original = client.createUser.bind(client);
+      client.createUser = async (username, password) => {
+        expect(password).toHaveLength(16);
+        expect(password).toMatch(/^[A-Za-z2-9]+$/);
+        expect(password).not.toMatch(/[0Oo1IilL]/);
+        store.saveSettings({
+          ...store.settings(),
+          password_length: 64,
+          credential_message_template: 'Changed {username}: {password} at {server_url}',
+        });
+        return original(username, password);
+      };
+      return client;
+    };
+    const job = await finish(await service.createAccount('casey'));
+    expect(job.status).toBe('completed');
+    const credentials = store.takeCredentials(job.id);
+    expect(credentials).toHaveLength(1);
+    const credential = credentials[0]!;
+    expect(credential.password).toHaveLength(16);
+    expect(credential.message).toBe(
+      `Welcome casey!\nSign in at http://jellyfin\nPassword: ${credential.password}`,
+    );
+    expect(JSON.stringify(job)).not.toContain(credential.password);
+    expect(JSON.stringify(job)).not.toContain(credential.message);
+  });
+  it('rejects an unusable saved message before issuing any account or password mutation', async () => {
+    store.saveSettings({
+      ...store.settings(),
+      credential_message_template: 'Missing server URL: {username} {password}',
+    });
+    const create = vi.fn();
+    const password = vi.fn();
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      client.createUser = create;
+      client.setPassword = password;
+      return client;
+    };
+    const job = await finish(await service.createAccount('casey'));
+    expect(job.status).toBe('failed');
+    expect(job.results[0]?.error).toContain('must include {username}, {password} and {server_url}');
+    expect(create).not.toHaveBeenCalled();
+    expect(password).not.toHaveBeenCalled();
+    expect(store.account('casey')).toBeNull();
   });
   it('never retries an uncertain creation or resets its password automatically', async () => {
     const calls: string[] = [];
@@ -1260,6 +1321,38 @@ describe('account migration and subscription safety', () => {
     expect(JSON.stringify(job)).not.toContain(bot.delivered[0]![2]);
     expect(store.takeCredentials(job.id)).toEqual([]);
     expect(store.link('123456789')?.username).toBe('alex');
+  });
+  it('passes the exact captured administrator message to private Discord delivery', async () => {
+    const template = 'Ahoy {username}!\n{server_url}\nYour password: {password}';
+    store.saveSettings({ ...store.settings(), credential_message_template: template });
+    const bot = new FakeBot();
+    const delivery = vi.spyOn(bot, 'sendCredentials');
+    service.bot = bot;
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      const original = client.createUser.bind(client);
+      client.createUser = async (...parameters) => {
+        store.saveSettings({
+          ...store.settings(),
+          credential_message_template: 'Changed {username}: {password} at {server_url}',
+        });
+        return original(...parameters);
+      };
+      return client;
+    };
+    const job = await finish(await service.createAccount('alex', '123456789'));
+    expect(job.status).toBe('completed');
+    const args = delivery.mock.calls[0] as unknown as [
+      string,
+      string,
+      string,
+      string,
+      boolean,
+      string,
+    ];
+    expect(args[5]).toBe(`Ahoy alex!\nhttp://jellyfin\nYour password: ${args[2]}`);
+    expect(store.takeCredentials(job.id)).toEqual([]);
+    expect(JSON.stringify(job)).not.toContain(args[2]);
   });
   it('retains one-time credentials after failed Discord delivery without exposing library exceptions', async () => {
     const bot = new FakeBot();
@@ -1916,6 +2009,8 @@ describe('account migration and subscription safety', () => {
     };
     expect((await finish(await service.migrateUsers(['e-sam']))).status).toBe('failed');
     expect(store.account('recover.alias')?.status).toBe('uncertain');
+    const savedPassword = store.accountPassword(store.account('recover.alias')!);
+    store.saveSettings({ ...store.settings(), password_length: 64 });
     const target = servers.users.jellyfin.find((user) => user.Name === 'recover.alias')!;
     const info = await service.recoveryInfo('recover.alias');
     expect(info.eligible).toBe(true);
@@ -1925,7 +2020,9 @@ describe('account migration and subscription safety', () => {
       target.Id,
     );
     expect(servers.users.jellyfin.filter((user) => user.Name === 'recover.alias')).toHaveLength(1);
-    expect(store.takeCredentials(recovered.id)).toHaveLength(1);
+    const credentials = store.takeCredentials(recovered.id);
+    expect(credentials).toHaveLength(1);
+    expect(credentials[0]?.password).toBe(savedPassword);
   });
   it('retains printable existing target names through explicit ID mappings', async () => {
     servers.users.jellyfin[1]!.Name = 'Existing / Family Account';
@@ -1940,15 +2037,16 @@ describe('account migration and subscription safety', () => {
 });
 
 describe('password and template validation', () => {
-  it('generates 24-character cryptographic passwords containing all required categories', () => {
+  it('generates readable 12-character cryptographic passwords containing letters and digits', () => {
     const values = new Set(Array.from({ length: 100 }, generatePassword));
     expect(values.size).toBe(100);
     for (const value of values) {
-      expect(value).toHaveLength(24);
+      expect(value).toHaveLength(12);
       expect(value).toMatch(/[A-Z]/);
       expect(value).toMatch(/[a-z]/);
       expect(value).toMatch(/[0-9]/);
-      expect(value).toMatch(/[!@#%+_-]/);
+      expect(value).toMatch(/^[A-Za-z0-9]+$/);
+      expect(value).not.toMatch(/[0Oo1IilL]/);
     }
   });
   it('rejects disabled, administrator and empty templates while preserving lockout settings', () => {

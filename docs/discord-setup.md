@@ -42,6 +42,8 @@ An advanced manual ID fallback remains available when you already know the membe
 
 Command replies are ephemeral: only the administrator who invoked the command can see them, including when the command runs in a shared channel. Check a job with `/jellyport status` or the web page, or opt into the private alerts below. New credentials are sent by DM only to the selected member. Users need to allow DMs from server members. Failed delivery leaves the new password available through the web app's one-time reveal for up to 24 hours. Existing Jellyfin passwords are not reset or sent by an ordinary migration.
 
+Set the welcome message under **Settings → New account passwords and messages**. It is plain text with required `{username}`, `{password}` and `{server_url}` placeholders, and the preview uses fictional values. Each new account retains the message from its job's captured settings for both private DM delivery and the administrator's one-time copy. Discord formatting is escaped and mentions and link embeds are disabled. The default password is 12 alphanumeric characters, excluding easily confused characters; length and ambiguity exclusion are configurable in the same section. Settings changes never reset existing account passwords.
+
 ### Private administrator alerts
 
 Background alerts are optional and off until an administrator explicitly enables them:

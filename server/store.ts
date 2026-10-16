@@ -29,6 +29,7 @@ export interface Credentials {
   username: string;
   password: string;
   server_url: string;
+  message?: string;
 }
 export interface QueuedJob {
   job: Job;
@@ -481,15 +482,24 @@ export class Store {
       ? this.decrypt<string>(account.password)
       : null;
   }
-  saveCredentials(jobId: string, username: string, password: string, serverUrl: string): void {
-    this.db
-      .prepare('INSERT OR REPLACE INTO credentials VALUES (?,?,?,?)')
-      .run(
-        jobId,
+  saveCredentials(
+    jobId: string,
+    username: string,
+    password: string,
+    serverUrl: string,
+    message?: string,
+  ): void {
+    this.db.prepare('INSERT OR REPLACE INTO credentials VALUES (?,?,?,?)').run(
+      jobId,
+      username,
+      this.encrypt({
         username,
-        this.encrypt({ username, password, server_url: serverUrl }),
-        Date.now() / 1000 + 86400,
-      );
+        password,
+        server_url: serverUrl,
+        ...(message ? { message } : {}),
+      }),
+      Date.now() / 1000 + 86400,
+    );
   }
   deleteCredentials(jobId: string, username: string): void {
     this.db.prepare('DELETE FROM credentials WHERE job_id=? AND username=?').run(jobId, username);

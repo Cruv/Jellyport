@@ -4,6 +4,12 @@ import AdminAlertsPanel from './AdminAlertsPanel';
 import SourceSnapshotsPanel from './SourceSnapshotsPanel';
 import DestinationCatalogPanel from './DestinationCatalogPanel';
 import {
+  DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
+  MAX_CREDENTIAL_MESSAGE_TEMPLATE_LENGTH,
+  renderCredentialMessage,
+  validateCredentialMessageTemplate,
+} from '../../server/credential-message';
+import {
   safeUrl,
   defaultMembershipTiers,
   type Api,
@@ -206,6 +212,11 @@ export default function SettingsPage({
   const [roles, setRoles] = useState<AccountRole[]>([]);
   const [rolesError, setRolesError] = useState('');
   const [defaultRoleId, setDefaultRoleId] = useState(s.default_role_id || '');
+  const [passwordLength, setPasswordLength] = useState(String(s.password_length ?? 12));
+  const [excludeAmbiguous, setExcludeAmbiguous] = useState(s.password_exclude_ambiguous ?? true);
+  const [credentialTemplate, setCredentialTemplate] = useState(
+    s.credential_message_template ?? DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
+  );
   const replacementKey = useRef<HTMLInputElement | null>(null);
   const serviceKeyRequest = useRef<AbortController | null>(null);
   useEffect(() => {
@@ -216,6 +227,16 @@ export default function SettingsPage({
     };
   }, []);
   useEffect(() => setDefaultRoleId(s.default_role_id || ''), [s.default_role_id]);
+  useEffect(() => setPasswordLength(String(s.password_length ?? 12)), [s.password_length]);
+  useEffect(
+    () => setExcludeAmbiguous(s.password_exclude_ambiguous ?? true),
+    [s.password_exclude_ambiguous],
+  );
+  useEffect(
+    () =>
+      setCredentialTemplate(s.credential_message_template ?? DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE),
+    [s.credential_message_template],
+  );
   useEffect(() => {
     const controller = new AbortController();
     void api<{ roles: AccountRole[] }>('/api/account-roles', { signal: controller.signal })
@@ -232,6 +253,18 @@ export default function SettingsPage({
     (user) => !user.Policy?.IsAdministrator && !user.Policy?.IsDisabled,
   );
   const invite = safeUrl(s.bot_invite_url);
+  let credentialPreview = '';
+  let credentialPreviewError = '';
+  try {
+    credentialPreview = renderCredentialMessage(credentialTemplate, {
+      username: 'example_user',
+      password: 'B7mQ4rX9sT6v',
+      server_url: 'https://jellyfin.example.com',
+    });
+  } catch (error) {
+    credentialPreviewError =
+      error instanceof Error ? error.message : 'Enter a valid credential message template.';
+  }
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -245,6 +278,14 @@ export default function SettingsPage({
       toggleNames.forEach((key) => {
         data[key] = (form.elements.namedItem(key) as HTMLInputElement).checked;
       });
+      if (!/^\d+$/.test(passwordLength))
+        throw new Error('Password length must be a whole number from 12 to 64.');
+      data.password_length = Number(passwordLength);
+      if (Number(passwordLength) < 12 || Number(passwordLength) > 64)
+        throw new Error('Password length must be a whole number from 12 to 64.');
+      data.password_exclude_ambiguous = excludeAmbiguous;
+      validateCredentialMessageTemplate(credentialTemplate);
+      data.credential_message_template = credentialTemplate;
       data.path_mappings = mappings
         .map((row) => ({ source: row.source.trim(), target: row.target.trim() }))
         .filter((row) => row.source || row.target);
@@ -477,6 +518,87 @@ export default function SettingsPage({
                   current permissions and preferences.
                 </small>
                 {rolesError && <small role="alert">{rolesError}</small>}
+              </div>
+            </div>
+          </Section>
+          <Section
+            title="New account passwords and messages"
+            description="Choose easy-to-type passwords and the message you copy or send privately to new users."
+          >
+            <div className="form-stack">
+              <div className="field">
+                <label htmlFor="setting-password_length">Generated password length</label>
+                <input
+                  id="setting-password_length"
+                  name="password_length"
+                  type="number"
+                  min={12}
+                  max={64}
+                  step={1}
+                  inputMode="numeric"
+                  value={passwordLength}
+                  onChange={(event) => setPasswordLength(event.target.value)}
+                />
+                <small>
+                  12–64 characters, using uppercase letters, lowercase letters, and numbers. No
+                  special characters. Changes apply to new passwords; existing accounts keep theirs.
+                </small>
+              </div>
+              <div className="toggle-row">
+                <div>
+                  <label htmlFor="setting-password_exclude_ambiguous" className="switch-label">
+                    Avoid ambiguous characters
+                  </label>
+                  <p className="muted text-tiny mt-4">
+                    Exclude 0, O, o, 1, I, i, l, and L to make passwords easier to read and type.
+                  </p>
+                </div>
+                <label className="toggle">
+                  <input
+                    id="setting-password_exclude_ambiguous"
+                    name="password_exclude_ambiguous"
+                    type="checkbox"
+                    checked={excludeAmbiguous}
+                    onChange={(event) => setExcludeAmbiguous(event.target.checked)}
+                  />
+                  <span className="toggle-track" />
+                </label>
+              </div>
+              <div className="field">
+                <label htmlFor="setting-credential_message_template">New account message</label>
+                <textarea
+                  id="setting-credential_message_template"
+                  name="credential_message_template"
+                  rows={9}
+                  maxLength={MAX_CREDENTIAL_MESSAGE_TEMPLATE_LENGTH}
+                  value={credentialTemplate}
+                  onChange={(event) => setCredentialTemplate(event.target.value)}
+                  aria-describedby="credential-template-help"
+                />
+                <small id="credential-template-help">
+                  Plain text, up to {MAX_CREDENTIAL_MESSAGE_TEMPLATE_LENGTH.toLocaleString()}{' '}
+                  characters. Include each placeholder: <code>{'{username}'}</code>,{' '}
+                  <code>{'{password}'}</code>, and <code>{'{server_url}'}</code>. Use this message
+                  when copying credentials and for private Discord delivery.
+                </small>
+                <button
+                  className="btn btn-small btn-quiet"
+                  type="button"
+                  onClick={() => setCredentialTemplate(DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE)}
+                >
+                  Reset message to default
+                </button>
+              </div>
+              <div className="support-note" aria-label="New account message preview">
+                <strong>Message preview · fictional example</strong>
+                <p className="text-tiny">This preview uses example credentials only.</p>
+                {credentialPreviewError ? (
+                  <p role="alert">{credentialPreviewError}</p>
+                ) : (
+                  <div style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+                    {credentialPreview}
+                  </div>
+                )}
               </div>
             </div>
           </Section>

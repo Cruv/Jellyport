@@ -348,7 +348,7 @@ describe('membership lifecycle races and edge cases', () => {
       { id: owner, username: 'Jim' },
       { id: owner, username: 'Jim_2' },
     ]);
-    expect(bot.delivered[1]?.password).toHaveLength(24);
+    expect(bot.delivered[1]?.password).toHaveLength(12);
     expect(JSON.stringify(recovered)).not.toContain(bot.delivered[1]!.password);
     expect(store.takeCredentials(recovered.id)).toEqual([]);
     expect(accounts()).toHaveLength(2);

@@ -1100,6 +1100,54 @@ describe('targeted Jellyfin destination state reads', () => {
     }
   });
 
+  it('reuses already-read parent names for episode review without extra API requests', async () => {
+    const shared = {
+      JellyportLibraryIds: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+      JellyportLibraryConfigHash: fixtureConfigHash,
+    };
+    const candidates: MediaItem[] = [
+      {
+        Id: 'episode',
+        Type: 'Episode',
+        Name: 'Synthetic pilot',
+        SeriesId: 'series',
+        ParentIndexNumber: 1,
+        IndexNumber: 1,
+        SeriesProviderIds: { Tvdb: '42' },
+        ...shared,
+      },
+      {
+        Id: 'series',
+        Type: 'Series',
+        Name: 'Cached show name',
+        ProviderIds: { Tvdb: '42' },
+        ...shared,
+      },
+    ];
+    const reads = vi.fn(async () =>
+      json({
+        Items: candidates.map((candidate) => ({
+          ...candidate,
+          ...(candidate.Type === 'Series' ? { Name: 'Current show name' } : {}),
+          UserData: { Played: false },
+        })),
+      }),
+    );
+    const client = clientWithPolicy('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      transport: reads,
+    });
+    try {
+      const items = await client.destinationItems('alice', candidates);
+      expect(items.find((item) => item.Id === 'episode')).toMatchObject({
+        SeriesName: 'Current show name',
+        UserData: { Played: false },
+      });
+      expect(reads).toHaveBeenCalledTimes(1);
+    } finally {
+      await client.close();
+    }
+  });
+
   it.each([
     { Type: 'Audio' },
     { Path: '/media/other.mkv' },

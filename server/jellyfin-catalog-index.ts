@@ -27,6 +27,8 @@ const fields = new Set([
   'ProviderIds',
   'SeriesProviderIds',
   'SeriesId',
+  'SeriesName',
+  'ProductionYear',
   'IndexNumber',
   'ParentIndexNumber',
   'IndexNumberEnd',

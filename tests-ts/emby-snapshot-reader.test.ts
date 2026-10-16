@@ -156,6 +156,37 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
     expect(readSnapshotHistory(projected, alice, identities)).toEqual(expected);
   });
 
+  it('reads the show name from the existing parent join for episode and season review', () => {
+    const f = fixture();
+    f.state(14, 2, { played: 1 });
+    f.database.close();
+    const history = readSnapshotHistory(f.path, alice, identities, 'complete');
+    expect(history.items.find((item) => item.Id === '13')).toMatchObject({
+      Name: 'Synthetic Pilot',
+      SeriesName: 'Synthetic Show',
+      ParentIndexNumber: 1,
+      IndexNumber: 1,
+    });
+    expect(history.items.find((item) => item.Id === '12')).toMatchObject({
+      Type: 'Season',
+      SeriesName: 'Synthetic Show',
+      IndexNumber: 1,
+    });
+  });
+
+  it('omits a malformed parent display name while preserving episode identity and played state', () => {
+    const f = fixture();
+    f.database.prepare('UPDATE MediaItems SET Name=? WHERE Id=11').run('bad\nshow');
+    f.database.close();
+    const history = readSnapshotHistory(f.path, alice, identities, 'watched_only');
+    const episode = history.items.find((item) => item.Id === '13');
+    expect(episode).not.toHaveProperty('SeriesName');
+    expect(episode).toMatchObject({
+      SeriesProviderIds: { Tvdb: '987654323', Tmdb: '987654324' },
+      UserData: { Played: true },
+    });
+  });
+
   it.each([
     '',
     'CREATE INDEX InvalidKey ON UserDatas(UserDataKeyId,userId)',

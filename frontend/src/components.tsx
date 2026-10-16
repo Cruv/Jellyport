@@ -1,9 +1,10 @@
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   type Job,
   activeJob,
   date,
   num,
+  type ItemIdentitySummary,
   type ItemIssue,
   type SourceSnapshotMetadata,
 } from './types';
@@ -346,6 +347,205 @@ export function JobsTable({
     </div>
   );
 }
+function issueText(value: unknown, limit = 512): string {
+  return typeof value === 'string' ? value.trim().slice(0, limit) : '';
+}
+function issueNumber(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : undefined;
+}
+function issuePath(value: unknown): string {
+  const path = issueText(value, 2048);
+  if (
+    /[\u0000-\u001f\u007f]/.test(path) ||
+    (/^[a-z][a-z\d+.-]*:/i.test(path) && !/^[a-z]:[\\/]/i.test(path)) ||
+    /^[/\\]{2}[^/\\]*@/.test(path)
+  )
+    return 'Remote URL omitted';
+  return path || 'Not recorded';
+}
+function issueIdentity(item: ItemIssue): ItemIdentitySummary {
+  return {
+    ...item,
+    id: issueText(item.id) || issueText(item.Id),
+    name:
+      issueText(item.name) ||
+      issueText(item.Name) ||
+      issueText(item.title) ||
+      issueText(item.source?.Name),
+    type: issueText(item.type) || issueText(item.Type),
+  };
+}
+function issueType(item: ItemIdentitySummary): string {
+  const type = issueText(item.type);
+  switch (type.toLowerCase()) {
+    case 'episode':
+      return 'TV episode';
+    case 'season':
+      return 'TV season';
+    case 'series':
+      return 'TV show';
+    case 'movie':
+      return 'Movie';
+    default:
+      return type || 'Media item';
+  }
+}
+function issueTitle(item: ItemIdentitySummary): string {
+  const name = issueText(item.name);
+  const type = issueText(item.type).toLowerCase();
+  if (type === 'episode' || type === 'season') {
+    const season = issueNumber(item.season_number);
+    const episode = issueNumber(item.episode_number);
+    const end = issueNumber(item.episode_number_end);
+    const position =
+      type === 'season'
+        ? season === undefined
+          ? 'Season number unavailable'
+          : `Season ${season}`
+        : season !== undefined && episode !== undefined
+          ? `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}${end !== undefined && end > episode ? `–E${String(end).padStart(2, '0')}` : ''}`
+          : episode !== undefined
+            ? `Episode ${episode} · season unavailable`
+            : 'Episode number unavailable';
+    return [issueText(item.series_name) || 'Show name unavailable', position, name]
+      .filter(Boolean)
+      .join(' · ');
+  }
+  const year = issueNumber(item.production_year);
+  return `${name || 'Unnamed item'}${year !== undefined && year > 0 && year <= 9999 ? ` (${year})` : ''}`;
+}
+const ambiguityReasons: Record<string, string> = {
+  media_type_conflict: 'The media types disagree, so Jellyport cannot safely select a match.',
+  provider_conflict: 'The provider IDs disagree, so Jellyport cannot safely select a match.',
+  numbering_conflict: 'The show, season or episode identity disagrees between these items.',
+  duplicate_provider_id: 'Several Jellyfin items share a matching provider ID.',
+  duplicate_series_episode: 'Several Jellyfin items match the same show, season and episode.',
+  duplicate_series_season: 'Several Jellyfin items match the same show and season.',
+  duplicate_path: 'Several Jellyfin items share the matching file path.',
+  competing_provider_matches: 'Different matching provider IDs select different Jellyfin items.',
+};
+const matchingMethods: Record<string, string> = {
+  provider_id: 'Provider ID',
+  series_episode: 'Show ID + season and episode',
+  series_season: 'Show ID + season',
+  path: 'Exact mapped file path',
+  'provider_id+path': 'Provider ID + exact mapped file path',
+  'series_episode+path': 'Show ID + season and episode + exact mapped file path',
+  'series_season+path': 'Show ID + season + exact mapped file path',
+};
+function issueReason(item: ItemIssue): string {
+  const reason = issueText(item.reason, 2048);
+  if (reason) return reason;
+  const codes = Array.isArray(item.reason_codes) ? [...new Set(item.reason_codes)].slice(0, 6) : [];
+  const explanations = codes
+    .filter((code) => typeof code === 'string' && Object.hasOwn(ambiguityReasons, code))
+    .map((code) => ambiguityReasons[code]);
+  return explanations.length
+    ? explanations.join(' ')
+    : 'This saved operation does not include the reason or enough information to explain the ambiguity. Run a new migration to record these details.';
+}
+function IssueProviders({ values }: { values?: Record<string, string> }) {
+  const entries =
+    values && typeof values === 'object' && !Array.isArray(values)
+      ? Object.entries(values)
+          .filter(([key, value]) => issueText(key) && issueText(value))
+          .slice(0, 20)
+      : [];
+  return entries.length ? (
+    <span className="issue-providers mono">
+      {entries.map(([key, value]) => (
+        <span key={key}>
+          {issueText(key)}: {issueText(value)}
+        </span>
+      ))}
+    </span>
+  ) : (
+    <span className="subtle">Not recorded</span>
+  );
+}
+function IssueIdentityCard({ label, item }: { label: string; item: ItemIdentitySummary }) {
+  return (
+    <section className="issue-identity-card" aria-label={label}>
+      <h4>{label}</h4>
+      <p className="issue-identity-title">
+        <span className="issue-type">{issueType(item)}</span> {issueTitle(item)}
+      </p>
+      <dl>
+        <dt>File path</dt>
+        <dd className="mono">{issuePath(item.path)}</dd>
+        <dt>
+          {issueText(item.type).toLowerCase() === 'episode'
+            ? 'Episode provider IDs'
+            : 'Provider IDs'}
+        </dt>
+        <dd>
+          <IssueProviders values={item.provider_ids} />
+        </dd>
+        {['episode', 'season'].includes(issueText(item.type).toLowerCase()) && (
+          <>
+            <dt>Show provider IDs</dt>
+            <dd>
+              <IssueProviders values={item.series_provider_ids} />
+            </dd>
+          </>
+        )}
+        <dt>Item ID</dt>
+        <dd className="mono">{issueText(item.id) || 'Not recorded'}</dd>
+      </dl>
+    </section>
+  );
+}
+function IssueCandidates({ item }: { item: ItemIssue }) {
+  const [expanded, setExpanded] = useState(false);
+  const candidates = Array.isArray(item.candidates)
+    ? item.candidates.filter((candidate) => candidate && typeof candidate === 'object').slice(0, 20)
+    : [];
+  const ids = Array.isArray(item.candidate_ids)
+    ? item.candidate_ids
+        .map((id) => issueText(id))
+        .filter(Boolean)
+        .slice(0, 20)
+    : [];
+  const count = Math.max(issueNumber(item.candidate_count) || 0, candidates.length, ids.length);
+  return (
+    <details
+      className="issue-candidates"
+      onToggle={(event) => setExpanded(event.currentTarget.open)}
+    >
+      <summary>
+        {candidates.length
+          ? `Compare ${num(count)} Jellyfin ${count === 1 ? 'candidate' : 'candidates'}`
+          : 'View saved item details'}
+      </summary>
+      {expanded && (
+        <>
+          <div className="issue-identity-grid">
+            <IssueIdentityCard label="Emby source" item={issueIdentity(item)} />
+            {candidates.map((candidate, index) => (
+              <IssueIdentityCard
+                key={`${issueText(candidate.id)}-${index}`}
+                label={`Jellyfin candidate ${index + 1}`}
+                item={candidate}
+              />
+            ))}
+          </div>
+          {!candidates.length && (
+            <p className="issue-note">
+              Candidate names and metadata were not saved with this operation.
+              {ids.length ? ` Jellyfin candidate IDs: ${ids.join(', ')}.` : ''}
+            </p>
+          )}
+          {count > Math.max(candidates.length, ids.length) && (
+            <p className="issue-note">
+              Showing {num(Math.max(candidates.length, ids.length))} of {num(count)} candidates.
+              Details are limited to 20 candidates per item; matching checks every candidate.
+            </p>
+          )}
+        </>
+      )}
+    </details>
+  );
+}
 export function Issues({
   label,
   items = [],
@@ -358,21 +558,29 @@ export function Issues({
   ambiguous?: boolean;
 }) {
   if (!count && !items.length) return null;
+  const displayed = items.slice(0, 200);
+  const total = Math.max(issueNumber(count) || 0, items.length);
   return (
     <details className="disclosure">
       <summary>
-        {label} ({num(count || items.length)})
+        {label} ({num(total)})
       </summary>
-      {items.length ? (
-        <ul>
-          {items.map((item, i) => (
-            <li key={`${item.Id || item.name || item.Name || ''}-${i}`}>
-              {item.Name || item.name || item.title || item.source?.Name || 'Unnamed item'}
-              {item.Type && <span className="subtle"> · {item.Type}</span>}
+      {displayed.length ? (
+        <ul className="issue-list">
+          {displayed.map((item, i) => (
+            <li className="issue-item" key={`${issueText(item.Id) || issueText(item.id)}-${i}`}>
+              <div className="issue-heading">
+                <span className="issue-type">{issueType(issueIdentity(item))}</span>
+                <strong>{issueTitle(issueIdentity(item))}</strong>
+              </div>
               {ambiguous && (
-                <span className="recovery-target mono">
-                  Candidate IDs: {item.candidate_ids?.join(', ') || 'Unavailable'}
-                </span>
+                <>
+                  <p className="issue-reason">{issueReason(item)}</p>
+                  {item.method && Object.hasOwn(matchingMethods, item.method) && (
+                    <p className="issue-note">Matching basis: {matchingMethods[item.method]}.</p>
+                  )}
+                  <IssueCandidates item={item} />
+                </>
               )}
             </li>
           ))}
@@ -382,6 +590,12 @@ export function Issues({
           {ambiguous
             ? 'These items were skipped because a unique Jellyfin match could not be established.'
             : 'See the operation details after migration for more information.'}
+        </p>
+      )}
+      {displayed.length > 0 && total > displayed.length && (
+        <p className="issue-note">
+          Showing {num(displayed.length)} of {num(total)} items. Details are limited to 200 items;
+          migration checks every item.
         </p>
       )}
     </details>

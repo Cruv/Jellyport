@@ -9,6 +9,7 @@ import {
   generatePassword,
   templatePolicy,
   validateUsername,
+  MAX_RESULT_DIAGNOSTIC_BYTES,
   type BotAdapter,
   type Job,
 } from '../server/service.js';
@@ -1067,14 +1068,20 @@ describe('account migration and subscription safety', () => {
                 Id: `ambiguous-${index}`,
                 Name: 'A'.repeat(700),
                 Type: 'Movie',
+                SeriesName: 'S'.repeat(700),
+                ProductionYear: 2024,
+                Path: 'https://user:PRIVATE_PASSWORD@host/item?api_key=PRIVATE_KEY#PRIVATE_FRAGMENT',
                 ProviderIds: { Tmdb: 'duplicate' },
                 UserData: { Played: true },
               })),
             ] as unknown as MediaItem[])
           : Array.from({ length: 21 }, (_, index) => ({
               Id: `candidate-${index}`,
+              Name: 'C'.repeat(700),
               Type: 'Movie',
-              ProviderIds: { Tmdb: 'duplicate' },
+              Path: '/media/' + 'P'.repeat(2000),
+              ProviderIds: { Tmdb: 'duplicate', PluginCredential: 'PRIVATE_PROVIDER_CREDENTIAL' },
+              UserData: { PrivateSession: 'PRIVATE_SESSION' },
             }));
       return client;
     };
@@ -1083,13 +1090,153 @@ describe('account migration and subscription safety', () => {
     expect(job.results[0]).toMatchObject({ unmatched: 201, ambiguous: 201 });
     expect(job.results[0]?.unmatched_items).toHaveLength(200);
     expect(job.results[0]?.unmatched_items?.[0]?.name).toBe('');
-    expect(job.results[0]?.ambiguous_items).toHaveLength(200);
+    expect(job.results[0]?.ambiguous_items?.length).toBeGreaterThan(0);
+    expect(job.results[0]?.ambiguous_items?.length).toBeLessThan(200);
     expect(job.results[0]?.ambiguous_items?.[0]?.name).toHaveLength(512);
     expect(job.results[0]?.ambiguous_items?.[0]?.candidate_ids).toHaveLength(20);
+    const diagnostic = job.results[0]?.ambiguous_items?.[0];
+    expect(diagnostic).toMatchObject({
+      type: 'Movie',
+      production_year: 2024,
+      candidate_count: 21,
+      method: 'provider_id',
+      reason_codes: ['duplicate_provider_id'],
+      path_resolution: 'no_candidate_at_path',
+    });
+    expect(diagnostic?.series_name).toHaveLength(512);
+    expect(diagnostic?.path).toBeUndefined();
+    expect(diagnostic?.candidates).toHaveLength(20);
+    expect(diagnostic?.candidates?.[0]?.name).toHaveLength(512);
+    expect(diagnostic?.candidates?.[0]?.path).toHaveLength(1024);
+    expect(diagnostic?.candidates?.[0]?.provider_ids).toEqual({ Tmdb: 'duplicate' });
+    expect(diagnostic?.candidate_ids).toEqual(
+      diagnostic?.candidates?.map((candidate) => candidate.id),
+    );
+    expect(JSON.stringify(job)).not.toMatch(/PRIVATE_|PluginCredential|PrivateSession/);
+    expect(
+      Buffer.byteLength(
+        JSON.stringify({
+          ambiguous_items: job.results[0]?.ambiguous_items,
+          unmatched_items: job.results[0]?.unmatched_items,
+        }),
+      ),
+    ).toBeLessThanOrEqual(MAX_RESULT_DIAGNOSTIC_BYTES);
+    expect(job.results[0]?.data?.warnings).toContain(
+      'Result diagnostic details are limited to 1 MiB per account. Full counts are shown; migration checks every item.',
+    );
     expect(JSON.stringify(job)).not.toContain('upstream-private-diagnostic');
     expect(job.results[0]?.data?.warnings).toContain(
       'Result details are limited to 200 unmatched items, 200 ambiguous items, and 20 candidates per item. Full counts are shown; migration checks every item.',
     );
+  });
+  it('persists actionable episode and candidate identity context without changing conflict decisions', async () => {
+    const before = structuredClone(servers.played);
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      client.migrationItems = async () => [
+        {
+          Id: args[2] === 'emby' ? 'source-episode' : 'target-episode',
+          Name: args[2] === 'emby' ? 'The Double Episode' : 'The Other Episode',
+          Type: 'Episode',
+          SeriesName: args[2] === 'emby' ? 'The Source Show' : 'The Destination Show',
+          ProductionYear: 2020,
+          ParentIndexNumber: 2,
+          IndexNumber: args[2] === 'emby' ? 4 : 5,
+          IndexNumberEnd: 6,
+          Path: '/media/show/episode.mkv',
+          ProviderIds: { Tvdb: '555' },
+          SeriesProviderIds: { Tvdb: args[2] === 'emby' ? '100' : '200' },
+          UserData: { Played: args[2] === 'emby' },
+        },
+      ];
+      return client;
+    };
+    const job = await finish(await service.migrateUsers(['e-river']));
+    expect(job.results[0]).toMatchObject({ ambiguous: 1, applied: 0 });
+    expect(job.results[0]?.ambiguous_items).toEqual([
+      {
+        id: 'source-episode',
+        name: 'The Double Episode',
+        type: 'Episode',
+        series_name: 'The Source Show',
+        production_year: 2020,
+        season_number: 2,
+        episode_number: 4,
+        episode_number_end: 6,
+        path: '/media/show/episode.mkv',
+        provider_ids: { Tvdb: '555' },
+        series_provider_ids: { Tvdb: '100' },
+        candidate_ids: ['target-episode'],
+        candidate_count: 1,
+        method: 'provider_id',
+        reason_codes: ['numbering_conflict', 'provider_conflict'],
+        reason:
+          'Provider IDs disagree or contain contradictory aliases; episode or season numbering also disagrees. An exact path cannot override conflicting identity metadata.',
+        path_resolution: 'conflict_prevents_path_resolution',
+        candidates: [
+          {
+            id: 'target-episode',
+            name: 'The Other Episode',
+            type: 'Episode',
+            series_name: 'The Destination Show',
+            production_year: 2020,
+            season_number: 2,
+            episode_number: 5,
+            episode_number_end: 6,
+            path: '/media/show/episode.mkv',
+            provider_ids: { Tvdb: '555' },
+            series_provider_ids: { Tvdb: '200' },
+          },
+        ],
+      },
+    ]);
+    expect(servers.played).toEqual(before);
+  });
+  it('omits credential-bearing URL and control-character paths while retaining local filesystem context', async () => {
+    const paths = [
+      'http://user:PRIVATE_PASSWORD@host/item?api_key=PRIVATE_KEY#PRIVATE_FRAGMENT',
+      'smb://user:PRIVATE_PASSWORD@host/share/item',
+      'custom:PRIVATE_TOKEN',
+      '//user:PRIVATE_PASSWORD@host/item',
+      '\\\\user:PRIVATE_PASSWORD@host\\item',
+      '/media/movie\nPRIVATE_CONTROL.mkv',
+      ' https://user:PRIVATE_PASSWORD@host/item?api_key=PRIVATE_KEY ',
+      'C:\\media\\source.mkv',
+      '/media/source.mkv',
+    ];
+    service.clientFactory = (...args) => {
+      const client = servers.factory(...args);
+      client.migrationItems = async () =>
+        args[2] === 'emby'
+          ? paths.map((Path, index) => ({
+              Id: `source-${index}`,
+              Name: 'A source movie',
+              Type: 'Movie',
+              Path,
+              ProviderIds: { Tmdb: 'duplicate' },
+              UserData: { Played: true },
+            }))
+          : [
+              {
+                Id: 'a',
+                Type: 'Movie',
+                Path: 'C:\\media\\a.mkv',
+                ProviderIds: { Tmdb: 'duplicate' },
+              },
+              { Id: 'b', Type: 'Movie', Path: '/media/b.mkv', ProviderIds: { Tmdb: 'duplicate' } },
+            ];
+      return client;
+    };
+    const job = await finish(await service.migrateUsers(['e-river']));
+    const issues = job.results[0]?.ambiguous_items;
+    expect(issues).toHaveLength(paths.length);
+    expect(issues?.slice(0, 7).every((issue) => issue.path === undefined)).toBe(true);
+    expect(issues?.slice(7).map((issue) => issue.path)).toEqual(paths.slice(7));
+    expect(issues?.[0]?.candidates?.map((candidate) => candidate.path)).toEqual([
+      'C:\\media\\a.mkv',
+      '/media/b.mkv',
+    ]);
+    expect(JSON.stringify(job)).not.toContain('PRIVATE');
   });
   it('reads source history successfully before creating any target account', async () => {
     service.clientFactory = (...args) => {
@@ -1680,6 +1827,7 @@ describe('account migration and subscription safety', () => {
       id: 'missing',
       name: 'An unmatched library item',
       type: 'Movie',
+      provider_ids: { Tmdb: '999999999' },
     });
     expect(JSON.stringify(job)).not.toContain('private-library-token');
   });

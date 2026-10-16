@@ -362,7 +362,8 @@ export function readSnapshotHistory(
       SELECT m.Id,m.type,substr(m.Path,1,8193) AS Path,substr(m.Name,1,1025) AS Name,
         substr(m.ProviderIds,1,16385) AS ProviderIds,m.SeriesId,m.IndexNumber,
         m.ParentIndexNumber,m.IndexNumberEnd,
-        substr(s.ProviderIds,1,16385) AS SeriesProviderIds,ud.played
+        substr(s.ProviderIds,1,16385) AS SeriesProviderIds,
+        substr(s.Name,1,1025) AS SeriesName,ud.played
         ${scope === 'complete' ? ',m.RunTimeTicks,ud.playCount,ud.isFavorite,ud.playbackPositionTicks,ud.LastPlayedDateInt,ud.rating' : ''}
       FROM UserDatas ud CROSS JOIN MediaItems m ON m.UserDataKeyId=ud.UserDataKeyId
       LEFT JOIN MediaItems s ON s.Id=m.SeriesId AND s.type=6
@@ -426,6 +427,14 @@ export function readSnapshotHistory(
       }
       const path = text(row.Path, 8_192);
       if (name !== undefined) item.Name = name;
+      // The parent is already joined for matching identities. Its label is only
+      // review context; malformed optional names cannot invalidate played flags.
+      try {
+        const seriesName = text(row.SeriesName, 1_024);
+        if (seriesName) item.SeriesName = seriesName;
+      } catch {
+        // Keep the existing episode identity when a parent label is unusable.
+      }
       if (path !== undefined) item.Path = path;
       const providers = providerIds(row.ProviderIds),
         seriesProviders = providerIds(row.SeriesProviderIds);

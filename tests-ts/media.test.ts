@@ -1,10 +1,43 @@
 import { describe, expect, it, vi } from 'vitest';
-import { MediaClient, type FetchTransport, type MediaUserDataPatch } from '../server/media.js';
+import {
+  MediaClient,
+  projectCatalogItem,
+  type FetchTransport,
+  type MediaUserDataPatch,
+} from '../server/media.js';
 import { MediaError } from '../server/errors.js';
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
 describe('media API boundary', () => {
+  it('retains bounded review context without retaining unrelated private DTO fields', () => {
+    expect(
+      projectCatalogItem({
+        Id: 'episode',
+        Type: 'Episode',
+        Name: 'Synthetic episode',
+        SeriesName: 'Synthetic show',
+        ProductionYear: 2020,
+        AuthenticationToken: 'private-token',
+        UserData: { Played: true },
+      }),
+    ).toEqual({
+      Id: 'episode',
+      Type: 'Episode',
+      Name: 'Synthetic episode',
+      SeriesName: 'Synthetic show',
+      ProductionYear: 2020,
+    });
+  });
+  it.each([
+    { SeriesName: 'bad\nlabel', ProductionYear: -1 },
+    { SeriesName: 'x'.repeat(2049), ProductionYear: 10000 },
+    { SeriesName: { secret: 'never-retain' }, ProductionYear: '2020' },
+  ])('omits unusable optional display context without weakening identity checks', (labels) => {
+    expect(
+      projectCatalogItem({ Id: 'movie', Type: 'Movie', ProviderIds: { Tmdb: '42' }, ...labels }),
+    ).toEqual({ Id: 'movie', Type: 'Movie', ProviderIds: { Tmdb: '42' } });
+  });
   it('filters quick source reads to watched playable items and enriches episodes from unfiltered series', async () => {
     const requests: URL[] = [];
     const movies = [

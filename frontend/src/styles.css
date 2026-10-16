@@ -1361,6 +1361,80 @@ textarea::placeholder {
 .disclosure li {
   padding: 3px 0;
 }
+.disclosure .issue-list {
+  list-style: none;
+  padding-left: 0;
+  max-height: 480px;
+}
+.disclosure .issue-item {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+.issue-heading {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--text);
+}
+.issue-type {
+  flex-shrink: 0;
+  color: var(--subtle);
+  font-size: 10px;
+  font-weight: 500;
+}
+.issue-reason,
+.issue-note {
+  margin: 7px 0 0;
+  line-height: 1.5;
+}
+.issue-note {
+  color: var(--subtle);
+}
+.issue-candidates {
+  margin-top: 9px;
+}
+.issue-candidates > summary {
+  color: var(--purple);
+}
+.issue-identity-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+.issue-identity-card {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.issue-identity-card h4 {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text);
+}
+.issue-identity-title {
+  margin: 7px 0 12px;
+  line-height: 1.5;
+}
+.issue-identity-card dl {
+  margin: 0;
+}
+.issue-identity-card dt {
+  margin: 8px 0 3px;
+  color: var(--subtle);
+  font-size: 10px;
+}
+.issue-identity-card dd {
+  margin: 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.issue-providers > span {
+  display: block;
+}
 .job-summary {
   display: flex;
   align-items: center;

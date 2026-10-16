@@ -31,6 +31,9 @@ export interface MediaItem extends JsonObject {
   ProviderIds?: JsonObject;
   SeriesProviderIds?: JsonObject;
   SeriesId?: string;
+  /** Display context only; never used to establish matching identity. */
+  SeriesName?: string;
+  ProductionYear?: number;
   Path?: string;
   UserData?: { Played?: boolean; [key: string]: unknown };
   /** Trusted backup-only membership. Never projected from a remote media DTO. */
@@ -200,6 +203,20 @@ export function projectCatalogItem(value: unknown): MediaItem {
   }
   if (typeof item.Type !== 'string' || !item.Type)
     throw new MediaError('The media server returned catalog items without media types.');
+  // Optional review labels must not invalidate otherwise usable media identity.
+  if (
+    typeof value.SeriesName === 'string' &&
+    value.SeriesName.length <= 2048 &&
+    !/[\u0000-\u001f\u007f]/.test(value.SeriesName)
+  )
+    item.SeriesName = value.SeriesName;
+  if (
+    typeof value.ProductionYear === 'number' &&
+    Number.isSafeInteger(value.ProductionYear) &&
+    value.ProductionYear > 0 &&
+    value.ProductionYear <= 9999
+  )
+    item.ProductionYear = value.ProductionYear;
   for (const field of [
     'IndexNumber',
     'ParentIndexNumber',
@@ -1502,6 +1519,31 @@ export class MediaClient implements MediaAPI {
         'Jellyfin confirmed item access but omitted its explicitly requested identity. Review the destination catalog before migrating. No item updates were started.',
       );
     });
+    // Parent identities are already part of the bounded dependency read. Reuse
+    // their current display names rather than issuing episode-by-episode reads.
+    const seriesNames = new Map(
+      items
+        .filter((item) => item.Type === 'Series' && item.Name)
+        .map((item) => [item.Id, item.Name!]),
+    );
+    for (let index = 0; index < items.length; index++) {
+      if (index % 1000 === 0) await this.yieldRead();
+      const item = items[index]!;
+      if (!item.SeriesName && item.SeriesId && ['Episode', 'Season'].includes(item.Type ?? '')) {
+        const name = seriesNames.get(item.SeriesId);
+        if (name && name.length <= 2048) {
+          const bytes =
+            Buffer.byteLength(JSON.stringify({ ...item, SeriesName: name })) -
+            Buffer.byteLength(JSON.stringify(item));
+          if (retainedBytes + bytes > MAX_CATALOG_BYTES)
+            throw new MediaError(
+              'Jellyfin destination state exceeds the supported migration size.',
+            );
+          retainedBytes += bytes;
+          item.SeriesName = name;
+        }
+      }
+    }
     return items;
   }
 

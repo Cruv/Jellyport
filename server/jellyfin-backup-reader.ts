@@ -710,6 +710,7 @@ export async function importJellyfinBackupCatalog(
           const parentItem = JSON.parse(String(parent.item)) as MediaItem;
           if (parentItem.Type !== 'Series') throw invalid();
           if (parentItem.ProviderIds) item.SeriesProviderIds = parentItem.ProviderIds;
+          if (parentItem.Name && parentItem.Name.length <= 2048) item.SeriesName = parentItem.Name;
         }
         const serialized = JSON.stringify(projectCatalogItem(item));
         const bytes = Buffer.byteLength(serialized);

@@ -1414,7 +1414,7 @@ export class MediaClient implements MediaAPI {
       returned.add(fresh.Id);
       items.push(fresh);
     };
-    const readBatch = async (batch: MediaItem[], signal?: AbortSignal) =>
+    const readBatch = async (batch: MediaItem[], signal?: AbortSignal, hasSubtitles?: boolean) =>
       this.destinationRead(
         'user_state',
         async (onAttempt) =>
@@ -1429,6 +1429,7 @@ export class MediaClient implements MediaAPI {
                 EnableImages: 'false',
                 EnableTotalRecordCount: 'false',
                 Limit: batch.length,
+                ...(hasSubtitles === undefined ? {} : { HasSubtitles: String(hasSubtitles) }),
               },
               undefined,
               true,
@@ -1483,12 +1484,23 @@ export class MediaClient implements MediaAPI {
     // item lookup as the write endpoint, then isolate an accessible version from
     // grouping with a one-ID request. Both phases share one exception budget.
     await this.destinationProbeAccess(userId, missing, budget, async (candidate, signal) => {
-      const data = await readBatch([candidate], signal);
-      if (!Array.isArray(data.Items) || data.Items.length !== 1)
-        throw new MediaError(
-          'Jellyfin confirmed item access but omitted its explicitly requested identity. Review the destination catalog before migrating. No item updates were started.',
-        );
-      retain(data.Items[0], candidate);
+      // General queries hide owned/alternate versions even when only one ID is
+      // requested. In Jellyfin's supported API, either HasSubtitles value includes
+      // those versions; the false/true predicates are complementary for every
+      // item type. Use them only after authoritative access confirmation and a
+      // normal singleton omission, without invoking on-demand metadata refresh.
+      for (const hasSubtitles of [undefined, false, true]) {
+        if (hasSubtitles !== undefined) await this.yieldRead(signal);
+        const data = await readBatch([candidate], signal, hasSubtitles);
+        if (!Array.isArray(data.Items) || data.Items.length > 1)
+          throw new MediaError('Jellyfin returned an invalid destination candidate page.');
+        if (data.Items.length === 0) continue;
+        retain(data.Items[0], candidate);
+        return;
+      }
+      throw new MediaError(
+        'Jellyfin confirmed item access but omitted its explicitly requested identity. Review the destination catalog before migrating. No item updates were started.',
+      );
     });
     return items;
   }

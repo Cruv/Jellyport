@@ -705,7 +705,135 @@ describe('targeted Jellyfin destination state reads', () => {
       });
       try {
         await expect(client.destinationItems('alice', catalog(1))).rejects.toThrow(message);
-        expect(batches).toBe(2);
+        expect(batches).toBe(_label === 'still omitted' ? 4 : 2);
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
+  it.each([
+    ['Movie', false],
+    ['Episode', true],
+    ['Series', false],
+    ['Season', true],
+    ['Audio', false],
+    ['MusicAlbum', true],
+    ['MusicArtist', false],
+    ['MusicVideo', true],
+    ['Video', false],
+    ['Book', true],
+    ['AudioBook', false],
+    ['Photo', true],
+    ['PhotoAlbum', false],
+    ['BoxSet', true],
+    ['Trailer', false],
+  ])('recovers a hidden owned/alternate %s with HasSubtitles=%s', async (type, subtitles) => {
+    const candidate = { ...catalog(1)[0]!, Type: type };
+    const filters: (string | null)[] = [];
+    let accessChecks = 0;
+    const client = clientWithLibraries('http://jellyfin.test', 'key', 'jellyfin', {
+      transport: async (address) => {
+        const url = new URL(address);
+        if (url.pathname === '/Users/alice') return json(user());
+        if (url.pathname.startsWith('/UserItems/')) {
+          accessChecks++;
+          return json({ Played: true });
+        }
+        const filter = url.searchParams.get('HasSubtitles');
+        filters.push(filter);
+        expect(url.searchParams.get('Ids')).toBe(candidate.Id);
+        expect(url.searchParams.get('Limit')).toBe('1');
+        expect(url.pathname).toBe('/Users/alice/Items');
+        // The actual API hides this version in both ordinary explicit-ID calls;
+        // a complementary stream filter enables owned versions without refreshing.
+        return json({
+          Items:
+            filter === String(subtitles)
+              ? [{ ...candidate, UserData: { Played: true, PlayCount: 9 } }]
+              : [],
+        });
+      },
+    });
+    try {
+      expect(await client.destinationItems('alice', [candidate])).toEqual([
+        { ...candidate, UserData: { Played: true, PlayCount: 9 } },
+      ]);
+      expect(accessChecks).toBe(1);
+      expect(filters).toEqual(subtitles ? [null, null, 'false', 'true'] : [null, null, 'false']);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it.each([
+    ['invalid page', {}, /invalid destination candidate page/],
+    [
+      'duplicate page',
+      {
+        Items: [
+          { ...catalog(1)[0], UserData: {} },
+          { ...catalog(1)[0], UserData: {} },
+        ],
+      },
+      /invalid destination candidate page/,
+    ],
+    ['foreign ID', { Items: [{ ...catalog(1)[0], Id: 'foreign', UserData: {} }] }, /unexpected/],
+    [
+      'changed identity',
+      { Items: [{ ...catalog(1)[0], Path: '/changed', UserData: {} }] },
+      /identities changed/,
+    ],
+    ['missing state', { Items: [catalog(1)[0]] }, /valid data object/],
+    ['invalid state', { Items: [{ ...catalog(1)[0], UserData: { Played: 'yes' } }] }, /boolean/],
+  ])(
+    'rejects a filtered singleton with %s instead of trying the other partition',
+    async (_label, response, message) => {
+      const filters: (string | null)[] = [];
+      const client = clientWithLibraries('http://jellyfin.test', 'key', 'jellyfin', {
+        transport: async (address) => {
+          const url = new URL(address);
+          if (url.pathname === '/Users/alice') return json(user());
+          if (url.pathname.startsWith('/UserItems/')) return json({ Played: false });
+          const filter = url.searchParams.get('HasSubtitles');
+          filters.push(filter);
+          return filter === 'false' ? json(response) : json({ Items: [] });
+        },
+      });
+      try {
+        await expect(client.destinationItems('alice', catalog(1))).rejects.toThrow(message);
+        expect(filters).toEqual([null, null, 'false']);
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    'bounds transient filtered-singleton retries (eventual success=%s)',
+    async (success) => {
+      const candidate = catalog(1)[0]!;
+      let attempts = 0;
+      const sleep = vi.fn(async () => {});
+      const client = clientWithLibraries('http://jellyfin.test', 'key', 'jellyfin', {
+        sleep,
+        transport: async (address) => {
+          const url = new URL(address);
+          if (url.pathname === '/Users/alice') return json(user());
+          if (url.pathname.startsWith('/UserItems/')) return json({ Played: false });
+          const filter = url.searchParams.get('HasSubtitles');
+          if (filter === null) return json({ Items: [] });
+          expect(filter).toBe('false');
+          if (++attempts < 3 || !success) return json({}, 503);
+          return json({ Items: [{ ...candidate, UserData: { Played: false } }] });
+        },
+      });
+      try {
+        if (success) expect(await client.destinationItems('alice', [candidate])).toHaveLength(1);
+        else
+          await expect(client.destinationItems('alice', [candidate])).rejects.toThrow(/HTTP 503/);
+        expect(attempts).toBe(3);
+        expect(sleep).toHaveBeenCalledTimes(2);
       } finally {
         await client.close();
       }
@@ -769,7 +897,7 @@ describe('targeted Jellyfin destination state reads', () => {
     }
   });
 
-  it.each(['access', 'singleton'])(
+  it.each(['access', 'singleton', 'without-subtitles', 'with-subtitles'])(
     'cancels and drains an active omitted-item %s read',
     async (phase) => {
       let signal: AbortSignal | undefined;
@@ -783,10 +911,15 @@ describe('targeted Jellyfin destination state reads', () => {
           const url = new URL(address);
           if (url.pathname === '/Users/alice') return json(user());
           if (url.pathname.startsWith('/UserItems/')) {
-            if (phase === 'singleton') return json({ Played: false });
+            if (phase !== 'access') return json({ Played: false });
           } else {
             batches++;
-            if (batches === 1) return json({ Items: [] });
+            if (
+              batches === 1 ||
+              (batches === 2 && phase !== 'singleton') ||
+              (batches === 3 && phase === 'with-subtitles')
+            )
+              return json({ Items: [] });
           }
           signal = init?.signal as AbortSignal;
           started();
@@ -802,7 +935,9 @@ describe('targeted Jellyfin destination state reads', () => {
       expect(await outcome).toBeInstanceOf(Error);
       expect(String(await outcome)).toMatch(/canceled/);
       expect(signal?.aborted).toBe(true);
-      expect(batches).toBe(phase === 'access' ? 1 : 2);
+      expect(batches).toBe(
+        { access: 1, singleton: 2, 'without-subtitles': 3, 'with-subtitles': 4 }[phase],
+      );
     },
   );
 

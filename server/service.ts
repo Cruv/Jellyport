@@ -119,6 +119,16 @@ export interface JobResult extends Partial<JobStats> {
 export interface Job {
   destination_catalog_id?: string;
   elapsed_ms?: number;
+  /** Trusted server-side review preparation, excluding time spent reading the review. */
+  preview_timing?: {
+    preview_id: string;
+    started_at: string;
+    finished_at: string;
+    elapsed_ms: number;
+    user_count: number;
+  };
+  /** Whole review preparation plus whole accepted job; never apportioned between users. */
+  workflow_elapsed_ms?: number;
   queue_ms?: number;
   cancel_requested?: boolean;
   source_snapshot_ids?: Record<string, string>;
@@ -1519,6 +1529,7 @@ export class Service {
     expectedMappingRevisions?: Record<string, string | null>,
     requestedScope?: MigrationScope,
     sourceSnapshotIds?: Record<string, string>,
+    previewTiming?: Job['preview_timing'],
   ): Promise<Job> {
     const requestedAt = now();
     const scope = migrationScope(requestedScope);
@@ -1600,7 +1611,13 @@ export class Service {
       };
     });
     await this.validateRecipients(Object.values(discordRecipients));
-    return this.queue('migrate', requests, requestedAt);
+    // Preflight may await media or Discord reads. Queueing must use the same
+    // configuration that was reviewed, rather than adopting a concurrent edit.
+    if (JSON.stringify(settings) !== JSON.stringify(this.store.settings()))
+      throw new ServiceError(
+        'Configuration changed during migration preparation. Prepare a new review.',
+      );
+    return this.queue('migrate', requests, requestedAt, previewTiming);
   }
   private async requireRoleServer(client: MediaAPI, role: AccountRole): Promise<void> {
     const info = await client.systemInfo();
@@ -1812,7 +1829,12 @@ export class Service {
     }
     this.save(job);
   }
-  private queue(kind: string, requests: JobRequest[], requestedAt?: string): Job {
+  private queue(
+    kind: string,
+    requests: JobRequest[],
+    requestedAt?: string,
+    previewTiming?: Job['preview_timing'],
+  ): Job {
     if (this.stopping) throw new ServiceError('The app is stopping. Retry after it restarts.');
     requests = requests.map((request) =>
       request.source_user_id
@@ -1828,6 +1850,7 @@ export class Service {
       updated_at: timestamp,
       progress: { processed: 0, total: requests.length },
       results: [],
+      ...(previewTiming ? { preview_timing: structuredClone(previewTiming) } : {}),
       ...(requests.some((request) => request.source_snapshot_id)
         ? {
             source_snapshot_ids: Object.fromEntries(
@@ -2964,6 +2987,8 @@ export class Service {
       }
       job.finished_at = new Date().toISOString();
       job.elapsed_ms = Math.max(0, Date.parse(job.finished_at) - Date.parse(job.created_at));
+      if (job.preview_timing)
+        job.workflow_elapsed_ms = job.preview_timing.elapsed_ms + job.elapsed_ms;
       this.save(job);
     }
   }

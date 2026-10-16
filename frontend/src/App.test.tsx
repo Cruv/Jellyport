@@ -210,6 +210,12 @@ async function selectAndPreview() {
   fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
   await screen.findByText('Preparing migration review… 0 of 2 users complete.');
 }
+async function selectAndPreviewReady() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+  await screen.findByRole('dialog');
+}
 describe('React account safeguards', () => {
   it('defaults plugin migrations to saved history even before any backup has been imported', async () => {
     prepareRunningPreview();
@@ -888,6 +894,7 @@ describe('React account safeguards', () => {
     const request = requests.find((value) => value.path === '/api/migrations')!;
     expect(JSON.parse(String(request.options?.body))).toEqual({
       source_user_ids: ['e-alex', 'e-river'],
+      preview_id: 'preview-bulk',
       migration_scope: 'watched_only',
       discord_recipients: { 'e-river': '123456789012345678' },
     });
@@ -1056,6 +1063,7 @@ describe('React account safeguards', () => {
     const migration = requests.find((request) => request.path === '/api/migrations')!;
     expect(JSON.parse(String(migration.options?.body))).toEqual({
       source_user_ids: ['e-alex', 'e-river'],
+      preview_id: 'preview-task-1',
       migration_scope: 'watched_only',
       discord_recipients: {},
     });
@@ -1196,6 +1204,119 @@ describe('React account safeguards', () => {
     );
   });
 
+  it('retains a ready review for acceptance and deletes it only when the administrator closes it', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview'] = { ...readyPreviewTask, elapsed_ms: 1250 };
+    render(<App />);
+    await selectAndPreviewReady();
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText(/Review build: 1.3 seconds/)).toBeTruthy();
+    expect(requests.some(({ options }) => options?.method === 'DELETE')).toBe(false);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Back to users' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(requests.filter(({ options }) => options?.method === 'DELETE')).toHaveLength(1);
+  });
+  it.each(['navigation', 'sign out', 'unmount'] as const)(
+    'releases a retained ready review once on %s',
+    async (action) => {
+      prepareRunningPreview();
+      responses['/api/migrations/preview'] = readyPreviewTask;
+      responses['/api/logout'] = anonymous;
+      const view = render(<App />);
+      await selectAndPreviewReady();
+      expect(requests.some(({ options }) => options?.method === 'DELETE')).toBe(false);
+      if (action === 'unmount') view.unmount();
+      else if (action === 'navigation')
+        fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+      else fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+      await waitFor(() =>
+        expect(requests.filter(({ options }) => options?.method === 'DELETE')).toHaveLength(1),
+      );
+      expect(requests.some(({ path }) => path === '/api/migrations')).toBe(false);
+      if (action === 'sign out') {
+        expect(requests.findIndex(({ options }) => options?.method === 'DELETE')).toBeLessThan(
+          requests.findIndex(({ path }) => path === '/api/logout'),
+        );
+      }
+    },
+  );
+  it('submits a retained preview ID and lets the accepted job own it without a premature deletion', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview'] = readyPreviewTask;
+    responses['/api/migrations'] = { ...job, kind: 'migrate' };
+    render(<App />);
+    await selectAndPreviewReady();
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Start migration' }),
+    );
+    await screen.findByRole('heading', { name: 'Migration details' });
+    const accepted = requests.find(({ path }) => path === '/api/migrations')!;
+    expect(JSON.parse(String(accepted.options?.body)).preview_id).toBe('preview-task-1');
+    expect(requests.some(({ options }) => options?.method === 'DELETE')).toBe(false);
+  });
+  it('refreshes an expired review without silently accepting or using the expired review ID', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview'] = readyPreviewTask;
+    responses['/api/migrations'] = {
+      detail: 'This migration review expired. Prepare a new preview.',
+    };
+    statuses['/api/migrations'] = 409;
+    render(<App />);
+    await selectAndPreviewReady();
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Start migration' }),
+    );
+    await screen.findByText('This migration review expired. Prepare a new preview.');
+    responses['/api/migrations/preview'] = { ...readyPreviewTask, id: 'refreshed-preview' };
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Refresh review' }),
+    );
+    await screen.findByRole('dialog');
+    expect(requests.filter(({ options }) => options?.method === 'DELETE')).toHaveLength(1);
+    expect(requests.filter(({ path }) => path === '/api/migrations')).toHaveLength(1);
+    responses['/api/migrations'] = { ...job, kind: 'migrate' };
+    statuses['/api/migrations'] = 200;
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Start migration' }),
+    );
+    await screen.findByRole('heading', { name: 'Migration details' });
+    const attempts = requests.filter(({ path }) => path === '/api/migrations');
+    expect(JSON.parse(String(attempts[1].options?.body)).preview_id).toBe('refreshed-preview');
+  });
+  it('shows durable combined timing for the whole accepted job and excludes human review wait', async () => {
+    responses['/api/jobs/job-1'] = {
+      ...job,
+      kind: 'migrate',
+      elapsed_ms: 90000,
+      queue_ms: 2000,
+      workflow_elapsed_ms: 101500,
+      preview_timing: {
+        preview_id: 'timed-preview',
+        started_at: '2026-10-16T12:00:00Z',
+        finished_at: '2026-10-16T12:00:11.500Z',
+        elapsed_ms: 11500,
+        user_count: 4,
+      },
+    };
+    const dialog = await openJob();
+    expect(
+      within(dialog).getByText(
+        /Combined migration elapsed: 101.5 seconds · review build: 11.5 seconds · accepted migration: 90.0 seconds/,
+      ),
+    ).toBeTruthy();
+    expect(within(dialog).getByText(/Human review wait is excluded/)).toBeTruthy();
+    expect(within(dialog).getByText(/whole job duration, not an average per user/)).toBeTruthy();
+  });
+  it('labels accepted-only timing honestly when a historical or direct job has no recorded review timing', async () => {
+    responses['/api/jobs/job-1'] = { ...job, kind: 'migrate', elapsed_ms: 90000 };
+    const dialog = await openJob();
+    expect(within(dialog).getByText(/Accepted migration elapsed: 90.0 seconds/)).toBeTruthy();
+    expect(
+      within(dialog).getByText(/Review-build timing was not recorded for this job/),
+    ).toBeTruthy();
+    expect(within(dialog).queryByText(/Combined migration elapsed/)).toBeNull();
+    expect(within(dialog).queryByText(/Preparation\/queue: 0.0/)).toBeNull();
+  });
   it('cancels a preview when leaving the migration page and ignores an already pending late result', async () => {
     prepareRunningPreview();
     const normalFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
@@ -1451,6 +1572,7 @@ describe('React account safeguards', () => {
       ),
     ).toEqual({
       source_user_ids: ['complex'],
+      preview_id: 'preview-mapped',
       migration_scope: 'watched_only',
       discord_recipients: { complex: '123456789012345678' },
       mapping_revisions: { complex: 'approved-revision' },

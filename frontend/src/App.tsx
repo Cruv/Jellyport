@@ -62,7 +62,7 @@ const pages: Record<Page, { title: string; icon: string }> = {
   settings: { title: 'Settings', icon: 'settings' },
 };
 type Dialog =
-  | { kind: 'preview'; preview: Preview }
+  | { kind: 'preview'; preview: Preview; previewId: string; reviewElapsedMs?: number }
   | { kind: 'job'; job: Job }
   | { kind: 'reveal'; jobId: string }
   | { kind: 'credentials'; credentials: Credential[] }
@@ -124,6 +124,7 @@ export default function App() {
   const busyRef = useRef(new Set<string>());
   const [previewProgress, setPreviewProgress] = useState<PreviewTask['progress'] | null>(null);
   const previewRun = useRef<{ controller: AbortController; cancel: () => void } | null>(null);
+  const readyPreview = useRef<{ id: string; cancel: () => void } | null>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastId = useRef(0);
@@ -148,14 +149,24 @@ export default function App() {
     },
     [],
   );
+  const releaseReadyPreview = useCallback(() => {
+    const ready = readyPreview.current;
+    readyPreview.current = null;
+    ready?.cancel();
+  }, []);
   const closeDialog = useCallback(() => {
+    releaseReadyPreview();
     dialogVersion.current++;
     setDialog(null);
-  }, []);
-  const showDialog = useCallback((next: Dialog) => {
-    dialogVersion.current++;
-    setDialog(next);
-  }, []);
+  }, [releaseReadyPreview]);
+  const showDialog = useCallback(
+    (next: Dialog) => {
+      releaseReadyPreview();
+      dialogVersion.current++;
+      setDialog(next);
+    },
+    [releaseReadyPreview],
+  );
   const cancelPreview = useCallback(() => {
     const run = previewRun.current;
     if (!run) return;
@@ -166,7 +177,13 @@ export default function App() {
     busyRef.current.delete('preview');
     setBusy(new Set(busyRef.current));
   }, []);
-  useEffect(() => () => cancelPreview(), [cancelPreview]);
+  useEffect(
+    () => () => {
+      cancelPreview();
+      releaseReadyPreview();
+    },
+    [cancelPreview, releaseReadyPreview],
+  );
   const clearSession = useCallback(() => {
     authGeneration.current++;
     loadVersion.current++;
@@ -478,20 +495,21 @@ export default function App() {
       showDialog({ kind: 'job', job: value });
       setPollPaused(false);
     });
-  function preview() {
+  function preview(sourceUserIds = [...selected], savedSource = useSnapshots) {
     if (busyRef.current.has('preview')) return;
     if (!sourceChosen.current && sourceDefaults !== 'ready') {
       notify('Choose a history source before preparing a migration preview.', true);
       return;
     }
-    if (selected.size > 100) {
+    if (sourceUserIds.length > 100) {
       notify('Select up to 100 users for one migration.', true);
       return;
     }
     const generation = authGeneration.current;
-    const savedSource = useSnapshots;
+    releaseReadyPreview();
     const controller = new AbortController();
     let taskId = '';
+    let retainedForApproval = false;
     let cancellationSent = false;
     const run = {
       controller,
@@ -523,13 +541,13 @@ export default function App() {
     previewRun.current = run;
     busyRef.current.add('preview');
     setBusy(new Set(busyRef.current));
-    setPreviewProgress({ processed: 0, total: selected.size });
+    setPreviewProgress({ processed: 0, total: sourceUserIds.length });
     void (async () => {
       try {
         let task = await api<PreviewTask>('/api/migrations/preview', {
           method: 'POST',
           body: {
-            source_user_ids: [...selected],
+            source_user_ids: sourceUserIds,
             migration_scope: 'watched_only',
             ...(savedSource ? { use_snapshots: true } : {}),
           },
@@ -574,6 +592,8 @@ export default function App() {
           );
         showDialog({
           kind: 'preview',
+          previewId: task.id,
+          reviewElapsedMs: task.elapsed_ms,
           preview: {
             ...task.preview,
             // An older preview cannot expand the scope of the explicit flags-only approval.
@@ -583,11 +603,13 @@ export default function App() {
               : {}),
           },
         });
+        readyPreview.current = { id: task.id, cancel: run.cancel };
+        retainedForApproval = true;
       } catch (error) {
         if (active()) notify(message(error), true);
       } finally {
-        // The reviewed preview is now copied locally; failed or abandoned scans also release capacity.
-        run.cancel();
+        // Ready reviews remain available for server-validated acceptance; abandoned work is released.
+        if (!retainedForApproval) run.cancel();
         if (previewRun.current === run) {
           previewRun.current = null;
           setPreviewProgress(null);
@@ -596,6 +618,15 @@ export default function App() {
         }
       }
     })();
+  }
+  function refreshPreview() {
+    if (dialog?.kind !== 'preview' || busyRef.current.has('migration')) return;
+    const ids = dialog.preview.users.map((user) => user.source_user_id);
+    const saved = !!dialog.preview.source_snapshot_ids;
+    closeDialog();
+    setSelected(new Set(ids));
+    chooseHistorySource(saved);
+    preview(ids, saved);
   }
   function startMigration(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -617,6 +648,7 @@ export default function App() {
         method: 'POST',
         body: {
           source_user_ids: ids,
+          preview_id: dialog.previewId,
           migration_scope: 'watched_only',
           ...(dialog.preview.source_snapshot_ids
             ? { source_snapshot_ids: dialog.preview.source_snapshot_ids }
@@ -625,6 +657,8 @@ export default function App() {
           ...(Object.keys(mappingRevisions).length ? { mapping_revisions: mappingRevisions } : {}),
         },
       });
+      // The accepted job now owns its trusted review metadata and any selected snapshot pins.
+      if (readyPreview.current?.id === dialog.previewId) readyPreview.current = null;
       setSelected(new Set());
       created(job);
       notify('Migration started. You can follow its progress here.');
@@ -669,6 +703,7 @@ export default function App() {
   }
   function logout() {
     cancelPreview();
+    releaseReadyPreview();
     void work('logout', async () => {
       let anonymous: Session = {
         authenticated: false,
@@ -787,7 +822,7 @@ export default function App() {
           select={setSelected}
           search={search}
           setSearch={setSearch}
-          preview={preview}
+          preview={() => preview()}
           useSnapshots={useSnapshots}
           setUseSnapshots={chooseHistorySource}
           busy={busy.has('preview')}
@@ -991,6 +1026,7 @@ export default function App() {
           dialog={dialog}
           close={closeDialog}
           startMigration={startMigration}
+          refreshPreview={refreshPreview}
           reveal={reveal}
           cancelJob={cancelJob}
           showReveal={(jobId) => showDialog({ kind: 'reveal', jobId })}
@@ -1070,6 +1106,7 @@ function DialogContent({
   dialog,
   close,
   startMigration,
+  refreshPreview,
   reveal,
   cancelJob,
   showReveal,
@@ -1081,6 +1118,7 @@ function DialogContent({
   dialog: Dialog;
   close: () => void;
   startMigration: (event: FormEvent<HTMLFormElement>) => void;
+  refreshPreview: () => void;
   reveal: (id: string) => void;
   cancelJob: (id: string) => void;
   showReveal: (id: string) => void;
@@ -1098,8 +1136,15 @@ function DialogContent({
         close={close}
         footer={
           <>
-            <button className="btn btn-quiet" onClick={close}>
+            <button className="btn btn-quiet" onClick={close} disabled={busy.has('migration')}>
               Back to users
+            </button>
+            <button
+              className="btn btn-quiet"
+              onClick={refreshPreview}
+              disabled={busy.has('migration')}
+            >
+              Refresh review
             </button>
             <button
               className="btn btn-primary"
@@ -1113,6 +1158,12 @@ function DialogContent({
           </>
         }
       >
+        {dialog.reviewElapsedMs !== undefined && (
+          <p className="subtle text-small">
+            Review build: {(dialog.reviewElapsedMs / 1000).toFixed(1)} seconds. This is included in
+            the combined migration timing after approval; time spent reviewing is excluded.
+          </p>
+        )}
         <Callout icon="shield" title="Preview before you move.">
           Played flags from either server are preserved. Only played or unplayed status is migrated;
           resume positions, playback dates, play counts, favorites, playlists, ratings, profile
@@ -1215,8 +1266,9 @@ function DialogContent({
   }
   if (dialog.kind === 'job') {
     const job = dialog.job;
+    const migrationJob = ['migrate', 'migration'].includes(job.kind);
     const historicalMigration =
-      ['migrate', 'migration'].includes(job.kind) &&
+      migrationJob &&
       (job.migration_scope !== 'watched_only' ||
         job.results?.some(
           ({ data }) =>
@@ -1287,11 +1339,31 @@ function DialogContent({
           </Callout>
         )}
         <JobProgressDetails job={job} />
+        {migrationJob &&
+          job.workflow_elapsed_ms !== undefined &&
+          job.preview_timing &&
+          job.elapsed_ms !== undefined && (
+            <p className="subtle text-small">
+              Combined migration elapsed: {(job.workflow_elapsed_ms / 1000).toFixed(1)} seconds ·
+              review build: {(job.preview_timing.elapsed_ms / 1000).toFixed(1)} seconds · accepted
+              migration: {(job.elapsed_ms / 1000).toFixed(1)} seconds, including all preparation,
+              queue, writes, retries and verification. Human review wait is excluded. This is the
+              whole job duration, not an average per user.
+            </p>
+          )}
         {job.elapsed_ms !== undefined && (
           <p className="subtle text-small">
-            Total elapsed: {(job.elapsed_ms / 1000).toFixed(1)} seconds, including preparation,
-            queue and verification. Preparation/queue: {((job.queue_ms ?? 0) / 1000).toFixed(1)}{' '}
-            seconds.
+            {migrationJob ? 'Accepted migration elapsed' : 'Operation elapsed'}:{' '}
+            {(job.elapsed_ms / 1000).toFixed(1)} seconds, including{' '}
+            {migrationJob
+              ? 'preparation, queue, writes, retries and verification.'
+              : 'preparation and queued work.'}
+            {job.queue_ms !== undefined && (
+              <> Preparation/queue: {(job.queue_ms / 1000).toFixed(1)} seconds.</>
+            )}
+            {migrationJob &&
+              !job.preview_timing &&
+              ' Review-build timing was not recorded for this job.'}
           </p>
         )}
         {activeJob(job) && (

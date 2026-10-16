@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
+import { performance } from 'node:perf_hooks';
 import { PreviewTasks } from '../server/preview-tasks.js';
 import { MediaError } from '../server/errors.js';
 import type { MigrationScope } from '../server/migration.js';
@@ -45,6 +46,38 @@ it('rejects invalid migration scopes before starting any work', async () => {
     expect(run).not.toHaveBeenCalled();
   } finally {
     tasks.close();
+  }
+});
+
+it('captures preparation duration once and excludes the retained human review interval', async () => {
+  let time = 100;
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => time);
+  let release!: () => void;
+  const tasks = new PreviewTasks(async () => {
+    await new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { users: ['synthetic'] };
+  });
+  try {
+    const initial = tasks.start('owner', 'context', ['source']);
+    expect(Number.isFinite(Date.parse(initial.started_at))).toBe(true);
+    expect(initial.elapsed_ms).toBeUndefined();
+    expect(initial.finished_at).toBeUndefined();
+    await flush();
+    time = 1334;
+    release();
+    await flush();
+    const ready = tasks.get('owner', 'context', initial.id)!;
+    expect(ready.elapsed_ms).toBe(1234);
+    expect(Number.isFinite(Date.parse(ready.finished_at!))).toBe(true);
+    time += 120_000;
+    expect(tasks.get('owner', 'context', initial.id)?.elapsed_ms).toBe(1234);
+    ready.elapsed_ms = 0;
+    expect(tasks.get('owner', 'context', initial.id)?.elapsed_ms).toBe(1234);
+  } finally {
+    tasks.close();
+    clock.mockRestore();
   }
 });
 

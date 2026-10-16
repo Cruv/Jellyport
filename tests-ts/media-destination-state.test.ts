@@ -3,14 +3,33 @@ import {
   CatalogChangedError,
   MAX_CATALOG_BYTES,
   MAX_CATALOG_ITEMS,
+  MAX_DESTINATION_VIEWS,
   MediaClient,
   type DestinationReadEvent,
   type MediaItem,
+  type MediaClientOptions,
+  type MediaKind,
 } from '../server/media.js';
 import { mergeUserData } from '../server/migration.js';
 
 const json = (value: unknown, status = 200, headers?: HeadersInit) =>
   new Response(JSON.stringify(value), { status, headers });
+// Existing state-boundary fixtures have one explicitly accessible library. New access
+// tests below exercise actual view discovery, multiple views and route failures.
+const clientWithView = (
+  url: string,
+  key: string,
+  kind: MediaKind,
+  options: MediaClientOptions,
+): MediaClient =>
+  new MediaClient(url, key, kind, {
+    ...options,
+    transport: async (address, init) =>
+      new URL(address).pathname.endsWith('/UserViews')
+        ? json({ Items: [{ Id: 'accessible-view' }] })
+        : options.transport!(address, init),
+  });
+
 const catalog = (length: number): MediaItem[] =>
   Array.from({ length }, (_, index) => ({
     Id: `movie-${index}`,
@@ -20,16 +39,198 @@ const catalog = (length: number): MediaItem[] =>
   }));
 
 describe('targeted Jellyfin destination state reads', () => {
-  it('reads a large candidate set once in bounded batches without enumerating the user library', async () => {
-    const candidates = catalog(10_001);
+  it('intersects explicit IDs with every accessible view without guessing mixed-library types', async () => {
+    const candidates = catalog(3);
+    candidates[1] = { ...candidates[1]!, Type: 'Episode', SeriesId: 'series' };
+    const calls: URL[] = [];
+    let views = [{ Id: 'movies', CollectionType: 'movies' }, { Id: 'television' }];
+    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      transport: async (address) => {
+        const url = new URL(address);
+        calls.push(url);
+        if (url.pathname === '/UserViews') {
+          expect(url.searchParams.get('userId')).toBe('alice');
+          expect(url.searchParams.get('includeHidden')).toBe('true');
+          expect(url.searchParams.get('includeExternalContent')).toBe('true');
+          return json({ Items: views });
+        }
+        expect(url.pathname).toBe('/Users/alice/Items');
+        expect(url.searchParams.get('Recursive')).toBe('true');
+        expect(url.searchParams.get('Ids')?.split(',')).toEqual(candidates.map((item) => item.Id));
+        // An unscoped query would incorrectly return the forbidden 4K candidate too.
+        const visible =
+          url.searchParams.get('ParentId') === 'movies'
+            ? candidates.slice(0, 2)
+            : url.searchParams.get('ParentId') === 'television'
+              ? [candidates[1]!]
+              : candidates;
+        return json({ Items: visible.map((item) => ({ ...item, UserData: { Played: false } })) });
+      },
+    });
+    try {
+      expect((await client.destinationItems('alice', candidates)).map((item) => item.Id)).toEqual([
+        'movie-0',
+        'movie-1',
+      ]);
+      expect(calls).toHaveLength(3);
+      // Permission changes must be re-read during independent verification.
+      views = [{ Id: 'television' }];
+      expect((await client.destinationItems('alice', candidates)).map((item) => item.Id)).toEqual([
+        'movie-1',
+      ]);
+      expect(calls).toHaveLength(5);
+      expect(calls.filter((url) => url.pathname === '/UserViews')).toHaveLength(2);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('deduplicates overlapping view state within one retained-memory budget', async () => {
+    const candidates = catalog(2000).map((item) => ({ ...item, Path: 'p'.repeat(16_384) }));
     const byId = new Map(candidates.map((item) => [item.Id, item]));
+    let pages = 0;
+    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      transport: async (address) => {
+        const url = new URL(address);
+        if (url.pathname === '/UserViews')
+          return json({ Items: [{ Id: 'one' }, { Id: 'two' }, { Id: 'three' }] });
+        pages++;
+        const ids = url.searchParams.get('Ids')!.split(',');
+        expect(ids.length).toBeLessThanOrEqual(100);
+        return json({
+          Items: ids.map((id) => ({ ...byId.get(id), UserData: { Played: true } })),
+        });
+      },
+    });
+    try {
+      const values = await client.destinationItems('alice', candidates);
+      expect(values).toHaveLength(2000);
+      expect(new Set(values.map((item) => item.Id)).size).toBe(2000);
+      expect(pages).toBe(60);
+      expect(Buffer.byteLength(JSON.stringify(values))).toBeLessThan(MAX_CATALOG_BYTES);
+      expect(Buffer.byteLength(JSON.stringify(values)) * 3).toBeGreaterThan(MAX_CATALOG_BYTES);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('fails closed on conflicting played state across accessible views', async () => {
+    const candidate = catalog(1)[0]!;
+    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      transport: async (address) => {
+        const url = new URL(address);
+        return url.pathname === '/UserViews'
+          ? json({ Items: [{ Id: 'one' }, { Id: 'two' }] })
+          : json({
+              Items: [
+                { ...candidate, UserData: { Played: url.searchParams.get('ParentId') === 'two' } },
+              ],
+            });
+      },
+    });
+    try {
+      await expect(client.destinationItems('alice', [candidate])).rejects.toThrow(/conflicting/);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it.each([
+    {},
+    { Items: null },
+    { Items: [{ Id: 'same' }, { Id: 'same' }] },
+    { Items: [{ Id: 'invalid,view' }] },
+    { Items: [{}] },
+    {
+      Items: Array.from({ length: MAX_DESTINATION_VIEWS + 1 }, (_, index) => ({
+        Id: String(index),
+      })),
+    },
+  ])(
+    'rejects malformed or excessive views before reading candidate state (%j)',
+    async (response) => {
+      const transport = vi.fn(async () => json(response));
+      const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+        transport,
+      });
+      try {
+        await expect(client.destinationItems('alice', catalog(1))).rejects.toThrow(/view/);
+        expect(transport).toHaveBeenCalledTimes(1);
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
+  it('returns no eligible destination items when the account has no accessible views', async () => {
+    const transport = vi.fn(async () => json({ Items: [] }));
+    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      transport,
+    });
+    try {
+      expect(await client.destinationItems('alice', catalog(1))).toEqual([]);
+      expect(transport).toHaveBeenCalledTimes(1);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('falls back only to the equivalent legacy user-view route and observes both attempts', async () => {
+    const candidate = catalog(1)[0]!;
+    const calls: string[] = [];
+    const events: DestinationReadEvent[] = [];
+    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      observeRead: (event) => events.push(event),
+      transport: async (address) => {
+        const url = new URL(address);
+        calls.push(url.pathname);
+        if (url.pathname === '/UserViews') return json({}, 404);
+        if (url.pathname === '/Users/alice/Views') return json({ Items: [{ Id: 'allowed' }] });
+        expect(url.searchParams.get('ParentId')).toBe('allowed');
+        return json({ Items: [{ ...candidate, UserData: {} }] });
+      },
+    });
+    try {
+      expect(await client.destinationItems('alice', [candidate])).toHaveLength(1);
+      expect(calls).toEqual(['/UserViews', '/Users/alice/Views', '/Users/alice/Items']);
+      expect(events.map(({ operation, attempts }) => [operation, attempts])).toEqual([
+        ['user_views', 2],
+        ['user_state', 1],
+      ]);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('cancels between views before starting another scoped page', async () => {
+    const candidate = catalog(1)[0]!;
     const calls: URL[] = [];
     const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async (address) => {
         const url = new URL(address);
         calls.push(url);
+        if (url.pathname === '/UserViews') return json({ Items: [{ Id: 'one' }, { Id: 'two' }] });
+        setTimeout(() => void client.close(), 0);
+        return json({ Items: [{ ...candidate, UserData: {} }] });
+      },
+    });
+    await expect(client.destinationItems('alice', [candidate])).rejects.toThrow(/canceled/);
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.searchParams.get('ParentId')).toBe('one');
+  });
+
+  it('reads a large candidate set once in bounded batches without enumerating the user library', async () => {
+    const candidates = catalog(10_001);
+    const byId = new Map(candidates.map((item) => [item.Id, item]));
+    const calls: URL[] = [];
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+      transport: async (address) => {
+        const url = new URL(address);
+        calls.push(url);
         expect(url.pathname).toBe('/Users/alice/Items');
-        for (const field of ['Recursive', 'SortBy', 'SortOrder', 'StartIndex', 'IncludeItemTypes'])
+        expect(url.searchParams.get('Recursive')).toBe('true');
+        expect(url.searchParams.get('ParentId')).toBe('accessible-view');
+        for (const field of ['SortBy', 'SortOrder', 'StartIndex', 'IncludeItemTypes'])
           expect(url.searchParams.has(field)).toBe(false);
         expect(url.searchParams.get('EnableUserData')).toBe('true');
         expect(url.searchParams.get('EnableImages')).toBe('false');
@@ -69,7 +270,7 @@ describe('targeted Jellyfin destination state reads', () => {
         TotalRecordCount: 99,
       }),
     );
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport,
     });
     try {
@@ -93,7 +294,7 @@ describe('targeted Jellyfin destination state reads', () => {
       PlayCount: 7,
       LastPlayedDate: '2026-10-15T12:00:00.0000000Z',
     };
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async () =>
         json({
           Items: [
@@ -134,7 +335,7 @@ describe('targeted Jellyfin destination state reads', () => {
   it('does not cache personal state between users or repeat calls', async () => {
     const candidate = catalog(1)[0]!;
     let calls = 0;
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async () => json({ Items: [{ ...candidate, UserData: { PlayCount: ++calls } }] }),
     });
     try {
@@ -155,7 +356,7 @@ describe('targeted Jellyfin destination state reads', () => {
       ParentIndexNumber: 1,
       SeriesProviderIds: { Tvdb: '42' },
     };
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async () => {
         const { SeriesProviderIds: _, ...metadata } = candidate;
         return json({ Items: [{ ...metadata, UserData: { Played: false } }] });
@@ -182,7 +383,7 @@ describe('targeted Jellyfin destination state reads', () => {
     { IndexNumberEnd: 2 },
   ])('fails closed when a cached identity changed: %j', async (changed) => {
     const candidate = catalog(1)[0]!;
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async () =>
         json({ Items: [{ ...candidate, ...changed, UserData: { Played: false } }] }),
     });
@@ -205,7 +406,7 @@ describe('targeted Jellyfin destination state reads', () => {
   ])('rejects %s', async (_, fields, repeat) => {
     const candidate = catalog(1)[0]!;
     const value = { ...candidate, ...(fields as Record<string, unknown>) };
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async () => json({ Items: repeat ? [value, value] : [value] }),
     });
     try {
@@ -221,7 +422,7 @@ describe('targeted Jellyfin destination state reads', () => {
       Id: `${'😀'.repeat(30)}-${index}`,
     }));
     const batches: string[][] = [];
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async (address) => {
         const ids = new URL(address).searchParams.get('Ids')!.split(',');
         expect(encodeURIComponent(ids.join(',')).length).toBeLessThanOrEqual(6000);
@@ -241,7 +442,7 @@ describe('targeted Jellyfin destination state reads', () => {
 
   it('bounds candidate metadata before making any API call', async () => {
     const transport = vi.fn(async () => json({ Items: [] }));
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport,
     });
     try {
@@ -264,7 +465,7 @@ describe('targeted Jellyfin destination state reads', () => {
     const byId = new Map(candidates.map((item) => [item.Id, item]));
     expect(candidates.length * 16_384).toBeLessThan(MAX_CATALOG_BYTES);
     let calls = 0;
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async (address) => {
         calls++;
         const ids = new URL(address).searchParams.get('Ids')!.split(',');
@@ -294,7 +495,7 @@ describe('targeted Jellyfin destination state reads', () => {
       started();
       return new Promise<Response>(() => {});
     });
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport,
     });
     const read = client.destinationItems('alice', catalog(101));
@@ -309,7 +510,7 @@ describe('targeted Jellyfin destination state reads', () => {
     const sleep = vi.fn(async () => {});
     const events: DestinationReadEvent[] = [];
     let calls = 0;
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       sleep,
       observeRead: (event) => events.push(event),
       transport: async () =>
@@ -321,8 +522,8 @@ describe('targeted Jellyfin destination state reads', () => {
       expect(await client.destinationItems('alice', [candidate])).toHaveLength(1);
       expect(calls).toBe(3);
       expect(sleep.mock.calls).toEqual([[1000], [1000]]);
-      expect(events).toHaveLength(1);
-      expect(events[0]).toMatchObject({ attempts: 3, items: 1, outcome: 'completed' });
+      expect(events).toHaveLength(2);
+      expect(events[1]).toMatchObject({ attempts: 3, items: 1, outcome: 'completed' });
     } finally {
       await client.close();
     }
@@ -331,7 +532,7 @@ describe('targeted Jellyfin destination state reads', () => {
   it('cancels between bounded pages before starting another API call', async () => {
     const candidates = catalog(101);
     let calls = 0;
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async () => {
         calls++;
         setTimeout(() => void client.close(), 0);
@@ -346,7 +547,7 @@ describe('targeted Jellyfin destination state reads', () => {
 
   it('bounds an active candidate request with the configured read timeout', async () => {
     const transport = vi.fn(async () => new Promise<Response>(() => {}));
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       timeoutMs: 10,
       transport,
     });
@@ -361,7 +562,7 @@ describe('targeted Jellyfin destination state reads', () => {
   it('reports neutral catalog and candidate page aggregates without private request or playback fields', async () => {
     const candidate = catalog(1)[0]!;
     const events: DestinationReadEvent[] = [];
-    const client = new MediaClient('http://jellyfin.test', 'fixture-secret', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-secret', 'jellyfin', {
       observeRead: (event) => events.push(event),
       transport: async (address) => {
         const url = new URL(address);
@@ -378,16 +579,17 @@ describe('targeted Jellyfin destination state reads', () => {
     try {
       await client.catalogItems();
       await client.destinationItems('private-user', [candidate]);
-      expect(events).toHaveLength(3);
+      expect(events).toHaveLength(4);
       expect(events.map(({ operation, items }) => [operation, items])).toEqual([
         ['catalog', 1],
         ['catalog', 0],
+        ['user_views', 1],
         ['user_state', 1],
       ]);
       for (const event of events) {
         expect(event).toEqual({
           event: 'destination_read',
-          operation: expect.stringMatching(/catalog|user_state/),
+          operation: expect.stringMatching(/catalog|user_views|user_state/),
           outcome: 'completed',
           duration_ms: expect.any(Number),
           items: expect.any(Number),
@@ -403,7 +605,7 @@ describe('targeted Jellyfin destination state reads', () => {
 
   it('reports canceled and failed reads while ignoring observer exceptions', async () => {
     const events: DestinationReadEvent[] = [];
-    const failed = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const failed = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async () => json({}, 500),
       observeRead: (event) => {
         events.push(event);
@@ -414,7 +616,7 @@ describe('targeted Jellyfin destination state reads', () => {
     await failed.close();
     let started!: () => void;
     const active = new Promise<void>((resolve) => (started = resolve));
-    const canceled = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const canceled = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       transport: async () => {
         started();
         return new Promise<Response>(() => {});
@@ -425,16 +627,25 @@ describe('targeted Jellyfin destination state reads', () => {
     await active;
     await canceled.close();
     await expect(read).rejects.toThrow();
-    expect(events.map((event) => event.outcome)).toEqual(['failed', 'canceled']);
-    expect(events.every((event) => event.items === 0)).toBe(true);
-    expect(events.map((event) => event.attempts)).toEqual([1, 1]);
+    expect(events.map((event) => event.outcome)).toEqual([
+      'completed',
+      'failed',
+      'completed',
+      'canceled',
+    ]);
+    expect(
+      events
+        .filter((event) => event.operation === 'user_state')
+        .every((event) => event.items === 0),
+    ).toBe(true);
+    expect(events.map((event) => event.attempts)).toEqual([1, 1, 1, 1]);
   });
 
   it('counts overlapping request attempts separately for each operation', async () => {
     const candidate = catalog(1)[0]!;
     const events: DestinationReadEvent[] = [];
     const attempts = new Map<string, number>();
-    const client = new MediaClient('http://jellyfin.test', 'fixture-key', 'jellyfin', {
+    const client = clientWithView('http://jellyfin.test', 'fixture-key', 'jellyfin', {
       sleep: async () => {},
       observeRead: (event) => events.push(event),
       transport: async (address) => {
@@ -450,7 +661,7 @@ describe('targeted Jellyfin destination state reads', () => {
         client.destinationItems('alice', [candidate]),
         client.destinationItems('bob', [candidate]),
       ]);
-      expect(events.map((event) => event.attempts).sort()).toEqual([1, 2]);
+      expect(events.map((event) => event.attempts).sort()).toEqual([1, 1, 1, 2]);
       expect(events.every((event) => event.items === 1 && event.outcome === 'completed')).toBe(
         true,
       );

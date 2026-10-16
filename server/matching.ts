@@ -15,7 +15,26 @@ export interface MediaMatch {
 export interface AmbiguousMatch {
   source: MediaItem;
   candidates: MediaItem[];
+  /** Diagnostics describe the existing matching decision, never a new identity strategy. */
+  method?: string;
+  reason_codes?: AmbiguityReasonCode[];
+  reason?: string;
+  path_resolution?: AmbiguityPathResolution;
 }
+export type AmbiguityReasonCode =
+  | 'provider_conflict'
+  | 'numbering_conflict'
+  | 'media_type_conflict'
+  | 'duplicate_provider_id'
+  | 'competing_provider_matches'
+  | 'duplicate_series_episode'
+  | 'duplicate_series_season'
+  | 'duplicate_path';
+export type AmbiguityPathResolution =
+  | 'missing_source_path'
+  | 'no_candidate_at_path'
+  | 'multiple_candidates_at_path'
+  | 'conflict_prevents_path_resolution';
 export interface MatchPlan {
   matches: MediaMatch[];
   unmatched: MediaItem[];
@@ -211,23 +230,58 @@ export function catalogCandidateKeys(
   if (value) keys.add(JSON.stringify(['path', type, value]));
   return [...keys];
 }
-function compatible(source: MediaItem, target: MediaItem): boolean {
-  if (kind(source) !== kind(target)) return false;
+function compatibilityReasons(source: MediaItem, target: MediaItem): AmbiguityReasonCode[] {
+  if (kind(source) !== kind(target)) return ['media_type_conflict'];
+  const reasons: AmbiguityReasonCode[] = [];
   const fields = ['ProviderIds'];
   if (['episode', 'season'].includes(kind(source))) {
     fields.push('SeriesProviderIds');
     const a = seriesNumbers(source),
       b = seriesNumbers(target);
-    if (a && b && a.join(',') !== b.join(',')) return false;
+    if (a && b && a.join(',') !== b.join(',')) reasons.push('numbering_conflict');
   }
   for (const field of fields) {
     const a = providers(source, field),
       b = providers(target, field);
     // Contradictory aliases must not silently overwrite one another, even for a path match.
-    if ([...a.values(), ...b.values()].some((ids) => ids.size > 1)) return false;
-    if ([...a].some(([key, ids]) => b.has(key) && !b.get(key)!.has([...ids][0]!))) return false;
+    if (
+      [...a.values(), ...b.values()].some((ids) => ids.size > 1) ||
+      [...a].some(([key, ids]) => b.has(key) && !b.get(key)!.has([...ids][0]!))
+    ) {
+      reasons.push('provider_conflict');
+      break;
+    }
   }
-  return true;
+  return reasons;
+}
+
+/** Only identity-provider fields are retained in administrator result diagnostics. */
+export function diagnosticProviderIds(item: MediaItem, field: string): Record<string, string> {
+  const raw = item[field];
+  if (!isObject(raw)) return {};
+  const type = kind(item);
+  const allowed =
+    field === 'SeriesProviderIds'
+      ? videoProviders
+      : Object.hasOwn(typeProviders, type)
+        ? typeProviders[type]
+        : undefined;
+  const result: Record<string, string> = Object.create(null);
+  for (const [key, value] of Object.entries(raw)) {
+    if (Object.keys(result).length >= 16) break;
+    const providerKey = caseFold(key.trim());
+    let provider = Object.hasOwn(providerNames, providerKey)
+      ? providerNames[providerKey]
+      : undefined;
+    if (provider === 'tmdb' && kind(item) === 'boxset') provider = 'tmdbcollection';
+    if (
+      provider &&
+      allowed?.has(provider) &&
+      (typeof value === 'string' || (typeof value === 'number' && Number.isSafeInteger(value)))
+    )
+      result[key.slice(0, 64)] = String(value).slice(0, 128);
+  }
+  return result;
 }
 function add(index: Map<string, Set<number>>, key: unknown[], value: number): void {
   const encoded = JSON.stringify(key);
@@ -276,9 +330,13 @@ export function createMatcher(
       const pathCandidates = value ? lookup(pathIndex, [type, value]) : new Set<number>();
       let candidates = new Set<number>(),
         method = 'provider_id';
+      let duplicateProvider = false;
       if (type !== 'season')
-        for (const [provider, id] of providerEntries(item, 'ProviderIds'))
-          for (const index of lookup(providerIndex, [type, provider, id])) candidates.add(index);
+        for (const [provider, id] of providerEntries(item, 'ProviderIds')) {
+          const bucket = lookup(providerIndex, [type, provider, id]);
+          if (bucket.size > 1) duplicateProvider = true;
+          for (const index of bucket) candidates.add(index);
+        }
       if (!candidates.size && ['episode', 'season'].includes(type)) {
         const numbers = seriesNumbers(item);
         if (numbers) {
@@ -300,8 +358,38 @@ export function createMatcher(
         retainedCandidates += candidates.size;
         return [...candidates].sort((a, b) => a - b).map((index) => target[index]!);
       };
-      if ([...candidates].some((index) => !compatible(item, target[index]!))) {
-        result.ambiguous.push({ source: item, candidates: values() });
+      const conflictCodes = new Set<AmbiguityReasonCode>();
+      for (const index of candidates) {
+        for (const code of compatibilityReasons(item, target[index]!)) conflictCodes.add(code);
+        // The first incompatible candidate already makes the decision ambiguous.
+        // Report that pair's conflicts without rescanning a large collision bucket.
+        if (conflictCodes.size) break;
+      }
+      if (conflictCodes.size) {
+        const numbering = conflictCodes.has('numbering_conflict');
+        const provider = conflictCodes.has('provider_conflict');
+        const mediaType = conflictCodes.has('media_type_conflict');
+        const conflictText = [
+          ...(provider ? ['Provider IDs disagree or contain contradictory aliases'] : []),
+          ...(numbering
+            ? [
+                provider
+                  ? 'episode or season numbering also disagrees'
+                  : 'Episode or season numbering disagrees',
+              ]
+            : []),
+          ...(mediaType
+            ? [provider || numbering ? 'media types also disagree' : 'Media types disagree']
+            : []),
+        ].join('; ');
+        result.ambiguous.push({
+          source: item,
+          candidates: values(),
+          method,
+          reason_codes: [...conflictCodes].sort() as AmbiguityReasonCode[],
+          reason: `${conflictText}. An exact path cannot override conflicting identity metadata.`,
+          path_resolution: 'conflict_prevents_path_resolution',
+        });
         continue;
       }
       if (candidates.size > 1) {
@@ -313,8 +401,49 @@ export function createMatcher(
       }
       if (candidates.size === 1)
         result.matches.push({ source: item, target: target[[...candidates][0]!]!, method });
-      else if (candidates.size) result.ambiguous.push({ source: item, candidates: values() });
-      else result.unmatched.push(item);
+      else if (candidates.size) {
+        const atPath = [...candidates].filter((index) => pathCandidates.has(index)).length;
+        const pathResolution: AmbiguityPathResolution = !value
+          ? 'missing_source_path'
+          : atPath === 0
+            ? 'no_candidate_at_path'
+            : 'multiple_candidates_at_path';
+        const code: AmbiguityReasonCode =
+          method === 'provider_id'
+            ? duplicateProvider
+              ? 'duplicate_provider_id'
+              : 'competing_provider_matches'
+            : method === 'series_episode'
+              ? 'duplicate_series_episode'
+              : method === 'series_season'
+                ? 'duplicate_series_season'
+                : 'duplicate_path';
+        const identity =
+          method === 'provider_id'
+            ? 'a matching provider ID'
+            : method === 'series_episode'
+              ? 'the same series identity and episode numbering'
+              : method === 'series_season'
+                ? 'the same series identity and season number'
+                : 'the same exact file path';
+        const pathReason =
+          pathResolution === 'missing_source_path'
+            ? 'The source has no file path to select one.'
+            : pathResolution === 'no_candidate_at_path'
+              ? 'None has the source’s exact mapped file path.'
+              : 'Multiple candidates also share the exact mapped file path.';
+        result.ambiguous.push({
+          source: item,
+          candidates: values(),
+          method,
+          reason_codes: [code],
+          reason:
+            code === 'competing_provider_matches'
+              ? `Different matching provider IDs select different Jellyfin items. ${pathReason}`
+              : `Several Jellyfin items share ${identity}. ${pathReason}`,
+          path_resolution: pathResolution,
+        });
+      } else result.unmatched.push(item);
     }
     return result;
   };

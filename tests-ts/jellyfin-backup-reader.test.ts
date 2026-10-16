@@ -191,6 +191,7 @@ describe('Jellyfin backup catalog reader', () => {
           Type: 'Episode',
           Path: '/synthetic/2',
           SeriesId: apiId(1),
+          SeriesName: 'Synthetic item 1',
           IndexNumber: 3,
           ParentIndexNumber: 2,
           IndexNumberEnd: 4,

@@ -83,6 +83,24 @@ users, mappings or saved generations requires a matching current review.
 
 Each user's saved migration result includes at most 200 unmatched items and 200 ambiguous items, with at most 20 candidate matches per ambiguous item. Summary statistics count all eligible matching work. Previews return deferred statistics rather than zero counts and empty matching-detail lists until execution. These bounds limit browser-response size and persisted diagnostics; migration matching and its result counts still cover all eligible items. A completed preview larger than 8 MiB is rejected with a request to select fewer users.
 
+From 0.16.5, ambiguity details identify the media type, movie title or show name,
+season/episode numbers and episode title. The reason distinguishes conflicting
+provider identities or numbering from duplicate matches; a single conflicting
+candidate can also be ambiguous. Expand a comparison to see the source and each
+retained Jellyfin candidate, including their recorded paths and provider IDs.
+An exact path does not override contradictory identity metadata, and no history
+flag is assigned to an ambiguous item. Optional labels are display context only;
+they do not alter matching. Show names reuse saved parent metadata or already-read
+series dependencies, without another library scan or per-episode API requests.
+
+Combined unmatched/ambiguous diagnostic JSON is capped at 1 MiB per account, in
+addition to the 200-item/20-candidate limits. Full counts and matching work remain
+unchanged, and limited details are labeled. These administrator-only details omit
+stream URLs that may contain credentials or playback tokens; they are not sent to
+Discord or aggregate logs. Existing saved operations remain unchanged and may
+lack type, show context or a reason. Their view states that limitation; a new
+migration records the richer details.
+
 For a new account using a saved role, the role's library restrictions determine which candidates are available after account creation. Execution verifies media through the newly created account's actual access and reports unavailable matches. A neutral catalog entry alone never authorizes a history write.
 
 Approved migrations reuse a user-neutral Jellyfin catalog and identity index across the bulk job. Candidate selection retains every provider, series/episode-number and exact mapped-path hit for played history, plus required parent series. Each account's fresh folder policy is checked against trusted library membership from the saved catalog, and a fresh library/location fingerprint must match before positive hints are trusted. Changed configuration requires a new matching backup. Unknown or apparently denied candidates receive authoritative target-scoped UserData GET checks; confirmed unavailable IDs are removed before matching. Accepted IDs receive one bounded identity/state pass, at most 170 IDs and 6,000 encoded characters per batch, without name sorting or total counts. Independent readback repeats fresh configuration, policy and access checks, including no-op flags. No other account's permissions or personal state are reused.

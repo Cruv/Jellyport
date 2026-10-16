@@ -1244,6 +1244,7 @@ function DialogContent({
                       label="Ambiguous items"
                       items={user.ambiguous}
                       count={user.stats.ambiguous}
+                      ambiguous
                     />
                   </>
                 )}

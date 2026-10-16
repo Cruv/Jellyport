@@ -1,6 +1,14 @@
 import { randomInt, randomUUID } from 'node:crypto';
 import { MediaError, ServiceError } from './errors.js';
-import { caseFold, createMatcher, type MatchPlan, type PreparedMatcher } from './matching.js';
+import {
+  caseFold,
+  createMatcher,
+  diagnosticProviderIds,
+  type AmbiguityPathResolution,
+  type AmbiguityReasonCode,
+  type MatchPlan,
+  type PreparedMatcher,
+} from './matching.js';
 import {
   UserMappings,
   validateExistingMappingUsername,
@@ -89,6 +97,31 @@ export interface JobStats {
   source_resume: number;
   source_playlists: number;
 }
+/** Bounded, display-only media identity; never credentials, user state or write identifiers. */
+export interface MigrationItemSummary {
+  id: string;
+  name: string;
+  type?: string;
+  series_name?: string;
+  season_number?: number;
+  episode_number?: number;
+  episode_number_end?: number;
+  production_year?: number;
+  path?: string;
+  provider_ids?: Record<string, string>;
+  series_provider_ids?: Record<string, string>;
+}
+export interface MigrationAmbiguitySummary extends MigrationItemSummary {
+  candidate_ids: string[];
+  candidates?: MigrationItemSummary[];
+  candidate_count?: number;
+  method?: string;
+  reason_codes?: AmbiguityReasonCode[];
+  reason?: string;
+  path_resolution?: AmbiguityPathResolution;
+}
+/** Per account, including both result lists; full matching counts remain unbounded by display. */
+export const MAX_RESULT_DIAGNOSTIC_BYTES = 1024 * 1024;
 export interface JobResult extends Partial<JobStats> {
   destination_catalog?: DestinationCatalogMetadata;
   timing?: {
@@ -113,8 +146,8 @@ export interface JobResult extends Partial<JobStats> {
   role_sections?: RoleSection[];
   warnings?: string[];
   data?: MigrationDetails;
-  unmatched_items?: Array<{ name: string; type: string; id: string }>;
-  ambiguous_items?: Array<{ name: string; id: string; candidate_ids: string[] }>;
+  unmatched_items?: Array<MigrationItemSummary & { type: string }>;
+  ambiguous_items?: MigrationAmbiguitySummary[];
 }
 export interface Job {
   destination_catalog_id?: string;
@@ -348,12 +381,44 @@ export function templatePolicy(template: MediaUser | { Policy?: JsonObject }): J
 }
 
 /** Display-only preview diagnostics; these shortened IDs never identify migration writes. */
-function previewItemSummary(item: MediaItem): Pick<MediaItem, 'Id' | 'Name' | 'Type'> {
-  return {
-    Id: typeof item.Id === 'string' ? item.Id.slice(0, 128) : '',
-    ...(typeof item.Name === 'string' ? { Name: item.Name.slice(0, 512) } : {}),
-    ...(typeof item.Type === 'string' ? { Type: item.Type.slice(0, 64) } : {}),
+function previewItemSummary(item: MediaItem): MigrationItemSummary {
+  const summary: MigrationItemSummary = {
+    id: typeof item.Id === 'string' ? item.Id.slice(0, 128) : '',
+    name: typeof item.Name === 'string' ? item.Name.slice(0, 512) : '',
   };
+  if (typeof item.Type === 'string') summary.type = item.Type.slice(0, 64);
+  if (typeof item.SeriesName === 'string') summary.series_name = item.SeriesName.slice(0, 512);
+  if (
+    typeof item.Path === 'string' &&
+    !/[\u0000-\u001f\u007f]/.test(item.Path) &&
+    // URLs can embed credentials, signatures and playback tokens. Display only
+    // filesystem paths; Windows drive prefixes are not URL schemes.
+    (!/^[a-z][a-z0-9+.-]*:/i.test(item.Path.trim()) || /^[a-z]:[\\/]/i.test(item.Path.trim())) &&
+    !/^[\\/]{2}[^\\/]*@/.test(item.Path.trim())
+  )
+    summary.path = item.Path.slice(0, 1024);
+  const numeric = (value: unknown): number | undefined => {
+    const parsed = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
+    return typeof parsed === 'number' &&
+      Number.isSafeInteger(parsed) &&
+      parsed >= 0 &&
+      parsed <= 1_000_000
+      ? parsed
+      : undefined;
+  };
+  const type = summary.type?.toLowerCase();
+  if (type === 'episode') {
+    summary.season_number = numeric(item.ParentIndexNumber);
+    summary.episode_number = numeric(item.IndexNumber);
+    summary.episode_number_end = numeric(item.IndexNumberEnd);
+  } else if (type === 'season') summary.season_number = numeric(item.IndexNumber);
+  const year = numeric(item.ProductionYear);
+  if (year !== undefined && year > 0 && year <= 9999) summary.production_year = year;
+  const own = diagnosticProviderIds(item, 'ProviderIds');
+  const series = diagnosticProviderIds(item, 'SeriesProviderIds');
+  if (Object.keys(own).length) summary.provider_ids = own;
+  if (Object.keys(series).length) summary.series_provider_ids = series;
+  return summary;
 }
 
 /** Account jobs and subscription actions share a mutation lock released between users. */
@@ -2561,20 +2626,48 @@ export class Service {
         const matcher = createMatcher(targetItems, settings.path_mappings);
         const [plan, stats] = this.plan(source.items, targetItems, settings, scope, matcher);
         Object.assign(result, stats);
-        result.unmatched_items = plan.unmatched.slice(0, 200).map((item) => {
-          const summary = previewItemSummary(item);
-          return { name: summary.Name ?? '', type: summary.Type ?? '', id: summary.Id };
-        });
-        result.ambiguous_items = plan.ambiguous.slice(0, 200).map((item) => {
+        result.ambiguous_items = [];
+        result.unmatched_items = [];
+        let diagnosticBytes = Buffer.byteLength('{"ambiguous_items":[],"unmatched_items":[]}');
+        let diagnosticBudgetLimited = false;
+        const retainDiagnostic = (value: MigrationItemSummary): boolean => {
+          const bytes = Buffer.byteLength(JSON.stringify(value)) + 1;
+          if (bytes > MAX_RESULT_DIAGNOSTIC_BYTES - diagnosticBytes) {
+            diagnosticBudgetLimited = true;
+            return false;
+          }
+          diagnosticBytes += bytes;
+          return true;
+        };
+        // Prefer actionable ambiguity explanations over unmatched entries when
+        // unusually long names/paths fill the bounded administrator diagnostics.
+        for (const item of plan.ambiguous.slice(0, 200)) {
           const summary = previewItemSummary(item.source);
-          return {
-            name: summary.Name ?? '',
-            id: summary.Id,
-            candidate_ids: item.candidates
-              .slice(0, 20)
-              .map((candidate) => previewItemSummary(candidate).Id),
+          const candidates = item.candidates.slice(0, 20).map(previewItemSummary);
+          const detail: MigrationAmbiguitySummary = {
+            ...summary,
+            candidate_ids: candidates.map((candidate) => candidate.id),
+            candidates,
+            candidate_count: item.candidates.length,
+            method: item.method,
+            reason_codes: item.reason_codes,
+            reason: item.reason,
+            path_resolution: item.path_resolution,
           };
-        });
+          if (!retainDiagnostic(detail)) break;
+          result.ambiguous_items.push(detail);
+        }
+        for (const item of plan.unmatched.slice(0, 200)) {
+          const summary = previewItemSummary(item);
+          const detail = { ...summary, type: summary.type ?? '' };
+          if (!retainDiagnostic(detail)) break;
+          result.unmatched_items.push(detail);
+        }
+        if (diagnosticBudgetLimited)
+          migrationWarning(
+            result.data,
+            'Result diagnostic details are limited to 1 MiB per account. Full counts are shown; migration checks every item.',
+          );
         if (
           plan.unmatched.length > 200 ||
           plan.ambiguous.length > 200 ||

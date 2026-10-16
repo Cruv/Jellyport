@@ -119,14 +119,32 @@ export interface Connection {
   error?: string;
 }
 export type Connections = Record<'emby' | 'jellyfin' | 'discord', Connection>;
-export interface ItemIssue {
+export interface ItemIdentitySummary {
+  id?: string;
+  name?: string;
+  type?: string;
+  series_name?: string;
+  season_number?: number;
+  episode_number?: number;
+  episode_number_end?: number;
+  production_year?: number;
+  path?: string;
+  provider_ids?: Record<string, string>;
+  series_provider_ids?: Record<string, string>;
+}
+export interface ItemIssue extends ItemIdentitySummary {
   Id?: string;
   Name?: string;
-  name?: string;
   title?: string;
   Type?: string;
   source?: { Name?: string };
   candidate_ids?: string[];
+  candidates?: ItemIdentitySummary[];
+  candidate_count?: number;
+  method?: string;
+  reason?: string;
+  reason_codes?: string[];
+  path_resolution?: string;
 }
 export interface DestinationCatalogMetadata {
   id: string;

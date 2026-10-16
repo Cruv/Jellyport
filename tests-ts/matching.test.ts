@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   createMatcher,
+  diagnosticProviderIds,
   matchItems,
   MAX_AMBIGUOUS_CANDIDATES,
   MIGRATABLE_ITEM_TYPES,
@@ -13,7 +14,212 @@ const item = (Id: string, fields: Partial<MediaItem> = {}): MediaItem => ({
   Type: 'Movie',
   ...fields,
 });
+it.each(['constructor', '__proto__', 'toString'])(
+  'does not inherit diagnostic provider allowlists for type %s',
+  (type) => {
+    expect(
+      diagnosticProviderIds(
+        item('source', { Type: type, ProviderIds: { Tmdb: '42' } }),
+        'ProviderIds',
+      ),
+    ).toEqual({});
+  },
+);
+const conflictDiagnostic = (method: string, reason_codes: string[]) => ({
+  method,
+  reason_codes,
+  reason: expect.any(String),
+  path_resolution: 'conflict_prevents_path_resolution',
+});
 describe('conservative media matching', () => {
+  it('bounds display provider identities and excludes arbitrary plugin fields and objects', () => {
+    const variants = Array.from({ length: 16 }, (_, mask) => [
+      [...'tmdb'].map((char, index) => (mask & (1 << index) ? char.toUpperCase() : char)).join(''),
+      'X'.repeat(300),
+    ]);
+    const source = item('source', {
+      ProviderIds: {
+        PrivatePluginCredential: 'PRIVATE',
+        Nested: { secret: 'PRIVATE_OBJECT' },
+        ...Object.fromEntries(variants),
+        Imdb: 'tt42',
+      },
+    });
+    const ids = diagnosticProviderIds(source, 'ProviderIds');
+    expect(Object.keys(ids)).toHaveLength(16);
+    expect(Object.values(ids).every((value) => value.length === 128)).toBe(true);
+    expect(JSON.stringify(ids)).not.toContain('PRIVATE');
+    expect(ids.Imdb).toBeUndefined();
+  });
+  it('explains duplicate provider identities and the actual failed path narrowing', () => {
+    const targets = [
+      item('first', { ProviderIds: { Imdb: 'tt42' }, Path: '/media/first.mkv' }),
+      item('second', { ProviderIds: { Imdb: 'tt42' }, Path: '/media/second.mkv' }),
+    ];
+    for (const [Path, path_resolution] of [
+      [undefined, 'missing_source_path'],
+      ['/other/movie.mkv', 'no_candidate_at_path'],
+    ] as const) {
+      const source = item('source', { ProviderIds: { Imdb: 'tt42' }, Path });
+      expect(matchItems([source], targets).ambiguous).toEqual([
+        {
+          source,
+          candidates: targets,
+          method: 'provider_id',
+          reason_codes: ['duplicate_provider_id'],
+          path_resolution,
+          reason:
+            Path === undefined
+              ? 'Several Jellyfin items share a matching provider ID. The source has no file path to select one.'
+              : 'Several Jellyfin items share a matching provider ID. None has the source’s exact mapped file path.',
+        },
+      ]);
+    }
+    const source = item('source', { ProviderIds: { Imdb: 'tt42' }, Path: targets[0]!.Path });
+    expect(matchItems([source], targets).matches).toEqual([
+      { source, target: targets[0], method: 'provider_id+path' },
+    ]);
+  });
+  it('does not call independent provider hits a duplicated provider ID', () => {
+    const source = item('source', { ProviderIds: { Imdb: 'tt42', Tmdb: '500' } });
+    const targets = [
+      item('imdb-result', { ProviderIds: { Imdb: 'tt42' } }),
+      item('tmdb-result', { ProviderIds: { Tmdb: '500' } }),
+    ];
+    expect(matchItems([source], targets).ambiguous[0]).toMatchObject({
+      source,
+      candidates: targets,
+      method: 'provider_id',
+      reason_codes: ['competing_provider_matches'],
+      path_resolution: 'missing_source_path',
+      reason:
+        'Different matching provider IDs select different Jellyfin items. The source has no file path to select one.',
+    });
+  });
+  it('reports provider and numbering conflicts together even with one exact-path candidate', () => {
+    const source = item('episode', {
+      Type: 'Episode',
+      ProviderIds: { Tvdb: '555' },
+      SeriesProviderIds: { Tvdb: '100' },
+      ParentIndexNumber: 1,
+      IndexNumber: 2,
+      Path: '/media/show/episode.mkv',
+    });
+    const target = item('wrong-episode', {
+      ...source,
+      Id: 'wrong-episode',
+      IndexNumber: 3,
+      SeriesProviderIds: { Tvdb: '200' },
+    });
+    expect(matchItems([source], [target]).ambiguous).toEqual([
+      {
+        source,
+        candidates: [target],
+        method: 'provider_id',
+        reason_codes: ['numbering_conflict', 'provider_conflict'],
+        reason:
+          'Provider IDs disagree or contain contradictory aliases; episode or season numbering also disagrees. An exact path cannot override conflicting identity metadata.',
+        path_resolution: 'conflict_prevents_path_resolution',
+      },
+    ]);
+  });
+  it('stops compatibility diagnostics at the first conflicting episode in a provider collision bucket', () => {
+    const source = item('source', {
+      Type: 'Episode',
+      ProviderIds: { Tvdb: '555' },
+      SeriesProviderIds: { Tvdb: '100' },
+      ParentIndexNumber: 1,
+      IndexNumber: 2,
+    });
+    const first = item('first', {
+      ...source,
+      Id: 'first',
+      IndexNumber: 3,
+      SeriesProviderIds: { Tvdb: '200' },
+    });
+    let indexed = false;
+    let laterCompatibilityReads = 0;
+    const later = item('later', { ...source, Id: 'later' });
+    Object.defineProperty(later, 'ProviderIds', {
+      enumerable: true,
+      get() {
+        if (indexed) {
+          laterCompatibilityReads++;
+          throw new Error('Later collision candidates must not be inspected after a conflict.');
+        }
+        return { Tvdb: '555' };
+      },
+    });
+    const matcher = createMatcher([first, later]);
+    indexed = true;
+    const plan = matcher([source]);
+    expect(plan.matches).toEqual([]);
+    expect(plan.unmatched).toEqual([]);
+    expect(plan.ambiguous).toHaveLength(1);
+    expect(plan.ambiguous[0]?.source).toBe(source);
+    expect(plan.ambiguous[0]?.candidates).toHaveLength(2);
+    expect(plan.ambiguous[0]?.candidates[0]).toBe(first);
+    expect(plan.ambiguous[0]?.candidates[1]).toBe(later);
+    expect(plan.ambiguous[0]?.reason_codes).toEqual(['numbering_conflict', 'provider_conflict']);
+    expect(laterCompatibilityReads).toBe(0);
+  });
+  it('retains the media type conflict guard when a prepared matcher target is mutated', () => {
+    const source = item('source', { ProviderIds: { Imdb: 'tt42' }, Path: '/media/movie.mkv' });
+    const target = item('target', { ProviderIds: { Imdb: 'tt42' }, Path: source.Path });
+    const matcher = createMatcher([target]);
+    target.Type = 'Episode';
+    expect(matcher([source])).toEqual({
+      matches: [],
+      unmatched: [],
+      ambiguous: [
+        {
+          source,
+          candidates: [target],
+          method: 'provider_id',
+          reason_codes: ['media_type_conflict'],
+          reason:
+            'Media types disagree. An exact path cannot override conflicting identity metadata.',
+          path_resolution: 'conflict_prevents_path_resolution',
+        },
+      ],
+    });
+  });
+  it('explains series-plus-number and exact-path collisions without using titles or years', () => {
+    for (const Type of ['Episode', 'Season']) {
+      const source = item('source', {
+        Type,
+        Name: 'Same title',
+        ProductionYear: 2001,
+        SeriesName: 'An identified show',
+        SeriesProviderIds: { Tvdb: '100' },
+        ParentIndexNumber: 1,
+        IndexNumber: 2,
+        IndexNumberEnd: 3,
+      });
+      const targets = [
+        item('a', { ...source, Id: 'a' }),
+        item('b', { ...source, Id: 'b', ProductionYear: 2024 }),
+      ];
+      expect(matchItems([source], targets).ambiguous[0]).toMatchObject({
+        source,
+        candidates: targets,
+        method: Type === 'Episode' ? 'series_episode' : 'series_season',
+        reason_codes: [Type === 'Episode' ? 'duplicate_series_episode' : 'duplicate_series_season'],
+        path_resolution: 'missing_source_path',
+      });
+    }
+    const source = item('path-source', { Path: '/media/movie.mkv' });
+    const targets = [item('a', { Path: source.Path }), item('b', { Path: source.Path })];
+    expect(matchItems([source], targets).ambiguous[0]).toMatchObject({
+      source,
+      candidates: targets,
+      method: 'path',
+      reason_codes: ['duplicate_path'],
+      path_resolution: 'multiple_candidates_at_path',
+      reason:
+        'Several Jellyfin items share the same exact file path. Multiple candidates also share the exact mapped file path.',
+    });
+  });
   it('retains provider, series and mapped path fallbacks before checking destination access', () => {
     const movie = item('source-movie', {
       ProviderIds: { Imdb: 'tt42' },
@@ -405,7 +611,13 @@ describe('conservative media matching', () => {
       IndexNumber: 1,
     });
     const target = item('t', { ...source, Id: 't', IndexNumber: 2 });
-    expect(matchItems([source], [target]).ambiguous).toEqual([{ source, candidates: [target] }]);
+    expect(matchItems([source], [target]).ambiguous).toEqual([
+      {
+        source,
+        candidates: [target],
+        ...conflictDiagnostic('provider_id', ['numbering_conflict']),
+      },
+    ]);
   });
   it('requires episode numbers rather than only a shared series ID', () => {
     const source = item('s', {
@@ -445,7 +657,9 @@ describe('conservative media matching', () => {
     expect(matchItems([source], [a, b])).toEqual({
       matches: [],
       unmatched: [],
-      ambiguous: [{ source, candidates: [a, b] }],
+      ambiguous: [
+        { source, candidates: [a, b], ...conflictDiagnostic('provider_id', ['provider_conflict']) },
+      ],
     });
   });
   it('uses longest directory-boundary prefix mapping', () => {
@@ -547,7 +761,15 @@ describe('conservative media matching', () => {
     });
     for (const fields of [{ IndexNumber: 2 }, { SeriesProviderIds: { Tvdb: '200' } }]) {
       const target = item('t', { ...source, ...fields, Id: 't' });
-      expect(matchItems([source], [target]).ambiguous).toEqual([{ source, candidates: [target] }]);
+      expect(matchItems([source], [target]).ambiguous).toEqual([
+        {
+          source,
+          candidates: [target],
+          ...conflictDiagnostic('path', [
+            'IndexNumber' in fields ? 'numbering_conflict' : 'provider_conflict',
+          ]),
+        },
+      ]);
     }
   });
   it('matches recordings and release tracks without confusing their distinct MusicBrainz IDs', () => {
@@ -632,7 +854,9 @@ describe('conservative media matching', () => {
       Type: 'MusicAlbum',
       ProviderIds: { MusicBrainzReleaseGroup: 'group', MusicBrainzAlbum: 'b' },
     });
-    expect(matchItems([source], [target]).ambiguous).toEqual([{ source, candidates: [target] }]);
+    expect(matchItems([source], [target]).ambiguous).toEqual([
+      { source, candidates: [target], ...conflictDiagnostic('provider_id', ['provider_conflict']) },
+    ]);
     const audio = item('audio', {
       Type: 'Audio',
       ProviderIds: { MusicBrainzRecording: 'recording', MusicBrainzTrack: 'a' },
@@ -642,7 +866,11 @@ describe('conservative media matching', () => {
       ProviderIds: { MusicBrainzRecording: 'recording', MusicBrainzTrack: 'b' },
     });
     expect(matchItems([audio], [other]).ambiguous).toEqual([
-      { source: audio, candidates: [other] },
+      {
+        source: audio,
+        candidates: [other],
+        ...conflictDiagnostic('provider_id', ['provider_conflict']),
+      },
     ]);
   });
   it('matches artist and AudioDB identities without using an artist ID for an album', () => {
@@ -698,9 +926,15 @@ describe('conservative media matching', () => {
       Path: '/same',
       ProviderIds: { TmdbCollection: '100' },
     });
-    expect(matchItems([source], [target]).ambiguous).toEqual([{ source, candidates: [target] }]);
+    expect(matchItems([source], [target]).ambiguous).toEqual([
+      { source, candidates: [target], ...conflictDiagnostic('provider_id', ['provider_conflict']) },
+    ]);
     expect(matchItems([target], [source]).ambiguous).toEqual([
-      { source: target, candidates: [source] },
+      {
+        source: target,
+        candidates: [source],
+        ...conflictDiagnostic('provider_id', ['provider_conflict']),
+      },
     ]);
   });
   it('matches book metadata while keeping case-sensitive Google Books IDs distinct', () => {
@@ -768,9 +1002,19 @@ describe('conservative media matching', () => {
       const provider = Type === 'MusicAlbum' ? { MusicBrainzAlbum: 'a' } : { Tmdb: '1' };
       const source = item('s', { Type, ProviderIds: aliases, Path: '/same' });
       const target = item('t', { Type, ProviderIds: provider, Path: '/same' });
-      expect(matchItems([source], [target]).ambiguous).toEqual([{ source, candidates: [target] }]);
+      expect(matchItems([source], [target]).ambiguous).toEqual([
+        {
+          source,
+          candidates: [target],
+          ...conflictDiagnostic('provider_id', ['provider_conflict']),
+        },
+      ]);
       expect(matchItems([target], [source]).ambiguous).toEqual([
-        { source: target, candidates: [source] },
+        {
+          source: target,
+          candidates: [source],
+          ...conflictDiagnostic('provider_id', ['provider_conflict']),
+        },
       ]);
     }
   });

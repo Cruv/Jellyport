@@ -422,6 +422,8 @@ export function JobProgressDetails({ job }: { job: Job }) {
     preparing_account: 'Preparing Jellyfin account',
     indexing_target: 'Preparing shared Jellyfin matching index',
     reading_target: 'Reading Jellyfin account history',
+    matching: 'Matching media identities',
+    verifying_history: 'Verifying Jellyfin watch history',
     transferring_history:
       job.migration_scope === 'watched_only'
         ? 'Migrating watched status'

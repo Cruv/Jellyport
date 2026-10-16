@@ -910,10 +910,12 @@ describe('account migration and subscription safety', () => {
     }));
     service.clientFactory = (...args) => {
       const client = servers.factory(...args);
-      client.migrationItems = async () =>
-        catalog.map((item) => ({ ...item, UserData: { Played: args[2] === 'emby' } }));
+      if (args[2] === 'emby')
+        client.migrationItems = async () =>
+          catalog.map((item) => ({ ...item, UserData: { Played: true } }));
       return client;
     };
+    servers.media = structuredClone(catalog);
     const snapshots: Job[] = [];
     const originalSave = store.saveJob.bind(store);
     vi.spyOn(store, 'saveJob').mockImplementation((job) => {

@@ -265,13 +265,15 @@ describe('destination catalog reuse and bounded user history', () => {
     expect(job.status).toBe('completed');
     expect(job.results).toHaveLength(100);
     expect(fixture.catalog).toHaveBeenCalledTimes(1);
-    expect(fixture.destination).toHaveBeenCalledTimes(100);
+    expect(fixture.destination).toHaveBeenCalledTimes(200);
     expect(fixture.items).toHaveBeenCalledTimes(100);
     expect(fixture.fullUserCatalog).not.toHaveBeenCalled();
     expect(fixture.sourceCatalog).not.toHaveBeenCalled();
-    for (const [id, candidates] of fixture.destination.mock.calls) {
+    for (const [index, [id, candidates]] of fixture.destination.mock.calls.entries()) {
       expect(fixture.targetIds).toContain(id);
-      expect(candidates.map((item) => item.Id).sort()).toEqual(['1', '2', '3']);
+      expect(candidates.map((item) => item.Id).sort()).toEqual(
+        index % 2 === 0 ? ['1', '2', '3'] : ['1', '3'],
+      );
       expect(candidates.every((item) => !Object.hasOwn(item, 'UserData'))).toBe(true);
     }
     for (const targetId of fixture.targetIds) {
@@ -304,11 +306,11 @@ describe('destination catalog reuse and bounded user history', () => {
     expect((await finish(await fixture.migrate())).status).toBe('completed');
     expect((await finish(await fixture.migrate())).status).toBe('completed');
     expect(fixture.catalog).toHaveBeenCalledTimes(1);
-    expect(fixture.destination).toHaveBeenCalledTimes(2);
+    expect(fixture.destination).toHaveBeenCalledTimes(4);
     store.saveSettings({ ...store.settings(), jellyfin_api_key: 'rotated-synthetic-key' });
     expect((await finish(await fixture.migrate())).status).toBe('completed');
     expect(fixture.catalog).toHaveBeenCalledTimes(2);
-    expect(fixture.destination).toHaveBeenCalledTimes(3);
+    expect(fixture.destination).toHaveBeenCalledTimes(6);
     expect(servers.playlists[fixture.targetIds[0]!]).toHaveLength(1);
   });
 
@@ -392,7 +394,7 @@ describe('destination catalog reuse and bounded user history', () => {
     const retried = await finish(await fixture.migrate());
     expect(retried.status).toBe('completed');
     expect(fixture.catalog).toHaveBeenCalledTimes(2);
-    expect(fixture.destination).toHaveBeenCalledTimes(2);
+    expect(fixture.destination).toHaveBeenCalledTimes(4);
   });
 
   it('invalidates a built catalog and stops remaining users after a failed destination state read', async () => {
@@ -406,7 +408,7 @@ describe('destination catalog reuse and bounded user history', () => {
     expect(fixture.writes).not.toHaveBeenCalled();
     expect((await finish(await fixture.migrate())).status).toBe('completed');
     expect(fixture.catalog).toHaveBeenCalledTimes(2);
-    expect(fixture.destination).toHaveBeenCalledTimes(3);
+    expect(fixture.destination).toHaveBeenCalledTimes(5);
   });
 
   it.each(['unavailable', 'changed'] as const)(

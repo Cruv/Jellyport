@@ -7,6 +7,7 @@ services:
     environment:
       - JELLYPORT_DATA_DIR=/data
       - JELLYPORT_SNAPSHOT_DIR=/snapshots
+      - JELLYPORT_JELLYFIN_CATALOG_MODE=backup # Fail closed before the helper first connects.
       - JELLYPORT_SECURE_COOKIE=false # Set true for browser HTTPS; local setup still works.
       - JELLYPORT_ALLOWED_HOSTS=${JELLYPORT_ALLOWED_HOSTS:-}
       - TZ=Etc/UTC
@@ -35,6 +36,7 @@ services:
       - JELLYPORT_SNAPSHOT_DIR=/snapshots
       - JELLYPORT_SNAPSHOT_WORK_DIR=/work
       - JELLYPORT_SNAPSHOT_METHOD=plugin_backup # Requires 0.14.0+ on both services.
+      - JELLYPORT_JELLYFIN_BACKUP_DIR=/jellyfin-backups # Jellyfin native database-only ZIP backups, 0.15.0+.
       - JELLYPORT_EMBY_BACKUP_DIR=/emby-backups
       - JELLYPORT_EMBY_VERSION=4.10.1.0 # Must match the supported Emby version.
       - TZ=Etc/UTC
@@ -42,6 +44,12 @@ services:
       - type: bind
         source: /path/to/emby/backups # Plugin backup root containing embyserver-backup-full.
         target: /emby-backups
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /path/to/jellyfin/data/backups # Actual native Jellyfin backup folder; not the entire config.
+        target: /jellyfin-backups
         read_only: true
         bind:
           create_host_path: false

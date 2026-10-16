@@ -70,9 +70,54 @@ without producing a detectable duplicate: a live catalog is a bounded-age view,
 not an atomic database snapshot. Additions and metadata changes after collection
 can require another migration.
 
-## Destination matching without a full per-user crawl
+## Saved destination matching — 0.15.0
 
-An approved migration collects one user-neutral Jellyfin catalog, or reuses a
+The preferred large-library path imports a completed native Jellyfin database-only
+backup through the network-isolated helper. It streams only the manifest, BaseItems
+and BaseItemProviders into an allowlisted SQLite projection with disk indexes.
+The web service receives an encrypted neutral catalog, never the original archive.
+Each account loads only indexed identity candidates and their series dependencies;
+all candidate IDs and identity fields are checked through fresh user-scoped API
+reads before matching. Detailed updates still recheck activity immediately before
+writing, and independent batched readback verifies intended history afterward.
+A successful HTTP update alone is not evidence of completed migration.
+
+Set `JELLYPORT_JELLYFIN_CATALOG_MODE=backup` on the web service so the first startup
+also refuses live catalog scans. Importing is explicit and shared across users;
+preview never starts an import or catalog crawl. Queueing pins a generation;
+missing, expired, changed or incompatible data fails closed, including helper
+outages. Original backup age is limited to 48 hours, without renewal on reimport.
+The last good catalog survives import failure. See the [setup and repeatable
+procedure](jellyfin-backup-catalog.md).
+
+Projection and matching indexes stay on disk: at most two million supported items,
+8 GiB projected database, 8 MiB SQLite page cache per connection. Per-account
+candidate limits remain 200,000 items / 64 MiB, and source history remains bounded
+separately. Limits reject work rather than truncate it. Import and candidate workers
+have five-minute deadlines; cancellation kills and reaps the worker. Decryption is
+shared per generation with bounded idle retention, not repeated per account.
+No live media-server database is modified or opened by this import.
+
+The independent readback retains pre-write expectations, including no-op matches
+and multiple source editions mapping to one target. It checks watched flags,
+favorites, counts, dates, resume positions and supported ratings. A strictly newer
+Jellyfin playback date can explain changed resume state; a same-date ignored resume
+write cannot pass. Missing, mismatched or unsupported fields make the result partial.
+Playlists retain their existing private-copy and independent content verification.
+Unmatched and ambiguous identities remain explicit and are never guessed.
+
+Job elapsed time covers the server migration request, including preflight validation,
+queue admission, final verification and completion. Browser/network overhead is
+measured separately in an end-to-end trial.
+Per-account timings include extraction, matching, writes, retries and verification;
+shared import time and original backup dates appear separately. A bulk job's wall
+time is authoritative: individual account work does not include its wait behind
+other accounts or once-per-job provisioning checks. Neither CPU-only simulation nor
+shared preparation establishes the five-minute target-environment acceptance limit.
+
+## Legacy live destination matching without a full per-user crawl
+
+When saved destination mode is not configured, an approved migration collects one user-neutral Jellyfin catalog, or reuses a
 matching cached catalog, and pins it across every account in that bulk job. Its
 in-process reuse window is ten minutes from successful completion of collection;
 the recorded capture time remains the beginning of collection. The
@@ -207,7 +252,7 @@ These limits apply without server-owner tuning:
 | Circuit cooldown                        | At least 5 minutes; reject queued work rather than retry it      |
 | Source catalog/playlist page size       | At most 100 items                                                |
 | IDs in a state batch                    | At most 100, and at most 6,000 encoded characters                |
-| Matching catalog, per server            | At most 200,000 items and 64 MiB of retained serialized metadata |
+| Live matching catalog, per server       | At most 200,000 items and 64 MiB of retained serialized metadata |
 | Retained source personal state          | At most 100,000 items and 32 MiB of retained serialized data     |
 | Jellyfin catalog page size              | At most 100 items                                                |
 | Jellyfin catalog idle interval          | 100 ms between pages                                             |

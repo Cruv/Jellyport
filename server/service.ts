@@ -50,6 +50,13 @@ import { AccountProfiles, type AccountProfileInput } from './account-profiles.js
 import { AdminAlerts } from './admin-alerts.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { SourceSnapshots, type SnapshotMetadata } from './source-snapshots.js';
+import { DestinationCatalogs } from './destination-catalogs.js';
+import type { DestinationCatalogMetadata } from './destination-catalog-files.js';
+import {
+  captureExpectation,
+  evaluateExpectation,
+  type VerificationExpectation,
+} from './migration-verification.js';
 import { MediaWorkload, type MediaWorkloadEvent } from './media-workload.js';
 import { MigrationCatalogCache, type MigrationCatalog } from './migration-catalog.js';
 import { snapshotHistoryWarnings } from './emby-snapshot-reader.js';
@@ -86,6 +93,8 @@ export interface JobStats {
   source_playlists: number;
 }
 export interface JobResult extends Partial<JobStats> {
+  destination_catalog?: DestinationCatalogMetadata;
+  timing?: { elapsed_ms: number; phase_ms: Record<string, number> };
   source_catalog?: { captured_at: string; items: number };
   source_snapshot?: SnapshotMetadata;
   username: string;
@@ -107,6 +116,9 @@ export interface JobResult extends Partial<JobStats> {
   ambiguous_items?: Array<{ name: string; id: string; candidate_ids: string[] }>;
 }
 export interface Job {
+  destination_catalog_id?: string;
+  elapsed_ms?: number;
+  queue_ms?: number;
   cancel_requested?: boolean;
   source_snapshot_ids?: Record<string, string>;
   id: string;
@@ -125,7 +137,9 @@ export interface Job {
       | 'preparing_account'
       | 'indexing_target'
       | 'reading_target'
+      | 'matching'
       | 'transferring_history'
+      | 'verifying_history'
       | 'transferring_playlists'
       | 'delivering_credentials';
     items_processed?: number;
@@ -208,6 +222,7 @@ export interface DestinationWorkloadEvent extends Omit<DestinationReadEvent, 'ev
 interface DestinationCatalogContext {
   key?: string;
   value?: MigrationCatalog;
+  metadata?: DestinationCatalogMetadata;
   matcher?: PreparedMatcher;
   byId?: Map<string, MediaItem>;
 }
@@ -353,6 +368,7 @@ export class Service {
   readonly profiles: AccountProfiles;
   readonly adminAlerts: AdminAlerts;
   readonly sourceSnapshots: SourceSnapshots;
+  readonly destinationSnapshots: DestinationCatalogs;
   private readonly membershipMutex = new Mutex();
   constructor(
     readonly store: Store,
@@ -420,6 +436,10 @@ export class Service {
       demo: this.demo,
       clientFactory: () => this.clientFactory,
     });
+    this.destinationSnapshots = new DestinationCatalogs(store, {
+      demo: this.demo,
+      clientFactory: () => this.clientFactory,
+    });
   }
   resolveDiscordMapping(discordId: string): UserMapping | null {
     return this.mappings.getForDiscord(discordId, this.store.settings());
@@ -462,6 +482,7 @@ export class Service {
   async start(): Promise<void> {
     this.stopping = false;
     await this.sourceSnapshots.start();
+    await this.destinationSnapshots.start();
     for (const { job, requests, settings } of this.store.queuedJobs())
       this.schedule(job, requests, settings);
   }
@@ -1510,6 +1531,7 @@ export class Service {
     requestedScope?: MigrationScope,
     sourceSnapshotIds?: Record<string, string>,
   ): Promise<Job> {
+    const requestedAt = now();
     const scope = migrationScope(requestedScope);
     if (
       !sourceUserIds.length ||
@@ -1589,7 +1611,7 @@ export class Service {
       };
     });
     await this.validateRecipients(Object.values(discordRecipients));
-    return this.queue('migrate', requests);
+    return this.queue('migrate', requests, requestedAt);
   }
   private async requireRoleServer(client: MediaAPI, role: AccountRole): Promise<void> {
     const info = await client.systemInfo();
@@ -1801,14 +1823,14 @@ export class Service {
     }
     this.save(job);
   }
-  private queue(kind: string, requests: JobRequest[]): Job {
+  private queue(kind: string, requests: JobRequest[], requestedAt?: string): Job {
     if (this.stopping) throw new ServiceError('The app is stopping. Retry after it restarts.');
     const timestamp = now();
     const job: Job = {
       id: randomUUID().replaceAll('-', ''),
       kind,
       status: 'queued',
-      created_at: timestamp,
+      created_at: requestedAt ?? timestamp,
       updated_at: timestamp,
       progress: { processed: 0, total: requests.length },
       results: [],
@@ -1829,6 +1851,8 @@ export class Service {
         : {}),
     };
     const settings = this.store.settings();
+    if (requests.some((request) => request.source_user_id))
+      job.destination_catalog_id = this.destinationSnapshots.queuedSelection(settings);
     if (
       kind !== 'role_update' &&
       requests.some((request) => request.access_disabled === undefined) &&
@@ -2026,7 +2050,7 @@ export class Service {
     guard: () => void,
   ): Promise<MediaItem[]> {
     try {
-      if (!jellyfin.catalogItems || !jellyfin.destinationItems)
+      if (!jellyfin.destinationItems || (!job.destination_catalog_id && !jellyfin.catalogItems))
         throw new ServiceError(
           'This destination client cannot perform bounded history reads. Update the Jellyfin integration before migrating.',
         );
@@ -2045,61 +2069,89 @@ export class Service {
         throw new ServiceError(
           'The Jellyfin destination changed during this job. Review before retrying.',
         );
-      Object.assign(job.progress, {
-        phase: 'indexing_target',
-        catalog_pages: 0,
-        catalog_items: 0,
-        catalog_elapsed_ms: 0,
-        catalog_last_page_ms: 0,
-        catalog_cache_hit: false,
-      });
-      this.save(job);
-      let lastCheckpoint = Date.now();
-      let built = false;
-      const onProgress = (value: CatalogProgress) => {
-        Object.assign(job.progress, {
-          catalog_pages: value.pages,
-          catalog_items: value.items,
-          catalog_elapsed_ms: Math.round(value.elapsed_ms),
-          catalog_last_page_ms: Math.round(value.last_page_ms),
-        });
-        if (value.pages === 1 || Date.now() - lastCheckpoint >= 1000) {
-          this.save(job);
-          lastCheckpoint = Date.now();
-        }
-      };
-      if (context.value) this.destinationCacheHit(context.value.items.length);
-      else
-        context.value = await this.destinationCatalogs.get(key, () => {
-          built = true;
-          return jellyfin.catalogItems!({
-            signal: this.jobControllers.get(job.id)?.signal,
-            onProgress,
-          });
-        });
-      context.key = key;
-      guard();
-      job.progress.catalog_cache_hit = !built;
-      job.progress.catalog_items = context.value.items.length;
-      this.save(job);
-      context.matcher ??= createMatcher(context.value.items, settings.path_mappings);
-      context.byId ??= new Map(context.value.items.map((item) => [item.Id, item]));
-      // Eligibility is identical to the final state plan. Playlist members need matching
-      // even when they have never been watched or favorited.
       const eligible = statePlan(source.items, [], settings, scope).unmatched;
-      const candidates = context.matcher.candidates([
-        ...eligible,
-        ...source.playlists.flatMap((playlist) => playlist.items),
-      ]);
-      const ids = new Set(candidates.map((item) => item.Id));
-      // Derived episode/season identifiers depend on their series. Read that small
-      // dependency set too so cached series-provider edits cannot authorize a match.
-      for (const item of [...candidates]) {
-        const series = item.SeriesId ? context.byId.get(item.SeriesId) : undefined;
-        if (series && item.SeriesProviderIds && !ids.has(series.Id)) {
-          ids.add(series.Id);
-          candidates.push(series);
+      let candidates: MediaItem[];
+      let byId: Map<string, MediaItem>;
+      if (job.destination_catalog_id) {
+        context.metadata = await this.destinationSnapshots.metadata(
+          job.destination_catalog_id,
+          settings,
+          info.Id,
+          info.Version,
+        );
+        candidates = await this.destinationSnapshots.candidates(
+          job.destination_catalog_id,
+          settings,
+          info.Id,
+          info.Version,
+          [...eligible, ...source.playlists.flatMap((playlist) => playlist.items)],
+          settings.path_mappings,
+          this.jobControllers.get(job.id)?.signal,
+        );
+        byId = new Map(candidates.map((item) => [item.Id, item]));
+        context.key = key;
+        this.destinationCacheHit(candidates.length);
+        Object.assign(job.progress, {
+          catalog_cache_hit: true,
+          catalog_items: context.metadata.items,
+        });
+      } else {
+        Object.assign(job.progress, {
+          phase: 'indexing_target',
+          catalog_pages: 0,
+          catalog_items: 0,
+          catalog_elapsed_ms: 0,
+          catalog_last_page_ms: 0,
+          catalog_cache_hit: false,
+        });
+        this.save(job);
+        let lastCheckpoint = Date.now();
+        let built = false;
+        const onProgress = (value: CatalogProgress) => {
+          Object.assign(job.progress, {
+            catalog_pages: value.pages,
+            catalog_items: value.items,
+            catalog_elapsed_ms: Math.round(value.elapsed_ms),
+            catalog_last_page_ms: Math.round(value.last_page_ms),
+          });
+          if (value.pages === 1 || Date.now() - lastCheckpoint >= 1000) {
+            this.save(job);
+            lastCheckpoint = Date.now();
+          }
+        };
+        if (context.value) this.destinationCacheHit(context.value.items.length);
+        else
+          context.value = await this.destinationCatalogs.get(key, () => {
+            built = true;
+            return jellyfin.catalogItems!({
+              signal: this.jobControllers.get(job.id)?.signal,
+              onProgress,
+            });
+          });
+        context.key = key;
+        guard();
+        job.progress.catalog_cache_hit = !built;
+        job.progress.catalog_items = context.value.items.length;
+        this.save(job);
+        context.matcher ??= createMatcher(context.value.items, settings.path_mappings);
+        context.byId ??= new Map(context.value.items.map((item) => [item.Id, item]));
+        // Eligibility is identical to the final state plan. Playlist members need matching
+        // even when they have never been watched or favorited.
+        candidates = context.matcher.candidates([
+          ...eligible,
+          ...source.playlists.flatMap((playlist) => playlist.items),
+        ]);
+        const ids = new Set(candidates.map((item) => item.Id));
+        // Derived episode/season identifiers depend on their series. Read that small
+        // dependency set too so cached series-provider edits cannot authorize a match.
+        for (const item of [...candidates]) {
+          const series = item.SeriesId ? context.byId.get(item.SeriesId) : undefined;
+          if (series && item.SeriesProviderIds && !ids.has(series.Id)) {
+            ids.add(series.Id);
+            candidates.push(series);
+          }
         }
+        byId = context.byId;
       }
       job.progress.phase = 'reading_target';
       this.save(job);
@@ -2107,7 +2159,7 @@ export class Service {
       guard();
       const returned = new Set(items.map((item) => item.Id));
       for (const item of items) {
-        const parent = item.SeriesId ? context.byId.get(item.SeriesId) : undefined;
+        const parent = item.SeriesId ? byId.get(item.SeriesId) : undefined;
         if (parent && item.SeriesProviderIds && !returned.has(parent.Id))
           throw new ServiceError(
             'A destination series identity could not be verified through this account. Review its library access before retrying.',
@@ -2137,6 +2189,17 @@ export class Service {
     catalogContext: { key?: string; value?: MigrationCatalog },
     destinationContext: DestinationCatalogContext,
   ): Promise<void> {
+    const accountStarted = performance.now();
+    const timing = { elapsed_ms: 0, phase_ms: {} as Record<string, number> };
+    let phaseStarted = accountStarted;
+    let previousPhase: string | undefined;
+    const recordPhase = () => {
+      const time = performance.now();
+      if (previousPhase)
+        timing.phase_ms[previousPhase] =
+          (timing.phase_ms[previousPhase] ?? 0) + time - phaseStarted;
+      phaseStarted = time;
+    };
     const scope = migrationScope(request.migration_scope);
     let source: SourceSnapshot | null = null;
     let savedMetadata: SnapshotMetadata | undefined;
@@ -2145,6 +2208,8 @@ export class Service {
     let destinationId: string | null = null;
     let username: string;
     const phase = (value: NonNullable<Job['progress']['phase']>) => {
+      recordPhase();
+      previousPhase = value;
       job.progress.phase = value;
       this.save(job);
     };
@@ -2324,6 +2389,7 @@ export class Service {
         throw new ServiceError('This Jellyfin account is already linked to another Discord user.');
     }
     const result: JobResult = {
+      timing,
       username,
       ...(source ? { source_username: source.user.Name } : {}),
       ...(source?.catalog ? { source_catalog: source.catalog } : {}),
@@ -2531,6 +2597,8 @@ export class Service {
           destinationContext,
           guard,
         );
+        if (destinationContext.metadata) result.destination_catalog = destinationContext.metadata;
+        phase('matching');
         const matcher = createMatcher(targetItems, settings.path_mappings);
         const [plan, stats] = this.plan(
           source.items,
@@ -2564,6 +2632,7 @@ export class Service {
             result.data,
             'Result details are limited to 200 unmatched items, 200 ambiguous items, and 20 candidates per item. Full counts are shown; migration checks every item.',
           );
+        phase('transferring_history');
         Object.assign(job.progress, {
           phase: 'transferring_history',
           items_processed: 0,
@@ -2571,6 +2640,7 @@ export class Service {
           items_updated: 0,
         });
         this.save(job);
+        const expectations = new Map<string, VerificationExpectation[]>();
         let pendingWrites = 0;
         let lastCheckpoint = Date.now();
         const checkpoint = (force = false) => {
@@ -2592,6 +2662,15 @@ export class Service {
             },
             {
               migration_scope: scope,
+              expectation: (target, patch, unsupported) => {
+                const expected = captureExpectation(target, patch, scope);
+                expected.unsupported_fields = [
+                  ...new Set([...(expected.unsupported_fields ?? []), ...unsupported]),
+                ];
+                const existing = expectations.get(target.Id) ?? [];
+                existing.push(expected);
+                expectations.set(target.Id, existing);
+              },
               progress: (processed, total, updated) => {
                 Object.assign(job.progress, {
                   items_processed: processed,
@@ -2608,6 +2687,71 @@ export class Service {
           checkpoint(true);
         }
         guard();
+        phase('verifying_history');
+        result.data.verification = {
+          checked: expectations.size,
+          verified: 0,
+          preserved_newer: 0,
+          missing: 0,
+          mismatched: 0,
+          unsupported_fields: 0,
+        };
+        const verification = result.data.verification;
+        try {
+          const candidates = [...expectations.values()].map((values) => values[0]!.item);
+          const ids = new Set(candidates.map((item) => item.Id));
+          const byId = new Map(targetItems.map((item) => [item.Id, item]));
+          for (const item of [...candidates]) {
+            const parent = item.SeriesId ? byId.get(item.SeriesId) : undefined;
+            if (parent && item.SeriesProviderIds && !ids.has(parent.Id)) {
+              ids.add(parent.Id);
+              candidates.push(parent);
+            }
+          }
+          const observed = new Map(
+            (await jellyfin.destinationItems!(target.Id, candidates)).map((item) => [
+              item.Id,
+              item,
+            ]),
+          );
+          guard();
+          for (const item of candidates) {
+            if (
+              item.SeriesProviderIds &&
+              item.SeriesId &&
+              byId.has(item.SeriesId) &&
+              !observed.has(item.SeriesId)
+            )
+              throw new ServiceError('A series identity could not be independently verified.');
+          }
+          for (const [id, values] of expectations) {
+            const evaluations = values.map((expected) =>
+              evaluateExpectation(expected, observed.get(id)),
+            );
+            verification.unsupported_fields += new Set(
+              evaluations.flatMap((value) => value.unsupported_fields),
+            ).size;
+            if (evaluations.some((value) => value.status === 'missing')) verification.missing++;
+            else if (evaluations.some((value) => value.status === 'mismatch'))
+              verification.mismatched++;
+            else if (evaluations.some((value) => value.status === 'preserved_newer'))
+              verification.preserved_newer++;
+            else verification.verified++;
+          }
+          if (verification.missing || verification.mismatched || verification.unsupported_fields)
+            migrationWarning(
+              result.data,
+              'Independent Jellyfin readback did not verify every intended history field. Review missing, mismatched and unsupported counts before retrying.',
+            );
+        } catch (error) {
+          guard();
+          verification.missing = expectations.size;
+          migrationWarning(
+            result.data,
+            'Independent Jellyfin history verification could not finish. Applied changes are preserved; review before retrying.',
+          );
+        }
+        this.save(job);
         if (scope === 'complete') {
           phase('transferring_playlists');
           await migratePlaylists(
@@ -2675,6 +2819,12 @@ export class Service {
         this.save(job);
         throw error;
       }
+    } finally {
+      recordPhase();
+      timing.elapsed_ms = Math.round(performance.now() - accountStarted);
+      for (const key of Object.keys(timing.phase_ms))
+        timing.phase_ms[key] = Math.round(timing.phase_ms[key]!);
+      this.save(job);
     }
     this.save(job);
   }
@@ -2705,6 +2855,7 @@ export class Service {
     const destinationContext: DestinationCatalogContext = {};
     job.status = 'running';
     job.started_at = new Date().toISOString();
+    job.queue_ms = Math.max(0, Date.parse(job.started_at) - Date.parse(job.created_at));
     this.save(job);
     let releaseSnapshots: (() => Promise<void>) | undefined;
     try {
@@ -2719,6 +2870,23 @@ export class Service {
         settings,
         'jellyfin',
         async (jellyfin) => {
+          if (requests.some((request) => request.source_user_id)) {
+            if (!job.destination_catalog_id && this.destinationSnapshots.queuedSelection(settings))
+              throw new ServiceError(
+                'This queued migration has no saved Jellyfin catalog pin. Review a new migration.',
+              );
+            if (job.destination_catalog_id) {
+              const info = await jellyfin.systemInfo();
+              if (typeof info.Id !== 'string' || typeof info.Version !== 'string')
+                throw new ServiceError('The Jellyfin identity could not be verified.');
+              await this.destinationSnapshots.metadata(
+                job.destination_catalog_id,
+                settings,
+                info.Id,
+                info.Version,
+              );
+            }
+          }
           const template =
             job.kind === 'role_update' ||
             requests.every((request) => request.access_disabled !== undefined)
@@ -2728,6 +2896,8 @@ export class Service {
             const work = () =>
               this.mutationMutex.run(async () => {
                 this.checkJobStopped(job);
+                const accountStarted = performance.now();
+                const previousResults = job.results.length;
                 try {
                   if (request.access_disabled !== undefined) {
                     const member = this.assertMembershipRequest(request, settings);
@@ -2798,6 +2968,12 @@ export class Service {
                     error: error.message,
                   });
                   if (error instanceof SourcePreparationError) throw error;
+                } finally {
+                  for (const result of job.results.slice(previousResults))
+                    result.timing ??= {
+                      elapsed_ms: Math.round(performance.now() - accountStarted),
+                      phase_ms: {},
+                    };
                 }
                 this.checkJobStopped(job);
                 if (
@@ -2859,6 +3035,7 @@ export class Service {
         job.error ??= 'Temporary snapshot cleanup failed. Review private storage permissions.';
       }
       job.finished_at = new Date().toISOString();
+      job.elapsed_ms = Math.max(0, Date.parse(job.finished_at) - Date.parse(job.created_at));
       this.save(job);
     }
   }
@@ -2868,6 +3045,7 @@ export class Service {
     this.sourceCatalogs.clear();
     this.destinationCatalogs.clear();
     await this.sourceSnapshots.stop();
+    await this.destinationSnapshots.stop();
     await Promise.allSettled([...this.clients].map((client) => client.close()));
     await Promise.allSettled([...this.jobTasks.values()]);
   }

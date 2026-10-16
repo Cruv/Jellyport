@@ -9,6 +9,58 @@ and measurements below retain their original inputs and limitations.
 
 ## Played-only production trials — 2026-10-16
 
+### Current result — 0.16.4
+
+Revision `f0cb0a36efa6d0797109c3bca2516f31846dffd2` was deployed by Watchtower
+after its required checks and native image smoke tests passed. The linked servers
+were Emby 4.10.1.0 and Jellyfin 12.2.0. Four isolated trials measured the linked
+review-build timer plus the entire accepted job, including queue, account work,
+live Jellyfin writes and independent live readback. Human review delay was excluded.
+No live Emby catalog was scanned. Timings below are rounded server measurements;
+the combined value is calculated before rounding its component timers.
+
+| Trial                          | Combined workflow | Flags independently verified | New flags written | Failed updates | Ambiguous source items | Unmatched source items | Orphan source history |
+| ------------------------------ | ----------------: | ---------------------------: | ----------------: | -------------: | ---------------------: | ---------------------: | --------------------: |
+| Heavy, previously blank target |           131.2 s |                       20,607 |            20,607 |              1 |                    636 |                      0 |                 1,719 |
+| Typical, fresh target          |            11.4 s |                        1,801 |             1,801 |              0 |                     12 |                      0 |                    38 |
+| High history, fresh target     |            55.3 s |                        9,286 |             9,286 |              2 |                     39 |                      1 |                   977 |
+| Existing account rerun         |             7.0 s |                        2,939 |                 1 |              0 |                     50 |                      1 |                   545 |
+
+All four measured workflows were below five minutes. Typical and high-history
+fresh-write trials met the two-minute target; the heavy trial missed it by
+11.2 seconds and is **partial performance success**. These are individual timings,
+not averages. They do not establish a new bulk wall time; the earlier whole-bulk
+measurement below remains separately dated evidence.
+
+The heavy target was created during the failed 0.16.3 attempt and had received
+zero history writes, so its 20,607 writes were fresh. Its accepted phases were
+source 0.5 s, account 0.3 s, target reads 18.9 s, matching 0.6 s, writes 94.4 s and
+verification 16.4 s. Typical phases were 0.2/0.3/1.6/0.0/8.0/1.0 seconds;
+high-history phases were 0.3/0.3/6.7/0.2/41.7/5.9 seconds in the same order.
+The existing-account rerun skipped 2,938 already-played items, wrote one missing
+flag, and independently verified all 2,939 intended flags without missing or
+mismatched results. Six write workers remained the ceiling.
+
+All runs correctly remained **Needs review**. One heavy and two high-history
+items still produced Jellyfin HTTP 500s and mismatched readback because their
+metadata yields duplicate user-data provider keys. No permissions, global media
+metadata or live database/indexes were changed to bypass those errors. The prior
+restricted-library HTTP 404 write failures disappeared; access restrictions were
+preserved. Ambiguous identities, unmatched entries and orphan source history were
+reported and untouched, so these are not claims of complete account migration.
+
+Shared preprocessing was approximately **63 seconds** for the Emby source import
+and **280.0 seconds** for the updated Jellyfin membership catalog: 194,633 items,
+1,095,111 matching keys and 273.7 MiB. Both imports were reused across these trials
+and retained their original backup dates. Backup creation time is separate and was
+not measured here. Afterward, all eight temporary trial accounts were disabled
+with their data preserved, and the three task-owned mappings were removed.
+The ordinary existing account remained enabled.
+
+The repeatable procedure is in [saved Jellyfin catalogs](jellyfin-backup-catalog.md#repeatable-migration-and-measurement).
+
+### Earlier trials and corrected assumptions
+
 A representative heavy history on version 0.16.0 took **136.3 seconds** from
 queueing through independent readback. Shared preparation was reported separately:
 about 63 seconds to import the Emby plugin backup and 280.9 seconds to import the

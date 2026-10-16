@@ -1329,6 +1329,13 @@ function DialogContent({
                   .join(' · ')}
               </p>
             )}
+            {result.timing?.checkpoints && (
+              <p className="subtle text-small">
+                Progress checkpoints: {num(result.timing.checkpoints.count)} persisted ·{' '}
+                {(result.timing.checkpoints.total_duration_ms / 1000).toFixed(1)} seconds total ·{' '}
+                {(result.timing.checkpoints.max_duration_ms / 1000).toFixed(1)} seconds slowest.
+              </p>
+            )}
             {result.source_catalog && (
               <p className="subtle text-small">
                 Matching catalog collected {date(result.source_catalog.captured_at)} ·{' '}
@@ -1367,6 +1374,9 @@ function DialogContent({
               {result.data && (
                 <>
                   <span>{num(result.data.items_updated)} items updated</span>
+                  {!!result.data.failed_items && (
+                    <span>{num(result.data.failed_items)} failed updates</span>
+                  )}
                   {!!result.data.favorites && <span>{num(result.data.favorites)} favorites</span>}
                   {!!result.data.resume_positions && (
                     <span>{num(result.data.resume_positions)} resume positions</span>
@@ -1394,6 +1404,49 @@ function DialogContent({
                 </>
               )}
             </div>
+            {result.data?.write_metrics && (
+              <p className="subtle text-small">
+                Played-status write requests: {num(result.data.write_metrics.attempts)} attempted ·{' '}
+                {num(result.data.write_metrics.succeeded)} succeeded ·{' '}
+                {num(result.data.write_metrics.failed)} failed · peak{' '}
+                {num(result.data.write_metrics.peak_in_flight)} in flight. Cumulative request time:{' '}
+                {(result.data.write_metrics.cumulative_ms / 1000).toFixed(1)} seconds; slowest
+                request: {(result.data.write_metrics.max_ms / 1000).toFixed(1)} seconds. Concurrent
+                request times overlap; use total elapsed for the migration duration.
+              </p>
+            )}
+            {!!result.data?.failed_items && (
+              <details className="disclosure">
+                <summary>
+                  {job.migration_scope === 'watched_only'
+                    ? 'Failed played updates'
+                    : 'Failed item updates'}{' '}
+                  ({num(result.data.failed_items)})
+                </summary>
+                {result.data.failed_updates?.length ? (
+                  <>
+                    <ul>
+                      {result.data.failed_updates.slice(0, 200).map((failure, failureIndex) => (
+                        <li key={`${failure.target_id}-${failureIndex}`}>
+                          <code>{failure.target_id}</code> · {failure.item_type || 'Unknown type'} ·{' '}
+                          {failure.error}
+                        </li>
+                      ))}
+                    </ul>
+                    {result.data.failed_items >
+                      Math.min(result.data.failed_updates.length, 200) && (
+                      <p className="mt-8">
+                        Showing {num(Math.min(result.data.failed_updates.length, 200))} of{' '}
+                        {num(result.data.failed_items)} failed updates. At most 200 item details are
+                        retained per account. Review these failures before retrying the migration.
+                      </p>
+                    )}
+                  </>
+                ) : (
+                  <p className="mt-8">Individual failure details were not recorded for this job.</p>
+                )}
+              </details>
+            )}
             {result.data?.verification && (
               <p className="subtle text-small">
                 Independent {job.migration_scope === 'watched_only' ? 'played-status' : 'history'}{' '}

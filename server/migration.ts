@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createMatcher, type MatchPlan, type PreparedMatcher } from './matching.js';
 import {
@@ -166,6 +167,17 @@ export interface SourceSnapshot {
   warnings: string[];
 }
 export interface MigrationDetails {
+  /** Aggregate destination mutation measurements, excluding account and item identities. */
+  write_metrics?: {
+    attempts: number;
+    succeeded: number;
+    failed: number;
+    cumulative_ms: number;
+    max_ms: number;
+    peak_in_flight: number;
+  };
+  /** Bounded diagnostics for the authenticated administrator; never application logs. */
+  failed_updates?: { target_id: string; item_type: string; error: string }[];
   verification?: {
     checked: number;
     verified: number;
@@ -299,11 +311,14 @@ export async function migrateItemState(
     expectation?: (target: MediaItem, patch: MediaUserDataPatch, unsupported: string[]) => void;
   } = {},
 ): Promise<number> {
-  const concurrency = options.concurrency ?? 4;
+  const concurrency = options.concurrency ?? 6;
   // Historical jobs and clients may still send "complete". The public migration
   // writer always transfers only additive played flags, irrespective of that value.
-  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4)
-    throw new ServiceError('Migration concurrency must be between 1 and 4.');
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 6)
+    throw new ServiceError('Migration concurrency must be between 1 and 6.');
+  // Every worker must yield before an already-merged history can starve a pending
+  // cancellation timer for more than 1,000 matches across the whole pool.
+  const yieldInterval = Math.min(250, Math.floor(1000 / concurrency));
   stopped();
   let capabilities = { userData: false };
   try {
@@ -316,6 +331,15 @@ export async function migrateItemState(
     );
   }
   let applied = 0;
+  const metrics = (details.write_metrics ??= {
+    attempts: 0,
+    succeeded: 0,
+    failed: 0,
+    cumulative_ms: 0,
+    max_ms: 0,
+    peak_in_flight: 0,
+  });
+  let inFlight = 0;
   const confirmedPlayed = new Set<string>();
   const attemptedTargets = new Set<string>();
   let processed = 0;
@@ -365,7 +389,22 @@ export async function migrateItemState(
         );
       guard();
       attemptedTargets.add(target.Id);
-      await jellyfin.updateUserData!(userId, target.Id, { Played: true });
+      const began = performance.now();
+      metrics.attempts++;
+      inFlight++;
+      metrics.peak_in_flight = Math.max(metrics.peak_in_flight, inFlight);
+      try {
+        await jellyfin.updateUserData!(userId, target.Id, { Played: true });
+        metrics.succeeded++;
+      } catch (error) {
+        metrics.failed++;
+        throw error;
+      } finally {
+        inFlight--;
+        const elapsed = performance.now() - began;
+        metrics.cumulative_ms += elapsed;
+        metrics.max_ms = Math.max(metrics.max_ms, elapsed);
+      }
       confirmedPlayed.add(target.Id);
       applied++;
       details.items_updated++;
@@ -374,12 +413,23 @@ export async function migrateItemState(
     } catch (error) {
       guard();
       details.failed_items++;
-      migrationWarning(
-        details,
+      const message =
         error instanceof MediaError || error instanceof ServiceError
           ? error.message
-          : 'An item could not be updated. Review the migration and retry.',
-      );
+          : 'An item could not be updated. Review the migration and retry.';
+      const failures = (details.failed_updates ??= []);
+      if (failures.length < 200)
+        failures.push({
+          target_id: match.target.Id,
+          item_type: match.source.Type ?? 'Unknown',
+          error: message,
+        });
+      else
+        migrationWarning(
+          details,
+          'Failed-update details are limited to 200 items. The full failed-item count is shown.',
+        );
+      migrationWarning(details, message);
       return false;
     }
   };
@@ -406,7 +456,7 @@ export async function migrateItemState(
           options.progress?.(processed, plan.matches.length, reportedUpdated);
           // Unchanged histories can complete entirely through resolved promises. Yield
           // periodically so timer/request-driven cancellation can run between no-ops.
-          if (processed % 250 === 0) {
+          if (processed % yieldInterval === 0) {
             await delay(0);
             guard();
           }

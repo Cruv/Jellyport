@@ -142,7 +142,11 @@ export interface DestinationCatalogMetadata {
 }
 export interface JobResult {
   destination_catalog?: DestinationCatalogMetadata;
-  timing?: { elapsed_ms: number; phase_ms: Record<string, number> };
+  timing?: {
+    elapsed_ms: number;
+    phase_ms: Record<string, number>;
+    checkpoints?: { count: number; total_duration_ms: number; max_duration_ms: number };
+  };
   source_catalog?: { captured_at: string; items: number };
   source_snapshot?: SourceSnapshotMetadata;
   username?: string;
@@ -167,6 +171,15 @@ export interface JobResult {
   error?: string;
 }
 export interface MigrationDetails {
+  write_metrics?: {
+    attempts: number;
+    succeeded: number;
+    failed: number;
+    cumulative_ms: number;
+    max_ms: number;
+    peak_in_flight: number;
+  };
+  failed_updates?: Array<{ target_id: string; item_type: string; error: string }>;
   verification?: {
     checked: number;
     verified: number;

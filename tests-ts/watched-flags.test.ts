@@ -112,6 +112,15 @@ describe('strict public played-flag writer', () => {
         failed_items: 0,
       });
       expect(details.warnings).toEqual([]);
+      expect(details.write_metrics).toMatchObject({
+        attempts: 1,
+        succeeded: 1,
+        failed: 0,
+        peak_in_flight: 1,
+      });
+      expect(details.write_metrics!.cumulative_ms).toBeGreaterThanOrEqual(0);
+      expect(details.write_metrics!.max_ms).toBe(details.write_metrics!.cumulative_ms);
+      expect(details.failed_updates).toBeUndefined();
       expect(expectations[0]!.state).toEqual({ Played: true });
       expect(evaluateExpectation(expectations[0]!, media('target', current)).status).toBe(
         'verified',
@@ -148,6 +157,14 @@ describe('strict public played-flag writer', () => {
     expect(updateUserData).not.toHaveBeenCalled();
     expect(expectation).toHaveBeenCalledExactlyOnceWith(selected.matches[1]!.target, {}, []);
     expect(details.failed_items).toBe(0);
+    expect(details.write_metrics).toEqual({
+      attempts: 0,
+      succeeded: 0,
+      failed: 0,
+      cumulative_ms: 0,
+      max_ms: 0,
+      peak_in_flight: 0,
+    });
   });
 
   it.each(['Movie', 'Episode', 'Audio', 'MusicVideo', 'Video', 'Book', 'AudioBook', 'Trailer'])(
@@ -206,6 +223,14 @@ describe('strict public played-flag writer', () => {
       expect(markPlayed).not.toHaveBeenCalled();
       expect(markFavorite).not.toHaveBeenCalled();
       expect(details.failed_items).toBe(1);
+      expect(details.write_metrics).toMatchObject({ attempts: 0, succeeded: 0, failed: 0 });
+      expect(details.failed_updates).toEqual([
+        {
+          target_id: 'target-0',
+          item_type: 'Movie',
+          error: expect.stringContaining('partial user-data'),
+        },
+      ]);
       expect(details.warnings.join(' ')).toContain('partial user-data');
       expect(details.warnings.join(' ')).not.toContain('PRIVATE_RAW_FAILURE');
       expect(expectation).toHaveBeenCalledWith(expect.anything(), { Played: true }, ['Played']);
@@ -239,6 +264,7 @@ describe('strict public played-flag writer', () => {
     expect(expectation).toHaveBeenCalledTimes(100);
     expect(progress).toHaveBeenLastCalledWith(100, 100, 10);
     expect(selected.matches.every((match) => match.target.UserData?.Played === false)).toBe(true);
+    expect(details.write_metrics).toMatchObject({ attempts: 10, succeeded: 10, failed: 0 });
   });
 
   it('does not replay an uncertain mutation through another source edition', async () => {
@@ -264,51 +290,76 @@ describe('strict public played-flag writer', () => {
     expect(expectation).toHaveBeenCalledTimes(2);
     expect(details.failed_items).toBe(2);
     expect(details.warnings.join(' ')).toContain('No duplicate mutation was sent');
+    expect(details.write_metrics).toMatchObject({ attempts: 1, succeeded: 0, failed: 1 });
+    expect(details.failed_updates).toHaveLength(2);
+    expect(details.failed_updates!.map((failure) => failure.target_id)).toEqual([
+      'target-0',
+      'target-0',
+    ]);
   });
 
-  it('bounds independent mutations to four and reports every completed match', async () => {
-    let release!: () => void, started!: () => void;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const writing = new Promise<void>((resolve) => {
-      started = resolve;
-    });
-    let active = 0,
-      maximum = 0,
-      calls = 0;
-    const updateUserData = vi.fn(async () => {
-      active++;
-      maximum = Math.max(maximum, active);
-      if (++calls === 4) started();
-      await gate;
-      await tick();
-      active--;
-    });
-    const progress = vi.fn(),
-      saved = vi.fn();
-    const operation = migrateItemState(
-      client({ updateUserData }),
-      'user',
-      plan(8),
-      migrationDetails(),
-      () => {},
-      saved,
-      { progress },
-    );
-    await writing;
-    expect(active).toBe(4);
-    expect(calls).toBe(4);
-    release();
-    expect(await operation).toBe(8);
-    expect(maximum).toBe(4);
-    expect(active).toBe(0);
-    expect(saved).toHaveBeenCalledTimes(8);
-    expect(progress.mock.calls.map(([processed, total]) => [processed, total])).toEqual(
-      Array.from({ length: 8 }, (_, index) => [index + 1, 8]),
-    );
-    expect(progress.mock.calls.every(([processed, , updated]) => updated <= processed)).toBe(true);
-  });
+  it.each([undefined, 1, 4, 6])(
+    'bounds independent mutations to the chosen ceiling and reports every completed match (%s)',
+    async (concurrency) => {
+      const limit = concurrency ?? 6;
+      const total = limit * 2;
+      let release!: () => void, started!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const writing = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      let active = 0,
+        maximum = 0,
+        calls = 0;
+      const updateUserData = vi.fn(async () => {
+        active++;
+        maximum = Math.max(maximum, active);
+        if (++calls === limit) started();
+        await gate;
+        await tick();
+        active--;
+      });
+      const details = migrationDetails();
+      const progress = vi.fn(),
+        saved = vi.fn();
+      const operation = migrateItemState(
+        client({ updateUserData }),
+        'user',
+        plan(total),
+        details,
+        () => {},
+        saved,
+        { concurrency, progress },
+      );
+      await writing;
+      expect(active).toBe(limit);
+      expect(calls).toBe(limit);
+      release();
+      expect(await operation).toBe(total);
+      expect(maximum).toBe(limit);
+      expect(active).toBe(0);
+      expect(saved).toHaveBeenCalledTimes(total);
+      expect(progress.mock.calls.map(([processed, total]) => [processed, total])).toEqual(
+        Array.from({ length: total }, (_, index) => [index + 1, total]),
+      );
+      expect(progress.mock.calls.every(([processed, , updated]) => updated <= processed)).toBe(
+        true,
+      );
+      expect(details.write_metrics).toMatchObject({
+        attempts: total,
+        succeeded: total,
+        failed: 0,
+        peak_in_flight: limit,
+      });
+      expect(details.write_metrics!.cumulative_ms).toBeGreaterThan(0);
+      expect(details.write_metrics!.max_ms).toBeGreaterThan(0);
+      expect(details.write_metrics!.max_ms).toBeLessThanOrEqual(
+        details.write_metrics!.cumulative_ms,
+      );
+    },
+  );
 
   it('drains an already-issued mutation before propagating a changed guard and never starts queued targets', async () => {
     let release!: () => void, started!: () => void, guardFailed!: () => void;
@@ -329,11 +380,12 @@ describe('strict public played-flag writer', () => {
       started();
       await gate;
     });
+    const details = migrationDetails();
     const operation = migrateItemState(
       client({ updateUserData }),
       'user',
       plan(3),
-      migrationDetails(),
+      details,
       () => {
         if (changed) {
           guardFailed();
@@ -354,6 +406,12 @@ describe('strict public played-flag writer', () => {
     release();
     await rejected;
     expect(settled).toBe(true);
+    expect(details.write_metrics).toMatchObject({
+      attempts: 1,
+      succeeded: 1,
+      failed: 0,
+      peak_in_flight: 1,
+    });
   });
 
   it('isolates an ordinary target failure while keeping accurate processed and updated counts', async () => {
@@ -376,6 +434,41 @@ describe('strict public played-flag writer', () => {
     expect(details).toMatchObject({ items_updated: 3, failed_items: 1 });
     expect(progress).toHaveBeenLastCalledWith(4, 4, 3);
     expect(details.warnings).toEqual(['Jellyfin request timed out.']);
+    expect(details.write_metrics).toMatchObject({ attempts: 4, succeeded: 3, failed: 1 });
+    expect(details.failed_updates).toEqual([
+      { target_id: 'target-1', item_type: 'Movie', error: 'Jellyfin request timed out.' },
+    ]);
+  });
+
+  it('caps authenticated failure details without dropping totals or exposing raw errors', async () => {
+    const details = migrationDetails();
+    const updateUserData = vi.fn(async () => {
+      throw new Error('PRIVATE_RAW_FAILURE');
+    });
+    expect(
+      await migrateItemState(
+        client({ updateUserData }),
+        'user',
+        plan(205),
+        details,
+        () => {},
+        () => {},
+      ),
+    ).toBe(0);
+    expect(updateUserData).toHaveBeenCalledTimes(205);
+    expect(details.failed_items).toBe(205);
+    expect(details.failed_updates).toHaveLength(200);
+    expect(new Set(details.failed_updates!.map((failure) => failure.target_id)).size).toBe(200);
+    expect(
+      details.failed_updates!.every(
+        (failure) =>
+          failure.item_type === 'Movie' &&
+          failure.error === 'An item could not be updated. Review the migration and retry.',
+      ),
+    ).toBe(true);
+    expect(details.write_metrics).toMatchObject({ attempts: 205, succeeded: 0, failed: 205 });
+    expect(details.warnings.join(' ')).toContain('limited to 200');
+    expect(JSON.stringify(details)).not.toContain('PRIVATE_RAW_FAILURE');
   });
 
   it('yields a large already-watched history so timer cancellation can run', async () => {
@@ -416,7 +509,7 @@ describe('strict public played-flag writer', () => {
     expect(updateUserData).not.toHaveBeenCalled();
   });
 
-  it.each([0, 5, 1.5, NaN])(
+  it.each([0, 7, 1.5, NaN])(
     'rejects invalid worker concurrency before server calls (%s)',
     async (concurrency) => {
       const migrationCapabilities = vi.fn();
@@ -430,7 +523,7 @@ describe('strict public played-flag writer', () => {
           () => {},
           { concurrency },
         ),
-      ).rejects.toThrow('between 1 and 4');
+      ).rejects.toThrow('between 1 and 6');
       expect(migrationCapabilities).not.toHaveBeenCalled();
     },
   );

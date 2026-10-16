@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import App from './App';
 import type {
   Job,
+  MigrationDetails,
   Session,
   Settings,
   SetupConnection,
@@ -32,6 +33,24 @@ const job: Job = {
       discord_delivery: 'not_requested',
     },
   ],
+};
+const emptyPlayedDetails: MigrationDetails = {
+  items_updated: 0,
+  favorites: 0,
+  resume_positions: 0,
+  play_counts: 0,
+  last_played_dates: 0,
+  ratings: 0,
+  preferences: [],
+  avatar: false,
+  playlists_created: 0,
+  playlists_existing: 0,
+  playlist_items_added: 0,
+  playlist_items_skipped: 0,
+  playlist_duplicates_skipped: 0,
+  failed_items: 0,
+  history_dates_missing: 0,
+  warnings: [],
 };
 const overview = {
   counts: { emby_users: 1, jellyfin_users: 1, jobs: 1 },
@@ -1590,6 +1609,129 @@ describe('React account safeguards', () => {
     expect(within(dialog).queryByText(/playlists created/)).toBeNull();
     expect(within(dialog).queryByText(/resume positions/)).toBeNull();
     expect(within(dialog).queryByText(/favorites/)).toBeNull();
+  });
+  it('reports request workload and escaped failed played updates without implying complete success', async () => {
+    responses['/api/jobs/job-1'] = {
+      ...job,
+      kind: 'migrate',
+      status: 'partial',
+      migration_scope: 'watched_only',
+      results: [
+        {
+          username: 'alex',
+          status: 'partial',
+          timing: {
+            elapsed_ms: 1000,
+            phase_ms: { transferring_history: 900 },
+            checkpoints: { count: 4, total_duration_ms: 120, max_duration_ms: 90 },
+          },
+          data: {
+            ...emptyPlayedDetails,
+            items_updated: 88,
+            failed_items: 12,
+            write_metrics: {
+              attempts: 100,
+              succeeded: 88,
+              failed: 12,
+              cumulative_ms: 2040,
+              max_ms: 910,
+              peak_in_flight: 4,
+            },
+            failed_updates: [
+              {
+                target_id: 'target-404',
+                item_type: 'Episode',
+                error: '<script>unsafe()</script> HTTP 404',
+              },
+            ],
+          },
+        },
+      ],
+    };
+    const dialog = await openJob();
+    expect(within(dialog).getAllByText('Needs review')).toHaveLength(2);
+    expect(within(dialog).getByText('12 failed updates')).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /Progress checkpoints: 4 persisted · 0.1 seconds total · 0.1 seconds slowest/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(/100 attempted · 88 succeeded · 12 failed · peak 4 in flight/),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /Cumulative request time: 2.0 seconds; slowest request: 0.9 seconds/,
+      ),
+    ).toBeTruthy();
+    const failures = within(dialog).getByText('Failed played updates (12)').closest('details')!;
+    fireEvent.click(within(failures).getByText('Failed played updates (12)'));
+    expect(within(failures).getByText('target-404')).toBeTruthy();
+    expect(
+      within(failures).getByText(/Episode · <script>unsafe\(\)<\/script> HTTP 404/),
+    ).toBeTruthy();
+    expect(within(failures).getByText(/Showing 1 of 12 failed updates/)).toBeTruthy();
+    expect(dialog.querySelector('script,img')).toBeNull();
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
+  it('bounds failed played update details while retaining the full failure count', async () => {
+    responses['/api/jobs/job-1'] = {
+      ...job,
+      kind: 'migrate',
+      status: 'partial',
+      migration_scope: 'watched_only',
+      results: [
+        {
+          username: 'alex',
+          status: 'partial',
+          data: {
+            ...emptyPlayedDetails,
+            failed_items: 220,
+            failed_updates: Array.from({ length: 201 }, (_, index) => ({
+              target_id: `target-${index}`,
+              item_type: 'Movie',
+              error: 'Jellyfin HTTP 500',
+            })),
+          },
+        },
+      ],
+    };
+    const dialog = await openJob();
+    expect(within(dialog).getByText('220 failed updates')).toBeTruthy();
+    const failures = within(dialog).getByText('Failed played updates (220)').closest('details')!;
+    fireEvent.click(within(failures).getByText('Failed played updates (220)'));
+    expect(within(failures).getAllByRole('listitem')).toHaveLength(200);
+    expect(within(failures).getByText('target-199')).toBeTruthy();
+    expect(within(failures).queryByText('target-200')).toBeNull();
+    expect(within(failures).getByText(/Showing 200 of 220 failed updates/)).toBeTruthy();
+    expect(
+      within(failures).getByText(/At most 200 item details are retained per account/),
+    ).toBeTruthy();
+  });
+  it('keeps older failure results readable when request metrics and individual details are absent', async () => {
+    responses['/api/jobs/job-1'] = {
+      ...job,
+      kind: 'migrate',
+      status: 'partial',
+      results: [
+        {
+          username: 'alex',
+          status: 'partial',
+          data: {
+            ...emptyPlayedDetails,
+            failed_items: 2,
+          },
+        },
+      ],
+    };
+    const dialog = await openJob();
+    const failures = within(dialog).getByText('Failed item updates (2)').closest('details')!;
+    fireEvent.click(within(failures).getByText('Failed item updates (2)'));
+    expect(
+      within(failures).getByText('Individual failure details were not recorded for this job.'),
+    ).toBeTruthy();
+    expect(within(dialog).queryByText(/Played-status write requests/)).toBeNull();
   });
   it('closes mobile navigation when moving to a page and dismisses private dialogs with Escape', async () => {
     const dialog = await openJob();

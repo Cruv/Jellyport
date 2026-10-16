@@ -1930,20 +1930,60 @@ describe('React account safeguards', () => {
     expect(document.activeElement).toBe(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
   });
-  it('opens a bookmarked settings section and clears its anchor when navigating elsewhere', async () => {
-    const original = window.location.href;
-    window.history.replaceState(null, '', '#settings-accounts');
-    try {
-      render(<App />);
-      await screen.findByRole('heading', { name: 'Settings', level: 1 });
-      expect(screen.getByRole('navigation', { name: 'Settings sections' })).toBeTruthy();
-      fireEvent.click(screen.getByRole('button', { name: 'Overview' }));
-      await screen.findByRole('heading', { name: 'Overview', level: 1 });
-      expect(window.location.hash).toBe('');
-    } finally {
-      window.history.replaceState(null, '', original);
-    }
+  it('focuses the current mobile page and contains keyboard focus that starts outside navigation', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    const toggle = screen.getByRole('button', { name: 'Toggle navigation' });
+    fireEvent.click(toggle);
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Activity' }));
+
+    toggle.focus();
+    fireEvent.keyDown(window, { key: 'Tab' });
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Overview' }));
+    toggle.focus();
+    fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Sign out' }));
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(document.activeElement).toBe(toggle);
   });
+  it('dismisses mobile navigation when expanding to desktop and releases its keyboard trap', async () => {
+    vi.stubGlobal('innerWidth', 400);
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    const toggle = screen.getByRole('button', { name: 'Toggle navigation' });
+    fireEvent.click(toggle);
+    vi.stubGlobal('innerWidth', 850);
+    fireEvent(window, new Event('resize'));
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    vi.stubGlobal('innerWidth', 851);
+    fireEvent(window, new Event('resize'));
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('button', { name: 'Close navigation' })).toBeNull();
+    expect(document.activeElement).toBe(toggle);
+
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', cancelable: true });
+    fireEvent(window, tab);
+    expect(tab.defaultPrevented).toBe(false);
+    expect(document.activeElement).toBe(toggle);
+  });
+  it.each(['media', 'accounts', 'discord', 'history'])(
+    'opens a bookmarked %s settings section and clears its anchor when navigating elsewhere',
+    async (section) => {
+      const original = window.location.href;
+      window.history.replaceState(null, '', `#settings-${section}`);
+      try {
+        render(<App />);
+        await screen.findByRole('heading', { name: 'Settings', level: 1 });
+        expect(screen.getByRole('navigation', { name: 'Settings sections' })).toBeTruthy();
+        fireEvent.click(screen.getByRole('button', { name: 'Overview' }));
+        await screen.findByRole('heading', { name: 'Overview', level: 1 });
+        expect(window.location.hash).toBe('');
+      } finally {
+        window.history.replaceState(null, '', original);
+      }
+    },
+  );
 });
 
 const anonymous: Session = { ...session, authenticated: false, user: undefined };

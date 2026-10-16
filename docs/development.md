@@ -53,6 +53,7 @@ directory. Demo startup refuses production data. Vite proxies `/api` to port 800
 | `npm run docs:check`                      | Repository Markdown links, local paths and heading anchors; no remote requests                   |
 | `npm test -- tests-ts/matching.test.ts`   | Example focused Vitest run; substitute affected files                                            |
 | `npm test`                                | Complete backend and React test corpus                                                           |
+| `npm run test:e2e`                        | Typechecked desktop/mobile browser regressions against the current production build; build first |
 | `npm run typecheck`                       | Backend and frontend types without building                                                      |
 | `npm run build`                           | Typecheck, compile server and build production interface; do not also typecheck unchanged inputs |
 | `HOST=127.0.0.1 npm start`                | Run an existing build; use the demo environment above for isolated checks                        |
@@ -63,6 +64,43 @@ directory. Demo startup refuses production data. Vite proxies `/api` to port 800
 `npx prettier --check <owned-files>` or `--write` on those files only; do not
 reformat unrelated Markdown tables or foreign work. Finish owned changes with
 `git diff --check` and a scope review.
+
+### Automated interface regressions
+
+`npm test` includes behavioral unit/component regressions for navigation, filtered
+selections, stale recovery responses, independent saves, cancelled confirmations,
+and failed-save retries. The required Node 24 CI job also runs real Chromium
+browser tests after building the app. A browser failure fails that required job
+and prevents image publication. Node 22 continues to run the full unit/component
+suite and production build.
+
+To run the browser suite locally:
+
+```sh
+npm run build
+npx playwright install chromium
+npm run test:e2e
+```
+
+The [Playwright suite](https://playwright.dev/docs/intro) checks all ten workspace
+pages at desktop and mobile widths, document overflow, Settings section links,
+keyboard focus, filtering, sign-in/out, credential reveal, and explicit migration
+approval. It uses the built interface and real Jellyport API with simulated media
+servers. These are behavioral and layout checks, not pixel-baseline comparisons
+or a guarantee of support for every browser.
+
+The runner creates and removes its own temporary demo data, binds only to
+`127.0.0.1:4179`, refuses to reuse an existing server, and ignores Jellyport
+environment variables and `.env`. It accepts no production URL or backup path.
+Browser requests outside that local origin fail the test. Each test has a fresh
+browser context; synthetic session cookies remain in memory. No real users,
+credentials, backups, media servers, or Discord messages are used.
+
+Failures save synthetic-only screenshots and traces in ignored `test-results/`;
+CI retains that evidence for seven days. Open a trace with
+`npx playwright show-trace <trace.zip>`. Retries are disabled so an intermittent
+failure stays visible. Fix the behavior or test synchronization rather than
+relaxing safeguards or accepting a failed run.
 
 ## Verification proportional to risk
 

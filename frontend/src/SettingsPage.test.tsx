@@ -40,11 +40,12 @@ const oldSettings: Settings = {
   bot_invite_url: '',
 };
 
-function page(settings: Settings = oldSettings) {
+function page(settings: Settings = oldSettings, respond?: Api) {
   const requests: { path: string; options?: ApiOptions }[] = [];
   const api = vi.fn(async (path: string, options?: ApiOptions) => {
     requests.push({ path, options });
     if (path === '/api/account-roles') return { roles: [] };
+    if (respond) return respond(path, options);
     if (path === '/api/settings' && options?.method === 'PUT') return {};
     throw new Error(`Unexpected request: ${path}`);
   }) as Api;
@@ -62,6 +63,132 @@ function submit() {
 afterEach(cleanup);
 
 describe('Settings layout and navigation', () => {
+  it('edits and removes repeated path and tier rows without saving or changing the surviving rows', async () => {
+    const p = page({
+      ...oldSettings,
+      path_mappings: [
+        { source: '/discarded', target: '/discarded-target' },
+        { source: '/source/movies', target: '/media/movies' },
+      ],
+      membership_tiers: [
+        { id: 'one', name: 'One', plan_name: 'One plan', account_limit: 1 },
+        { id: 'two', name: 'Two', plan_name: 'Two plan', account_limit: 2 },
+      ],
+    });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Remove path mapping' })[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    fireEvent.change(screen.getAllByLabelText('Emby path prefix')[1], {
+      target: { value: ' /source/shows ' },
+    });
+    fireEvent.change(screen.getAllByLabelText('Jellyfin path prefix')[1], {
+      target: { value: ' /media/shows ' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Remove tier One' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add tier' }));
+    const newTier = screen.getByRole('group', { name: 'Tier 2' });
+    fireEvent.change(within(newTier).getByLabelText('Stable tier ID'), {
+      target: { value: ' three ' },
+    });
+    fireEvent.change(within(newTier).getByLabelText('Tier name'), {
+      target: { value: ' Three ' },
+    });
+    fireEvent.change(within(newTier).getByLabelText('Subscription plan name'), {
+      target: { value: ' Three plan ' },
+    });
+    fireEvent.change(within(newTier).getByLabelText('Account allowance'), {
+      target: { value: '3' },
+    });
+    expect(screen.getAllByLabelText('Emby path prefix')[0]).toHaveProperty(
+      'value',
+      '/source/movies',
+    );
+    expect(
+      within(screen.getByRole('group', { name: 'Tier 1' })).getByLabelText('Stable tier ID'),
+    ).toHaveProperty('value', 'two');
+    expect(p.requests.filter((request) => request.options?.method)).toHaveLength(0);
+
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(
+      p.requests.find((request) => request.options?.method === 'PUT')?.options?.body,
+    ).toMatchObject({
+      path_mappings: [
+        { source: '/source/movies', target: '/media/movies' },
+        { source: '/source/shows', target: '/media/shows' },
+      ],
+      membership_tiers: [
+        { id: 'two', name: 'Two', plan_name: 'Two plan', account_limit: 2 },
+        { id: 'three', name: 'Three', plan_name: 'Three plan', account_limit: 3 },
+      ],
+    });
+  });
+
+  it('tests saved connections without submitting unsaved server details or credentials', async () => {
+    const p = page(
+      oldSettings,
+      vi.fn(async (path: string) => {
+        if (path === '/api/connections/test')
+          return {
+            connections: { emby: { configured: true, connected: true, name: 'Saved source' } },
+          };
+        if (path === '/api/settings') return {};
+        throw new Error(`Unexpected request: ${path}`);
+      }) as Api,
+    );
+    const source = screen.getByRole('region', { name: 'Media servers' });
+    const sourceUrl = within(source).getAllByLabelText('Server URL')[0];
+    const key = within(source).getAllByLabelText(/API key/)[0];
+    fireEvent.change(sourceUrl, { target: { value: 'https://draft.example.test' } });
+    fireEvent.change(key, { target: { value: 'synthetic-unsaved-secret' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Test saved connections' }));
+    await screen.findByText('Saved source');
+    expect(p.requests.filter((request) => request.options?.method)).toEqual([
+      { path: '/api/connections/test', options: { method: 'POST', body: {} } },
+    ]);
+    expect(sourceUrl).toHaveProperty('value', 'https://draft.example.test');
+    expect(key).toHaveProperty('value', 'synthetic-unsaved-secret');
+    expect(p.refresh).not.toHaveBeenCalled();
+    expect(p.notify).not.toHaveBeenCalled();
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(
+      p.requests.find((request) => request.options?.method === 'PUT')?.options?.body,
+    ).toMatchObject({
+      emby_url: 'https://draft.example.test',
+      emby_api_key: 'synthetic-unsaved-secret',
+    });
+  });
+
+  it('retains edited settings after a rejected save and retries only when requested', async () => {
+    let attempts = 0;
+    const p = page(
+      oldSettings,
+      vi.fn(async () => {
+        if (++attempts === 1) throw new Error('The source connection could not be verified.');
+        return {};
+      }) as Api,
+    );
+    fireEvent.change(screen.getByLabelText('Generated password length'), {
+      target: { value: '18' },
+    });
+    submit();
+    await waitFor(() =>
+      expect(p.notify).toHaveBeenCalledWith('The source connection could not be verified.', true),
+    );
+    expect(screen.getByLabelText('Generated password length')).toHaveProperty('value', '18');
+    expect(p.refresh).not.toHaveBeenCalled();
+    expect(attempts).toBe(1);
+    expect(screen.getByRole('button', { name: 'Save settings' })).toHaveProperty('disabled', false);
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(attempts).toBe(2);
+    expect(
+      p.requests
+        .filter((request) => request.options?.method === 'PUT')
+        .map((request) => (request.options?.body as { password_length: number }).password_length),
+    ).toEqual([18, 18]);
+  });
+
   it('keeps unsaved connection and account fields mounted when navigating sections', async () => {
     const p = page();
     expect(screen.getByRole('heading', { name: 'Settings', level: 1 })).toBeTruthy();

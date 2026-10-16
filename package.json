@@ -13,8 +13,9 @@
     "dev:ui": "vite --host 127.0.0.1",
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.frontend.json",
     "test": "vitest run",
+    "test:e2e": "tsc --noEmit -p tsconfig.e2e.json && playwright test",
     "benchmark:snapshots": "node --import tsx scripts/benchmark-snapshots.ts",
-    "format": "prettier --write server frontend tests-ts scripts *.ts *.json .github/**/*.yml",
+    "format": "prettier --write server frontend e2e tests-ts scripts *.ts *.json .github/**/*.yml",
     "build": "npm run typecheck && tsc -p tsconfig.build.json && vite build",
     "start": "node dist/server/index.js",
     "benchmark:destination": "node --import tsx scripts/benchmark-destination.ts"
@@ -32,6 +33,7 @@
     "yauzl": "3.4.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.64.1",
     "@testing-library/react": "16.3.3",
     "@testing-library/user-event": "14.6.7",
     "@types/node": "26.6.4",

@@ -9,13 +9,15 @@ export interface MigrationCatalog {
 
 /** Metadata only. Personal state is never admitted to, or served from, this cache. */
 export class MigrationCatalogCache {
-  private entry?: { key: string; value: MigrationCatalog };
+  private entry?: { key: string; value: MigrationCatalog; completedAt: number };
   private pending?: { key: string; value: Promise<MigrationCatalog> };
   private epoch = 0;
   constructor(
     private readonly options: {
       clock?: () => number;
       ttlMs?: number;
+      /** Destination identities are revalidated; their reuse window can start after collection. */
+      reuseTtlFromCompletion?: boolean;
       hit?: (items: number) => void;
       label?: 'source' | 'destination';
     } = {},
@@ -31,7 +33,11 @@ export class MigrationCatalogCache {
     const clock = this.options.clock ?? Date.now;
     if (
       this.entry?.key === key &&
-      clock() - this.entry.value.capturedAt < (this.options.ttlMs ?? 600_000)
+      clock() -
+        (this.options.reuseTtlFromCompletion
+          ? this.entry.completedAt
+          : this.entry.value.capturedAt) <
+        (this.options.ttlMs ?? 600_000)
     ) {
       this.options.hit?.(this.entry.value.items.length);
       return this.entry.value;
@@ -48,8 +54,8 @@ export class MigrationCatalogCache {
     }
     this.entry = undefined;
     const epoch = this.epoch;
-    // Record the beginning of collection, not its end: this is a bounded-age
-    // matching view, never a claim to an atomic live library snapshot.
+    // Keep collection start truthful even when the reuse window begins at completion.
+    // Neither timestamp claims an atomic live library snapshot.
     const capturedAt = clock();
     const pending = Promise.resolve()
       .then(load)
@@ -72,7 +78,7 @@ export class MigrationCatalogCache {
           Object.freeze(item);
         }
         const value = { items: Object.freeze(items) as unknown as MediaItem[], capturedAt };
-        if (this.epoch === epoch) this.entry = { key, value };
+        if (this.epoch === epoch) this.entry = { key, value, completedAt: clock() };
         return value;
       });
     this.pending = { key, value: pending };

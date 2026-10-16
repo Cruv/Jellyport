@@ -74,6 +74,14 @@ with no unknown candidates for the three sampled histories. Final local import p
 index construction took 60.06 seconds without API calls or writes; this is preparation
 evidence, not production migration acceptance.
 
+The 0.16.3 production membership import completed in **280.0 seconds** and retained
+194,633 matching items. Its first fresh heavy migration stopped before history
+writes at **19.5 seconds** combined: an authoritative UserData read confirmed
+access, but ordinary singleton metadata omitted an alternate version. A bounded
+read-only reproduction returned that exact item with `HasSubtitles=true` after
+the ordinary and `false` queries returned no item. This was a failed migration,
+not a successful timing result. Version 0.16.4 adds the verified recovery below.
+
 ## Incident evidence and limits of attribution
 
 On October 8, 2026, the installed Jellyport revision
@@ -238,9 +246,14 @@ abort and drain on fatal failure or cancellation. The normal metadata/state pass
 uses batches of at most 170 IDs and 6,000 encoded characters, without name sorting,
 total counts or repeated views. Independent readback refreshes policy and checks
 again. Unexpected omissions share the same exception budget: exact target-scoped
-access distinguishes a real 404 from Jellyfin version grouping, and accessible
-missing items receive a single-ID identity/state read. If that also omits the item,
-the read fails rather than silently discarding history. Destination batches use
+access distinguishes a real 404 from Jellyfin grouping or hidden alternate versions.
+Accessible missing items receive a single-ID identity/state read. If empty, up to
+two supported queries with complementary `HasSubtitles=false` and `true` include
+owned/alternate versions while covering both subtitle cases. Every returned item
+must still match the requested identity and contain valid state. Both remaining
+empty, malformed or contradictory responses fail rather than discard history.
+These exception-only reads share the same deadline, workers and check budget;
+they do not trigger on-demand metadata refresh. Destination batches use
 170 IDs within the unchanged 6,000-character URL bound; source batches remain 100.
 Aggregate `user_access` events omit user and item identities.
 
@@ -251,6 +264,9 @@ whose [setter also clears ParentId](https://github.com/jellyfin/jellyfin/blob/ca
 The extra passes doubled reads without filtering inaccessible items. They were
 removed; fixtures now model that actual API behavior. The fresh access check uses
 [the same item lookup as the POST](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Api/Controllers/ItemsController.cs#L1078).
+The installed version's [stream-filter switch](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Api/Controllers/ItemsController.cs#L477)
+includes owned items; its [subtitle predicates](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Server.Implementations/Item/BaseItemRepository.TranslateQuery.cs#L896)
+are complementary for leaf items and folders.
 
 The request shape was checked against Jellyfin's tagged
 [Items controller](https://github.com/jellyfin/jellyfin/blob/v10.11.6/Jellyfin.Api/Controllers/ItemsController.cs#L300),

@@ -65,6 +65,11 @@ const pages: Record<Page, { title: string; icon: string }> = {
   activity: { title: 'Activity', icon: 'activity' },
   settings: { title: 'Settings', icon: 'settings' },
 };
+const navigationGroups: { title: string; pages: Page[] }[] = [
+  { title: 'Workspace', pages: ['overview', 'users', 'migrate', 'accounts'] },
+  { title: 'Account management', pages: ['mappings', 'roles', 'memberships', 'subscriptions'] },
+  { title: 'System', pages: ['activity', 'settings'] },
+];
 
 function accountMessage(credential: Credential): string {
   if (credential.message) return credential.message;
@@ -113,7 +118,11 @@ export default function App() {
   const sessionRef = useRef<Session | null>(null);
   const authGeneration = useRef(0);
   const [booting, setBooting] = useState(true);
-  const [page, setPage] = useState<Page>('overview');
+  const [page, setPage] = useState<Page>(() =>
+    /^#settings-(media|accounts|discord|history)$/.test(window.location.hash)
+      ? 'settings'
+      : 'overview',
+  );
   const pageRef = useRef(page);
   pageRef.current = page;
   const [loading, setLoading] = useState(false);
@@ -145,6 +154,47 @@ export default function App() {
   const previewRun = useRef<{ controller: AbortController; cancel: () => void } | null>(null);
   const readyPreview = useRef<{ id: string; cancel: () => void } | null>(null);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const mobileToggle = useRef<HTMLButtonElement>(null);
+  const navigation = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const buttons = () =>
+      Array.from(
+        navigation.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? [],
+      );
+    (
+      navigation.current?.querySelector<HTMLButtonElement>('[aria-current="page"]') ?? buttons()[0]
+    )?.focus();
+    const closeNavigation = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setMobileOpen(false);
+      }
+      if (event.key === 'Tab') {
+        const controls = buttons();
+        const first = controls[0];
+        const last = controls.at(-1);
+        const outside = !navigation.current?.contains(document.activeElement);
+        if (event.shiftKey && (document.activeElement === first || outside)) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || outside)) {
+          event.preventDefault();
+          first?.focus();
+        }
+      }
+    };
+    const resize = () => {
+      if (window.innerWidth > 850) setMobileOpen(false);
+    };
+    window.addEventListener('keydown', closeNavigation);
+    window.addEventListener('resize', resize);
+    return () => {
+      window.removeEventListener('keydown', closeNavigation);
+      window.removeEventListener('resize', resize);
+      mobileToggle.current?.focus();
+    };
+  }, [mobileOpen]);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastId = useRef(0);
   const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
@@ -437,6 +487,11 @@ export default function App() {
     if (session?.authenticated) void load(page);
   }, [session?.authenticated, page, load]);
   function navigate(target: Page) {
+    if (
+      target !== 'settings' &&
+      /^#settings-(media|accounts|discord|history)$/.test(window.location.hash)
+    )
+      window.history.replaceState(null, '', window.location.pathname + window.location.search);
     if (target !== 'migrate') cancelPreview();
     closeDialog();
     setMobileOpen(false);
@@ -938,7 +993,19 @@ export default function App() {
         />
       ) : (
         <div className="shell">
+          <a className="skip-link" href="#workspace-content">
+            Skip to content
+          </a>
+          {mobileOpen && (
+            <button
+              className="nav-scrim"
+              aria-label="Close navigation"
+              onClick={() => setMobileOpen(false)}
+            />
+          )}
           <aside
+            ref={navigation}
+            id="workspace-navigation"
             className={`sidebar${mobileOpen ? ' mobile-open' : ''}`}
             aria-label="Main navigation"
           >
@@ -950,19 +1017,26 @@ export default function App() {
                 Jellyport<small>EMBY → JELLYFIN</small>
               </div>
             </div>
-            <div className="nav-label">Workspace</div>
             <nav className="nav">
-              {(Object.entries(pages) as [Page, (typeof pages)[Page]][]).map(([key, value]) => (
-                <button
-                  className={`nav-button${page === key ? ' active' : ''}`}
-                  aria-current={page === key ? 'page' : undefined}
-                  onClick={() => navigate(key)}
-                  key={key}
-                >
-                  <Icon name={value.icon} />
-                  {value.title}
-                  {page === key && <span className="nav-dot" />}
-                </button>
+              {navigationGroups.map((group) => (
+                <div className="nav-group" key={group.title}>
+                  <div className="nav-label">{group.title}</div>
+                  {group.pages.map((key) => {
+                    const value = pages[key];
+                    return (
+                      <button
+                        className={`nav-button${page === key ? ' active' : ''}`}
+                        aria-current={page === key ? 'page' : undefined}
+                        onClick={() => navigate(key)}
+                        key={key}
+                      >
+                        <Icon name={value.icon} />
+                        {value.title}
+                        {page === key && <span className="nav-dot" />}
+                      </button>
+                    );
+                  })}
+                </div>
               ))}
             </nav>
             <div className="sidebar-bottom">
@@ -984,7 +1058,6 @@ export default function App() {
                   <Icon name="logout" />
                 </button>
               </div>
-              <div className="sidebar-note">A smoother way to move forward.</div>
               <div className="sidebar-note" aria-label="Jellyport version">
                 v{appVersion}
               </div>
@@ -993,10 +1066,12 @@ export default function App() {
           <main className="main">
             <header className="topbar">
               <button
+                ref={mobileToggle}
                 className="icon-button mobile-menu"
                 onClick={() => setMobileOpen((value) => !value)}
                 aria-label="Toggle navigation"
                 aria-expanded={mobileOpen}
+                aria-controls="workspace-navigation"
               >
                 <Icon name="menu" />
               </button>
@@ -1007,10 +1082,10 @@ export default function App() {
               </div>
               <div className="topbar-right">
                 <span className="version-label">Emby → Jellyfin</span>
-                <span className="operator-label">ADMIN CONSOLE</span>
+                <span className="operator-label">Admin workspace</span>
               </div>
             </header>
-            <div className="content">
+            <div className="content" id="workspace-content" tabIndex={-1}>
               {session.demo && (
                 <div className="demo-banner">
                   <Icon name="info" />

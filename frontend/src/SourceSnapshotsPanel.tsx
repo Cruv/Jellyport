@@ -176,15 +176,20 @@ export default function SourceSnapshotsPanel({
   const hasPluginBackups =
     pluginBackup || status?.records.some((record) => record.source_type === 'plugin_backup');
   return (
-    <section className="panel mt-18" aria-label="Saved Emby database snapshots">
+    <section className="panel" aria-label="Saved Emby database snapshots">
       <div className="panel-header">
-        <div>
-          <h2>Saved Emby database snapshots</h2>
-          <p>
-            {pluginBackup
-              ? 'Import an Emby backup, then read saved user history for migrations.'
-              : 'Capture the database once, then read saved user history for migrations.'}
-          </p>
+        <div className="setting-heading">
+          <span className="server-icon emby">
+            <Icon name="emby" />
+          </span>
+          <div>
+            <h3>Saved Emby database snapshots</h3>
+            <p>
+              {pluginBackup
+                ? 'Import an Emby backup, then read saved user history for migrations.'
+                : 'Capture the database once, then read saved user history for migrations.'}
+            </p>
+          </div>
         </div>
       </div>
       <div className="panel-body form-stack">
@@ -242,7 +247,7 @@ export default function SourceSnapshotsPanel({
           </p>
         )}
         {status && (
-          <div aria-live="polite">
+          <div className="status-summary form-stack" aria-live="polite">
             <p className="muted text-small">
               History source:{' '}
               <strong>
@@ -291,9 +296,13 @@ export default function SourceSnapshotsPanel({
         {draft && status && (
           <form
             onSubmit={save}
-            className="form-stack"
+            className="inline-panel form-stack"
             aria-label={pluginBackup ? 'Backup import schedule' : 'Database capture schedule'}
           >
+            <div className="section-heading">
+              <h4>{pluginBackup ? 'Daily import schedule' : 'Daily capture schedule'}</h4>
+              <p>Save this schedule independently from connection and account settings.</p>
+            </div>
             <label className="check-label">
               <input
                 className="checkbox"
@@ -341,7 +350,15 @@ export default function SourceSnapshotsPanel({
                 The saved schedule changed. Reload it before saving your changes.
               </p>
             )}
-            <div className="button-row">
+            <div className="form-actions">
+              <button
+                className="btn btn-quiet"
+                type="button"
+                onClick={resetDraft}
+                disabled={!!busy}
+              >
+                Reload saved schedule
+              </button>
               <button
                 className="btn btn-primary"
                 type="submit"
@@ -353,18 +370,14 @@ export default function SourceSnapshotsPanel({
                     ? 'Save import schedule'
                     : 'Save capture schedule'}
               </button>
-              <button
-                className="btn btn-quiet"
-                type="button"
-                onClick={resetDraft}
-                disabled={!!busy}
-              >
-                Reload saved schedule
-              </button>
             </div>
           </form>
         )}
-        <div className="button-row">
+        <div className="section-heading">
+          <h4>{pluginBackup ? 'Import a backup now' : 'Capture database now'}</h4>
+          <p>Manual actions do not change the daily schedule.</p>
+        </div>
+        <div className="form-actions">
           <button
             className="btn btn-quiet"
             type="button"
@@ -373,6 +386,14 @@ export default function SourceSnapshotsPanel({
           >
             <Icon name="refresh" />
             Refresh snapshot status
+          </button>
+          <button
+            className="btn btn-quiet"
+            type="button"
+            onClick={() => void change('clear')}
+            disabled={demo || !!busy || !status || status.running || !status.snapshots}
+          >
+            {busy === 'clear' ? 'Clearing captures…' : 'Clear saved captures'}
           </button>
           <button
             className="btn btn-primary"
@@ -387,14 +408,6 @@ export default function SourceSnapshotsPanel({
               : pluginBackup
                 ? 'Import latest backup'
                 : 'Capture database now'}
-          </button>
-          <button
-            className="btn btn-quiet"
-            type="button"
-            onClick={() => void change('clear')}
-            disabled={demo || !!busy || !status || status.running || !status.snapshots}
-          >
-            {busy === 'clear' ? 'Clearing captures…' : 'Clear saved captures'}
           </button>
         </div>
         {demo && (

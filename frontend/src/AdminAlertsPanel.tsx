@@ -81,8 +81,11 @@ export default function AdminAlertsPanel({
     }
   }
   return (
-    <div className="discord-commands" aria-label="Private admin alerts">
-      <h3>Private admin alerts</h3>
+    <section className="inline-panel form-stack" aria-label="Private admin alerts">
+      <div className="section-heading">
+        <h4>Private admin alerts</h4>
+        <p>Optional notices sent directly to one verified administrator.</p>
+      </div>
       <p>
         Slash-command replies are visible only to the person running the command. For automatic
         notices, run <code>/jellyport alerts action:enable</code> in your Discord server. The bot
@@ -94,7 +97,7 @@ export default function AdminAlertsPanel({
         a server channel.
       </p>
       {status && (
-        <div role="status">
+        <div className="status-summary" role="status">
           <strong>
             {status.enabled
               ? `Private DMs enabled for @${status.recipient_username || 'selected admin'}`
@@ -142,6 +145,6 @@ export default function AdminAlertsPanel({
         to check delivery, or <code>action:disable</code> to opt out. Allow DMs from the bot;
         delivery problems appear here. Alerts are optional and start off.
       </small>
-    </div>
+    </section>
   );
 }

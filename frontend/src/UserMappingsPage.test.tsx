@@ -54,6 +54,26 @@ afterEach(() => {
 });
 
 describe('Manual user mappings', () => {
+  it('keeps the selected saved mapping and its unsaved draft state visible beside the editor', () => {
+    const { api } = page([mapping]);
+    expect(screen.getByRole('heading', { level: 1, name: 'User mappings' })).toBeTruthy();
+    const edit = screen.getByRole('button', { name: 'Edit mapping for Mr. Complex Name !' });
+    expect(edit.getAttribute('aria-pressed')).toBe('false');
+    fireEvent.click(edit);
+    expect(edit.getAttribute('aria-pressed')).toBe('true');
+    expect(screen.getByText('Saved mapping', { selector: 'span' })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText(/Discord username/), {
+      target: { value: 'new.discord.label' },
+    });
+    expect(screen.getByText('Unsaved changes', { selector: 'span' })).toBeTruthy();
+    expect(screen.getByText('actual.discord.name')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel edit' }));
+    expect(edit.getAttribute('aria-pressed')).toBe('false');
+    expect(screen.getByText('New mapping', { selector: 'span' })).toBeTruthy();
+    expect(screen.getByLabelText('Emby account')).toHaveProperty('value', '');
+    expect(api).not.toHaveBeenCalled();
+  });
+
   it('assigns a second account slot to the same Discord owner without inventing another identity', async () => {
     const { requests } = page();
     fireEvent.change(screen.getByLabelText('Emby account'), { target: { value: 'emby-alex' } });
@@ -302,12 +322,12 @@ describe('Manual user mappings', () => {
     );
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'User mappings' }));
-    await screen.findByText('Connect the right accounts.');
+    await screen.findByRole('heading', { level: 1, name: 'User mappings' });
     expect(screen.getByText('actual.discord.name')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     await screen.findByLabelText('Jellyfin username');
     expect(screen.queryByText('actual.discord.name')).toBeNull();
-    expect(screen.queryByText('Connect the right accounts.')).toBeNull();
+    expect(screen.queryByRole('heading', { level: 1, name: 'User mappings' })).toBeNull();
     expect(localStorage.length).toBe(0);
     expect(sessionStorage.length).toBe(0);
   });

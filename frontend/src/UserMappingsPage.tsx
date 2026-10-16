@@ -134,11 +134,19 @@ export default function UserMappingsPage({
     }
   }
 
+  const changed = editing
+    ? targetId !== (editing.target_user_id || '') ||
+      targetName !== editing.target_username ||
+      discordName !== (editing.discord_username || '') ||
+      discordId !== (editing.discord_user_id || '') ||
+      membershipSlot !== (editing.membership_slot || 1)
+    : Boolean(sourceId || targetName || discordName || discordId);
+
   return (
-    <>
+    <div className="page-stack">
       <Heading
-        title="Connect the right accounts."
-        description="Link an Emby user to an existing Jellyfin account or a simpler new username."
+        title="User mappings"
+        description="Connect Emby, Jellyfin, and Discord identities when usernames differ."
         actions={
           <button className="btn" onClick={() => void refresh()} disabled={busy}>
             <Icon name="refresh" />
@@ -152,15 +160,15 @@ export default function UserMappingsPage({
         their stable identity automatically. Saving a mapping does not create an account or send a
         message.
       </Callout>
-      <div className="stack">
+      <div className="form-layout">
         <section className="panel">
           <div className="panel-header">
             <div>
               <h2>{editing ? 'Edit user mapping' : 'Add a user mapping'}</h2>
               <p>Choose the destination explicitly, then migrate the Emby user as usual.</p>
             </div>
-            <span className="server-icon jellyfin">
-              <Icon name="link" />
+            <span className={`status${changed ? ' warn' : ''}`}>
+              {changed ? 'Unsaved changes' : editing ? 'Saved mapping' : 'New mapping'}
             </span>
           </div>
           <div className="panel-body">
@@ -348,71 +356,75 @@ export default function UserMappingsPage({
           <div className="panel-header">
             <div>
               <h2>Saved mappings</h2>
-              <p>Each Emby account has one approved Jellyfin destination.</p>
+              <p>Select a mapping to review or edit its approved destination.</p>
             </div>
+            <span className="status">{mappings.length}</span>
           </div>
           {mappings.length ? (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Emby</th>
-                    <th>Jellyfin</th>
-                    <th>Discord</th>
-                    <th className="right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {mappings.map((mapping) => (
-                    <tr key={mapping.id}>
-                      <td>
+            <div className="panel-body summary-list mapping-list" aria-label="Saved mappings">
+              {mappings.map((mapping) => (
+                <article
+                  className={`summary-card${editing?.id === mapping.id ? ' selected' : ''}`}
+                  key={mapping.id}
+                >
+                  <dl>
+                    <div>
+                      <dt>Emby</dt>
+                      <dd>
                         <strong>{mapping.source_username}</strong>
-                      </td>
-                      <td>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Jellyfin</dt>
+                      <dd>
                         <strong>{mapping.target_username}</strong>
                         <small>
                           {mapping.target_user_id ? 'Existing account' : 'Create during migration'}
                         </small>
-                      </td>
-                      <td>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Discord</dt>
+                      <dd>
                         {mapping.discord_username || 'No username label'}
                         <small>
                           {mapping.discord_user_id
                             ? `Verified user ID: ${mapping.discord_user_id} · Account slot ${mapping.membership_slot || 1}`
                             : 'No verified Discord identity'}
                         </small>
-                      </td>
-                      <td className="right">
-                        <button
-                          className="btn btn-quiet"
-                          onClick={() => edit(mapping)}
-                          disabled={busy}
-                          aria-label={`Edit mapping for ${mapping.source_username}`}
-                        >
-                          Edit
-                        </button>
-                        <button
-                          className="icon-button"
-                          onClick={() => {
-                            setError('');
-                            setRemoving(mapping);
-                          }}
-                          disabled={busy}
-                          aria-label={`Remove mapping for ${mapping.source_username}`}
-                        >
-                          <Icon name="trash" />
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                      </dd>
+                    </div>
+                  </dl>
+                  <div className="toolbar">
+                    <button
+                      className="btn btn-quiet"
+                      onClick={() => edit(mapping)}
+                      disabled={busy}
+                      aria-label={`Edit mapping for ${mapping.source_username}`}
+                      aria-pressed={editing?.id === mapping.id}
+                    >
+                      Edit
+                    </button>
+                    <button
+                      className="btn btn-quiet"
+                      onClick={() => {
+                        setError('');
+                        setRemoving(mapping);
+                      }}
+                      disabled={busy}
+                      aria-label={`Remove mapping for ${mapping.source_username}`}
+                    >
+                      <Icon name="trash" /> Remove
+                    </button>
+                  </div>
+                </article>
+              ))}
             </div>
           ) : (
             <Empty
               icon="link"
-              title="Use the names that work for your users."
-              text="Add a mapping when an Emby account and its Jellyfin or Discord identity use different usernames."
+              title="No saved mappings"
+              text="Add a mapping when media accounts or Discord identities use different usernames."
             />
           )}
         </section>
@@ -456,6 +468,6 @@ export default function UserMappingsPage({
           )}
         </Modal>
       )}
-    </>
+    </div>
   );
 }

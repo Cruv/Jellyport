@@ -149,6 +149,41 @@ afterEach(() => {
 });
 
 describe('User directory and Discord organization', () => {
+  it('prioritizes account review and the directory before optional access guidance', async () => {
+    page();
+    const warning = await screen.findByText('1 user needs review');
+    const directory = screen.getByRole('table', { name: 'Media accounts and confirmed ownership' });
+    const guidance = screen.getByText('Discord and subscriptions are optional.');
+    expect(
+      warning.compareDocumentPosition(directory) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      directory.compareDocumentPosition(guidance) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Memberships' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Show users needing review' })).toBeTruthy();
+  });
+
+  it('shows the filtered result count and clears all filters without requesting the servers again', async () => {
+    const { requests } = page();
+    await screen.findByText('Showing 4 of 4 users');
+    expect(screen.getByRole('heading', { level: 1, name: 'Users' })).toBeTruthy();
+    expect(
+      screen.getByRole('table', { name: 'Media accounts and confirmed ownership' }),
+    ).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Search users'), { target: { value: 'Child' } });
+    fireEvent.change(screen.getByLabelText('Server presence'), { target: { value: 'jellyfin' } });
+    fireEvent.change(screen.getByLabelText('Account review'), { target: { value: 'review' } });
+    expect(screen.getByText('Showing 1 of 4 users')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(screen.getByText('Showing 4 of 4 users')).toBeTruthy();
+    expect(screen.getByLabelText('Search users')).toHaveProperty('value', '');
+    expect(screen.getByLabelText('Server presence')).toHaveProperty('value', 'all');
+    expect(screen.getByLabelText('Account review')).toHaveProperty('value', 'all');
+    expect(screen.queryByRole('button', { name: 'Clear filters' })).toBeNull();
+    expect(requests).toHaveLength(1);
+  });
+
   it('keeps manual account creation reachable when the directory cannot load', async () => {
     const api = vi.fn(async () => {
       throw new Error('The Emby server is unavailable.');

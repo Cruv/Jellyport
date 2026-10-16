@@ -243,7 +243,7 @@ export default function AuthScreen({
             <Icon name="logo" />
           </span>
           <div>
-            Jellyport<small>YOUR NEXT CHAPTER</small>
+            Jellyport<small>EMBY → JELLYFIN</small>
           </div>
         </div>
         <h1>

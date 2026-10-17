@@ -828,7 +828,8 @@ export function ActivityPage({
   refresh,
   openJob,
   navigate,
-}: Common & { jobs: Job[]; refresh: () => void }) {
+  clearHistory,
+}: Common & { jobs: Job[]; refresh: () => void; clearHistory?: (filteredIds: string[]) => void }) {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('all');
   const filtered = jobs.filter(
@@ -846,10 +847,21 @@ export function ActivityPage({
         title="Activity"
         description="Review migrations, new accounts, and any items that need your attention."
         actions={
-          <button className="btn btn-quiet" onClick={refresh}>
-            <Icon name="refresh" />
-            Refresh
-          </button>
+          <>
+            <button className="btn btn-quiet" onClick={refresh}>
+              <Icon name="refresh" />
+              Refresh
+            </button>
+            {clearHistory && (
+              <button
+                className="btn btn-quiet"
+                onClick={() => clearHistory(filtered.map((job) => job.id))}
+                disabled={!jobs.length}
+              >
+                Clear history…
+              </button>
+            )}
+          </>
         }
       />
       <section className="panel">
@@ -1064,6 +1076,8 @@ export function SubscriptionsPage({
                               >
                                 View operation
                               </button>
+                            ) : event.report_cleared ? (
+                              <span className="subtle">Report cleared</span>
                             ) : (
                               '—'
                             )}

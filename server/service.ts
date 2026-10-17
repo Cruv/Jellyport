@@ -215,8 +215,22 @@ export interface SubscriptionEvent {
   error?: string | null;
   result?: string;
   job_id?: string;
+  /** The administrator cleared the linked local report; event deduplication is retained. */
+  report_cleared?: boolean;
   tier_id?: string;
   account_limit?: number;
+}
+export const MAX_JOB_HISTORY_CLEANUP = 1000;
+export type JobHistoryCleanupSkipReason =
+  | 'not_found'
+  | 'not_finished'
+  | 'active'
+  | 'pending_credentials'
+  | 'recovery_required'
+  | 'subscription_processing';
+export interface JobHistoryCleanupResult {
+  removed_ids: string[];
+  skipped: Array<{ id: string; reason: JobHistoryCleanupSkipReason }>;
 }
 export interface SubscriptionInput {
   id: string;
@@ -1962,6 +1976,26 @@ export class Service {
     if (!job) throw new ServiceError('Job not found.');
     return job;
   }
+  /** Clear only the reviewed local reports; never mutate accounts or media-server state. */
+  clearJobHistory(jobIds: string[]): JobHistoryCleanupResult {
+    if (
+      !Array.isArray(jobIds) ||
+      !jobIds.length ||
+      jobIds.length > MAX_JOB_HISTORY_CLEANUP ||
+      new Set(jobIds).size !== jobIds.length ||
+      jobIds.some((id) => typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(id))
+    )
+      throw new ServiceError('Choose between 1 and 1000 distinct activity reports.');
+    // No await separates this guard from the synchronous database transaction. A job
+    // remains protected through its final save and task/controller cleanup, including
+    // a canceled job that already displays a terminal status while still unwinding.
+    const activeIds = new Set([
+      ...this.jobTasks.keys(),
+      ...this.jobControllers.keys(),
+      ...this.activeJobs.keys(),
+    ]);
+    return this.store.clearJobHistory(jobIds, activeIds);
+  }
   cancelJob(id: string): Job {
     const job = this.getJob(id);
     if (!['queued', 'running'].includes(job.status)) return job;
@@ -3229,6 +3263,7 @@ export class Service {
           event.account_limit = tier.account_limit;
           const job = await this.provisionMembership(memberId, tier.id);
           event.job_id = job.id;
+          delete event.report_cleared;
           this.store.saveSubscription(event);
           await this.jobTasks.get(job.id);
           const outcome = this.getJob(job.id);

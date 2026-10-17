@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import App from './App';
+import { StrictMode } from 'react';
 import type {
   Job,
   MigrationDetails,
@@ -10,6 +11,7 @@ import type {
   SetupConnection,
   SourceSnapshotMetadata,
   SourceSnapshotStatus,
+  HistoryCleanupResult,
 } from './types';
 
 const session: Session = {
@@ -165,6 +167,276 @@ beforeEach(() => {
       return { ok: status >= 200 && status < 300, status, json: async () => value };
     }),
   );
+});
+
+describe('Activity report cleanup', () => {
+  const past = (id: string, status = 'completed'): Job => ({
+    ...job,
+    id,
+    status,
+    created_at: '2000-01-01T00:00:00Z',
+    finished_at: '2000-01-02T00:00:00Z',
+    results: [{ username: `private-${id}`, status: 'completed' }],
+  });
+  async function review(jobs: Job[]) {
+    responses['/api/jobs'] = { jobs };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    fireEvent.click(await screen.findByRole('button', { name: 'Clear history…' }));
+    return screen.findByRole('dialog', { name: 'Clear activity history?' });
+  }
+  const cleanupRequests = () => requests.filter((request) => request.path === '/api/jobs/cleanup');
+
+  it('requires explicit approval and cancellation sends no request', async () => {
+    const dialog = await review([
+      past('old'),
+      past('running', 'running'),
+      past('unknown', 'future'),
+    ]);
+    expect(within(dialog).getByText(/1 finished report selected/)).toBeTruthy();
+    expect(within(dialog).getByText(/2 active or unrecognized operations excluded/)).toBeTruthy();
+    expect(
+      within(dialog).getByText(/does not undo migrations, change media accounts/),
+    ).toBeTruthy();
+    expect(within(dialog).queryByText('private-old')).toBeNull();
+    expect(cleanupRequests()).toHaveLength(0);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(cleanupRequests()).toHaveLength(0);
+  });
+
+  it('uses current filters across pagination and clears only frozen reviewed IDs with CSRF', async () => {
+    const jobs = Array.from({ length: 60 }, (_, i) =>
+      past(`old-${i}`, i % 2 ? 'failed' : 'completed'),
+    );
+    responses['/api/jobs'] = { jobs };
+    responses['/api/jobs/cleanup'] = {
+      removed_ids: jobs.filter((item) => item.status === 'failed').map((item) => item.id),
+      skipped: [],
+    };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Status' }), {
+      target: { value: 'failed' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.change(within(dialog).getByRole('combobox', { name: 'Reports to review' }), {
+      target: { value: 'filtered' },
+    });
+    expect(within(dialog).getByRole('button', { name: 'Clear 30 reports' })).toBeTruthy();
+    // A concurrent refresh finishes another matching job after this review opened.
+    responses['/api/jobs'] = { jobs: [...jobs, past('newly-finished', 'failed')] };
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await waitFor(() => expect(screen.getByText('61 operations')).toBeTruthy());
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 30 reports' }));
+    await within(dialog).findByText('30 reports cleared. 0 kept.');
+    const request = cleanupRequests()[0];
+    expect(request.options?.method).toBe('POST');
+    expect(JSON.parse(request.options!.body as string)).toEqual({
+      job_ids: jobs.filter((item) => item.status === 'failed').map((item) => item.id),
+    });
+    expect((request.options?.headers as Record<string, string>)['X-CSRF-Token']).toBe('test-csrf');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Done' }));
+    expect(screen.getByText('31 operations')).toBeTruthy();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Status' }), {
+      target: { value: 'failed' },
+    });
+    expect(screen.getByText('private-newly-finished')).toBeTruthy();
+    expect(screen.queryByText('private-old-1')).toBeNull();
+  });
+
+  it('keeps recent completed reports by default and allows an explicit any-time choice', async () => {
+    const recent = { ...past('recent'), finished_at: '2099-01-01T00:00:00Z' };
+    const dialog = await review([recent]);
+    expect(
+      (within(dialog).getByRole('button', { name: 'Clear 0 reports' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    fireEvent.change(within(dialog).getByRole('combobox', { name: 'Recorded before' }), {
+      target: { value: 'all' },
+    });
+    expect(
+      (within(dialog).getByRole('button', { name: 'Clear 1 report' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+
+  it('refuses an oversized review instead of silently truncating it', async () => {
+    const dialog = await review(Array.from({ length: 1001 }, (_, i) => past(`old-${i}`)));
+    expect(within(dialog).getByRole('alert').textContent).toContain('Clear at most 1,000 reports');
+    expect(
+      (within(dialog).getByRole('button', { name: 'Clear 1,001 reports' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(cleanupRequests()).toHaveLength(0);
+  });
+
+  it('keeps failed requests retryable and groups protected reasons without disclosing identifiers', async () => {
+    const dialog = await review([past('old'), past('protected')]);
+    statuses['/api/jobs/cleanup'] = 503;
+    responses['/api/jobs/cleanup'] = { detail: 'History cleanup is unavailable.' };
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 2 reports' }));
+    await within(dialog).findByRole('alert');
+    expect(
+      (within(dialog).getByRole('button', { name: 'Clear 2 reports' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    statuses['/api/jobs/cleanup'] = 200;
+    responses['/api/jobs/cleanup'] = {
+      removed_ids: ['old'],
+      skipped: [
+        { id: 'protected', reason: 'pending_credentials' },
+        { id: 'outside-review', reason: 'private-arbitrary-text' },
+      ],
+    };
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 2 reports' }));
+    await within(dialog).findByText('1 report cleared. 1 kept.');
+    expect(
+      within(dialog).getByText(/New credentials still await delivery or one-time reveal: 1/),
+    ).toBeTruthy();
+    expect(
+      within(dialog).queryByText(/private-arbitrary-text|outside-review|private-protected/),
+    ).toBeNull();
+    expect(cleanupRequests()).toHaveLength(2);
+    expect(cleanupRequests()[0].options?.body).toBe(cleanupRequests()[1].options?.body);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Done' }));
+    expect(screen.getByText('private-protected')).toBeTruthy();
+    expect(screen.queryByText('private-old')).toBeNull();
+  });
+
+  it('prevents duplicate requests and disables closing while clearing', async () => {
+    const dialog = await review([past('old')]);
+    const original = globalThis.fetch;
+    let finish!: (value: Response) => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((path: string, options?: RequestInit) => {
+        if (path !== '/api/jobs/cleanup') return original(path, options);
+        requests.push({ path, options });
+        return new Promise<Response>((resolve) => {
+          finish = resolve;
+        });
+      }),
+    );
+    const clear = within(dialog).getByRole('button', { name: 'Clear 1 report' });
+    fireEvent.click(clear);
+    fireEvent.click(clear);
+    expect(cleanupRequests()).toHaveLength(1);
+    expect(
+      (within(dialog).getByRole('button', { name: 'Close dialog' }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.getByRole('dialog')).toBe(dialog);
+    await act(async () =>
+      finish({
+        ok: true,
+        status: 200,
+        json: async () => ({ removed_ids: ['old'], skipped: [] }),
+      } as Response),
+    );
+    expect(within(dialog).getByRole('button', { name: 'Done' })).toBeTruthy();
+  });
+
+  it('suppresses a late cleanup result after navigation away', async () => {
+    const dialog = await review([past('old')]);
+    const original = globalThis.fetch;
+    let finish!: (value: Response) => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((path: string, options?: RequestInit) =>
+        path === '/api/jobs/cleanup'
+          ? new Promise<Response>((resolve) => {
+              finish = resolve;
+            })
+          : original(path, options),
+      ),
+    );
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    await screen.findByRole('heading', { name: 'Settings', level: 1 });
+    await act(async () =>
+      finish({
+        ok: true,
+        status: 200,
+        json: async () => ({ removed_ids: ['old'], skipped: [] }),
+      } as Response),
+    );
+    expect(screen.queryByText('1 report cleared. 0 kept.')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('does not restore history or errors from cleanup after administrator sign-out', async () => {
+    const dialog = await review([past('old')]);
+    responses['/api/logout'] = { ...session, authenticated: false, user: undefined };
+    const original = globalThis.fetch;
+    let finish!: (value: Response) => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((path: string, options?: RequestInit) =>
+        path === '/api/jobs/cleanup'
+          ? new Promise<Response>((resolve) => {
+              finish = resolve;
+            })
+          : original(path, options),
+      ),
+    );
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await screen.findByRole('heading', { name: 'Welcome back' });
+    await act(async () =>
+      finish({
+        ok: false,
+        status: 500,
+        json: async () => ({ detail: 'late-cleanup-error' }),
+      } as Response),
+    );
+    expect(screen.queryByText('late-cleanup-error')).toBeNull();
+    expect(screen.queryByText('private-old')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+
+  it('supports clearing one finished migration report from its details', async () => {
+    responses['/api/jobs/cleanup'] = {
+      removed_ids: ['job-1'],
+      skipped: [],
+    } satisfies HistoryCleanupResult;
+    const detail = await openJob();
+    fireEvent.click(within(detail).getByRole('button', { name: 'Clear report…' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Clear this report?' });
+    expect(within(dialog).queryByRole('combobox')).toBeNull();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
+    await within(dialog).findByText('1 report cleared. 0 kept.');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Done' }));
+    expect(screen.queryByRole('button', { name: 'View operation details' })).toBeNull();
+    expect(JSON.parse(cleanupRequests()[0].options!.body as string)).toEqual({
+      job_ids: ['job-1'],
+    });
+  });
+
+  it('never offers single-report deletion for an active or unknown operation', async () => {
+    responses['/api/jobs/job-1'] = { ...job, status: 'finalizing' };
+    const dialog = await openJob();
+    expect(within(dialog).queryByRole('button', { name: 'Clear report…' })).toBeNull();
+  });
+
+  it('completes report deletion with StrictMode effect replay enabled', async () => {
+    responses['/api/jobs'] = { jobs: [past('old')] };
+    responses['/api/jobs/cleanup'] = { removed_ids: ['old'], skipped: [] };
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
+    await within(dialog).findByText('1 report cleared. 0 kept.');
+    expect(within(dialog).getByRole('button', { name: 'Done' })).toBeTruthy();
+  });
 });
 afterEach(() => {
   cleanup();

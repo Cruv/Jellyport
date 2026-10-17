@@ -32,6 +32,7 @@ import {
 } from './WorkspacePages';
 import {
   activeJob,
+  finishedJob,
   date,
   num,
   safeUrl,
@@ -51,6 +52,7 @@ import {
   type DiscordMember,
   type PreviewUser,
   type SourceSnapshotStatus,
+  type HistoryCleanupResult,
 } from './types';
 
 const pages: Record<Page, { title: string; icon: string }> = {
@@ -85,11 +87,19 @@ function accountMessage(credential: Credential): string {
     return `Username: ${credential.username}\nPassword: ${credential.password}${credential.server_url ? `\nJellyfin: ${credential.server_url}` : ''}`;
   }
 }
+type CleanupCandidate = Pick<Job, 'id' | 'status' | 'created_at' | 'updated_at' | 'finished_at'>;
 type Dialog =
   | { kind: 'preview'; preview: Preview; previewId: string; reviewElapsedMs?: number }
   | { kind: 'job'; job: Job }
   | { kind: 'reveal'; jobId: string }
   | { kind: 'credentials'; credentials: Credential[] }
+  | {
+      kind: 'cleanup';
+      candidates: CleanupCandidate[];
+      filteredIds: string[];
+      openedAt: number;
+      single: boolean;
+    }
   | { kind: 'event'; event: SubscriptionEvent };
 interface Toast {
   id: number;
@@ -135,6 +145,7 @@ export default function App() {
   const [settingsVersion, setSettingsVersion] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const jobsRef = useRef(jobs);
+  const historyRevision = useRef(0);
   jobsRef.current = jobs;
   const overviewRef = useRef(overview);
   overviewRef.current = overview;
@@ -383,13 +394,15 @@ export default function App() {
   const load = useCallback(
     async (target: Page) => {
       const version = ++loadVersion.current;
+      const historyVersion = historyRevision.current;
       setLoading(true);
       setPageError('');
       setPollPaused(false);
       try {
         if (target === 'overview') {
           const value = await api<Overview>('/api/overview');
-          if (version === loadVersion.current) setOverview(value);
+          if (version === loadVersion.current && historyVersion === historyRevision.current)
+            setOverview(value);
         } else if (target === 'migrate') {
           const [value, summary] = await Promise.all([
             api<Users>('/api/users'),
@@ -437,7 +450,8 @@ export default function App() {
           }
         } else if (target === 'activity') {
           const value = await api<{ jobs: Job[] }>('/api/jobs');
-          if (version === loadVersion.current) setJobs(value.jobs || []);
+          if (version === loadVersion.current && historyVersion === historyRevision.current)
+            setJobs(value.jobs || []);
         } else if (target === 'subscriptions') {
           const value = await api<{ events: SubscriptionEvent[] }>('/api/subscriptions');
           if (version === loadVersion.current) setEvents(value.events || []);
@@ -496,7 +510,10 @@ export default function App() {
     closeDialog();
     setMobileOpen(false);
     if (target === page) void load(target);
-    else setPage(target);
+    else {
+      setLoading(true);
+      setPage(target);
+    }
   }
   const hasActive =
     jobs.some(activeJob) ||
@@ -509,6 +526,7 @@ export default function App() {
     const poll = async () => {
       if (polling || document.hidden) return;
       polling = true;
+      const historyVersion = historyRevision.current;
       try {
         const previous = new Set(
           [...jobsRef.current, ...(overviewRef.current?.recent_jobs || [])]
@@ -516,7 +534,12 @@ export default function App() {
             .map((job) => job.id),
         );
         const result = await api<{ jobs: Job[] }>('/api/jobs');
-        if (stopped || !sessionRef.current?.authenticated) return;
+        if (
+          stopped ||
+          !sessionRef.current?.authenticated ||
+          historyVersion !== historyRevision.current
+        )
+          return;
         const next = result.jobs || [];
         setJobs(next);
         setOverview((current) =>
@@ -541,7 +564,12 @@ export default function App() {
         }
         if (pageRef.current === 'overview') {
           const value = await api<Overview>('/api/overview');
-          if (!stopped && pageRef.current === 'overview') setOverview(value);
+          if (
+            !stopped &&
+            pageRef.current === 'overview' &&
+            historyVersion === historyRevision.current
+          )
+            setOverview(value);
         }
       } catch (error) {
         if (!stopped && sessionRef.current?.authenticated) {
@@ -775,6 +803,58 @@ export default function App() {
         showDialog({ kind: 'credentials', credentials: result.credentials || [] });
     });
   }
+  function reviewHistory(filteredIds: string[], single?: Job) {
+    const candidates = single ? [single] : jobsRef.current;
+    showDialog({
+      kind: 'cleanup',
+      candidates: candidates.map(({ id, status, created_at, updated_at, finished_at }) => ({
+        id,
+        status,
+        created_at,
+        updated_at,
+        finished_at,
+      })),
+      filteredIds: single ? [single.id] : [...filteredIds],
+      openedAt: Date.now(),
+      single: !!single,
+    });
+  }
+  async function cleanupHistory(ids: string[]): Promise<HistoryCleanupResult | undefined> {
+    const version = dialogVersion.current;
+    const generation = authGeneration.current;
+    const result = await api<HistoryCleanupResult>('/api/jobs/cleanup', {
+      method: 'POST',
+      body: { job_ids: ids },
+    });
+    if (version !== dialogVersion.current || generation !== authGeneration.current) return;
+    const requested = new Set(ids);
+    const removed = new Set(result.removed_ids.filter((id) => requested.has(id)));
+    historyRevision.current++;
+    setJobs((current) => current.filter((job) => !removed.has(job.id)));
+    setOverview((current) =>
+      current
+        ? {
+            ...current,
+            counts: {
+              ...current.counts,
+              jobs: Math.max(0, (current.counts.jobs ?? 0) - removed.size),
+            },
+            recent_jobs: current.recent_jobs.filter((job) => !removed.has(job.id)),
+          }
+        : current,
+    );
+    setEvents((current) =>
+      current.map((event) => {
+        if (!event.job_id || !removed.has(event.job_id)) return event;
+        const { job_id: _jobId, ...retained } = event;
+        return { ...retained, report_cleared: true };
+      }),
+    );
+    return {
+      removed_ids: [...removed],
+      skipped: result.skipped.filter((item) => requested.has(item.id)),
+    };
+  }
   function logout() {
     cancelPreview();
     releaseReadyPreview();
@@ -962,6 +1042,7 @@ export default function App() {
         navigate={navigate}
         openJob={openJob}
         refresh={() => void load(page)}
+        clearHistory={reviewHistory}
       />
     );
   else if (page === 'subscriptions')
@@ -1124,6 +1205,8 @@ export default function App() {
           reveal={reveal}
           cancelJob={cancelJob}
           showReveal={(jobId) => showDialog({ kind: 'reveal', jobId })}
+          clearReport={(job) => reviewHistory([job.id], job)}
+          cleanupHistory={cleanupHistory}
           apply={apply}
           busy={busy}
           notify={notify}
@@ -1195,6 +1278,186 @@ function MigrationRecipient({ user, api }: { user: PreviewUser; api: Api }) {
   );
 }
 
+function HistoryCleanupDialog({
+  review,
+  close,
+  submit,
+}: {
+  review: Extract<Dialog, { kind: 'cleanup' }>;
+  close: () => void;
+  submit: (ids: string[]) => Promise<HistoryCleanupResult | undefined>;
+}) {
+  const [scope, setScope] = useState('all');
+  const [age, setAge] = useState(review.single ? 'all' : '30');
+  const [pending, setPending] = useState(false);
+  const pendingRef = useRef(false);
+  const [error, setError] = useState('');
+  const [result, setResult] = useState<HistoryCleanupResult | null>(null);
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  const filteredIds = new Set(review.filteredIds);
+  const inScope = review.candidates.filter((job) => scope === 'all' || filteredIds.has(job.id));
+  const cutoff = review.openedAt - Number(age) * 86_400_000;
+  const eligible = inScope.filter(
+    (job) =>
+      finishedJob(job) &&
+      (age === 'all' || Date.parse(job.finished_at || job.updated_at || job.created_at) < cutoff),
+  );
+  const ids = [...new Set(eligible.map((job) => job.id))];
+  const protectedCount = inScope.filter((job) => !finishedJob(job)).length;
+  const overLimit = ids.length > 1000;
+  const reasons: Record<string, string> = {
+    not_found: 'Already cleared or unavailable',
+    not_finished: 'Not finished or still queued',
+    active: 'Still finalizing',
+    pending_credentials: 'New credentials still await delivery or one-time reveal',
+    recovery_required: 'Account creation requires recovery review',
+    subscription_processing: 'Subscription processing still needs this report',
+  };
+  const skipped = new Map<string, number>();
+  result?.skipped.forEach((item) => {
+    const label = reasons[item.reason] || 'Protected by the server';
+    skipped.set(label, (skipped.get(label) || 0) + 1);
+  });
+  async function clear() {
+    if (!ids.length || overLimit || pendingRef.current || result) return;
+    // These exact reviewed IDs are sent once. Polling never adds newly finished jobs.
+    const reviewedIds = [...ids];
+    pendingRef.current = true;
+    setPending(true);
+    setError('');
+    try {
+      const value = await submit(reviewedIds);
+      if (alive.current && value) setResult(value);
+    } catch (reason) {
+      if (alive.current) setError(message(reason));
+    } finally {
+      pendingRef.current = false;
+      if (alive.current) setPending(false);
+    }
+  }
+  return (
+    <Modal
+      title={review.single ? 'Clear this report?' : 'Clear activity history?'}
+      description="Remove stored Jellyport activity and migration reports."
+      close={() => {
+        if (!pendingRef.current) close();
+      }}
+      closeDisabled={pending}
+      footer={
+        result ? (
+          <button className="btn btn-primary" onClick={close}>
+            Done
+          </button>
+        ) : (
+          <>
+            <button className="btn btn-quiet" onClick={close} disabled={pending}>
+              Cancel
+            </button>
+            <button
+              className="btn btn-danger"
+              onClick={() => void clear()}
+              disabled={pending || !ids.length || overLimit}
+            >
+              {pending && <span className="spinner" />}
+              {pending
+                ? 'Clearing…'
+                : `Clear ${num(ids.length)} ${ids.length === 1 ? 'report' : 'reports'}`}
+            </button>
+          </>
+        )
+      }
+    >
+      <Callout icon="info" title="Completed server changes are kept.">
+        This only removes Jellyport’s stored reports. It does not undo migrations, change media
+        accounts, or change watch history. Reports needed for active work, credential delivery, or
+        account recovery are kept.
+      </Callout>
+      {review.single && (
+        <p className="subtle text-small">
+          Operation ID: <code>{review.candidates[0]?.id}</code>
+        </p>
+      )}
+      {result ? (
+        <>
+          <p role="status">
+            {num(result.removed_ids.length)}{' '}
+            {result.removed_ids.length === 1 ? 'report cleared' : 'reports cleared'}.{' '}
+            {num(result.skipped.length)} kept.
+          </p>
+          {!!skipped.size && (
+            <ul>
+              {[...skipped].map(([label, count]) => (
+                <li key={label}>
+                  {label}: {num(count)}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      ) : (
+        <>
+          {!review.single && (
+            <div className="field-row">
+              <label className="field">
+                Reports to review
+                <select
+                  value={scope}
+                  onChange={(event) => setScope(event.target.value)}
+                  disabled={pending}
+                >
+                  <option value="all">All finished operations</option>
+                  <option value="filtered">Current Activity filters</option>
+                </select>
+              </label>
+              <label className="field">
+                Recorded before
+                <select
+                  value={age}
+                  onChange={(event) => setAge(event.target.value)}
+                  disabled={pending}
+                >
+                  <option value="30">30 days ago</option>
+                  <option value="7">7 days ago</option>
+                  <option value="90">90 days ago</option>
+                  <option value="all">Any time</option>
+                </select>
+              </label>
+            </div>
+          )}
+          <p role="status">
+            {num(ids.length)} finished {ids.length === 1 ? 'report' : 'reports'} selected.{' '}
+            {protectedCount > 0 &&
+              `${num(protectedCount)} active or unrecognized operations excluded.`}
+          </p>
+          {!review.single && (
+            <p className="subtle text-small">
+              Uses the finish date when recorded, otherwise the last update or creation date. This
+              review stays fixed while open; new activity is not added.
+            </p>
+          )}
+          {overLimit && (
+            <p className="error-block" role="alert">
+              Clear at most 1,000 reports at a time. Use Activity filters or an older date to narrow
+              this review.
+            </p>
+          )}
+          {error && (
+            <p className="error-block" role="alert">
+              {error} You can retry this same review.
+            </p>
+          )}
+        </>
+      )}
+    </Modal>
+  );
+}
+
 function DialogContent({
   api,
   dialog,
@@ -1204,6 +1467,8 @@ function DialogContent({
   reveal,
   cancelJob,
   showReveal,
+  clearReport,
+  cleanupHistory,
   apply,
   busy,
   notify,
@@ -1216,10 +1481,14 @@ function DialogContent({
   reveal: (id: string) => void;
   cancelJob: (id: string) => void;
   showReveal: (id: string) => void;
+  clearReport: (job: Job) => void;
+  cleanupHistory: (ids: string[]) => Promise<HistoryCleanupResult | undefined>;
   apply: (event: SubscriptionEvent) => void;
   busy: Set<string>;
   notify: (text: string, error?: boolean) => void;
 }) {
+  if (dialog.kind === 'cleanup')
+    return <HistoryCleanupDialog review={dialog} close={close} submit={cleanupHistory} />;
   if (dialog.kind === 'preview') {
     const users = dialog.preview.users;
     return (
@@ -1398,6 +1667,11 @@ function DialogContent({
             <button className="btn btn-quiet" onClick={close}>
               Close
             </button>
+            {finishedJob(job) && (
+              <button className="btn btn-quiet" onClick={() => clearReport(job)}>
+                Clear report…
+              </button>
+            )}
             {activeJob(job) && (
               <button
                 className="btn btn-quiet"

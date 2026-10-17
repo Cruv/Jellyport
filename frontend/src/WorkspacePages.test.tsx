@@ -317,6 +317,60 @@ describe('Workspace navigation and migration controls', () => {
     expect(screen.queryByText('A fresh start')).toBeNull();
   });
 
+  it('reviews every filtered activity result rather than only the current page', () => {
+    const jobs = Array.from({ length: 80 }, (_, i) => ({
+      ...job,
+      id: `job-${i}`,
+      status: i % 2 ? 'failed' : 'completed',
+    }));
+    const clearHistory = vi.fn();
+    render(
+      <ActivityPage
+        jobs={jobs}
+        navigate={vi.fn()}
+        openJob={vi.fn()}
+        refresh={vi.fn()}
+        clearHistory={clearHistory}
+      />,
+    );
+    fireEvent.change(screen.getByRole('combobox', { name: 'Status' }), {
+      target: { value: 'failed' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
+    expect(clearHistory).toHaveBeenCalledWith(
+      jobs.filter((item) => item.status === 'failed').map((item) => item.id),
+    );
+  });
+
+  it('shows cleared subscription reports without offering a broken operation link', () => {
+    const openJob = vi.fn();
+    const events: SubscriptionEvent[] = [
+      {
+        id: 'settled-event',
+        action: 'subscribe',
+        status: 'applied',
+        created_at: job.created_at,
+        report_cleared: true,
+      },
+    ];
+    render(
+      <SubscriptionsPage
+        events={events}
+        navigate={vi.fn()}
+        openJob={openJob}
+        refresh={vi.fn()}
+        review={vi.fn()}
+        ignore={vi.fn()}
+        busy={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole('tab', { name: 'Processed' }));
+    expect(screen.getByText('Report cleared')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'View operation' })).toBeNull();
+    expect(openJob).not.toHaveBeenCalled();
+  });
+
   it('separates actionable subscriptions from processed events without changing them', () => {
     const events = [
       {

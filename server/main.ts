@@ -1114,6 +1114,24 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         ),
   );
   app.get('/api/jobs', async () => ({ jobs: store.jobs() }));
+  app.get('/api/jobs/retention', async () => service.jobRetentionStatus());
+  app.put<{ Body: { retention_days: number } }>(
+    '/api/jobs/retention',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['retention_days'],
+          properties: { retention_days: { type: 'integer', minimum: 0, maximum: 3650 } },
+        },
+      },
+    },
+    async (request) => {
+      if (demo) throw new ServiceError('Demo settings are read-only.');
+      return service.setJobRetention(request.body.retention_days);
+    },
+  );
   app.post<{ Body: { job_ids: string[] } }>(
     '/api/jobs/cleanup',
     {
@@ -1401,7 +1419,21 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       });
   }, 300000);
   maintenance.unref();
+  let closing = false;
+  const retention = setInterval(() => {
+    try {
+      if (closing || demo || store.authState()?.kind !== 'configured') return;
+      // The worker is synchronous and bounded, so ticks cannot overlap. It reports
+      // aggregate failures through its status without logging private report data.
+      service.runJobRetention();
+    } catch {
+      app.log.warn('Activity retention could not run; it will retry on the next scheduled tick.');
+    }
+  }, 60000);
+  retention.unref();
   app.addHook('onClose', async () => {
+    closing = true;
+    clearInterval(retention);
     clearInterval(maintenance);
     previews.close();
     await Promise.all([bot.stop(), service.stop()]);

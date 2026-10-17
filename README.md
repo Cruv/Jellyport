@@ -253,11 +253,13 @@ For an incomplete numbered account, inspect its exact username and select the sa
 
 ## Clear activity and reports
 
-Open **Activity → Clear history…** to review finished operations from all history or the current Activity filters. Choose records older than 7, 30, or 90 days, or **Any time**, then confirm the displayed count. The default is 30 days; the finish date is used when available, otherwise the last update or creation date. The selection stays fixed while the confirmation is open. To remove one operation, open its details and choose **Clear report…**.
+Open **Activity → Clear history…** to review finished operations from all history or the current Activity filters. Choose records older than 7, 30, or 90 days, or **Any time**, then confirm the displayed count. Without filters, the default is 30 days. With a search or status filter, the review defaults to those matching reports from any time, including **Failed** and **Needs review**. The finish date is used when available, otherwise the last update or creation date. The selection stays fixed while the confirmation is open. To remove one operation, open its details and choose **Clear report…**.
 
 Clearing permanently removes Jellyport's selected activity records and migration reports. It does not undo migrations or change accounts, permissions, passwords, or watch history on either media server. Running, queued, or still-finalizing operations are protected, as are reports needed for unexpired credential delivery, uncertain account recovery, or an in-progress subscription action. The result shows how many were cleared and why others were kept. Up to 1,000 reports can be cleared in one request; narrow larger selections by age or filters.
 
-Account and playlist recovery journals, identity links, membership records, and subscription deduplication remain intact. A subscription whose report was cleared keeps its event status and displays **Report cleared** instead of a broken report link. Existing backups are unchanged. This is manual cleanup; no automatic retention policy is enabled.
+Account and playlist recovery journals, identity links, membership records, and subscription deduplication remain intact. A subscription whose report was cleared keeps its event status and displays **Report cleared** instead of a broken report link. Existing backups are unchanged. SQLite can reuse space freed by cleanup, although the database file may not immediately shrink.
+
+For automatic cleanup, open **Settings → Activity**, enable retention, and choose how many days to keep reports (1–3,650 days; 30 is suggested). This saves independently from connection and account settings. Automatic cleanup is disabled by default, including after upgrading an existing installation. Once enabled, Jellyport checks every minute and considers up to 100 old finished reports per tick, using the same date preference and protections as manual cleanup. Ambiguous or malformed timestamps are kept for manual review. Failed and Needs review reports are eligible once old enough; protected reports stay until their delivery or recovery requirement is resolved. Large backlogs drain gradually, and protected records do not block later eligible reports. Disabling retention stops future automatic cleanup; it does not restore removed reports. The settings panel shows aggregate results from the latest check since app startup. Cleanup uses Jellyport's local database and makes no media-server requests.
 
 ## Optional Discord and membership automation
 
@@ -380,6 +382,7 @@ The browser uses authenticated session cookies. Mutating API requests require th
 | List or inspect jobs | `GET /api/jobs`, `GET /api/jobs/{job_id}` |
 | Cancel queued or running work and preserve applied changes | `POST /api/jobs/{job_id}/cancel` |
 | Clear reviewed finished activity and migration reports locally | `POST /api/jobs/cleanup` with `{"job_ids":["JOB_ID"]}` |
+| Inspect or configure automatic report retention | `GET /api/jobs/retention`, `PUT /api/jobs/retention` with `{"retention_days":30}` (`0` disables) |
 | Consume retained credentials | `POST /api/jobs/{job_id}/credentials` |
 | Review, apply, or ignore membership events | `GET /api/subscriptions`, `POST /api/subscriptions/{event_id}/apply`, `POST /api/subscriptions/{event_id}/ignore` |
 

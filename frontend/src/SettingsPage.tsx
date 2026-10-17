@@ -4,6 +4,7 @@ import { Tabs, TabPanel } from './ui-layout';
 import AdminAlertsPanel from './AdminAlertsPanel';
 import SourceSnapshotsPanel from './SourceSnapshotsPanel';
 import DestinationCatalogPanel from './DestinationCatalogPanel';
+import ActivityRetentionPanel from './ActivityRetentionPanel';
 import {
   DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
   MAX_CREDENTIAL_MESSAGE_TEMPLATE_LENGTH,
@@ -28,6 +29,7 @@ const settingsTabs = [
   { id: 'discord', label: 'Discord' },
   { id: 'automation', label: 'Automation' },
   { id: 'history', label: 'Saved history' },
+  { id: 'activity', label: 'Activity' },
 ];
 function settingsTabFromHash() {
   const value = window.location.hash.replace('#settings-', '');
@@ -467,6 +469,7 @@ export default function SettingsPage({
       />
       <form
         id="settings-form"
+        hidden={activeTab === 'activity' || activeTab === 'history'}
         noValidate
         onSubmit={save}
         onChange={(event) => {
@@ -474,7 +477,10 @@ export default function SettingsPage({
             setDirty(true);
         }}
       >
-        <div className="view-toolbar settings-save-bar" hidden={activeTab === 'history'}>
+        <div
+          className="view-toolbar settings-save-bar"
+          hidden={activeTab === 'history' || activeTab === 'activity'}
+        >
           <p className="section-note">
             {dirty
               ? 'Unsaved changes · save all settings together.'
@@ -491,7 +497,7 @@ export default function SettingsPage({
             </button>
           </div>
         </div>
-        {tested && activeTab !== 'history' && (
+        {tested && activeTab !== 'history' && activeTab !== 'activity' && (
           <section className="panel connection-test-results">
             <div className="panel-header">
               <h2>Saved connection test</h2>
@@ -1344,6 +1350,14 @@ export default function SettingsPage({
             </section>
           </TabPanel>
         </section>
+      </TabPanel>
+      <TabPanel id="settings" tabId="activity" active={activeTab === 'activity'}>
+        <ActivityRetentionPanel
+          api={api}
+          notify={notify}
+          demo={demo}
+          active={activeTab === 'activity'}
+        />
       </TabPanel>
     </div>
   );

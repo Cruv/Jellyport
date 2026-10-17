@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { SecretCipher } from './crypto.js';
 import { nameKey } from './identity.js';
 import { DEFAULT_SETTINGS, DEMO_SETTINGS, type Settings } from './types.js';
+import { jobRetentionTimestamp, type JobRetentionCursor } from './job-retention.js';
 import type {
   Job,
   JobRequest,
@@ -110,6 +111,12 @@ export class Store {
       CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS auth_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS job_retention (job_id TEXT PRIMARY KEY,age_ms REAL);
+      CREATE INDEX IF NOT EXISTS job_retention_age ON job_retention(age_ms,job_id);
+      CREATE TRIGGER IF NOT EXISTS job_retention_insert AFTER INSERT ON jobs BEGIN DELETE FROM job_retention WHERE job_id=NEW.id; END;
+      CREATE TRIGGER IF NOT EXISTS job_retention_update AFTER UPDATE ON jobs BEGIN DELETE FROM job_retention WHERE job_id=OLD.id OR job_id=NEW.id; END;
+      CREATE TRIGGER IF NOT EXISTS job_retention_delete AFTER DELETE ON jobs BEGIN DELETE FROM job_retention WHERE job_id=OLD.id; END;
+      CREATE TABLE IF NOT EXISTS job_retention_config (id INTEGER PRIMARY KEY CHECK(id=1),days INTEGER NOT NULL CHECK(typeof(days)='integer' AND days BETWEEN 0 AND 3650));
       CREATE TABLE IF NOT EXISTS accounts (name_key TEXT PRIMARY KEY, username TEXT NOT NULL, remote_id TEXT, status TEXT NOT NULL, password BLOB, expires REAL);
       CREATE TABLE IF NOT EXISTS credentials (job_id TEXT NOT NULL, username TEXT NOT NULL, encrypted BLOB NOT NULL, expires REAL NOT NULL, PRIMARY KEY (job_id,username));
       CREATE TABLE IF NOT EXISTS links (discord_user_id TEXT NOT NULL, membership_slot INTEGER NOT NULL DEFAULT 1 CHECK(membership_slot BETWEEN 1 AND 3), username TEXT NOT NULL, remote_id TEXT NOT NULL UNIQUE, disabled_by_jellyport INTEGER NOT NULL DEFAULT 0, pending_disabled INTEGER, PRIMARY KEY(discord_user_id,membership_slot));
@@ -157,7 +164,8 @@ export class Store {
       UNION ALL SELECT 1 FROM account_roles UNION ALL SELECT 1 FROM account_role_assignments
       UNION ALL SELECT 1 FROM memberships UNION ALL SELECT 1 FROM account_profiles
       UNION ALL SELECT 1 FROM admin_alert_config UNION ALL SELECT 1 FROM admin_alert_receipts
-      UNION ALL SELECT 1 FROM source_snapshot_state UNION ALL SELECT 1 FROM destination_catalog_state LIMIT 1`,
+      UNION ALL SELECT 1 FROM source_snapshot_state UNION ALL SELECT 1 FROM destination_catalog_state
+      UNION ALL SELECT 1 FROM job_retention_config UNION ALL SELECT 1 FROM job_retention LIMIT 1`,
         )
         .get();
     if (options.demo && (auth || (hasData && !recognizedDemo))) {
@@ -166,6 +174,22 @@ export class Store {
         'Demo mode requires a separate empty data directory. Production data was not loaded.',
       );
     }
+    // Backfill only absent metadata, using a streaming projection instead of report
+    // objects. Ordinary restarts do not parse existing reports for retention again.
+    this.transaction(() => {
+      const missing = this.db.prepare(`SELECT jobs.id,
+        json_extract(payload,'$.status') AS status,
+        json_extract(payload,'$.finished_at') AS finished_at,
+        json_extract(payload,'$.updated_at') AS updated_at,
+        json_extract(payload,'$.created_at') AS created_at
+        FROM jobs LEFT JOIN job_retention ON job_retention.job_id=jobs.id
+        WHERE job_retention.job_id IS NULL`);
+      const save = this.db.prepare('INSERT INTO job_retention (job_id,age_ms) VALUES (?,?)');
+      for (const row of missing.iterate()) save.run(String(row.id), jobRetentionTimestamp(row));
+      this.db.exec(
+        'DELETE FROM job_retention WHERE NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.id=job_retention.job_id)',
+      );
+    });
     for (const job of this.jobs()) {
       if (
         job.status === 'running' ||
@@ -401,7 +425,49 @@ export class Store {
     });
   }
   saveJob(job: Job): void {
-    this.db.prepare('INSERT OR REPLACE INTO jobs VALUES (?,?)').run(job.id, JSON.stringify(job));
+    // A savepoint composes with queue/claim transactions and makes metadata atomic
+    // with the report even when this method is called without an outer transaction.
+    this.db.exec('SAVEPOINT jellyport_save_job');
+    try {
+      this.db.prepare('INSERT OR REPLACE INTO jobs VALUES (?,?)').run(job.id, JSON.stringify(job));
+      this.db
+        .prepare('INSERT OR REPLACE INTO job_retention (job_id,age_ms) VALUES (?,?)')
+        .run(job.id, jobRetentionTimestamp(job));
+      this.db.exec('RELEASE jellyport_save_job');
+    } catch (error) {
+      this.db.exec('ROLLBACK TO jellyport_save_job; RELEASE jellyport_save_job');
+      throw error;
+    }
+  }
+  jobRetentionDays(): number {
+    return Number(
+      this.db.prepare('SELECT days FROM job_retention_config WHERE id=1').get()?.days ?? 0,
+    );
+  }
+  saveJobRetentionDays(days: number): void {
+    this.db.prepare('INSERT OR REPLACE INTO job_retention_config (id,days) VALUES (1,?)').run(days);
+  }
+  jobRetentionCandidates(
+    cutoff: number,
+    cursor: JobRetentionCursor | null,
+    limit: number,
+  ): JobRetentionCursor[] {
+    if (!Number.isFinite(cutoff) || !Number.isInteger(limit) || limit < 1 || limit > 100)
+      throw new Error('Invalid activity retention scan.');
+    const rows = cursor
+      ? this.db
+          .prepare(
+            `SELECT job_id AS id,age_ms FROM job_retention
+          WHERE age_ms<? AND (age_ms,job_id)>(?,?) ORDER BY age_ms,job_id LIMIT ?`,
+          )
+          .all(cutoff, cursor.age_ms, cursor.id, limit)
+      : this.db
+          .prepare(
+            `SELECT job_id AS id,age_ms FROM job_retention
+          WHERE age_ms<? ORDER BY age_ms,job_id LIMIT ?`,
+          )
+          .all(cutoff, limit);
+    return rows.map((row) => ({ id: String(row.id), age_ms: Number(row.age_ms) }));
   }
   job(id: string): Job | null {
     const row = this.db.prepare('SELECT payload FROM jobs WHERE id=?').get(id);
@@ -413,14 +479,23 @@ export class Store {
       .all()
       .map((row) => JSON.parse(row.payload as string) as Job);
   }
-  clearJobHistory(jobIds: string[], activeIds: ReadonlySet<string>): JobHistoryCleanupResult {
+  clearJobHistory(
+    jobIds: string[],
+    activeIds: ReadonlySet<string>,
+    retention?: { cutoff: number; now: number },
+  ): JobHistoryCleanupResult {
     if (!jobIds.length || jobIds.length > 1000 || new Set(jobIds).size !== jobIds.length)
       throw new Error('Activity cleanup requires 1 to 1000 distinct report IDs.');
+    if (retention && (!Number.isFinite(retention.cutoff) || !Number.isFinite(retention.now)))
+      throw new Error('Invalid activity retention cutoff.');
     return this.transaction(() => {
       const result: JobHistoryCleanupResult = { removed_ids: [], skipped: [] };
-      const time = Date.now() / 1000;
+      const time = (retention?.now ?? Date.now()) / 1000;
       const inspect = this.db.prepare(`
         SELECT json_extract(payload,'$.status') AS status,
+          json_extract(payload,'$.finished_at') AS finished_at,
+          json_extract(payload,'$.updated_at') AS updated_at,
+          json_extract(payload,'$.created_at') AS created_at,
           EXISTS(SELECT 1 FROM job_queue WHERE job_id=jobs.id) AS queued,
           EXISTS(SELECT 1 FROM credentials WHERE job_id=jobs.id AND expires>?) AS credentials
         FROM jobs WHERE id=?`);
@@ -447,9 +522,11 @@ export class Store {
       for (const id of jobIds) {
         let reason: JobHistoryCleanupSkipReason | undefined;
         const row = inspect.get(time, id);
+        const age = retention && row ? jobRetentionTimestamp(row) : null;
         if (!row) reason = 'not_found';
         else if (activeIds.has(id)) reason = 'active';
         else if (!terminal.has(String(row.status)) || row.queued) reason = 'not_finished';
+        else if (retention && (age === null || age >= retention.cutoff)) reason = 'not_finished';
         else if (row.credentials) reason = 'pending_credentials';
         else if (processing.get(id)) reason = 'subscription_processing';
         else {

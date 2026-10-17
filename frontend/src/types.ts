@@ -399,6 +399,15 @@ export interface HistoryCleanupResult {
   removed_ids: string[];
   skipped: { id: string; reason: string }[];
 }
+export interface ActivityRetentionStatus {
+  retention_days: number;
+  interval_seconds: 60;
+  batch_limit: 100;
+  last_run_at: string | null;
+  last_removed: number;
+  last_kept: number;
+  error: string | null;
+}
 export interface Recovery {
   username: string;
   eligible: boolean;

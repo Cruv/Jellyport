@@ -47,6 +47,16 @@ function page(settings: Settings = oldSettings, respond?: Api) {
   const api = vi.fn(async (path: string, options?: ApiOptions) => {
     requests.push({ path, options });
     if (path === '/api/account-roles') return { roles: [] };
+    if (path === '/api/jobs/retention' && options?.method !== 'PUT')
+      return {
+        retention_days: 0,
+        interval_seconds: 60,
+        batch_limit: 100,
+        last_run_at: null,
+        last_removed: 0,
+        last_kept: 0,
+        error: null,
+      };
     if (respond) return respond(path, options);
     if (path === '/api/settings' && options?.method === 'PUT') return {};
     throw new Error(`Unexpected request: ${path}`);
@@ -252,6 +262,7 @@ describe('Settings layout and navigation', () => {
     const settingsForm = screen.getByRole('button', { name: 'Save settings' }).closest('form');
     settingsTab('Saved history');
     const schedule = screen.getByRole('form', { name: 'Backup import schedule' });
+    expect(settingsForm).toHaveProperty('hidden', true);
     expect(settingsForm?.contains(schedule)).toBe(false);
     expect(screen.getByRole('button', { name: 'Save import schedule' }).closest('form')).toBe(
       schedule,
@@ -265,12 +276,67 @@ describe('Settings layout and navigation', () => {
     expect(screen.getByText(/Import actions and schedules save independently/)).toBeTruthy();
   });
 
+  it('saves activity retention independently and keeps both retention and server drafts across tabs', async () => {
+    const p = page(oldSettings, async <T,>(path: string, options?: ApiOptions) =>
+      path === '/api/jobs/retention'
+        ? ({
+            retention_days: (options?.body as { retention_days: number }).retention_days,
+            interval_seconds: 60,
+            batch_limit: 100,
+            last_run_at: null,
+            last_removed: 0,
+            last_kept: 0,
+            error: null,
+          } as T)
+        : ({} as T),
+    );
+    const settingsForm = screen.getByRole('button', { name: 'Save settings' }).closest('form');
+    const sourceUrl = screen.getByLabelText('Server URL', { selector: '#setting-emby_url' });
+    fireEvent.change(sourceUrl, { target: { value: 'https://draft.example.test' } });
+    settingsTab('Activity');
+    await screen.findByText('Automatic cleanup off');
+    const form = screen.getByRole('form', { name: 'Activity retention' });
+    expect(settingsForm).toHaveProperty('hidden', true);
+    expect(settingsForm?.contains(form)).toBe(false);
+    expect(screen.queryByRole('button', { name: 'Save settings' })).toBeNull();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable automatic activity cleanup' }));
+    fireEvent.change(screen.getByRole('spinbutton'), { target: { value: '60' } });
+    settingsTab('Servers');
+    expect(settingsForm).toHaveProperty('hidden', false);
+    expect(sourceUrl).toHaveProperty('value', 'https://draft.example.test');
+    settingsTab('Activity');
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Save activity retention' })).toHaveProperty(
+        'disabled',
+        false,
+      ),
+    );
+    expect(screen.getByRole('spinbutton')).toHaveProperty('value', '60');
+    fireEvent.click(screen.getByRole('button', { name: 'Save activity retention' }));
+    await waitFor(() => expect(p.notify).toHaveBeenCalledWith('Automatic activity cleanup saved.'));
+    expect(p.requests.filter((request) => request.options?.method === 'PUT')).toEqual([
+      expect.objectContaining({
+        path: '/api/jobs/retention',
+        options: expect.objectContaining({ body: { retention_days: 60 } }),
+      }),
+    ]);
+    settingsTab('Servers');
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    const saved = p.requests.find(
+      (request) => request.path === '/api/settings' && request.options?.method === 'PUT',
+    );
+    expect(saved?.options?.body).toMatchObject({ emby_url: 'https://draft.example.test' });
+    expect(saved?.options?.body).not.toHaveProperty('retention_days');
+  });
+
   it.each([
     ['media', 'Servers', 'Emby · source server'],
     ['accounts', 'Account defaults', 'New account permissions'],
     ['discord', 'Discord', 'Discord · optional'],
     ['automation', 'Automation', 'Membership tiers'],
     ['history', 'Saved history', null],
+    ['activity', 'Activity', null],
   ])('opens the %s bookmarked tab', (hash, label, heading) => {
     window.history.replaceState(null, '', `#settings-${hash}`);
     page();

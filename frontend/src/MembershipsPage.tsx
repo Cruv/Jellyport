@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { Callout, Empty, Heading, Icon, Loading, Modal } from './components';
+import { Empty, Heading, Icon, Loading, Modal } from './components';
+import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import {
   defaultMembershipTiers,
@@ -36,6 +37,9 @@ export default function MembershipsPage({
   created: (job: Job) => void;
 }) {
   const tiers = settings.membership_tiers || defaultMembershipTiers;
+  const [view, setView] = useState('list');
+  const [query, setQuery] = useState('');
+  const [accessFilter, setAccessFilter] = useState('all');
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [mappings, setMappings] = useState<UserMapping[]>([]);
   const [member, setMember] = useState<DiscordMember | null>(null);
@@ -90,6 +94,14 @@ export default function MembershipsPage({
     };
   }, [reload]);
 
+  const filteredMemberships = memberships.filter(
+    (item) =>
+      (accessFilter === 'all' || (item.access_mode || 'subscription') === accessFilter) &&
+      [item.base_username, ...item.links.map((link) => link.username)].some((name) =>
+        name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
+      ),
+  );
+  const memberPage = usePagination(filteredMemberships, 25, `${query}:${accessFilter}`);
   const existing = memberships.find((item) => item.discord_user_id === member?.id);
   const tier =
     accessMode === 'complimentary'
@@ -116,6 +128,7 @@ export default function MembershipsPage({
   );
 
   function selectMember(value: DiscordMember | null) {
+    setView('editor');
     setMember(value);
     setError('');
     const saved = memberships.find((item) => item.discord_user_id === value?.id);
@@ -242,230 +255,272 @@ export default function MembershipsPage({
         </div>
       )}
       <div className="page-stack">
-        <section className="panel">
-          <div className="panel-header">
-            <div>
-              <h2>Manage a member’s accounts</h2>
-              <p>Select the owner and review their account allowance.</p>
-            </div>
-            <span className="server-icon discord">
-              <Icon name="discord" />
-            </span>
-          </div>
-          <div className="panel-body form-layout">
-            <form className="form-stack" onSubmit={showReview}>
-              <DiscordMemberPicker
-                api={api}
-                value={member}
-                onChange={selectMember}
+        <Tabs
+          id="membership-views"
+          label="Membership tasks"
+          tabs={[
+            { id: 'list', label: 'Managed memberships', count: memberships.length },
+            { id: 'editor', label: member ? 'Manage member' : 'Add member' },
+          ]}
+          value={view}
+          onChange={setView}
+        />
+        <TabPanel id="membership-views" tabId="list" active={view === 'list'}>
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <h2>Managed memberships</h2>
+                <p>Review each owner’s account allowance and linked accounts.</p>
+              </div>
+              <button
+                className="btn btn-primary"
                 disabled={busy || loading}
-                allowInactive={accessMode === 'complimentary'}
+                onClick={() => {
+                  setMember(null);
+                  setError('');
+                  setAccessMode('subscription');
+                  setTierId(tiers[0]?.id || '');
+                  setComplimentaryLimit(1);
+                  setView('editor');
+                }}
+              >
+                Add member
+              </button>
+            </div>
+            <div className="panel-body directory-toolbar">
+              <div className="field">
+                <label htmlFor="membership-search">Find memberships</label>
+                <input
+                  id="membership-search"
+                  type="search"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                  placeholder="Search owners or linked accounts"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="membership-filter">Access type</label>
+                <select
+                  id="membership-filter"
+                  value={accessFilter}
+                  onChange={(event) => setAccessFilter(event.target.value)}
+                >
+                  <option value="all">All memberships</option>
+                  <option value="subscription">Subscription managed</option>
+                  <option value="complimentary">Complimentary</option>
+                </select>
+              </div>
+            </div>
+            {loading ? (
+              <Loading />
+            ) : memberPage.total ? (
+              <div className="panel-body record-list">
+                {memberPage.items.map((item) => (
+                  <article className="summary-card" key={item.discord_user_id}>
+                    <div className="record-heading">
+                      <div>
+                        <h3>{item.base_username}</h3>
+                        <p className="section-note">
+                          {item.access_mode === 'complimentary'
+                            ? 'Complimentary · admin managed · billing exempt'
+                            : `${tiers.find((entry) => entry.id === item.tier_id)?.name || item.tier_id} · ${item.active === false ? 'Inactive membership' : `${item.account_limit} entitled ${item.account_limit === 1 ? 'account' : 'accounts'}`}`}
+                        </p>
+                      </div>
+                      <button
+                        className="btn"
+                        disabled={busy}
+                        aria-label={`Manage membership for ${item.base_username}`}
+                        onClick={() =>
+                          selectMember({
+                            id: item.discord_user_id,
+                            username: item.base_username,
+                            display_name: null,
+                            nickname: null,
+                            membership_active: null,
+                          })
+                        }
+                      >
+                        Manage
+                      </button>
+                    </div>
+                    {item.links.length ? (
+                      <ul className="account-slot-list">
+                        {item.links.map((link) => (
+                          <li key={link.membership_slot}>
+                            <strong>{link.username}</strong>
+                            <span className="section-note">
+                              Slot {link.membership_slot} ·{' '}
+                              {link.pending_disabled !== null
+                                ? 'Access update pending'
+                                : link.disabled_by_jellyport
+                                  ? 'Disabled by Jellyport · data preserved'
+                                  : 'Linked'}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="section-note">No accounts linked yet</p>
+                    )}
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <Empty
+                icon="discord"
+                title={
+                  memberships.length
+                    ? 'No matching memberships'
+                    : 'Give each member their account allowance.'
+                }
+                text="Add a Discord member to create or migrate the accounts included in their tier."
               />
-              <div className="field-row">
-                <div className="field">
-                  <label htmlFor="membership-access-mode">Access policy</label>
-                  <select
-                    id="membership-access-mode"
-                    value={accessMode}
-                    disabled={busy || loading}
-                    onChange={(event) =>
-                      setAccessMode(event.target.value as 'subscription' | 'complimentary')
-                    }
-                  >
-                    <option value="subscription">Subscription managed</option>
-                    <option value="complimentary">Complimentary · admin managed</option>
-                  </select>
-                  <small>
-                    Use complimentary access for family and other non-paying Discord members. Users
-                    without Discord can have independent accounts from Create account.
-                  </small>
-                </div>
-                {accessMode === 'subscription' ? (
+            )}
+            <Pagination
+              label="Memberships"
+              page={memberPage.page}
+              total={memberPage.total}
+              pageSize={memberPage.pageSize}
+              onPageChange={memberPage.setPage}
+              onPageSizeChange={memberPage.setPageSize}
+            />
+          </section>
+        </TabPanel>
+        <TabPanel id="membership-views" tabId="editor" active={view === 'editor'}>
+          <section className="panel task-panel">
+            <div className="panel-header">
+              <div>
+                <h2>Manage a member’s accounts</h2>
+                <p>Select the owner and review their account allowance.</p>
+              </div>
+              <span className="server-icon discord">
+                <Icon name="discord" />
+              </span>
+            </div>
+            <div className="panel-body form-stack">
+              <form className="form-stack" onSubmit={showReview}>
+                <DiscordMemberPicker
+                  api={api}
+                  value={member}
+                  onChange={selectMember}
+                  disabled={busy || loading}
+                  allowInactive={accessMode === 'complimentary'}
+                />
+                <div className="field-row">
                   <div className="field">
-                    <label htmlFor="membership-tier">Membership tier</label>
+                    <label htmlFor="membership-access-mode">Access policy</label>
                     <select
-                      id="membership-tier"
-                      value={tierId}
-                      onChange={(event) => setTierId(event.target.value)}
+                      id="membership-access-mode"
+                      value={accessMode}
                       disabled={busy || loading}
-                      required
+                      onChange={(event) =>
+                        setAccessMode(event.target.value as 'subscription' | 'complimentary')
+                      }
                     >
-                      {!tiers.some((item) => item.id === tierId) && (
-                        <option value="">Select a configured tier</option>
-                      )}
-                      {tiers.map((item) => (
-                        <option key={item.id} value={item.id}>
-                          {item.name} · {item.account_limit}{' '}
-                          {item.account_limit === 1 ? 'account' : 'accounts'}
-                        </option>
-                      ))}
+                      <option value="subscription">Subscription managed</option>
+                      <option value="complimentary">Complimentary · admin managed</option>
                     </select>
                     <small>
-                      Tier names, trusted subscription plan names, and account limits can be changed
-                      in Settings.
+                      Use complimentary access for family and other non-paying Discord members.
+                      Users without Discord can have independent accounts from Create account.
                     </small>
                   </div>
-                ) : (
-                  <div className="field">
-                    <label htmlFor="complimentary-allowance">Complimentary account allowance</label>
-                    <select
-                      id="complimentary-allowance"
-                      value={complimentaryLimit}
-                      disabled={busy || loading}
-                      onChange={(event) => setComplimentaryLimit(Number(event.target.value))}
-                    >
-                      {[1, 2, 3].map((count) => (
-                        <option key={count} value={count}>
-                          {count} {count === 1 ? 'account' : 'accounts'}
-                        </option>
-                      ))}
-                    </select>
-                    <small>
-                      Billing events do not disable these accounts. Save this policy to protect
-                      existing accounts without creating or changing any accounts.
-                    </small>
+                  {accessMode === 'subscription' ? (
+                    <div className="field">
+                      <label htmlFor="membership-tier">Membership tier</label>
+                      <select
+                        id="membership-tier"
+                        value={tierId}
+                        onChange={(event) => setTierId(event.target.value)}
+                        disabled={busy || loading}
+                        required
+                      >
+                        {!tiers.some((item) => item.id === tierId) && (
+                          <option value="">Select a configured tier</option>
+                        )}
+                        {tiers.map((item) => (
+                          <option key={item.id} value={item.id}>
+                            {item.name} · {item.account_limit}{' '}
+                            {item.account_limit === 1 ? 'account' : 'accounts'}
+                          </option>
+                        ))}
+                      </select>
+                      <small>
+                        Tier names, trusted subscription plan names, and account limits can be
+                        changed in Settings.
+                      </small>
+                    </div>
+                  ) : (
+                    <div className="field">
+                      <label htmlFor="complimentary-allowance">
+                        Complimentary account allowance
+                      </label>
+                      <select
+                        id="complimentary-allowance"
+                        value={complimentaryLimit}
+                        disabled={busy || loading}
+                        onChange={(event) => setComplimentaryLimit(Number(event.target.value))}
+                      >
+                        {[1, 2, 3].map((count) => (
+                          <option key={count} value={count}>
+                            {count} {count === 1 ? 'account' : 'accounts'}
+                          </option>
+                        ))}
+                      </select>
+                      <small>
+                        Billing events do not disable these accounts. Save this policy to protect
+                        existing accounts without creating or changing any accounts.
+                      </small>
+                    </div>
+                  )}
+                </div>
+                {member && tier && (
+                  <div className="support-note">
+                    <strong>
+                      {existing ? 'Saved account names are preserved.' : 'Expected account names'}
+                    </strong>
+                    <p>{usernames.join(', ')}</p>
+                    <p>
+                      Use User mappings to associate differently named Emby accounts with the
+                      owner’s account slots before provisioning.
+                    </p>
                   </div>
                 )}
-              </div>
-              {member && tier && (
-                <div className="support-note">
-                  <strong>
-                    {existing ? 'Saved account names are preserved.' : 'Expected account names'}
-                  </strong>
-                  <p>{usernames.join(', ')}</p>
-                  <p>
-                    Use User mappings to associate differently named Emby accounts with the owner’s
-                    account slots before provisioning.
-                  </p>
+                <div className="form-actions">
+                  <button
+                    className="btn"
+                    type="button"
+                    disabled={!member || !tier || !loaded || loading || busy}
+                    onClick={() => void saveAccess()}
+                  >
+                    Save access policy
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    type="submit"
+                    disabled={!member || !tier || !loaded || loading || busy}
+                  >
+                    <Icon name="check" /> Review membership update
+                  </button>
                 </div>
-              )}
-              <div className="form-actions">
-                <button
-                  className="btn"
-                  type="button"
-                  disabled={!member || !tier || !loaded || loading || busy}
-                  onClick={() => void saveAccess()}
-                >
-                  Save access policy
-                </button>
-                <button
-                  className="btn btn-primary"
-                  type="submit"
-                  disabled={!member || !tier || !loaded || loading || busy}
-                >
-                  <Icon name="check" /> Review membership update
-                </button>
-              </div>
-            </form>
-            <aside className="form-stack" aria-label="Membership access guidance">
-              <Callout icon="shield" title="Account access is reviewed before changing.">
-                New accounts receive the default account role and their own generated password,
-                delivered privately to the Discord owner. Downgrades disable extra accounts and
-                preserve their data. Upgrades can restore those same accounts when Jellyport
-                disabled them. Complimentary access is managed by you and is exempt from
-                subscription cancellation and renewal automation.
-              </Callout>
-              <div className="section-note">
-                <h3>Choose the action you need</h3>
+              </form>
+              <details className="help-details">
+                <summary>Access rules and available actions</summary>
                 <p>
-                  <strong>Save access policy</strong> updates how membership events are handled
-                  without changing media accounts.
+                  Save access policy changes how membership events are handled without changing
+                  media accounts. Review membership update checks account slots before queuing
+                  creation, migration, or access changes.
                 </p>
                 <p>
-                  <strong>Review membership update</strong> checks the account slots before you
-                  queue creation, migration, or access changes.
+                  New accounts receive the default role and separate passwords delivered privately
+                  to the Discord owner. Downgrades disable extras while preserving data. Upgrades
+                  can restore accounts disabled by Jellyport. Complimentary accounts are exempt from
+                  subscription cancellation and renewal automation.
                 </p>
-              </div>
-            </aside>
-          </div>
-        </section>
-        <section className="panel">
-          <div className="panel-header">
-            <div>
-              <h2>Managed memberships</h2>
-              <p>Each owner keeps their account slots across upgrades and downgrades.</p>
+              </details>
             </div>
-          </div>
-          {loading ? (
-            <Loading />
-          ) : memberships.length ? (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Discord owner</th>
-                    <th>Tier</th>
-                    <th>Linked Jellyfin accounts</th>
-                    <th className="right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {memberships.map((item) => (
-                    <tr key={item.discord_user_id}>
-                      <td>
-                        <strong>{item.base_username}</strong>
-                        <small>Discord ID: {item.discord_user_id}</small>
-                      </td>
-                      <td>
-                        {item.access_mode === 'complimentary'
-                          ? 'Complimentary'
-                          : tiers.find((entry) => entry.id === item.tier_id)?.name || item.tier_id}
-                        <small>
-                          {item.access_mode === 'complimentary'
-                            ? 'Admin managed · billing exempt'
-                            : item.active === false
-                              ? 'Inactive membership'
-                              : `${item.account_limit} entitled ${item.account_limit === 1 ? 'account' : 'accounts'}`}
-                        </small>
-                      </td>
-                      <td>
-                        {item.links.length
-                          ? item.links.map((link) => (
-                              <div key={link.membership_slot}>
-                                <strong>{link.username}</strong>
-                                <small>
-                                  Slot {link.membership_slot} ·{' '}
-                                  {link.pending_disabled !== null
-                                    ? 'Access update pending'
-                                    : link.disabled_by_jellyport
-                                      ? 'Disabled by Jellyport · data preserved'
-                                      : 'Linked'}
-                                </small>
-                              </div>
-                            ))
-                          : 'No accounts linked yet'}
-                      </td>
-                      <td className="right">
-                        <button
-                          className="btn btn-quiet"
-                          disabled={busy}
-                          onClick={() =>
-                            selectMember({
-                              id: item.discord_user_id,
-                              username: item.base_username,
-                              display_name: null,
-                              nickname: null,
-                              membership_active: null,
-                            })
-                          }
-                          aria-label={`Manage membership for ${item.base_username}`}
-                        >
-                          Manage
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <Empty
-              icon="discord"
-              title="Give each member their account allowance."
-              text="Select a Discord member above to create or migrate the accounts included in their tier."
-            />
-          )}
-        </section>
+          </section>
+        </TabPanel>
       </div>
       {review && (
         <Modal

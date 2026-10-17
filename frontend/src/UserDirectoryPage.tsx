@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { Callout, Empty, Heading, Icon, Loading, Modal } from './components';
+import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import { safeUrl } from './types';
 import type {
@@ -69,6 +70,9 @@ export default function UserDirectoryPage({
   const [access, setAccess] = useState('all');
   const [family, setFamily] = useState('all');
   const [review, setReview] = useState('all');
+  const [section, setSection] = useState('directory');
+  const [advanced, setAdvanced] = useState(false);
+  const [actionUser, setActionUser] = useState('');
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState<DirectoryUser | null>(null);
   const [profileTarget, setProfileTarget] = useState('');
@@ -161,6 +165,7 @@ export default function UserDirectoryPage({
     }
   }
   function openLink(user: DirectoryUser) {
+    setActionUser('');
     setLinking(user);
     setTarget(user.jellyfin[0]?.id || '');
     setSlot(1);
@@ -186,6 +191,7 @@ export default function UserDirectoryPage({
   function openProfile(user: DirectoryUser) {
     const account = profileAccounts(user)[0];
     if (!account) return;
+    setActionUser('');
     setEditing(user);
     selectProfile(account);
     setError('');
@@ -216,6 +222,7 @@ export default function UserDirectoryPage({
   function openAccessReview(user: DirectoryUser) {
     const target = profileAccounts(user)[0];
     if (!target) return;
+    setActionUser('');
     setAccessReview(user);
     setAccessTarget(target.key);
     setAccessDisabled(!target.account.disabled);
@@ -340,6 +347,15 @@ export default function UserDirectoryPage({
   });
   const filtered =
     search.trim() !== '' || [server, access, family, review].some((value) => value !== 'all');
+  const pagination = usePagination(
+    visible,
+    25,
+    JSON.stringify([search, server, access, family, review]),
+  );
+  useEffect(
+    () => setActionUser(''),
+    [pagination.page, pagination.pageSize, search, server, access, family, review],
+  );
   return (
     <div className="page-stack">
       <Heading
@@ -356,27 +372,43 @@ export default function UserDirectoryPage({
           </>
         }
       />
-      {!loading && reviewCount > 0 && (
-        <Callout
-          warning
-          icon="warning"
-          title={`${reviewCount} ${reviewCount === 1 ? 'user needs' : 'users need'} review`}
-        >
-          These users have accounts without a confirmed Discord owner or a family flag. Review who
-          owns them and how their access should be managed. They will not be automatically disabled.
-          <p>
-            <button className="text-button" onClick={() => setReview('review')}>
-              Show users needing review
-            </button>
-          </p>
-        </Callout>
-      )}
+      <Tabs
+        id="users"
+        label="User management sections"
+        tabs={[
+          { id: 'directory', label: 'Directory', count: loading ? undefined : users.length },
+          { id: 'organization', label: 'Discord organization' },
+        ]}
+        value={section}
+        onChange={(value) => {
+          setSection(value);
+          setActionUser('');
+        }}
+      />
       {error && !linking && !editing && !accessReview && (
         <div className="error-block" role="alert">
           {error}
         </div>
       )}
-      <div className="page-stack">
+      <TabPanel
+        id="users"
+        tabId="directory"
+        active={section === 'directory'}
+        className="page-stack"
+      >
+        {!loading && reviewCount > 0 && (
+          <Callout
+            warning
+            icon="warning"
+            title={`${reviewCount} ${reviewCount === 1 ? 'user needs' : 'users need'} review`}
+          >
+            Confirm an owner or family flag for these accounts. They will not be automatically
+            disabled.{' '}
+            <button className="text-button" onClick={() => setReview('review')}>
+              Show users needing review
+            </button>
+          </Callout>
+        )}
         <section className="panel">
           <div className="panel-header">
             <div>
@@ -388,17 +420,17 @@ export default function UserDirectoryPage({
             {!loading && <span className="status">{users.length} users</span>}
           </div>
           <div className="panel-body form-stack">
-            <div className="field">
-              <label htmlFor="directory-search">Search users</label>
-              <input
-                id="directory-search"
-                type="search"
-                value={search}
-                onChange={(event) => setSearch(event.target.value)}
-                placeholder="Media or Discord username"
-              />
-            </div>
-            <div className="section-grid">
+            <div className="directory-filters">
+              <div className="field">
+                <label htmlFor="directory-search">Search users</label>
+                <input
+                  id="directory-search"
+                  type="search"
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Media or Discord username"
+                />
+              </div>
               <div className="field">
                 <label htmlFor="directory-server">Server presence</label>
                 <select
@@ -414,6 +446,34 @@ export default function UserDirectoryPage({
                   ))}
                 </select>
               </div>
+              <div className="field">
+                <label htmlFor="directory-review">Account review</label>
+                <select
+                  id="directory-review"
+                  value={review}
+                  onChange={(event) => setReview(event.target.value)}
+                >
+                  <option value="all">All users</option>
+                  <option value="review">
+                    Needs review{reviewCount ? ` (${reviewCount})` : ''}
+                  </option>
+                </select>
+              </div>
+              <button
+                className="btn"
+                aria-expanded={advanced}
+                aria-controls="directory-advanced-filters"
+                onClick={() => setAdvanced((value) => !value)}
+              >
+                {advanced ? 'Fewer filters' : 'More filters'}
+                {(access !== 'all' || family !== 'all') && <span className="status">Active</span>}
+              </button>
+            </div>
+            <div
+              id="directory-advanced-filters"
+              className="directory-advanced-filters"
+              hidden={!advanced}
+            >
               <div className="field">
                 <label htmlFor="directory-access">Access policy</label>
                 <select
@@ -443,17 +503,6 @@ export default function UserDirectoryPage({
                   <option value="other">Other users</option>
                 </select>
               </div>
-              <div className="field">
-                <label htmlFor="directory-review">Account review</label>
-                <select
-                  id="directory-review"
-                  value={review}
-                  onChange={(event) => setReview(event.target.value)}
-                >
-                  <option value="all">All users</option>
-                  <option value="review">Needs review</option>
-                </select>
-              </div>
             </div>
             {!loading && (
               <div className="toolbar">
@@ -481,7 +530,10 @@ export default function UserDirectoryPage({
             <Loading />
           ) : visible.length ? (
             <div className="table-wrap">
-              <table aria-label="Media accounts and confirmed ownership">
+              <table
+                className="directory-table"
+                aria-label="Media accounts and confirmed ownership"
+              >
                 <thead>
                   <tr>
                     <th>Emby accounts</th>
@@ -491,9 +543,9 @@ export default function UserDirectoryPage({
                   </tr>
                 </thead>
                 <tbody>
-                  {visible.map((user) => (
+                  {pagination.items.map((user) => (
                     <tr key={user.id}>
-                      <td>
+                      <td data-label="Emby accounts">
                         {user.emby.length
                           ? user.emby.map((account) => (
                               <div className="account-cell" key={account.id}>
@@ -507,7 +559,7 @@ export default function UserDirectoryPage({
                             ))
                           : '—'}
                       </td>
-                      <td>
+                      <td data-label="Jellyfin accounts">
                         {user.jellyfin.length
                           ? user.jellyfin.map((account) => (
                               <div className="account-cell" key={account.id}>
@@ -521,7 +573,7 @@ export default function UserDirectoryPage({
                             ))
                           : '—'}
                       </td>
-                      <td>
+                      <td data-label="Discord owner / access">
                         <strong>
                           {user.discord_username
                             ? `@${user.discord_username}`
@@ -541,44 +593,87 @@ export default function UserDirectoryPage({
                           <small>Protected administrator or template account</small>
                         )}
                       </td>
-                      <td className="right">
-                        <div className="table-actions">
-                          {profileAccounts(user).length > 0 && (
+                      <td className="right" data-label="Actions">
+                        {profileAccounts(user).length > 0 ||
+                        (!user.protected && (user.emby.length > 0 || user.jellyfin.length > 0)) ? (
+                          <div
+                            className="directory-actions"
+                            onKeyDown={(event) => {
+                              if (event.key !== 'Escape' || actionUser !== user.id) return;
+                              event.preventDefault();
+                              setActionUser('');
+                              event.currentTarget
+                                .querySelector<HTMLButtonElement>('button')
+                                ?.focus();
+                            }}
+                          >
                             <button
                               className="btn btn-quiet"
                               disabled={busy}
-                              onClick={() => openProfile(user)}
-                              aria-label={`Family and owner notes for ${profileAccounts(user)[0]!.account.name}`}
+                              aria-expanded={actionUser === user.id}
+                              aria-controls={`directory-actions-${encodeURIComponent(user.id)}`}
+                              aria-label={`Manage ${profileAccounts(user)[0]?.account.name || user.jellyfin[0]?.name || user.emby[0]?.name}`}
+                              onClick={() =>
+                                setActionUser((value) => (value === user.id ? '' : user.id))
+                              }
                             >
-                              Family and notes
+                              Manage <span aria-hidden="true">▾</span>
                             </button>
-                          )}
-                          {profileAccounts(user).length > 0 && (
-                            <button
-                              className="btn btn-quiet"
-                              disabled={busy}
-                              onClick={() => openAccessReview(user)}
-                              aria-label={`Manage account access for ${profileAccounts(user)[0]!.account.name}`}
+                            <div
+                              className="directory-action-menu"
+                              id={`directory-actions-${encodeURIComponent(user.id)}`}
+                              role="group"
+                              aria-label="Account management actions"
+                              hidden={actionUser !== user.id}
                             >
-                              Account access
-                            </button>
-                          )}
-                          {user.jellyfin.length > 0 && !user.protected && (
-                            <button
-                              className="btn btn-quiet"
-                              disabled={busy}
-                              onClick={() => openLink(user)}
-                              aria-label={`Link Discord owner for ${user.jellyfin[0].name}`}
-                            >
-                              Discord owner
-                            </button>
-                          )}
-                          {user.emby.length > 0 && !user.protected && (
-                            <button className="btn btn-quiet" onClick={() => navigate('mappings')}>
-                              User mappings
-                            </button>
-                          )}
-                        </div>
+                              {profileAccounts(user).length > 0 && (
+                                <button
+                                  className="btn btn-quiet"
+                                  disabled={busy}
+                                  onClick={() => openProfile(user)}
+                                  aria-label={`Family and owner notes for ${profileAccounts(user)[0]!.account.name}`}
+                                >
+                                  Family and notes
+                                </button>
+                              )}
+                              {profileAccounts(user).length > 0 && (
+                                <button
+                                  className="btn btn-quiet"
+                                  disabled={busy}
+                                  onClick={() => openAccessReview(user)}
+                                  aria-label={`Manage account access for ${profileAccounts(user)[0]!.account.name}`}
+                                >
+                                  Account access
+                                </button>
+                              )}
+                              {user.jellyfin.length > 0 && !user.protected && (
+                                <button
+                                  className="btn btn-quiet"
+                                  disabled={busy}
+                                  onClick={() => openLink(user)}
+                                  aria-label={`Link Discord owner for ${user.jellyfin[0].name}`}
+                                >
+                                  Discord owner
+                                </button>
+                              )}
+                              {user.emby.length > 0 && !user.protected && (
+                                <button
+                                  className="btn btn-quiet"
+                                  onClick={() => {
+                                    setActionUser('');
+                                    navigate('mappings');
+                                  }}
+                                >
+                                  User mappings
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        ) : (
+                          <span className="section-note">
+                            {user.protected ? 'Protected' : 'No media account'}
+                          </span>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -592,20 +687,43 @@ export default function UserDirectoryPage({
               text="Refresh the directory or change your filters."
             />
           )}
+          {!loading && (
+            <Pagination
+              label="Users"
+              page={pagination.page}
+              total={pagination.total}
+              pageSize={pagination.pageSize}
+              onPageChange={pagination.setPage}
+              onPageSizeChange={pagination.setPageSize}
+            />
+          )}
         </section>
-        <Callout icon="users" title="Discord and subscriptions are optional.">
-          Mark family accounts and record who owns them using Family and owner notes. Family access
-          stays admin-managed, with no Discord or payment requirement. Paying members require a
-          Discord owner. You can also save complimentary access in{' '}
-          <button className="text-button" onClick={() => navigate('memberships')}>
-            Memberships
-          </button>{' '}
-          for other non-paying members. Create independent accounts from{' '}
-          <button className="text-button" onClick={() => navigate('accounts')}>
-            Create account
-          </button>
-          .
-        </Callout>
+        <details className="directory-guidance">
+          <summary>About family accounts and account ownership</summary>
+          <div className="form-stack">
+            <strong>Discord and subscriptions are optional.</strong>
+            <p>
+              Mark family accounts and record who owns them using Family and owner notes. Family
+              access stays admin-managed, with no Discord or payment requirement. Paying members
+              require a Discord owner. You can also save complimentary access in{' '}
+              <button className="text-button" onClick={() => navigate('memberships')}>
+                Memberships
+              </button>{' '}
+              for other non-paying members. Create independent accounts from{' '}
+              <button className="text-button" onClick={() => navigate('accounts')}>
+                Create account
+              </button>
+              .
+            </p>
+          </div>
+        </details>
+      </TabPanel>
+      <TabPanel
+        id="users"
+        tabId="organization"
+        active={section === 'organization'}
+        className="page-stack"
+      >
         <section className="panel">
           <div className="panel-header">
             <div>
@@ -737,7 +855,7 @@ export default function UserDirectoryPage({
             </div>
           )}
         </section>
-      </div>
+      </TabPanel>
       {accessReview && (
         <Modal
           title="Review account access"

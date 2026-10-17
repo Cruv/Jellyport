@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { useState } from 'react';
 import {
   AccountsPage,
   ActivityPage,
@@ -170,6 +171,7 @@ describe('Account page request lifecycle', () => {
       });
     }) as Api;
     const { unmount, created, notify } = page(api);
+    fireEvent.click(screen.getByRole('tab', { name: 'Recover interrupted creation' }));
     fireEvent.change(screen.getByLabelText('Account to inspect'), { target: { value: 'Child' } });
     fireEvent.click(screen.getByRole('button', { name: 'Inspect account' }));
     fireEvent.click(
@@ -201,6 +203,7 @@ describe('Account page request lifecycle', () => {
         reason: 'No tracked incomplete creation.',
       }) as Api;
     const { created } = page(api);
+    fireEvent.click(screen.getByRole('tab', { name: 'Recover interrupted creation' }));
     const username = screen.getByLabelText('Account to inspect');
     fireEvent.change(username, { target: { value: 'Child' } });
     fireEvent.click(screen.getByRole('button', { name: 'Inspect account' }));
@@ -230,6 +233,131 @@ describe('Account page request lifecycle', () => {
 });
 
 describe('Workspace navigation and migration controls', () => {
+  it('keeps a new-account draft when switching to recovery without starting either action', () => {
+    const api = vi.fn() as Api;
+    page(api);
+    fireEvent.change(screen.getByRole('textbox', { name: 'Username' }), {
+      target: { value: 'Family' },
+    });
+    fireEvent.click(screen.getByRole('tab', { name: 'Recover interrupted creation' }));
+    expect(screen.queryByRole('textbox', { name: 'Username' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Inspect account' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: 'New account' }));
+    expect((screen.getByRole('textbox', { name: 'Username' }) as HTMLInputElement).value).toBe(
+      'Family',
+    );
+    expect(api).not.toHaveBeenCalled();
+  });
+
+  it('selects only one migration page at a time, retains other pages, and enforces the batch limit', () => {
+    const users = {
+      emby: Array.from({ length: 120 }, (_, i) => ({
+        Id: `source-${i}`,
+        Name: `Crew${String(i).padStart(3, '0')}`,
+      })),
+      jellyfin: [],
+    };
+    function Batch() {
+      const [selected, select] = useState(new Set<string>());
+      const [search, setSearch] = useState('');
+      return (
+        <MigratePage
+          users={users}
+          overview={overview}
+          selected={selected}
+          select={select}
+          search={search}
+          setSearch={setSearch}
+          preview={vi.fn()}
+          useSnapshots
+          setUseSnapshots={vi.fn()}
+          busy={false}
+          navigate={vi.fn()}
+        />
+      );
+    }
+    render(<Batch />);
+    const nav = screen.getByRole('navigation', { name: 'Emby users' });
+    expect(screen.getAllByRole('row')).toHaveLength(26);
+    for (let i = 0; i < 4; i++) {
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
+      fireEvent.click(within(nav).getByRole('button', { name: 'Next page' }));
+    }
+    expect(
+      (screen.getByRole('checkbox', { name: 'Select Crew100' }) as HTMLInputElement).disabled,
+    ).toBe(true);
+    expect(screen.getByRole('button', { name: 'Preview migration (100)' })).toBeTruthy();
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search Emby users' }), {
+      target: { value: 'Crew000' },
+    });
+    const first = screen.getByRole('checkbox', { name: 'Select Crew000' }) as HTMLInputElement;
+    expect(first.checked).toBe(true);
+    expect(first.disabled).toBe(false);
+    fireEvent.click(first);
+    expect(screen.getByRole('button', { name: 'Preview migration (99)' })).toBeTruthy();
+  });
+
+  it('filters activity across pages and distinguishes no matches from no operations', () => {
+    const jobs = Array.from(
+      { length: 80 },
+      (_, i) => ({ ...job, id: `job-${i}`, status: i === 70 ? 'failed' : 'completed' }) as Job,
+    );
+    render(<ActivityPage jobs={jobs} navigate={vi.fn()} openJob={vi.fn()} refresh={vi.fn()} />);
+    expect(screen.getAllByRole('row')).toHaveLength(26);
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    fireEvent.change(screen.getByRole('combobox', { name: 'Status' }), {
+      target: { value: 'failed' },
+    });
+    expect(screen.getAllByRole('row')).toHaveLength(2);
+    expect(screen.getByText('1–1 of 1')).toBeTruthy();
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Search operations' }), {
+      target: { value: 'nonexistent' },
+    });
+    expect(screen.getByText('No matching operations')).toBeTruthy();
+    expect(screen.queryByText('A fresh start')).toBeNull();
+  });
+
+  it('separates actionable subscriptions from processed events without changing them', () => {
+    const events = [
+      {
+        id: 'pending',
+        action: 'subscribe',
+        status: 'pending',
+        username: 'NewCrew',
+        created_at: '2026-10-08T12:00:00Z',
+      },
+      {
+        id: 'processed',
+        action: 'subscribe',
+        status: 'ignored',
+        username: 'OldCrew',
+        created_at: '2026-10-08T12:00:00Z',
+      },
+    ] as SubscriptionEvent[];
+    const review = vi.fn();
+    const ignore = vi.fn();
+    render(
+      <SubscriptionsPage
+        events={events}
+        navigate={vi.fn()}
+        openJob={vi.fn()}
+        refresh={vi.fn()}
+        review={review}
+        ignore={ignore}
+        busy={false}
+      />,
+    );
+    expect(screen.getByText('NewCrew')).toBeTruthy();
+    expect(screen.queryByText('OldCrew')).toBeNull();
+    fireEvent.click(screen.getByRole('tab', { name: 'Processed' }));
+    expect(screen.getByText('OldCrew')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Review' })).toBeNull();
+    fireEvent.click(screen.getByRole('tab', { name: 'All events' }));
+    expect(screen.getByText('NewCrew')).toBeTruthy();
+    expect(screen.getByText('OldCrew')).toBeTruthy();
+    expect(review).not.toHaveBeenCalled();
+    expect(ignore).not.toHaveBeenCalled();
+  });
   it('makes the overview task actions direct and keeps server readiness visible', () => {
     const navigate = vi.fn();
     render(
@@ -269,12 +397,13 @@ describe('Workspace navigation and migration controls', () => {
     };
     const { rerender } = render(<MigratePage {...props} />);
     expect(screen.getByRole('heading', { level: 1, name: 'Migrate users' })).toBeTruthy();
-    expect(screen.getByText(/missing or expired snapshots stop the preview/)).toBeTruthy();
+    expect(screen.getByText(/Missing data stops the preview/)).toBeTruthy();
     expect(preview).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('checkbox', { name: 'Select all visible Emby users' }));
     expect(select).toHaveBeenCalledWith(new Set(['source-two', 'source-one']));
     fireEvent.click(screen.getByRole('checkbox', { name: 'Use saved Emby snapshot' }));
     expect(setUseSnapshots).toHaveBeenCalledWith(false);
+    fireEvent.click(screen.getByText('What is migrated', { selector: 'summary' }));
     fireEvent.click(screen.getByRole('button', { name: 'User mappings' }));
     expect(navigate).toHaveBeenCalledWith('mappings');
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (1)' }));

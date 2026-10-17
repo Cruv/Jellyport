@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Callout, Empty, Heading, Icon, JobsTable, Status, UserCell } from './components';
 import { ConnectionRows, UserWarnings } from './SettingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
+import { Pagination, Tabs, TabPanel, usePagination } from './ui-layout';
 import {
   activeJob,
   date,
@@ -91,97 +92,80 @@ export function OverviewPage({
           </div>
         ))}
       </div>
-      <div className="form-layout">
-        <div className="stack">
-          <section className="panel">
-            <div className="panel-header">
-              <div>
-                <h2>Server connections</h2>
-                <p>Connection status for your media servers and Discord bot.</p>
-              </div>
-              <button className="btn btn-small btn-quiet" onClick={() => navigate('settings')}>
-                Manage
-              </button>
+      <div className="overview-grid">
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <h2>Server connections</h2>
+              <p>Connection status for your media servers and Discord bot.</p>
             </div>
-            <ConnectionRows connections={data.connections} />
-          </section>
-          <section className="panel">
-            <div className="panel-header">
-              <div>
-                <h2>Recent activity</h2>
-                <p>Your latest migrations and account changes.</p>
-              </div>
-              <button className="text-button" onClick={() => navigate('activity')}>
-                View all
-              </button>
-            </div>
-            <JobsTable
-              jobs={data.recent_jobs}
-              compact
-              openJob={openJob}
-              migrate={() => navigate('migrate')}
-            />
-          </section>
-        </div>
-        <div className="stack">
-          <section className="panel">
-            <div className="panel-header">
-              <h2>Account management</h2>
-            </div>
-            <div className="quick-actions">
-              {[
-                {
-                  page: 'migrate' as Page,
-                  icon: 'migrate',
-                  title: 'Migrate existing users',
-                  text: 'Bring played status into Jellyfin.',
-                },
-                {
-                  page: 'accounts' as Page,
-                  icon: 'userPlus',
-                  title: 'Create an account',
-                  text: 'Apply your saved account defaults.',
-                },
-                {
-                  page: 'subscriptions' as Page,
-                  icon: 'inbox',
-                  title: 'Review subscriptions',
-                  text: 'Approve incoming membership events.',
-                },
-              ].map((action) => (
-                <button
-                  className="quick-action"
-                  onClick={() => navigate(action.page)}
-                  key={action.page}
-                >
-                  <Icon name={action.icon} />
-                  <span>
-                    <strong>{action.title}</strong>
-                    <small>{action.text}</small>
-                  </span>
-                  <Icon name="chevron" />
-                </button>
-              ))}
-            </div>
-          </section>
-          <section className="panel">
-            <div className="panel-header">
-              <h2>Migration safeguards</h2>
-            </div>
-            <div className="panel-body form-stack">
-              <p className="section-note">
-                Preview the match before you migrate. Existing Jellyfin activity is preserved as
-                Emby watched flags are added.
-              </p>
-              <div>
-                <span className={`status ${ready ? 'good' : ''}`}>
-                  {ready ? 'Servers are ready' : 'Configure servers to begin'}
+            <button className="btn btn-small btn-quiet" onClick={() => navigate('settings')}>
+              Manage
+            </button>
+          </div>
+          <ConnectionRows connections={data.connections} />
+        </section>
+        <section className="panel">
+          <div className="panel-header">
+            <h2>Account management</h2>
+          </div>
+          <div className="quick-actions">
+            {[
+              {
+                page: 'migrate' as Page,
+                icon: 'migrate',
+                title: 'Migrate existing users',
+                text: 'Bring played status into Jellyfin.',
+              },
+              {
+                page: 'accounts' as Page,
+                icon: 'userPlus',
+                title: 'Create an account',
+                text: 'Apply your saved account defaults.',
+              },
+              {
+                page: 'subscriptions' as Page,
+                icon: 'inbox',
+                title: 'Review subscriptions',
+                text: 'Approve incoming membership events.',
+              },
+            ].map((action) => (
+              <button
+                className="quick-action"
+                onClick={() => navigate(action.page)}
+                key={action.page}
+              >
+                <Icon name={action.icon} />
+                <span>
+                  <strong>{action.title}</strong>
+                  <small>{action.text}</small>
                 </span>
-              </div>
-            </div>
-          </section>
-        </div>
+                <Icon name="chevron" />
+              </button>
+            ))}
+          </div>
+        </section>
       </div>
+      <section className="panel">
+        <div className="panel-header">
+          <h2>Recent activity</h2>
+          <button className="text-button" onClick={() => navigate('activity')}>
+            View all
+          </button>
+        </div>
+        <JobsTable
+          jobs={data.recent_jobs.slice(0, 5)}
+          compact
+          openJob={openJob}
+          migrate={() => navigate('migrate')}
+        />
+      </section>
+      <p className="section-note">
+        <span className={`status ${ready ? 'good' : ''}`}>
+          {ready ? 'Servers are ready' : 'Configure servers to begin'}
+        </span>{' '}
+        Migration reviews protect existing Jellyfin activity before any played flags are added.
+      </p>
     </div>
   );
 }
@@ -213,13 +197,14 @@ export function MigratePage({
   const filtered = users.emby.filter((user) =>
     user.Name.toLowerCase().includes(search.trim().toLowerCase()),
   );
+  const pagination = usePagination(filtered, 25, search.trim().toLowerCase());
   const targets = new Set(users.jellyfin.map((user) => user.Name.toLowerCase()));
   const all = useRef<HTMLInputElement>(null);
-  const selectedVisible = filtered.filter((user) => selected.has(user.Id)).length;
+  const selectedVisible = pagination.items.filter((user) => selected.has(user.Id)).length;
   useEffect(() => {
     if (all.current)
-      all.current.indeterminate = selectedVisible > 0 && selectedVisible < filtered.length;
-  }, [selectedVisible, filtered.length]);
+      all.current.indeterminate = selectedVisible > 0 && selectedVisible < pagination.items.length;
+  }, [selectedVisible, pagination.items.length]);
   return (
     <div className="page-stack">
       <Heading
@@ -230,7 +215,7 @@ export function MigratePage({
             id="preview-migration"
             className="btn btn-primary"
             onClick={preview}
-            disabled={!selected.size || busy}
+            disabled={!selected.size || selected.size > 100 || busy}
           >
             {busy ? <span className="spinner" /> : <Icon name="migrate" />}
             {busy
@@ -261,7 +246,24 @@ export function MigratePage({
           before starting a migration.
         </Callout>
       )}
-      <div className="form-layout">
+      <div className="migration-options">
+        <label className="check-label">
+          <input
+            type="checkbox"
+            className="checkbox"
+            checked={useSnapshots}
+            onChange={(event) => setUseSnapshots(event.target.checked)}
+            disabled={busy}
+            aria-describedby="migration-snapshot-help"
+          />
+          Use saved Emby snapshot
+        </label>
+        <span id="migration-snapshot-help" className="section-note">
+          Saved history must be current and cover every selected user. Missing data stops the
+          preview.
+        </span>
+      </div>
+      <div className="page-stack">
         <section className="panel">
           <div className="panel-header">
             <div>
@@ -281,36 +283,45 @@ export function MigratePage({
                 onChange={(event) => setSearch(event.target.value)}
               />
             </div>
-            <span className="selection-info">{num(selected.size)} selected</span>
+            <div className="migration-selection">
+              <label className="check-label">
+                <input
+                  ref={all}
+                  className="checkbox"
+                  type="checkbox"
+                  aria-label="Select all visible Emby users"
+                  checked={!!pagination.items.length && selectedVisible === pagination.items.length}
+                  disabled={
+                    busy ||
+                    (selectedVisible < pagination.items.length &&
+                      selected.size + pagination.items.length - selectedVisible > 100)
+                  }
+                  onChange={(event) => {
+                    const next = new Set(selected);
+                    pagination.items.forEach((user) =>
+                      event.target.checked ? next.add(user.Id) : next.delete(user.Id),
+                    );
+                    select(next);
+                  }}
+                />
+                Select this page
+              </label>
+              <span className="selection-info">{num(selected.size)} selected</span>
+            </div>
           </div>
           {filtered.length ? (
             <div className="table-wrap">
-              <table>
+              <table className="responsive-table migration-table">
                 <thead>
                   <tr>
-                    <th className="check-col">
-                      <input
-                        ref={all}
-                        className="checkbox"
-                        type="checkbox"
-                        aria-label="Select all visible Emby users"
-                        checked={!!filtered.length && selectedVisible === filtered.length}
-                        onChange={(event) => {
-                          const next = new Set(selected);
-                          filtered.forEach((user) =>
-                            event.target.checked ? next.add(user.Id) : next.delete(user.Id),
-                          );
-                          select(next);
-                        }}
-                      />
-                    </th>
+                    <th className="check-col" aria-label="Selection" />
                     <th>Username</th>
                     <th>Jellyfin account</th>
                     <th className="right">Emby access</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filtered.map((user) => (
+                  {pagination.items.map((user) => (
                     <tr key={user.Id}>
                       <td className="check-col">
                         <input
@@ -318,6 +329,7 @@ export function MigratePage({
                           type="checkbox"
                           aria-label={`Select ${user.Name}`}
                           checked={selected.has(user.Id)}
+                          disabled={busy || (!selected.has(user.Id) && selected.size >= 100)}
                           onChange={(event) => {
                             const next = new Set(selected);
                             if (event.target.checked) next.add(user.Id);
@@ -326,10 +338,10 @@ export function MigratePage({
                           }}
                         />
                       </td>
-                      <td>
+                      <td data-label="Username">
                         <UserCell name={user.Name} />
                       </td>
-                      <td>
+                      <td data-label="Jellyfin">
                         <span
                           className={`status ${targets.has(user.Name.toLowerCase()) ? '' : 'good'}`}
                         >
@@ -338,7 +350,7 @@ export function MigratePage({
                             : 'Will be created'}
                         </span>
                       </td>
-                      <td className="right">
+                      <td className="right" data-label="Emby access">
                         <span className="subtle">
                           {user.Policy?.IsDisabled
                             ? 'Disabled'
@@ -381,63 +393,41 @@ export function MigratePage({
               Clear selection
             </button>
           </div>
+          <Pagination
+            label="Emby users"
+            page={pagination.page}
+            total={pagination.total}
+            pageSize={pagination.pageSize}
+            onPageChange={pagination.setPage}
+            onPageSizeChange={pagination.setPageSize}
+          />
         </section>
-        <aside className="stack">
-          <section className="panel">
-            <div className="panel-header">
-              <h2>Migration settings</h2>
-            </div>
-            <div className="panel-body form-stack">
-              <div className="field">
-                <label className="check-label">
-                  <input
-                    className="checkbox"
-                    type="checkbox"
-                    checked={useSnapshots}
-                    onChange={(event) => setUseSnapshots(event.target.checked)}
-                    disabled={busy}
-                    aria-describedby="migration-snapshot-help"
-                  />
-                  Use saved Emby snapshot
-                </label>
-                <small id="migration-snapshot-help">
-                  Previews check accounts and backup freshness without scanning libraries; matching
-                  and played flags are read only after approval. Migrations pause between source
-                  requests to protect playback. Saved snapshots must cover every selected account
-                  and be current enough; missing or expired snapshots stop the preview. File copies
-                  provide best-effort saved history.
-                </small>
-              </div>
-              <p className="section-note">
-                Set username exceptions in{' '}
-                <button className="text-button" onClick={() => navigate('mappings')}>
-                  User mappings
-                </button>
-                .
-              </p>
-            </div>
-          </section>
-          <section className="panel aside-panel">
-            <div className="panel-header">
-              <h2>What is migrated</h2>
-            </div>
-            <div className="panel-body">
-              <p>
-                Only played or unplayed status is migrated. Existing Jellyfin resume positions and
-                other personal state stay unchanged.
-              </p>
-              <ul>
-                <li>The same username, or your saved user mapping</li>
-                <li>Played status for matched movies and episodes</li>
-                <li>Saved account defaults for new accounts</li>
-                <li>A generated password for each new account</li>
-              </ul>
-            </div>
-            <div className="aside-footer">
-              Existing accounts keep their passwords. Unmatched items are reported for review.
-            </div>
-          </section>
-        </aside>
+        <details className="help-details">
+          <summary>What is migrated</summary>
+          <div className="help-body form-stack">
+            <p>
+              Only played or unplayed status is migrated. Existing Jellyfin resume positions and
+              other personal state stay unchanged.
+            </p>
+            <p>
+              New accounts use saved defaults and receive a generated password. Existing accounts
+              keep their passwords and permissions. Unmatched or ambiguous items are reported for
+              review.
+            </p>
+            <p>
+              Previews check accounts and backup freshness without scanning libraries; matching and
+              played flags are read only after approval. Migrations pause between source requests to
+              protect playback. File copies provide best-effort saved history.
+            </p>
+            <p>
+              Set username exceptions in{' '}
+              <button type="button" className="text-button" onClick={() => navigate('mappings')}>
+                User mappings
+              </button>
+              .
+            </p>
+          </div>
+        </details>
       </div>
     </div>
   );
@@ -458,6 +448,7 @@ export function AccountsPage({
   navigate: (page: Page) => void;
 }) {
   const [busy, setBusy] = useState('');
+  const [task, setTask] = useState('create');
   const [accountUsername, setAccountUsername] = useState('');
   const [accountMember, setAccountMember] = useState<DiscordMember | null>(null);
   const [recoveryUsername, setRecoveryUsername] = useState('');
@@ -596,223 +587,218 @@ export function AccountsPage({
           .
         </Callout>
       )}
-      <div className="form-layout">
-        <section className="panel">
-          <div className="panel-header">
-            <div>
-              <h2>Account details</h2>
-              <p>For new members, family, and children without an Emby account.</p>
+      <Tabs
+        id="account-task"
+        label="Account task"
+        tabs={[
+          { id: 'create', label: 'New account' },
+          { id: 'recover', label: 'Recover interrupted creation' },
+        ]}
+        value={task}
+        onChange={setTask}
+      />
+      <TabPanel id="account-task" tabId="create" active={task === 'create'}>
+        <div className="task-panel">
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <h2>Account details</h2>
+                <p>For new members, family, and children without an Emby account.</p>
+              </div>
+              <span className="server-icon jellyfin">
+                <Icon name="userPlus" />
+              </span>
             </div>
-            <span className="server-icon jellyfin">
-              <Icon name="userPlus" />
-            </span>
+            <div className="panel-body">
+              <form className="form-stack" onSubmit={create}>
+                <div className="field">
+                  <label htmlFor="account-username">Username</label>
+                  <input
+                    id="account-username"
+                    name="username"
+                    value={accountUsername}
+                    onChange={(event) => setAccountUsername(event.target.value)}
+                    placeholder="Enter a username"
+                    required
+                    maxLength={64}
+                    autoComplete="off"
+                  />
+                  <small>
+                    Selecting a Discord member fills in their actual username automatically.
+                  </small>
+                </div>
+                <DiscordMemberPicker
+                  api={api}
+                  value={accountMember}
+                  onChange={(member) => {
+                    setAccountMember(member);
+                    if (member) setAccountUsername(member.username);
+                  }}
+                  suggestedQuery={accountUsername}
+                  disabled={!!busy}
+                  label="Discord member (optional)"
+                  allowInactive
+                  id="account-discord"
+                  inputName="discord_user_id"
+                />
+                <div className="form-stack">
+                  <p className="section-note">
+                    {overview.connections.discord.connected
+                      ? 'Jellyport will privately message this member with their credentials.'
+                      : 'Connect your Discord bot in Settings to enable private account delivery.'}
+                  </p>
+                  <p className="section-note">
+                    Leave Discord blank for an independent, admin-managed account with no
+                    subscription requirement. For non-paying Discord members, save complimentary
+                    access in Memberships first.
+                  </p>
+                </div>
+                <ManualDiscordId id="account-manual-discord" disabled={!!busy || !!accountMember} />
+                <Callout
+                  icon="key"
+                  title="A password will be generated automatically."
+                  className="mb-0"
+                >
+                  You can reveal it once after the account is created. If delivery fails, the
+                  operation will show the reason.
+                </Callout>
+                <div className="form-actions">
+                  <button type="submit" className="btn btn-primary" disabled={!ready || !!busy}>
+                    {busy === 'create' ? <span className="spinner" /> : <Icon name="userPlus" />}
+                    {busy === 'create' ? 'Creating account…' : 'Create account'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </section>
+          <details className="help-details">
+            <summary>Account defaults and delivery</summary>
+            <div className="help-body form-stack">
+              <p>
+                New accounts receive your default role’s saved settings, or your fallback Jellyfin
+                template. Credentials can be revealed once or delivered privately through Discord.
+              </p>
+              <p>
+                Discord IDs keep membership links stable when names change. Leave Discord blank for
+                an independent, admin-managed account. Set complimentary access in Memberships for
+                non-paying Discord members.
+              </p>
+              <p>
+                Already using Emby?{' '}
+                <button type="button" className="text-button" onClick={() => navigate('migrate')}>
+                  Migrate users
+                </button>{' '}
+                to preserve their username and played history.
+              </p>
+            </div>
+          </details>
+        </div>
+      </TabPanel>
+      <TabPanel id="account-task" tabId="recover" active={task === 'recover'}>
+        <section className="panel task-panel">
+          <div className="panel-header">
+            <h2>Recover an interrupted account creation</h2>
           </div>
           <div className="panel-body">
-            <form className="form-stack" onSubmit={create}>
-              <div className="field">
-                <label htmlFor="account-username">Username</label>
-                <input
-                  id="account-username"
-                  name="username"
-                  value={accountUsername}
-                  onChange={(event) => setAccountUsername(event.target.value)}
-                  placeholder="Enter a username"
-                  required
-                  maxLength={64}
-                  autoComplete="off"
+            <p className="section-note">
+              If a creation request timed out after reaching Jellyfin, inspect the resulting account
+              before retrying. Recovery is available only for an incomplete creation tracked by
+              Jellyport.
+            </p>
+            <form
+              onSubmit={inspect}
+              onInput={() => {
+                recoveryVersion.current++;
+                setRecovery(null);
+                setApproved(false);
+              }}
+            >
+              <div className="field-row">
+                <div className="field">
+                  <label htmlFor="recovery-username">Account to inspect</label>
+                  <input
+                    id="recovery-username"
+                    name="username"
+                    value={recoveryUsername}
+                    onChange={(event) => setRecoveryUsername(event.target.value)}
+                    required
+                    maxLength={64}
+                    placeholder="Exact Jellyfin username"
+                    autoComplete="off"
+                  />
+                </div>
+                <DiscordMemberPicker
+                  api={api}
+                  value={recoveryMember}
+                  onChange={(member) => {
+                    recoveryVersion.current++;
+                    setRecovery(null);
+                    setApproved(false);
+                    setRecoveryMember(member);
+                  }}
+                  suggestedQuery={recoveryUsername}
+                  disabled={!!busy}
+                  label="Recovery Discord member (optional)"
+                  id="recovery-discord"
+                  inputName="discord_user_id"
                 />
-                <small>
-                  Selecting a Discord member fills in their actual username automatically.
-                </small>
               </div>
-              <DiscordMemberPicker
-                api={api}
-                value={accountMember}
-                onChange={(member) => {
-                  setAccountMember(member);
-                  if (member) setAccountUsername(member.username);
-                }}
-                suggestedQuery={accountUsername}
-                disabled={!!busy}
-                label="Discord member (optional)"
-                allowInactive
-                id="account-discord"
-                inputName="discord_user_id"
-              />
-              <div className="form-stack">
-                <p className="section-note">
-                  {overview.connections.discord.connected
-                    ? 'Jellyport will privately message this member with their credentials.'
-                    : 'Connect your Discord bot in Settings to enable private account delivery.'}
-                </p>
-                <p className="section-note">
-                  Leave Discord blank for an independent, admin-managed account with no subscription
-                  requirement. For non-paying Discord members, save complimentary access in
-                  Memberships first.
-                </p>
-              </div>
-              <ManualDiscordId id="account-manual-discord" disabled={!!busy || !!accountMember} />
-              <Callout
-                icon="key"
-                title="A password will be generated automatically."
-                className="mb-0"
-              >
-                You can reveal it once after the account is created. If delivery fails, the
-                operation will show the reason.
-              </Callout>
+              <ManualDiscordId id="recovery-manual-discord" disabled={!!busy || !!recoveryMember} />
               <div className="form-actions">
-                <button type="submit" className="btn btn-primary" disabled={!ready || !!busy}>
-                  {busy === 'create' ? <span className="spinner" /> : <Icon name="userPlus" />}
-                  {busy === 'create' ? 'Creating account…' : 'Create account'}
+                <button className="btn btn-quiet" type="submit" disabled={!!busy}>
+                  {busy === 'inspect' ? <span className="spinner" /> : <Icon name="search" />}
+                  {busy === 'inspect' ? 'Inspecting…' : 'Inspect account'}
                 </button>
               </div>
             </form>
+            <div className="recovery-result" aria-live="polite">
+              {recovery && (
+                <>
+                  <Callout
+                    icon={recovery.eligible ? 'warning' : 'info'}
+                    warning={recovery.eligible}
+                    title={`${recovery.username} · ${recovery.eligible ? 'Eligible for recovery' : 'Recovery unavailable'}`}
+                  >
+                    {recovery.reason}
+                    {recovery.target_user_id && (
+                      <span className="recovery-target mono">
+                        Jellyfin account ID: {recovery.target_user_id}
+                      </span>
+                    )}
+                  </Callout>
+                  {recovery.eligible && (
+                    <>
+                      <label className="approval-check">
+                        <input
+                          type="checkbox"
+                          className="checkbox"
+                          checked={approved}
+                          onChange={(event) => setApproved(event.target.checked)}
+                        />
+                        <span>
+                          I inspected this Jellyfin account and approve a new password and account
+                          defaults.
+                        </span>
+                      </label>
+                      <div className="form-actions">
+                        <button
+                          className="btn btn-danger"
+                          type="button"
+                          onClick={recover}
+                          disabled={!approved || !!busy}
+                        >
+                          {busy === 'recover' && <span className="spinner" />}
+                          {busy === 'recover' ? 'Recovering…' : 'Recover account'}
+                        </button>
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
           </div>
         </section>
-        <aside className="stack">
-          <section className="panel">
-            <div className="panel-header">
-              <h2>Account defaults and delivery</h2>
-            </div>
-            <div className="panel-body">
-              {[
-                {
-                  icon: 'shield',
-                  title: 'Your account defaults',
-                  text: 'New accounts receive your default role’s saved settings, or your fallback Jellyfin template when no default role is selected.',
-                },
-                {
-                  icon: 'discord',
-                  title: 'A stable Discord link',
-                  text: 'Discord user IDs keep each membership linked to its Jellyfin account. The initial username is preserved even if their Discord name changes.',
-                },
-                {
-                  icon: 'lock',
-                  title: 'Private credential delivery',
-                  text: 'Credentials are sent by direct message. Members should change their password after signing in.',
-                },
-              ].map((row) => (
-                <div className="command-row" key={row.icon}>
-                  <Icon name={row.icon} />
-                  <strong className="command-title">{row.title}</strong>
-                  <p>{row.text}</p>
-                </div>
-              ))}
-            </div>
-          </section>
-          <Callout icon="migrate" title="Already using Emby?">
-            Use{' '}
-            <button className="text-button" onClick={() => navigate('migrate')}>
-              Migrate users
-            </button>{' '}
-            to keep their username and played history.
-          </Callout>
-        </aside>
-      </div>
-      <details className="panel recovery-panel">
-        <summary>
-          <Icon name="refresh" />
-          Recover an interrupted account creation
-        </summary>
-        <div className="panel-body">
-          <p className="section-note">
-            If a creation request timed out after reaching Jellyfin, inspect the resulting account
-            before retrying. Recovery is available only for an incomplete creation tracked by
-            Jellyport.
-          </p>
-          <form
-            onSubmit={inspect}
-            onInput={() => {
-              recoveryVersion.current++;
-              setRecovery(null);
-              setApproved(false);
-            }}
-          >
-            <div className="field-row">
-              <div className="field">
-                <label htmlFor="recovery-username">Account to inspect</label>
-                <input
-                  id="recovery-username"
-                  name="username"
-                  value={recoveryUsername}
-                  onChange={(event) => setRecoveryUsername(event.target.value)}
-                  required
-                  maxLength={64}
-                  placeholder="Exact Jellyfin username"
-                  autoComplete="off"
-                />
-              </div>
-              <DiscordMemberPicker
-                api={api}
-                value={recoveryMember}
-                onChange={(member) => {
-                  recoveryVersion.current++;
-                  setRecovery(null);
-                  setApproved(false);
-                  setRecoveryMember(member);
-                }}
-                suggestedQuery={recoveryUsername}
-                disabled={!!busy}
-                label="Recovery Discord member (optional)"
-                id="recovery-discord"
-                inputName="discord_user_id"
-              />
-            </div>
-            <ManualDiscordId id="recovery-manual-discord" disabled={!!busy || !!recoveryMember} />
-            <div className="form-actions">
-              <button className="btn btn-quiet" type="submit" disabled={!!busy}>
-                {busy === 'inspect' ? <span className="spinner" /> : <Icon name="search" />}
-                {busy === 'inspect' ? 'Inspecting…' : 'Inspect account'}
-              </button>
-            </div>
-          </form>
-          <div className="recovery-result" aria-live="polite">
-            {recovery && (
-              <>
-                <Callout
-                  icon={recovery.eligible ? 'warning' : 'info'}
-                  warning={recovery.eligible}
-                  title={`${recovery.username} · ${recovery.eligible ? 'Eligible for recovery' : 'Recovery unavailable'}`}
-                >
-                  {recovery.reason}
-                  {recovery.target_user_id && (
-                    <span className="recovery-target mono">
-                      Jellyfin account ID: {recovery.target_user_id}
-                    </span>
-                  )}
-                </Callout>
-                {recovery.eligible && (
-                  <>
-                    <label className="approval-check">
-                      <input
-                        type="checkbox"
-                        className="checkbox"
-                        checked={approved}
-                        onChange={(event) => setApproved(event.target.checked)}
-                      />
-                      <span>
-                        I inspected this Jellyfin account and approve a new password and account
-                        defaults.
-                      </span>
-                    </label>
-                    <div className="form-actions">
-                      <button
-                        className="btn btn-danger"
-                        type="button"
-                        onClick={recover}
-                        disabled={!approved || !!busy}
-                      >
-                        {busy === 'recover' && <span className="spinner" />}
-                        {busy === 'recover' ? 'Recovering…' : 'Recover account'}
-                      </button>
-                    </div>
-                  </>
-                )}
-              </>
-            )}
-          </div>
-        </div>
-      </details>
+      </TabPanel>
     </div>
   );
 }
@@ -843,6 +829,16 @@ export function ActivityPage({
   openJob,
   navigate,
 }: Common & { jobs: Job[]; refresh: () => void }) {
+  const [query, setQuery] = useState('');
+  const [status, setStatus] = useState('all');
+  const filtered = jobs.filter(
+    (job) =>
+      (status === 'all' || (status === 'active' ? activeJob(job) : job.status === status)) &&
+      `${job.kind} ${job.id} ${job.results?.map((item) => item.username).join(' ') ?? ''}`
+        .toLowerCase()
+        .includes(query.trim().toLowerCase()),
+  );
+  const pagination = usePagination(filtered, 25, `${status}:${query}`);
   const count = jobs.filter(activeJob).length;
   return (
     <div className="page-stack">
@@ -870,7 +866,42 @@ export function ActivityPage({
             {num(jobs.length)} {jobs.length === 1 ? 'operation' : 'operations'}
           </span>
         </div>
-        <JobsTable jobs={jobs} openJob={openJob} migrate={() => navigate('migrate')} />
+        <div className="view-toolbar">
+          <label className="field toolbar-search">
+            Search operations
+            <input
+              type="search"
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Username, operation, or job ID"
+            />
+          </label>
+          <label className="field">
+            Status
+            <select value={status} onChange={(event) => setStatus(event.target.value)}>
+              <option value="all">All operations</option>
+              <option value="active">Running or queued</option>
+              <option value="completed">Completed</option>
+              <option value="partial">Needs review</option>
+              <option value="failed">Failed</option>
+              <option value="canceled">Canceled</option>
+            </select>
+          </label>
+        </div>
+        <JobsTable
+          jobs={pagination.items}
+          filtered={query.trim() !== '' || status !== 'all'}
+          openJob={openJob}
+          migrate={() => navigate('migrate')}
+        />
+        <Pagination
+          label="Operations"
+          page={pagination.page}
+          total={pagination.total}
+          pageSize={pagination.pageSize}
+          onPageChange={pagination.setPage}
+          onPageSizeChange={pagination.setPageSize}
+        />
         <div className="table-footer">
           <span>Newest first</span>
           <span>Credentials are available through an explicit, one-time reveal.</span>
@@ -894,6 +925,17 @@ export function SubscriptionsPage({
   ignore: (event: SubscriptionEvent) => void;
   busy: boolean;
 }) {
+  const [scope, setScope] = useState('review');
+  const [query, setQuery] = useState('');
+  const needsReview = (event: SubscriptionEvent) => ['pending', 'failed'].includes(event.status);
+  const filtered = events.filter(
+    (event) =>
+      (scope === 'all' || (scope === 'review' ? needsReview(event) : !needsReview(event))) &&
+      `${event.username ?? ''} ${event.discord_user_id ?? ''} ${event.detail ?? ''}`
+        .toLowerCase()
+        .includes(query.trim().toLowerCase()),
+  );
+  const pagination = usePagination(filtered, 25, `${scope}:${query}`);
   const pending = events.filter((event) => event.status === 'pending').length;
   const names: Record<string, string> = {
     subscribe: 'Subscribed',
@@ -917,109 +959,164 @@ export function SubscriptionsPage({
           </>
         }
       />
-      <Callout icon="shield" title="Review before applying account changes">
-        Automatic creation and disabling are off by default. A subscription cancellation and an
-        access expiration can be handled separately in Settings.
-      </Callout>
-      <section className="panel">
-        <div className="panel-header">
-          <div>
-            <h2>Subscription events</h2>
-            <p>
-              {pending
-                ? `${num(pending)} ${pending === 1 ? 'event is' : 'events are'} waiting for review.`
-                : 'Events appear when your configured Discord integration receives a membership change.'}
-            </p>
-          </div>
-          <span className={`status ${pending ? 'warn' : ''}`}>{num(pending)} pending</span>
+      <Tabs
+        id="subscription-queue"
+        label="Subscription view"
+        tabs={[
+          { id: 'review', label: 'Needs review', count: events.filter(needsReview).length },
+          { id: 'history', label: 'Processed' },
+          { id: 'all', label: 'All events' },
+        ]}
+        value={scope}
+        onChange={setScope}
+      />
+      <div className="view-toolbar">
+        <label className="field toolbar-search">
+          Search subscription events
+          <input
+            type="search"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Member or plan"
+          />
+        </label>
+      </div>
+      {['review', 'history', 'all'].map((tab) => (
+        <TabPanel key={tab} id="subscription-queue" tabId={tab} active={scope === tab}>
+          {scope === tab && (
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h2>Subscription events</h2>
+                  <p>
+                    {pending
+                      ? `${num(pending)} ${pending === 1 ? 'event is' : 'events are'} waiting for review.`
+                      : 'Events appear when your configured Discord integration receives a membership change.'}
+                  </p>
+                </div>
+                <span className={`status ${pending ? 'warn' : ''}`}>{num(pending)} pending</span>
+              </div>
+              {filtered.length ? (
+                <div className="table-wrap">
+                  <table className="responsive-table">
+                    <thead>
+                      <tr>
+                        <th>Member</th>
+                        <th>Event</th>
+                        <th>Status</th>
+                        <th>Received</th>
+                        <th className="right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pagination.items.map((event) => (
+                        <tr key={event.id}>
+                          <td data-label="Member">
+                            <strong>{event.username || 'Discord member'}</strong>
+                            <small>{event.discord_user_id}</small>
+                            {event.error && <small className="red">{event.error}</small>}
+                          </td>
+                          <td data-label="Event">
+                            <span>{names[event.action] || event.action}</span>
+                            <small>
+                              {event.source === 'mee6_message'
+                                ? 'MEE6 announcement'
+                                : event.source || 'Discord'}
+                            </small>
+                            {event.action === 'subscribe' &&
+                              event.source === 'mee6_message' &&
+                              event.detail && <small>Plan: {event.detail}</small>}
+                            {event.account_limit !== undefined && (
+                              <small>
+                                {event.account_limit} entitled{' '}
+                                {event.account_limit === 1 ? 'account' : 'accounts'}
+                              </small>
+                            )}
+                          </td>
+                          <td data-label="Status">
+                            <Status value={event.status} />
+                          </td>
+                          <td className="nowrap" data-label="Received">
+                            {date(event.created_at)}
+                          </td>
+                          <td className="right nowrap" data-label="Actions">
+                            {['pending', 'failed'].includes(event.status) ? (
+                              <div className="row-actions">
+                                <button
+                                  className="btn btn-small btn-quiet"
+                                  disabled={busy}
+                                  onClick={() => ignore(event)}
+                                >
+                                  Ignore
+                                </button>
+                                <button
+                                  className="btn btn-small btn-primary"
+                                  disabled={busy}
+                                  onClick={() => review(event)}
+                                >
+                                  Review
+                                </button>
+                              </div>
+                            ) : event.job_id ? (
+                              <button
+                                className="btn btn-small btn-quiet"
+                                onClick={() => openJob(event.job_id!)}
+                              >
+                                View operation
+                              </button>
+                            ) : (
+                              '—'
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <Empty
+                  icon="inbox"
+                  title={
+                    query
+                      ? 'No events match'
+                      : scope === 'review'
+                        ? 'Your review queue is clear'
+                        : 'No subscription events'
+                  }
+                  text={
+                    query.trim()
+                      ? 'Try a different member or plan.'
+                      : events.length
+                        ? 'Use another view to see previously processed events.'
+                        : 'Connect the Discord bot and configure trusted membership events in Settings to start collecting subscription activity.'
+                  }
+                >
+                  {!events.length && (
+                    <button className="btn btn-quiet" onClick={() => navigate('settings')}>
+                      Configure Discord
+                    </button>
+                  )}
+                </Empty>
+              )}
+              <Pagination
+                label="Subscription events"
+                page={pagination.page}
+                total={pagination.total}
+                pageSize={pagination.pageSize}
+                onPageChange={pagination.setPage}
+                onPageSizeChange={pagination.setPageSize}
+              />
+            </section>
+          )}
+        </TabPanel>
+      ))}
+      <details className="help-details">
+        <summary>Membership automation</summary>
+        <div className="help-body">
+          Automatic creation and disabling are off by default. A subscription cancellation and an
+          access expiration can be handled separately in Settings.
         </div>
-        {events.length ? (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Member</th>
-                  <th>Event</th>
-                  <th>Status</th>
-                  <th>Received</th>
-                  <th className="right">Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {events.map((event) => (
-                  <tr key={event.id}>
-                    <td>
-                      <strong>{event.username || 'Discord member'}</strong>
-                      <small>{event.discord_user_id}</small>
-                      {event.error && <small className="red">{event.error}</small>}
-                    </td>
-                    <td>
-                      <span>{names[event.action] || event.action}</span>
-                      <small>
-                        {event.source === 'mee6_message'
-                          ? 'MEE6 announcement'
-                          : event.source || 'Discord'}
-                      </small>
-                      {event.action === 'subscribe' &&
-                        event.source === 'mee6_message' &&
-                        event.detail && <small>Plan: {event.detail}</small>}
-                      {event.account_limit !== undefined && (
-                        <small>
-                          {event.account_limit} entitled{' '}
-                          {event.account_limit === 1 ? 'account' : 'accounts'}
-                        </small>
-                      )}
-                    </td>
-                    <td>
-                      <Status value={event.status} />
-                    </td>
-                    <td className="nowrap">{date(event.created_at)}</td>
-                    <td className="right nowrap">
-                      {['pending', 'failed'].includes(event.status) ? (
-                        <div className="row-actions">
-                          <button
-                            className="btn btn-small btn-quiet"
-                            disabled={busy}
-                            onClick={() => ignore(event)}
-                          >
-                            Ignore
-                          </button>
-                          <button
-                            className="btn btn-small btn-primary"
-                            disabled={busy}
-                            onClick={() => review(event)}
-                          >
-                            Review
-                          </button>
-                        </div>
-                      ) : event.job_id ? (
-                        <button
-                          className="btn btn-small btn-quiet"
-                          onClick={() => openJob(event.job_id!)}
-                        >
-                          View operation
-                        </button>
-                      ) : (
-                        '—'
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <Empty
-            icon="inbox"
-            title="Your review queue is clear"
-            text="Connect the Discord bot and configure trusted membership events in Settings to start collecting subscription activity."
-          >
-            <button className="btn btn-quiet" onClick={() => navigate('settings')}>
-              Configure Discord
-            </button>
-          </Empty>
-        )}
-      </section>
+      </details>
     </div>
   );
 }

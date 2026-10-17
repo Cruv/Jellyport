@@ -258,11 +258,13 @@ export function JobsTable({
   compact = false,
   openJob,
   migrate,
+  filtered = false,
 }: {
   jobs: Job[];
   compact?: boolean;
   openJob: (id: string) => void;
   migrate: () => void;
+  filtered?: boolean;
 }) {
   const names: Record<string, string> = {
     migrate: 'User migration',
@@ -278,17 +280,23 @@ export function JobsTable({
     return (
       <Empty
         icon="activity"
-        title="A fresh start"
-        text="Your migration and account creation activity will appear here."
+        title={filtered ? 'No matching operations' : 'A fresh start'}
+        text={
+          filtered
+            ? 'Try another search or status filter.'
+            : 'Your migration and account creation activity will appear here.'
+        }
       >
-        <button className="btn btn-quiet" onClick={migrate}>
-          Migrate your first user
-        </button>
+        {!filtered && (
+          <button className="btn btn-quiet" onClick={migrate}>
+            Migrate your first user
+          </button>
+        )}
       </Empty>
     );
   return (
     <div className="table-wrap">
-      <table>
+      <table className="responsive-table jobs-table">
         <thead>
           <tr>
             <th>Operation</th>
@@ -301,7 +309,7 @@ export function JobsTable({
         <tbody>
           {jobs.map((job) => (
             <tr key={job.id}>
-              <td>
+              <td data-label="Operation">
                 <strong>
                   {job.migration_scope === 'watched_only' &&
                   ['migrate', 'migration'].includes(job.kind)
@@ -317,11 +325,11 @@ export function JobsTable({
                   {(job.results?.length || 0) > 2 && ` +${job.results!.length - 2}`}
                 </small>
               </td>
-              <td>
+              <td data-label="Status">
                 <Status value={job.status} />
               </td>
               {!compact && (
-                <td>
+                <td data-label="Users">
                   {typeof job.progress === 'object' &&
                   job.progress.processed !== undefined &&
                   job.progress.total !== undefined
@@ -329,8 +337,10 @@ export function JobsTable({
                     : num(job.results?.length)}
                 </td>
               )}
-              <td className="nowrap">{date(job.created_at)}</td>
-              <td className="right">
+              <td className="nowrap" data-label="Started">
+                {date(job.created_at)}
+              </td>
+              <td className="right" data-label="Details">
                 <button
                   className="icon-button"
                   onClick={() => openJob(job.id)}

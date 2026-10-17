@@ -125,8 +125,11 @@ function page(customApi?: Api, defaultRoleId?: string, customUsers: Users = user
 }
 const mutations = (requests: { path: string; options?: ApiOptions }[]) =>
   requests.filter((request) => Boolean(request.options?.method));
-async function selectRole() {
+async function selectRole(view = 'apply') {
   await screen.findByLabelText('Saved role');
+  fireEvent.click(
+    screen.getByRole('tab', { name: view === 'apply' ? 'Apply role' : 'Role editor' }),
+  );
   fireEvent.change(screen.getByLabelText('Saved role'), { target: { value: role.id } });
 }
 
@@ -138,6 +141,34 @@ afterEach(() => {
 });
 
 describe('Account roles', () => {
+  it('pages saved roles separately from the editor and preserves a draft when tasks change', async () => {
+    const many = Array.from({ length: 61 }, (_, index) => ({
+      ...role,
+      id: `role-${index}`,
+      name: `Role ${index}`,
+    }));
+    const api = vi.fn(async (path: string) => {
+      if (path === '/api/account-roles') return { roles: many, assignments: [] };
+      throw new Error('Unexpected mutation');
+    }) as Api;
+    page(api);
+    const directory = await screen.findByRole('tabpanel', { name: /Saved roles/ });
+    expect(within(directory).getAllByRole('article')).toHaveLength(25);
+    expect(screen.queryByRole('button', { name: 'Save new role' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(within(directory).getByRole('button', { name: 'Edit role Role 25' })).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Find saved roles'), { target: { value: 'Role 60' } });
+    expect(within(directory).getAllByRole('article')).toHaveLength(1);
+    expect(within(directory).getByText('Page 1 of 1')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Edit role Role 60' }));
+    fireEvent.change(screen.getByLabelText('Role name'), { target: { value: 'Unfinished role' } });
+    fireEvent.click(screen.getByRole('tab', { name: /Saved roles/ }));
+    expect(screen.queryByRole('button', { name: 'Replace saved role' })).toBeNull();
+    fireEvent.click(screen.getByRole('tab', { name: 'Role draft' }));
+    expect(screen.getByLabelText('Role name')).toHaveProperty('value', 'Unfinished role');
+    expect(api).toHaveBeenCalledOnce();
+  });
+
   it('blocks assignment and application while the role editor has unsaved changes', async () => {
     const { requests } = page();
     await selectRole();
@@ -147,7 +178,9 @@ describe('Account roles', () => {
       'disabled',
       false,
     );
+    fireEvent.click(screen.getByRole('tab', { name: 'Role editor' }));
     fireEvent.change(screen.getByLabelText('Role name'), { target: { value: 'Unsaved crew' } });
+    fireEvent.click(screen.getByRole('tab', { name: 'Apply role' }));
     expect(screen.getByRole('button', { name: 'Assign role' })).toHaveProperty('disabled', true);
     expect(screen.getByRole('button', { name: 'Review changes' })).toHaveProperty('disabled', true);
     expect(
@@ -157,8 +190,10 @@ describe('Account roles', () => {
     ).toBeTruthy();
     expect(mutations(requests)).toHaveLength(0);
 
+    fireEvent.click(screen.getByRole('tab', { name: /Role (editor|draft)/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Reload saved role' }));
     expect(screen.getByLabelText('Role name')).toHaveProperty('value', role.name);
+    fireEvent.click(screen.getByRole('tab', { name: 'Apply role' }));
     expect(screen.getByRole('checkbox', { name: /^alex/ })).toHaveProperty('checked', true);
     expect(screen.getByRole('checkbox', { name: /^Permissions/ })).toHaveProperty('checked', false);
     expect(screen.getByRole('button', { name: 'Assign role' })).toHaveProperty('disabled', false);
@@ -208,9 +243,9 @@ describe('Account roles', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: /^alex/ }));
     fireEvent.change(screen.getByLabelText('Find Jellyfin accounts'), { target: { value: 'sam' } });
     expect(screen.queryByRole('checkbox', { name: /^alex/ })).toBeNull();
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select up to 100 visible accounts' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select this page' }));
     expect(screen.getByText('2 selected')).toBeTruthy();
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select up to 100 visible accounts' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select this page' }));
     expect(screen.getByText('1 selected')).toBeTruthy();
     expect(screen.getByRole('checkbox', { name: /^sam/ })).toHaveProperty('checked', false);
     fireEvent.click(screen.getByRole('button', { name: 'Assign role' }));
@@ -239,6 +274,7 @@ describe('Account roles', () => {
     expect(screen.getByRole('heading', { name: '1. Choose accounts' })).toBeTruthy();
     expect(screen.getByRole('heading', { name: '2. Assign the saved role' })).toBeTruthy();
     expect(screen.getByRole('heading', { name: '3. Choose settings to update' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: 'Role editor' }));
     fireEvent.change(screen.getByLabelText('Role name'), { target: { value: 'Updated role' } });
     expect(screen.getByText('Unsaved changes', { selector: 'span' })).toBeTruthy();
     expect(screen.queryByText('Saved role', { selector: 'span' })).toBeNull();
@@ -251,6 +287,7 @@ describe('Account roles', () => {
   it('copies supported settings into a new saved role without changing Jellyfin accounts', async () => {
     const { requests, notify, created } = page();
     await screen.findByLabelText('Saved role');
+    fireEvent.click(screen.getByRole('tab', { name: 'Role editor' }));
     fireEvent.change(screen.getByLabelText('Role name'), { target: { value: 'Movie night' } });
     const source = screen.getByLabelText('Copy settings from');
     expect(within(source).getByText('Template (template)')).toBeTruthy();
@@ -281,7 +318,7 @@ describe('Account roles', () => {
 
   it('reimports a different account into an existing role using the saved revision', async () => {
     const { requests, created } = page();
-    await selectRole();
+    await selectRole('editor');
     fireEvent.change(screen.getByLabelText('Copy settings from'), {
       target: { value: 'jellyfin-sam' },
     });
@@ -386,7 +423,7 @@ describe('Account roles', () => {
       throw new Error('Unexpected mutation');
     }) as Api;
     page(api);
-    await selectRole();
+    await selectRole('editor');
     fireEvent.click(screen.getByRole('button', { name: 'Refresh roles' }));
     expect(await screen.findByText(/This role changed after you opened it/)).toBeTruthy();
     expect(
@@ -497,7 +534,7 @@ describe('Account roles', () => {
 
   it('protects default and assigned roles from removal', async () => {
     page(undefined, role.id);
-    await selectRole();
+    await selectRole('editor');
     expect(
       (screen.getByRole('button', { name: 'Remove role' }) as HTMLButtonElement).disabled,
     ).toBe(true);
@@ -517,7 +554,10 @@ describe('Account roles', () => {
     };
     const { requests, notify } = page(undefined, undefined, manyUsers);
     await selectRole();
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select up to 100 visible accounts' }));
+    for (let index = 0; index < 4; index++) {
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Select this page' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    }
     expect(screen.getByText('100 selected')).toBeTruthy();
     expect(
       (screen.getByRole('checkbox', { name: /^member100/ }) as HTMLInputElement).disabled,
@@ -546,6 +586,7 @@ describe('Account roles', () => {
     }) as Api;
     const { unmount, notify, created } = page(api);
     await screen.findByLabelText('Saved role');
+    fireEvent.click(screen.getByRole('tab', { name: 'Role editor' }));
     fireEvent.change(screen.getByLabelText('Copy settings from'), {
       target: { value: 'jellyfin-template' },
     });

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { Callout, Icon } from './components';
+import { Pagination, usePagination } from './ui-layout';
 import type {
   Api,
   Notify,
@@ -175,6 +176,7 @@ export default function SourceSnapshotsPanel({
     fileCopy || status?.records.some((record) => record.source_type === 'file_copy');
   const hasPluginBackups =
     pluginBackup || status?.records.some((record) => record.source_type === 'plugin_backup');
+  const captures = usePagination(status?.records || [], 10);
   return (
     <section className="panel" aria-label="Saved Emby database snapshots">
       <div className="panel-header">
@@ -193,21 +195,24 @@ export default function SourceSnapshotsPanel({
         </div>
       </div>
       <div className="panel-body form-stack">
-        <p className="muted text-small">
-          {pluginBackup ? (
-            'A network-isolated helper reads saved Emby Backup & Restore backups. Jellyport does not start Emby’s backup task or open its live databases.'
-          ) : (
-            <>
-              A network-isolated helper uses a read-only Emby database mount on the same Docker
-              host.{' '}
-              {fileCopy
-                ? 'File copies run while Emby stays online; no filesystem snapshot or downtime is needed.'
-                : 'Emby can keep running while a consistent SQLite online backup is captured.'}
-            </>
-          )}{' '}
-          This avoids a full library scan through Emby’s API. Migrations use only played flags from
-          the captured database.
-        </p>
+        <details className="help-disclosure">
+          <summary>How saved Emby history works</summary>
+          <p className="muted text-small">
+            {pluginBackup ? (
+              'A network-isolated helper reads saved Emby Backup & Restore backups. Jellyport does not start Emby’s backup task or open its live databases.'
+            ) : (
+              <>
+                A network-isolated helper uses a read-only Emby database mount on the same Docker
+                host.{' '}
+                {fileCopy
+                  ? 'File copies run while Emby stays online; no filesystem snapshot or downtime is needed.'
+                  : 'Emby can keep running while a consistent SQLite online backup is captured.'}
+              </>
+            )}{' '}
+            This avoids a full library scan through Emby’s API. Migrations use only played flags
+            from the captured database.
+          </p>
+        </details>
         {hasPluginBackups && (
           <Callout icon="info" title="Backup age stays with the original backup.">
             Import after Emby’s backup finishes. Jellyport checks stable backup files before
@@ -293,86 +298,6 @@ export default function SourceSnapshotsPanel({
             )}
           </div>
         )}
-        {draft && status && (
-          <form
-            onSubmit={save}
-            className="inline-panel form-stack"
-            aria-label={pluginBackup ? 'Backup import schedule' : 'Database capture schedule'}
-          >
-            <div className="section-heading">
-              <h4>{pluginBackup ? 'Daily import schedule' : 'Daily capture schedule'}</h4>
-              <p>Save this schedule independently from connection and account settings.</p>
-            </div>
-            <label className="check-label">
-              <input
-                className="checkbox"
-                type="checkbox"
-                checked={draft.enabled}
-                onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
-                disabled={demo || !!busy}
-              />
-              {pluginBackup ? 'Enable daily backup import' : 'Enable daily database capture'}
-            </label>
-            <div className="field-row">
-              <div className="field">
-                <label htmlFor="snapshot-time">
-                  {pluginBackup ? 'Import time' : 'Capture time'}
-                </label>
-                <input
-                  id="snapshot-time"
-                  type="time"
-                  required
-                  value={captureTime}
-                  onChange={(event) => setCaptureTime(event.target.value)}
-                  disabled={demo || !!busy}
-                />
-              </div>
-              <div className="field">
-                <label htmlFor="snapshot-zone">Time zone</label>
-                <input
-                  id="snapshot-zone"
-                  required
-                  value={draft.time_zone}
-                  onChange={(event) => setDraft({ ...draft, time_zone: event.target.value })}
-                  disabled={demo || !!busy}
-                  aria-describedby="snapshot-schedule-help"
-                />
-              </div>
-            </div>
-            <small id="snapshot-schedule-help">
-              Scheduling starts off. Times use the time zone shown here, supplied by the server.{' '}
-              {pluginBackup
-                ? 'Schedule imports after Emby’s backup task finishes. This does not change Emby’s backup schedule.'
-                : 'Each capture supplies played flags for migration.'}
-            </small>
-            {draft.revision !== status.config.revision && (
-              <p className="error-block">
-                The saved schedule changed. Reload it before saving your changes.
-              </p>
-            )}
-            <div className="form-actions">
-              <button
-                className="btn btn-quiet"
-                type="button"
-                onClick={resetDraft}
-                disabled={!!busy}
-              >
-                Reload saved schedule
-              </button>
-              <button
-                className="btn btn-primary"
-                type="submit"
-                disabled={demo || !!busy || draft.revision !== status.config.revision}
-              >
-                {busy === 'schedule'
-                  ? 'Saving schedule…'
-                  : pluginBackup
-                    ? 'Save import schedule'
-                    : 'Save capture schedule'}
-              </button>
-            </div>
-          </form>
-        )}
         <div className="section-heading">
           <h4>{pluginBackup ? 'Import a backup now' : 'Capture database now'}</h4>
           <p>Manual actions do not change the daily schedule.</p>
@@ -413,73 +338,167 @@ export default function SourceSnapshotsPanel({
         {demo && (
           <p className="muted text-small">Demo mode: database capture changes are disabled.</p>
         )}
+        {draft && status && (
+          <details className="help-disclosure">
+            <summary>Daily schedule</summary>
+            <form
+              onSubmit={save}
+              className="inline-panel form-stack"
+              aria-label={pluginBackup ? 'Backup import schedule' : 'Database capture schedule'}
+            >
+              <div className="section-heading">
+                <h4>{pluginBackup ? 'Daily import schedule' : 'Daily capture schedule'}</h4>
+                <p>Save this schedule independently from connection and account settings.</p>
+              </div>
+              <label className="check-label">
+                <input
+                  className="checkbox"
+                  type="checkbox"
+                  checked={draft.enabled}
+                  onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
+                  disabled={demo || !!busy}
+                />
+                {pluginBackup ? 'Enable daily backup import' : 'Enable daily database capture'}
+              </label>
+              <div className="field-row">
+                <div className="field">
+                  <label htmlFor="snapshot-time">
+                    {pluginBackup ? 'Import time' : 'Capture time'}
+                  </label>
+                  <input
+                    id="snapshot-time"
+                    type="time"
+                    required
+                    value={captureTime}
+                    onChange={(event) => setCaptureTime(event.target.value)}
+                    disabled={demo || !!busy}
+                  />
+                </div>
+                <div className="field">
+                  <label htmlFor="snapshot-zone">Time zone</label>
+                  <input
+                    id="snapshot-zone"
+                    required
+                    value={draft.time_zone}
+                    onChange={(event) => setDraft({ ...draft, time_zone: event.target.value })}
+                    disabled={demo || !!busy}
+                    aria-describedby="snapshot-schedule-help"
+                  />
+                </div>
+              </div>
+              <small id="snapshot-schedule-help">
+                Scheduling starts off. Times use the time zone shown here, supplied by the server.{' '}
+                {pluginBackup
+                  ? 'Schedule imports after Emby’s backup task finishes. This does not change Emby’s backup schedule.'
+                  : 'Each capture supplies played flags for migration.'}
+              </small>
+              {draft.revision !== status.config.revision && (
+                <p className="error-block">
+                  The saved schedule changed. Reload it before saving your changes.
+                </p>
+              )}
+              <div className="form-actions">
+                <button
+                  className="btn btn-quiet"
+                  type="button"
+                  onClick={resetDraft}
+                  disabled={!!busy}
+                >
+                  Reload saved schedule
+                </button>
+                <button
+                  className="btn btn-primary"
+                  type="submit"
+                  disabled={demo || !!busy || draft.revision !== status.config.revision}
+                >
+                  {busy === 'schedule'
+                    ? 'Saving schedule…'
+                    : pluginBackup
+                      ? 'Save import schedule'
+                      : 'Save capture schedule'}
+                </button>
+              </div>
+            </form>
+          </details>
+        )}
         {!!status?.records.length && (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Source</th>
-                  <th>History date</th>
-                  <th>Contents</th>
-                  <th>Availability</th>
-                </tr>
-              </thead>
-              <tbody>
-                {status.records.map((record) => (
-                  <tr key={`${record.id}:${record.source_user_id}`}>
-                    <td>
-                      <strong>{record.source_username || 'All Emby users'}</strong>
-                      <small>
-                        Emby {record.source_server_version}
-                        {record.schema ? ` · ${record.schema}` : ''}
-                      </small>
-                      <small>Source {record.source_server_id}</small>
-                    </td>
-                    <td>
-                      <strong>{timestamp(historyDate(record))}</strong>
-                      <small>{age(historyDate(record))}</small>
-                      <small>
-                        {record.source_type === 'plugin_backup'
-                          ? `Imported ${timestamp(record.finished_at)}`
-                          : `Read window ${timestamp(record.started_at)} – ${timestamp(record.finished_at)}`}
-                      </small>
-                    </td>
-                    <td>
-                      <strong>
-                        {record.source_type === 'plugin_backup'
-                          ? 'Emby plugin backup'
-                          : record.source_type === 'file_copy'
-                            ? 'File copy'
-                            : record.source_type === 'sqlite_online_backup'
-                              ? 'SQLite online backup'
-                              : record.scope === 'watched_only'
-                                ? 'Played-status capture'
-                                : 'Complete database capture'}
-                      </strong>
-                      {record.source_type && (
-                        <small>
-                          {record.scope === 'watched_only'
-                            ? 'Played-status capture'
-                            : 'Complete database capture'}
-                        </small>
-                      )}
-                      <small>{Math.ceil(record.bytes / 1024).toLocaleString()} KiB</small>
-                    </td>
-                    <td>
-                      <span
-                        className={`status ${new Date(record.expires_at).getTime() <= Date.now() ? 'warn' : 'good'}`}
-                      >
-                        {new Date(record.expires_at).getTime() <= Date.now()
-                          ? 'Expired'
-                          : 'Available'}
-                      </span>
-                      <small>Expires {timestamp(record.expires_at)}</small>
-                    </td>
+          <details className="help-disclosure">
+            <summary>Saved captures ({status.records.length.toLocaleString()})</summary>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Source</th>
+                    <th>History date</th>
+                    <th>Contents</th>
+                    <th>Availability</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody>
+                  {captures.items.map((record) => (
+                    <tr key={`${record.id}:${record.source_user_id}`}>
+                      <td>
+                        <strong>{record.source_username || 'All Emby users'}</strong>
+                        <small>
+                          Emby {record.source_server_version}
+                          {record.schema ? ` · ${record.schema}` : ''}
+                        </small>
+                        <small>Source {record.source_server_id}</small>
+                      </td>
+                      <td>
+                        <strong>{timestamp(historyDate(record))}</strong>
+                        <small>{age(historyDate(record))}</small>
+                        <small>
+                          {record.source_type === 'plugin_backup'
+                            ? `Imported ${timestamp(record.finished_at)}`
+                            : `Read window ${timestamp(record.started_at)} – ${timestamp(record.finished_at)}`}
+                        </small>
+                      </td>
+                      <td>
+                        <strong>
+                          {record.source_type === 'plugin_backup'
+                            ? 'Emby plugin backup'
+                            : record.source_type === 'file_copy'
+                              ? 'File copy'
+                              : record.source_type === 'sqlite_online_backup'
+                                ? 'SQLite online backup'
+                                : record.scope === 'watched_only'
+                                  ? 'Played-status capture'
+                                  : 'Complete database capture'}
+                        </strong>
+                        {record.source_type && (
+                          <small>
+                            {record.scope === 'watched_only'
+                              ? 'Played-status capture'
+                              : 'Complete database capture'}
+                          </small>
+                        )}
+                        <small>{Math.ceil(record.bytes / 1024).toLocaleString()} KiB</small>
+                      </td>
+                      <td>
+                        <span
+                          className={`status ${new Date(record.expires_at).getTime() <= Date.now() ? 'warn' : 'good'}`}
+                        >
+                          {new Date(record.expires_at).getTime() <= Date.now()
+                            ? 'Expired'
+                            : 'Available'}
+                        </span>
+                        <small>Expires {timestamp(record.expires_at)}</small>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <Pagination
+              label="Saved captures"
+              page={captures.page}
+              total={captures.total}
+              pageSize={captures.pageSize}
+              onPageChange={captures.setPage}
+              onPageSizeChange={captures.setPageSize}
+            />
+          </details>
         )}
         <small>
           Saved copies contain user data and stay on the Jellyport server. Choose “Use saved Emby

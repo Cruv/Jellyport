@@ -119,7 +119,7 @@ export default function App() {
   const authGeneration = useRef(0);
   const [booting, setBooting] = useState(true);
   const [page, setPage] = useState<Page>(() =>
-    /^#settings-(media|accounts|discord|history)$/.test(window.location.hash)
+    /^#settings-(media|accounts|discord|automation|history)$/.test(window.location.hash)
       ? 'settings'
       : 'overview',
   );
@@ -489,7 +489,7 @@ export default function App() {
   function navigate(target: Page) {
     if (
       target !== 'settings' &&
-      /^#settings-(media|accounts|discord|history)$/.test(window.location.hash)
+      /^#settings-(media|accounts|discord|automation|history)$/.test(window.location.hash)
     )
       window.history.replaceState(null, '', window.location.pathname + window.location.search);
     if (target !== 'migrate') cancelPreview();

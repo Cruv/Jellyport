@@ -12,7 +12,9 @@ vi.mock('./SourceSnapshotsPanel', () => ({
     </form>
   ),
 }));
-vi.mock('./DestinationCatalogPanel', () => ({ default: () => null }));
+vi.mock('./DestinationCatalogPanel', () => ({
+  default: () => <button type="button">Import Jellyfin backup</button>,
+}));
 vi.mock('./AdminAlertsPanel', () => ({ default: () => null }));
 
 const oldSettings: Settings = {
@@ -60,7 +62,23 @@ function submit() {
   fireEvent.submit(screen.getByRole('button', { name: 'Save settings' }).closest('form')!);
 }
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  window.history.replaceState(null, '', window.location.pathname);
+});
+
+function settingsTab(name: string) {
+  fireEvent.click(
+    within(screen.getByRole('tablist', { name: 'Settings sections' })).getByRole('tab', { name }),
+  );
+}
+function passwordPage(...args: Parameters<typeof page>) {
+  const result = page(...args);
+  settingsTab('Account defaults');
+  fireEvent.click(screen.getByRole('tab', { name: 'Passwords & messages' }));
+  fireEvent.click(screen.getByText('Preview new account message'));
+  return result;
+}
 
 describe('Settings layout and navigation', () => {
   it('edits and removes repeated path and tier rows without saving or changing the surviving rows', async () => {
@@ -75,6 +93,7 @@ describe('Settings layout and navigation', () => {
         { id: 'two', name: 'Two', plan_name: 'Two plan', account_limit: 2 },
       ],
     });
+    fireEvent.click(screen.getByRole('tab', { name: 'Path mapping' }));
     fireEvent.click(screen.getAllByRole('button', { name: 'Remove path mapping' })[0]);
     fireEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
     fireEvent.change(screen.getAllByLabelText('Emby path prefix')[1], {
@@ -83,11 +102,12 @@ describe('Settings layout and navigation', () => {
     fireEvent.change(screen.getAllByLabelText('Jellyfin path prefix')[1], {
       target: { value: ' /media/shows ' },
     });
+    settingsTab('Automation');
     fireEvent.click(screen.getByRole('button', { name: 'Remove tier One' }));
     fireEvent.click(screen.getByRole('button', { name: 'Add tier' }));
     const newTier = screen.getByRole('group', { name: 'Tier 2' });
     fireEvent.change(within(newTier).getByLabelText('Stable tier ID'), {
-      target: { value: ' three ' },
+      target: { value: 'three' },
     });
     fireEvent.change(within(newTier).getByLabelText('Tier name'), {
       target: { value: ' Three ' },
@@ -102,6 +122,7 @@ describe('Settings layout and navigation', () => {
       'value',
       '/source/movies',
     );
+    fireEvent.change(screen.getByLabelText('Edit membership tier'), { target: { value: '0' } });
     expect(
       within(screen.getByRole('group', { name: 'Tier 1' })).getByLabelText('Stable tier ID'),
     ).toHaveProperty('value', 'two');
@@ -189,38 +210,31 @@ describe('Settings layout and navigation', () => {
     ).toEqual([18, 18]);
   });
 
-  it('keeps unsaved connection and account fields mounted when navigating sections', async () => {
+  it('shows one focused view and preserves unsaved fields and secrets across every tab', async () => {
     const p = page();
     expect(screen.getByRole('heading', { name: 'Settings', level: 1 })).toBeTruthy();
-    const navigation = screen.getByRole('navigation', { name: 'Settings sections' });
-    const media = screen.getByRole('region', { name: 'Media servers' });
-    const accounts = screen.getByRole('region', { name: 'Account defaults' });
-    const access = screen.getByRole('region', { name: 'Discord & access' });
-    const history = screen.getByRole('region', { name: 'Saved history' });
-    expect(within(media).getByRole('heading', { name: 'Emby · source server' })).toBeTruthy();
-    expect(within(accounts).getByLabelText('Fallback template user')).toBeTruthy();
-    expect(within(accounts).getByLabelText('Default account role')).toBeTruthy();
-    expect(within(access).getByLabelText('Enable Discord bot')).toBeTruthy();
-    const sourceUrl = within(media).getAllByLabelText('Server URL')[0];
+    expect(screen.getAllByRole('tabpanel')).toHaveLength(2);
+    expect(screen.getByRole('heading', { name: 'Emby · source server' })).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: 'Jellyfin · destination server' })).toBeNull();
+    const sourceUrl = screen.getByLabelText('Server URL', { selector: '#setting-emby_url' });
+    const key = screen.getByLabelText('API key', { selector: '#setting-emby_api_key' });
     fireEvent.change(sourceUrl, { target: { value: 'https://source.example.test' } });
-    fireEvent.change(within(accounts).getByLabelText('Generated password length'), {
-      target: { value: '18' },
-    });
-    for (const [name, target] of [
-      ['Account defaults', accounts],
-      ['Discord & access', access],
-      ['Saved history', history],
-      ['Media servers', media],
-    ] as const) {
-      const link = within(navigation).getByRole('link', { name });
-      expect(link.getAttribute('href')).toBe(`#${target.id}`);
-      fireEvent.click(link);
+    fireEvent.change(key, { target: { value: 'synthetic-unsaved-secret' } });
+    settingsTab('Account defaults');
+    fireEvent.click(screen.getByRole('tab', { name: 'Passwords & messages' }));
+    const length = screen.getByLabelText('Generated password length');
+    fireEvent.change(length, { target: { value: '18' } });
+    expect(screen.queryByRole('heading', { name: 'Emby · source server' })).toBeNull();
+    for (const name of ['Discord', 'Automation', 'Saved history', 'Servers']) {
+      settingsTab(name);
+      expect(screen.getAllByRole('tabpanel')).toHaveLength(2);
     }
+    expect(window.location.hash).toBe('#settings-media');
     expect(sourceUrl.isConnected).toBe(true);
-    expect((sourceUrl as HTMLInputElement).value).toBe('https://source.example.test');
-    expect((screen.getByLabelText('Generated password length') as HTMLInputElement).value).toBe(
-      '18',
-    );
+    expect(sourceUrl).toHaveProperty('value', 'https://source.example.test');
+    expect(key).toHaveProperty('value', 'synthetic-unsaved-secret');
+    expect(length.isConnected).toBe(true);
+    expect(length).toHaveProperty('value', '18');
     expect(p.requests.filter((request) => request.options?.method)).toHaveLength(0);
     submit();
     await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
@@ -228,27 +242,88 @@ describe('Settings layout and navigation', () => {
       p.requests.find((request) => request.options?.method === 'PUT')?.options?.body,
     ).toMatchObject({
       emby_url: 'https://source.example.test',
+      emby_api_key: 'synthetic-unsaved-secret',
       password_length: 18,
     });
   });
 
-  it('keeps the independent backup schedule outside the main settings save form', () => {
+  it('keeps independent history forms outside settings and displays one backup source at a time', () => {
     page();
     const settingsForm = screen.getByRole('button', { name: 'Save settings' }).closest('form');
+    settingsTab('Saved history');
     const schedule = screen.getByRole('form', { name: 'Backup import schedule' });
     expect(settingsForm?.contains(schedule)).toBe(false);
-    expect(
-      within(screen.getByRole('region', { name: 'Saved history' }))
-        .getByRole('button', { name: 'Save import schedule' })
-        .closest('form'),
-    ).toBe(schedule);
+    expect(screen.getByRole('button', { name: 'Save import schedule' }).closest('form')).toBe(
+      schedule,
+    );
+    expect(screen.queryByRole('button', { name: 'Save settings' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Import Jellyfin backup' })).toBeNull();
+    fireEvent.click(screen.getByRole('tab', { name: 'Jellyfin catalog' }));
+    expect(screen.getByRole('button', { name: 'Import Jellyfin backup' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Save import schedule' })).toBeNull();
+    expect(schedule.isConnected).toBe(true);
     expect(screen.getByText(/Import actions and schedules save independently/)).toBeTruthy();
+  });
+
+  it.each([
+    ['media', 'Servers', 'Emby · source server'],
+    ['accounts', 'Account defaults', 'New account permissions'],
+    ['discord', 'Discord', 'Discord · optional'],
+    ['automation', 'Automation', 'Membership tiers'],
+    ['history', 'Saved history', null],
+  ])('opens the %s bookmarked tab', (hash, label, heading) => {
+    window.history.replaceState(null, '', `#settings-${hash}`);
+    page();
+    expect(
+      within(screen.getByRole('tablist', { name: 'Settings sections' }))
+        .getByRole('tab', { name: label })
+        .getAttribute('aria-selected'),
+    ).toBe('true');
+    if (heading) expect(screen.getByRole('heading', { name: heading })).toBeTruthy();
+  });
+
+  it.each([
+    ['#setting-discord_application_id', 'not-numeric', 'Discord', 'Bot connection'],
+    ['#membership-tier-id-0', '', 'Automation', 'Membership tiers'],
+    ['#membership-tier-name-1', '', 'Automation', 'Membership tiers'],
+    ['#setting-jellyfin_public_url', 'not-a-url', 'Servers', 'Jellyfin'],
+  ])(
+    'reveals and focuses the invalid hidden field %s without saving',
+    async (selector, value, main, sub) => {
+      const p = page();
+      const field = p.container.querySelector<HTMLInputElement>(selector)!;
+      fireEvent.change(field, { target: { value } });
+      submit();
+      await waitFor(() => expect(document.activeElement).toBe(field));
+      expect(screen.getByRole('tab', { name: main, selected: true })).toBeTruthy();
+      expect(screen.getByRole('tab', { name: sub, selected: true })).toBeTruthy();
+      expect(p.notify).toHaveBeenCalledWith(expect.any(String), true);
+      expect(p.requests.some((request) => request.options?.method === 'PUT')).toBe(false);
+      expect(screen.getByRole('button', { name: 'Save settings' })).toHaveProperty(
+        'disabled',
+        false,
+      );
+    },
+  );
+
+  it('focuses an invalid field on repeated saves even when its tab is already visible', async () => {
+    const p = page();
+    const field = p.container.querySelector<HTMLInputElement>('#setting-emby_url')!;
+    fireEvent.change(field, { target: { value: 'invalid-url' } });
+    const save = screen.getByRole('button', { name: 'Save settings' });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      save.focus();
+      submit();
+      await waitFor(() => expect(document.activeElement).toBe(field));
+    }
+    expect(p.notify).toHaveBeenCalledTimes(2);
+    expect(p.requests.some((request) => request.options?.method === 'PUT')).toBe(false);
   });
 });
 
 describe('New account password and message settings', () => {
   it('defaults older settings to 12 characters, ambiguous-character exclusion, and a fictional preview', async () => {
-    const p = page();
+    const p = passwordPage();
     expect((screen.getByLabelText('Generated password length') as HTMLInputElement).value).toBe(
       '12',
     );
@@ -277,7 +352,7 @@ describe('New account password and message settings', () => {
   });
 
   it('saves selected values and preserves the exact multiline template through a refreshed response', async () => {
-    const p = page();
+    const p = passwordPage();
     const template =
       'Welcome aboard, {username}!\n\nOpen {server_url}\nYour password: {password}\n';
     fireEvent.change(screen.getByLabelText('Generated password length'), {
@@ -316,7 +391,7 @@ describe('New account password and message settings', () => {
   });
 
   it('adopts a newer saved response and resets only the local message until Save settings is used', () => {
-    const p = page({
+    const p = passwordPage({
       ...oldSettings,
       password_length: 20,
       password_exclude_ambiguous: false,
@@ -352,7 +427,7 @@ describe('New account password and message settings', () => {
   it.each(['', '11', '65', '12.5'])(
     'rejects invalid password length %j before saving',
     async (value) => {
-      const p = page();
+      const p = passwordPage();
       fireEvent.change(screen.getByLabelText('Generated password length'), { target: { value } });
       submit();
       await waitFor(() =>
@@ -371,7 +446,7 @@ describe('New account password and message settings', () => {
     '{username} {password} {server_url}\u0000',
     '{username} {password} {server_url}' + 'x'.repeat(1200),
   ])('rejects an invalid message and bounds its preview before saving', async (template) => {
-    const p = page();
+    const p = passwordPage();
     fireEvent.change(screen.getByLabelText('New account message'), { target: { value: template } });
     expect(
       within(screen.getByLabelText('New account message preview')).getByRole('alert'),
@@ -385,7 +460,7 @@ describe('New account password and message settings', () => {
   });
 
   it('renders HTML, Markdown, and URLs as plain text without executing or linking them', () => {
-    const p = page();
+    const p = passwordPage();
     const template =
       '<script>alert(1)</script> **{username}**\n{password}\n{server_url}\njavascript:alert(2)';
     fireEvent.change(screen.getByLabelText('New account message'), { target: { value: template } });

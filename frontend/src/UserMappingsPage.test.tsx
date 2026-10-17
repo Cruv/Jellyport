@@ -45,6 +45,7 @@ function page(mappings: UserMapping[] = [], customApi?: Api) {
       refresh={refresh}
     />,
   );
+  if (!mappings.length) fireEvent.click(screen.getByRole('tab', { name: 'Add mapping' }));
   return { ...view, requests, api, notify, refresh };
 }
 afterEach(() => {
@@ -54,6 +55,26 @@ afterEach(() => {
 });
 
 describe('Manual user mappings', () => {
+  it('starts with a bounded searchable mapping directory and resets pagination after filtering', () => {
+    const many = Array.from({ length: 61 }, (_, index) => ({
+      ...mapping,
+      id: `mapping-${index}`,
+      source_username: `Source ${index}`,
+      target_username: `Destination ${index}`,
+    }));
+    const { api } = page(many);
+    const directory = screen.getByRole('tabpanel', { name: /Saved mappings/ });
+    expect(within(directory).getAllByRole('article')).toHaveLength(25);
+    expect(screen.queryByRole('button', { name: 'Save mapping' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(within(directory).getAllByRole('article')).toHaveLength(25);
+    expect(within(directory).getByText('Source 25')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Find mappings'), { target: { value: 'Source 60' } });
+    expect(within(directory).getAllByRole('article')).toHaveLength(1);
+    expect(within(directory).getByText('Page 1 of 1')).toBeTruthy();
+    expect(api).not.toHaveBeenCalled();
+  });
+
   it('cancels removal without losing the mapping draft or changing a server account', async () => {
     const { requests, refresh } = page([mapping]);
     fireEvent.click(screen.getByRole('button', { name: 'Edit mapping for Mr. Complex Name !' }));
@@ -160,7 +181,7 @@ describe('Manual user mappings', () => {
     expect(screen.getByLabelText(/Discord username/)).toHaveProperty('value', '');
   });
 
-  it('keeps the selected saved mapping and its unsaved draft state visible beside the editor', () => {
+  it('keeps the selected mapping draft while switching focused task views', () => {
     const { api } = page([mapping]);
     expect(screen.getByRole('heading', { level: 1, name: 'User mappings' })).toBeTruthy();
     const edit = screen.getByRole('button', { name: 'Edit mapping for Mr. Complex Name !' });
@@ -172,7 +193,13 @@ describe('Manual user mappings', () => {
       target: { value: 'new.discord.label' },
     });
     expect(screen.getByText('Unsaved changes', { selector: 'span' })).toBeTruthy();
-    expect(screen.getByText('actual.discord.name')).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: /Saved mappings/ }));
+    expect(
+      screen.getByRole('button', { name: 'Edit mapping for Mr. Complex Name !' }),
+    ).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Save mapping' })).toBeNull();
+    fireEvent.click(screen.getByRole('tab', { name: 'Edit mapping' }));
+    expect(screen.getByLabelText(/Discord username/)).toHaveProperty('value', 'new.discord.label');
     fireEvent.click(screen.getByRole('button', { name: 'Cancel edit' }));
     expect(edit.getAttribute('aria-pressed')).toBe('false');
     expect(screen.getByText('New mapping', { selector: 'span' })).toBeTruthy();

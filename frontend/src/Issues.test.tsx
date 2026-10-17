@@ -7,8 +7,9 @@ import type { ItemIssue } from './types';
 afterEach(cleanup);
 
 function expandCandidateDetails() {
-  const details = screen.getByText(/Compare .* Jellyfin candidate|View saved item details/)
-    .parentElement as HTMLDetailsElement;
+  const details = screen.getByText(
+    /Compare .* Jellyfin candidate|View Emby source|View saved Emby source details/,
+  ).parentElement as HTMLDetailsElement;
   act(() => {
     details.open = true;
     fireEvent(details, new Event('toggle'));
@@ -52,7 +53,7 @@ describe('Readable migration item issues', () => {
     expect(screen.getByText('Harbor Stories · S02E03 · The Crossing')).toBeTruthy();
     expect(screen.getByText(episode.reason!)).toBeTruthy();
     expect(screen.getByText('Matching basis: Provider ID.')).toBeTruthy();
-    expect(screen.getByText('Compare 1 Jellyfin candidate')).toBeTruthy();
+    expect(screen.getByText('Compare 1 Emby item with 1 Jellyfin candidate')).toBeTruthy();
     expect(screen.queryByLabelText('Emby source')).toBeNull();
     expect(screen.queryByText('target-episode')).toBeNull();
 
@@ -112,6 +113,78 @@ describe('Readable migration item issues', () => {
     expect(screen.getByText('/4K/Ocean Voyage.mkv')).toBeTruthy();
     expect(screen.queryByText(/4K library|inaccessible|restricted/)).toBeNull();
     expect(screen.queryByRole('link')).toBeNull();
+  });
+
+  it('distinguishes one Emby reference from two Jellyfin destination candidates', () => {
+    const item: ItemIssue = {
+      ...episode,
+      candidate_count: 2,
+      candidate_ids: ['target-one', 'target-two'],
+      candidates: [
+        { ...episode.candidates![0]!, id: 'target-one' },
+        { ...episode.candidates![0]!, id: 'target-two', episode_number: 3 },
+      ],
+    };
+    render(<Issues label="Ambiguous items" items={[item]} count={1} ambiguous />);
+    expect(screen.getByText('Ambiguous items (1 Emby item)')).toBeTruthy();
+    expect(screen.getByText('Compare 1 Emby item with 2 Jellyfin candidates')).toBeTruthy();
+    expandCandidateDetails();
+    expect(
+      screen.getByText('The Emby source is a reference, not an additional Jellyfin match.'),
+    ).toBeTruthy();
+    expect(screen.getAllByLabelText('Emby source')).toHaveLength(1);
+    expect(screen.getAllByLabelText(/^Jellyfin candidate/)).toHaveLength(2);
+    expect(screen.queryByLabelText('Jellyfin candidate 3')).toBeNull();
+  });
+
+  it('counts ambiguous Emby items separately from their differing destination candidate counts', () => {
+    const items: ItemIssue[] = [2, 3].map((count, index) => ({
+      ...episode,
+      id: `source-${index}`,
+      candidate_count: count,
+      candidates: Array.from({ length: count }, (_, candidate) => ({
+        ...episode.candidates![0]!,
+        id: `target-${index}-${candidate}`,
+      })),
+    }));
+    render(<Issues label="Ambiguous items" items={items} count={2} ambiguous />);
+    expect(screen.getByText('Ambiguous items (2 Emby items)')).toBeTruthy();
+    for (const count of [2, 3]) {
+      const details = screen.getByText(`Compare 1 Emby item with ${count} Jellyfin candidates`)
+        .parentElement as HTMLDetailsElement;
+      act(() => {
+        details.open = true;
+        fireEvent(details, new Event('toggle'));
+      });
+    }
+    expect(screen.getAllByLabelText('Emby source')).toHaveLength(2);
+    expect(screen.getAllByLabelText(/^Jellyfin candidate/)).toHaveLength(5);
+    expect(screen.queryByText('Ambiguous items (5 Emby items)')).toBeNull();
+  });
+
+  it('reports missing candidate cards even when all candidate IDs were saved', () => {
+    render(
+      <Issues
+        label="Ambiguous items"
+        items={[{ ...episode, candidate_count: 2, candidate_ids: ['target-one', 'target-two'] }]}
+        ambiguous
+      />,
+    );
+    expandCandidateDetails();
+    expect(screen.getByText(/Showing 1 of 2 Jellyfin candidate cards/)).toBeTruthy();
+    expect(screen.getByText(/remaining candidate details were not saved/)).toBeTruthy();
+    expect(screen.getAllByLabelText(/^Jellyfin candidate/)).toHaveLength(1);
+  });
+
+  it.each([
+    ['series_episode+provider_id', 'Show ID + season and episode + episode provider ID'],
+    [
+      'series_episode+provider_id+path',
+      'Show ID + season and episode + episode provider ID + exact mapped file path',
+    ],
+  ])('explains the recorded matching method %s', (method, label) => {
+    render(<Issues label="Ambiguous items" items={[{ ...episode, method }]} ambiguous />);
+    expect(screen.getByText(`Matching basis: ${label}.`)).toBeTruthy();
   });
 
   it('honestly explains missing details on legacy jobs and retains the saved candidate IDs', () => {
@@ -272,11 +345,11 @@ describe('Readable migration item issues', () => {
       candidates,
     }));
     render(<Issues label="Ambiguous items" items={issues} count={241} ambiguous />);
-    expect(screen.getByText('Ambiguous items (241)')).toBeTruthy();
+    expect(screen.getByText('Ambiguous items (241 Emby items)')).toBeTruthy();
     expect(screen.getByText(/Showing 200 of 241 items/)).toBeTruthy();
     expect(screen.queryByText('Source 200')).toBeNull();
     expect(screen.queryByText('Candidate 0', { exact: false })).toBeNull();
-    const details = screen.getAllByText('Compare 25 Jellyfin candidates')[0]!
+    const details = screen.getAllByText('Compare 1 Emby item with 25 Jellyfin candidates')[0]!
       .parentElement as HTMLDetailsElement;
     act(() => {
       details.open = true;
@@ -284,12 +357,31 @@ describe('Readable migration item issues', () => {
     });
     expect(screen.getByLabelText('Jellyfin candidate 20')).toBeTruthy();
     expect(screen.queryByLabelText('Jellyfin candidate 21')).toBeNull();
-    expect(screen.getByText(/Showing 20 of 25 candidates/)).toBeTruthy();
+    expect(screen.getByText(/Showing 20 of 25 Jellyfin candidate cards/)).toBeTruthy();
     expect(screen.getAllByLabelText('Emby source')).toHaveLength(1);
     act(() => {
       details.open = false;
       fireEvent(details, new Event('toggle'));
     });
     expect(screen.queryByLabelText('Emby source')).toBeNull();
+  });
+
+  it('preserves the full recorded candidate count when an old report omitted candidate_count', () => {
+    const candidates = Array.from({ length: 25 }, (_, index) => ({
+      id: `candidate-${index}`,
+      name: `Candidate ${index}`,
+      type: 'Movie',
+    }));
+    render(
+      <Issues
+        label="Ambiguous items"
+        items={[{ id: 'source', name: 'Source', candidates }]}
+        ambiguous
+      />,
+    );
+    expect(screen.getByText('Compare 1 Emby item with 25 Jellyfin candidates')).toBeTruthy();
+    expandCandidateDetails();
+    expect(screen.getAllByLabelText(/^Jellyfin candidate/)).toHaveLength(20);
+    expect(screen.getByText(/Showing 20 of 25 Jellyfin candidate cards/)).toBeTruthy();
   });
 });

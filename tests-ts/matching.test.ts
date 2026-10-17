@@ -123,11 +123,10 @@ describe('conservative media matching', () => {
       },
     ]);
   });
-  it('stops compatibility diagnostics at the first conflicting episode in a provider collision bucket', () => {
+  it('stops compatibility diagnostics at the first provider conflict when complete series context is unavailable', () => {
     const source = item('source', {
       Type: 'Episode',
       ProviderIds: { Tvdb: '555' },
-      SeriesProviderIds: { Tvdb: '100' },
       ParentIndexNumber: 1,
       IndexNumber: 2,
     });
@@ -160,7 +159,7 @@ describe('conservative media matching', () => {
     expect(plan.ambiguous[0]?.candidates).toHaveLength(2);
     expect(plan.ambiguous[0]?.candidates[0]).toBe(first);
     expect(plan.ambiguous[0]?.candidates[1]).toBe(later);
-    expect(plan.ambiguous[0]?.reason_codes).toEqual(['numbering_conflict', 'provider_conflict']);
+    expect(plan.ambiguous[0]?.reason_codes).toEqual(['numbering_conflict']);
     expect(laterCompatibilityReads).toBe(0);
   });
   it('retains the media type conflict guard when a prepared matcher target is mutated', () => {
@@ -251,7 +250,7 @@ describe('conservative media matching', () => {
     const match = createMatcher(targets, mappings);
     expect(match([movie, episode]).matches.map(({ target }) => target.Id)).toEqual([
       'provider-movie',
-      'provider-episode',
+      'series-episode',
     ]);
     expect(match.candidates([movie, episode])).toEqual(targets.slice(0, 5));
     const accessible = match

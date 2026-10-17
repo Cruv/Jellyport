@@ -1114,6 +1114,33 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         ),
   );
   app.get('/api/jobs', async () => ({ jobs: store.jobs() }));
+  app.post<{ Body: { job_ids: string[] } }>(
+    '/api/jobs/cleanup',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['job_ids'],
+          properties: {
+            job_ids: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 1000,
+              uniqueItems: true,
+              items: {
+                type: 'string',
+                minLength: 1,
+                maxLength: 128,
+                pattern: '^[A-Za-z0-9_-]+$',
+              },
+            },
+          },
+        },
+      },
+    },
+    async (request) => service.clearJobHistory(request.body.job_ids),
+  );
   app.get<{ Params: { job_id: string } }>('/api/jobs/:job_id', async (request) =>
     service.getJob(request.params.job_id),
   );

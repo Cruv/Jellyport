@@ -6,7 +6,13 @@ import { isDeepStrictEqual } from 'node:util';
 import { SecretCipher } from './crypto.js';
 import { nameKey } from './identity.js';
 import { DEFAULT_SETTINGS, DEMO_SETTINGS, type Settings } from './types.js';
-import type { Job, JobRequest, SubscriptionEvent } from './service.js';
+import type {
+  Job,
+  JobRequest,
+  JobHistoryCleanupResult,
+  JobHistoryCleanupSkipReason,
+  SubscriptionEvent,
+} from './service.js';
 export { DEFAULT_SETTINGS } from './types.js';
 
 export interface Account {
@@ -120,6 +126,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS source_snapshot_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS destination_catalog_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS credentials_expiry ON credentials(expires);
+      CREATE INDEX IF NOT EXISTS subscriptions_job_id ON subscriptions(json_extract(payload,'$.job_id'));
     `);
     const columns = this.db.prepare('PRAGMA table_info(links)').all();
     if (!columns.some((row) => row.name === 'pending_disabled'))
@@ -405,6 +412,68 @@ export class Store {
       .prepare("SELECT payload FROM jobs ORDER BY json_extract(payload,'$.created_at') DESC")
       .all()
       .map((row) => JSON.parse(row.payload as string) as Job);
+  }
+  clearJobHistory(jobIds: string[], activeIds: ReadonlySet<string>): JobHistoryCleanupResult {
+    if (!jobIds.length || jobIds.length > 1000 || new Set(jobIds).size !== jobIds.length)
+      throw new Error('Activity cleanup requires 1 to 1000 distinct report IDs.');
+    return this.transaction(() => {
+      const result: JobHistoryCleanupResult = { removed_ids: [], skipped: [] };
+      const time = Date.now() / 1000;
+      const inspect = this.db.prepare(`
+        SELECT json_extract(payload,'$.status') AS status,
+          EXISTS(SELECT 1 FROM job_queue WHERE job_id=jobs.id) AS queued,
+          EXISTS(SELECT 1 FROM credentials WHERE job_id=jobs.id AND expires>?) AS credentials
+        FROM jobs WHERE id=?`);
+      const processing = this.db.prepare(`SELECT 1 FROM subscriptions
+        WHERE json_extract(payload,'$.job_id')=?
+          AND json_extract(payload,'$.status')='processing' LIMIT 1`);
+      // Project only identity strings. A report may contain megabytes of migration
+      // diagnostics; cleanup must not deserialize or retain those details in memory.
+      const usernames = this.db.prepare(`SELECT json_extract(value,'$.username') AS username
+        FROM jobs,json_each(jobs.payload,'$.results') WHERE jobs.id=?`);
+      const removeCredentials = this.db.prepare('DELETE FROM credentials WHERE job_id=?');
+      const remove = this.db.prepare('DELETE FROM jobs WHERE id=?');
+      const detach = this.db.prepare(`UPDATE subscriptions
+        SET payload=json_set(json_remove(payload,'$.job_id'),'$.report_cleared',json('true'))
+        WHERE json_extract(payload,'$.job_id')=?`);
+      const terminal = new Set([
+        'completed',
+        'partial',
+        'failed',
+        'interrupted',
+        'cancelled',
+        'canceled',
+      ]);
+      for (const id of jobIds) {
+        let reason: JobHistoryCleanupSkipReason | undefined;
+        const row = inspect.get(time, id);
+        if (!row) reason = 'not_found';
+        else if (activeIds.has(id)) reason = 'active';
+        else if (!terminal.has(String(row.status)) || row.queued) reason = 'not_finished';
+        else if (row.credentials) reason = 'pending_credentials';
+        else if (processing.get(id)) reason = 'subscription_processing';
+        else {
+          for (const row of usernames.iterate(id)) {
+            const account = typeof row.username === 'string' ? this.account(row.username) : null;
+            if (account && ['uncertain', 'provisioning'].includes(account.status)) {
+              reason = 'recovery_required';
+              break;
+            }
+          }
+        }
+        if (reason) {
+          result.skipped.push({ id, reason });
+          continue;
+        }
+        detach.run(id);
+        removeCredentials.run(id);
+        remove.run(id);
+        result.removed_ids.push(id);
+      }
+      // Journals, subscription dedupe, identity links and alert receipts are separate
+      // operational state. They deliberately survive removing a presentation report.
+      return result;
+    });
   }
   saveQueuedJob(job: Job, requests: JobRequest[], settings: Settings): void {
     this.transaction(() => {

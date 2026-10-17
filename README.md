@@ -251,6 +251,14 @@ If a creation times out or stops before initialization finishes, inspect Jellyfi
 
 For an incomplete numbered account, inspect its exact username and select the same Discord owner for recovery. Jellyport checks the account slot against the member's active allowance before resetting a password or linking the account. Recovery cannot claim another member's account or reactivate a slot outside the current tier.
 
+## Clear activity and reports
+
+Open **Activity → Clear history…** to review finished operations from all history or the current Activity filters. Choose records older than 7, 30, or 90 days, or **Any time**, then confirm the displayed count. The default is 30 days; the finish date is used when available, otherwise the last update or creation date. The selection stays fixed while the confirmation is open. To remove one operation, open its details and choose **Clear report…**.
+
+Clearing permanently removes Jellyport's selected activity records and migration reports. It does not undo migrations or change accounts, permissions, passwords, or watch history on either media server. Running, queued, or still-finalizing operations are protected, as are reports needed for unexpired credential delivery, uncertain account recovery, or an in-progress subscription action. The result shows how many were cleared and why others were kept. Up to 1,000 reports can be cleared in one request; narrow larger selections by age or filters.
+
+Account and playlist recovery journals, identity links, membership records, and subscription deduplication remain intact. A subscription whose report was cleared keeps its event status and displays **Report cleared** instead of a broken report link. Existing backups are unchanged. This is manual cleanup; no automatic retention policy is enabled.
+
 ## Optional Discord and membership automation
 
 Follow [Discord setup](docs/discord-setup.md) to configure the bot, command permissions, trusted MEE6 announcement source, and optional membership role events.
@@ -371,6 +379,7 @@ The browser uses authenticated session cookies. Mutating API requests require th
 | Inspect or recover an incomplete creation | `GET /api/accounts/recovery`, `POST /api/accounts/recover` |
 | List or inspect jobs | `GET /api/jobs`, `GET /api/jobs/{job_id}` |
 | Cancel queued or running work and preserve applied changes | `POST /api/jobs/{job_id}/cancel` |
+| Clear reviewed finished activity and migration reports locally | `POST /api/jobs/cleanup` with `{"job_ids":["JOB_ID"]}` |
 | Consume retained credentials | `POST /api/jobs/{job_id}/credentials` |
 | Review, apply, or ignore membership events | `GET /api/subscriptions`, `POST /api/subscriptions/{event_id}/apply`, `POST /api/subscriptions/{event_id}/ignore` |
 

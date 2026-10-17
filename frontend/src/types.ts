@@ -393,6 +393,11 @@ export interface SubscriptionEvent {
   account_limit?: number;
   error?: string;
   job_id?: string;
+  report_cleared?: boolean;
+}
+export interface HistoryCleanupResult {
+  removed_ids: string[];
+  skipped: { id: string; reason: string }[];
 }
 export interface Recovery {
   username: string;
@@ -448,6 +453,9 @@ export interface ApiOptions {
 export type Api = <T>(path: string, options?: ApiOptions) => Promise<T>;
 export type Notify = (message: string, error?: boolean) => void;
 export const activeJob = (job: Job) => ['queued', 'running'].includes(job.status);
+/** Unknown statuses stay protected until the application explicitly supports their lifecycle. */
+export const finishedJob = (job: Pick<Job, 'status'>) =>
+  ['completed', 'partial', 'failed', 'interrupted', 'cancelled', 'canceled'].includes(job.status);
 export const num = (value?: number) => Number(value || 0).toLocaleString();
 export const date = (value?: string) => {
   if (!value) return '—';

@@ -769,6 +769,7 @@ export function Modal({
   footer,
   wide = false,
   close,
+  closeDisabled = false,
 }: {
   title: string;
   description?: string;
@@ -776,6 +777,7 @@ export function Modal({
   footer?: ReactNode;
   wide?: boolean;
   close: () => void;
+  closeDisabled?: boolean;
 }) {
   const dialog = useRef<HTMLElement>(null);
   const closeRef = useRef(close);
@@ -838,7 +840,12 @@ export function Modal({
             <h2 id="modal-title">{title}</h2>
             {description && <p>{description}</p>}
           </div>
-          <button className="icon-button" onClick={close} aria-label="Close dialog">
+          <button
+            className="icon-button"
+            onClick={close}
+            aria-label="Close dialog"
+            disabled={closeDisabled}
+          >
             <Icon name="close" />
           </button>
         </div>

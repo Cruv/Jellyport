@@ -35,9 +35,8 @@ test('clears a reviewed report after credentials are consumed, preserving the me
   await expect(page.getByRole('button', { name: 'View operation details' })).toHaveCount(1);
   await page.getByRole('button', { name: 'Clear history…', exact: true }).click();
   const bulk = page.getByRole('dialog', { name: 'Clear activity history?' });
-  await expect(bulk).toContainText('0 finished reports selected.');
-  await bulk.getByRole('combobox', { name: 'Reports to review' }).selectOption('filtered');
-  await bulk.getByRole('combobox', { name: 'Recorded before' }).selectOption('all');
+  await expect(bulk.getByRole('combobox', { name: 'Reports to review' })).toHaveValue('filtered');
+  await expect(bulk.getByRole('combobox', { name: 'Recorded before' })).toHaveValue('all');
   await expect(bulk).toContainText('1 finished report selected.');
   await expectContainedLayout(page);
   await page.screenshot({ path: info.outputPath('clear-history-review.png'), fullPage: true });

@@ -66,6 +66,13 @@ import {
 import { MediaWorkload, type MediaWorkloadEvent } from './media-workload.js';
 import { MigrationCatalogCache, type MigrationCatalog } from './migration-catalog.js';
 import { snapshotHistoryWarnings } from './emby-snapshot-reader.js';
+import { validateActivityRetentionDays } from './settings.js';
+import {
+  JOB_RETENTION_INTERVAL_SECONDS,
+  JOB_RETENTION_BATCH_LIMIT,
+  type JobRetentionCursor,
+  type JobRetentionStatus,
+} from './job-retention.js';
 
 export { ServiceError } from './errors.js';
 export { generatePassword } from './credentials.js';
@@ -433,6 +440,17 @@ export class Service {
   private readonly historyMutex = new Mutex();
   private readonly jobControllers = new Map<string, AbortController>();
   private readonly activeJobs = new Map<string, Job>();
+  private retentionDays = 0;
+  private retentionCursor: JobRetentionCursor | null = null;
+  private retentionLastRun: Omit<
+    JobRetentionStatus,
+    'retention_days' | 'interval_seconds' | 'batch_limit'
+  > = {
+    last_run_at: null,
+    last_removed: 0,
+    last_kept: 0,
+    error: null,
+  };
   private readonly sourceWorkload: MediaWorkload;
   private readonly sourceCatalogs: MigrationCatalogCache;
   private readonly destinationCatalogs: MigrationCatalogCache;
@@ -1989,12 +2007,84 @@ export class Service {
     // No await separates this guard from the synchronous database transaction. A job
     // remains protected through its final save and task/controller cleanup, including
     // a canceled job that already displays a terminal status while still unwinding.
-    const activeIds = new Set([
+    return this.store.clearJobHistory(jobIds, this.protectedJobIds());
+  }
+  private protectedJobIds(): Set<string> {
+    return new Set([
       ...this.jobTasks.keys(),
       ...this.jobControllers.keys(),
       ...this.activeJobs.keys(),
     ]);
-    return this.store.clearJobHistory(jobIds, activeIds);
+  }
+  jobRetentionStatus(): JobRetentionStatus {
+    const days = this.store.jobRetentionDays();
+    if (days !== this.retentionDays) {
+      this.retentionDays = days;
+      this.retentionCursor = null;
+      this.retentionLastRun = { last_run_at: null, last_removed: 0, last_kept: 0, error: null };
+    }
+    return {
+      retention_days: days,
+      interval_seconds: JOB_RETENTION_INTERVAL_SECONDS,
+      batch_limit: JOB_RETENTION_BATCH_LIMIT,
+      ...this.retentionLastRun,
+    };
+  }
+  setJobRetention(days: number): JobRetentionStatus {
+    validateActivityRetentionDays(days);
+    if (this.demo) throw new ServiceError('Demo activity retention is read-only.');
+    // Retention policy is independent operational configuration: changing it must
+    // not invalidate reviewed migrations or settings captured by active jobs.
+    this.store.saveJobRetentionDays(days);
+    return this.jobRetentionStatus();
+  }
+  runJobRetention(now = Date.now()): JobRetentionStatus {
+    const status = this.jobRetentionStatus();
+    if (this.stopping || this.demo || !status.retention_days) return status;
+    try {
+      const runAt = new Date(now).toISOString();
+      const cutoff = now - status.retention_days * 86_400_000;
+      let candidates = this.store.jobRetentionCandidates(
+        cutoff,
+        this.retentionCursor,
+        JOB_RETENTION_BATCH_LIMIT,
+      );
+      if (!candidates.length && this.retentionCursor) {
+        this.retentionCursor = null;
+        candidates = this.store.jobRetentionCandidates(cutoff, null, JOB_RETENTION_BATCH_LIMIT);
+      }
+      const result = candidates.length
+        ? this.store.clearJobHistory(
+            candidates.map((item) => item.id),
+            this.protectedJobIds(),
+            { cutoff, now },
+          )
+        : { removed_ids: [], skipped: [] };
+      // Advance past protected records too. A fixed oldest batch must never starve
+      // later eligible reports; after exhaustion, revisit those guards next cycle.
+      this.retentionCursor =
+        candidates.length === JOB_RETENTION_BATCH_LIMIT ? candidates.at(-1)! : null;
+      this.retentionLastRun = {
+        last_run_at: runAt,
+        last_removed: result.removed_ids.length,
+        last_kept: result.skipped.length,
+        error: null,
+      };
+    } catch {
+      // Keep the cursor unchanged on failure so an atomic batch can be retried.
+      // Neither status nor logs expose SQL errors, report identities or diagnostics.
+      this.retentionLastRun = {
+        last_run_at:
+          Number.isFinite(now) && Math.abs(now) <= 8_640_000_000_000_000
+            ? new Date(now).toISOString()
+            : null,
+        last_removed: 0,
+        last_kept: 0,
+        error:
+          'Automatic activity cleanup could not finish. It will retry on the next scheduled pass.',
+      };
+    }
+    return this.jobRetentionStatus();
   }
   cancelJob(id: string): Job {
     const job = this.getJob(id);

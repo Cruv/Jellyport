@@ -99,6 +99,7 @@ type Dialog =
       filteredIds: string[];
       openedAt: number;
       single: boolean;
+      filtered: boolean;
     }
   | { kind: 'event'; event: SubscriptionEvent };
 interface Toast {
@@ -129,7 +130,7 @@ export default function App() {
   const authGeneration = useRef(0);
   const [booting, setBooting] = useState(true);
   const [page, setPage] = useState<Page>(() =>
-    /^#settings-(media|accounts|discord|automation|history)$/.test(window.location.hash)
+    /^#settings-(media|accounts|discord|automation|history|activity)$/.test(window.location.hash)
       ? 'settings'
       : 'overview',
   );
@@ -503,7 +504,7 @@ export default function App() {
   function navigate(target: Page) {
     if (
       target !== 'settings' &&
-      /^#settings-(media|accounts|discord|automation|history)$/.test(window.location.hash)
+      /^#settings-(media|accounts|discord|automation|history|activity)$/.test(window.location.hash)
     )
       window.history.replaceState(null, '', window.location.pathname + window.location.search);
     if (target !== 'migrate') cancelPreview();
@@ -803,7 +804,7 @@ export default function App() {
         showDialog({ kind: 'credentials', credentials: result.credentials || [] });
     });
   }
-  function reviewHistory(filteredIds: string[], single?: Job) {
+  function reviewHistory(filteredIds: string[], filtered = false, single?: Job) {
     const candidates = single ? [single] : jobsRef.current;
     showDialog({
       kind: 'cleanup',
@@ -817,6 +818,7 @@ export default function App() {
       filteredIds: single ? [single.id] : [...filteredIds],
       openedAt: Date.now(),
       single: !!single,
+      filtered,
     });
   }
   async function cleanupHistory(ids: string[]): Promise<HistoryCleanupResult | undefined> {
@@ -1205,7 +1207,7 @@ export default function App() {
           reveal={reveal}
           cancelJob={cancelJob}
           showReveal={(jobId) => showDialog({ kind: 'reveal', jobId })}
-          clearReport={(job) => reviewHistory([job.id], job)}
+          clearReport={(job) => reviewHistory([job.id], false, job)}
           cleanupHistory={cleanupHistory}
           apply={apply}
           busy={busy}
@@ -1287,8 +1289,8 @@ function HistoryCleanupDialog({
   close: () => void;
   submit: (ids: string[]) => Promise<HistoryCleanupResult | undefined>;
 }) {
-  const [scope, setScope] = useState('all');
-  const [age, setAge] = useState(review.single ? 'all' : '30');
+  const [scope, setScope] = useState(review.filtered ? 'filtered' : 'all');
+  const [age, setAge] = useState(review.single || review.filtered ? 'all' : '30');
   const [pending, setPending] = useState(false);
   const pendingRef = useRef(false);
   const [error, setError] = useState('');
@@ -1376,7 +1378,7 @@ function HistoryCleanupDialog({
       <Callout icon="info" title="Completed server changes are kept.">
         This only removes Jellyport’s stored reports. It does not undo migrations, change media
         accounts, or change watch history. Reports needed for active work, credential delivery, or
-        account recovery are kept.
+        account recovery are kept. Finished reports include Failed and Needs review activity.
       </Callout>
       {review.single && (
         <p className="subtle text-small">

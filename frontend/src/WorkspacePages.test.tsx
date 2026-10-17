@@ -340,6 +340,7 @@ describe('Workspace navigation and migration controls', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
     expect(clearHistory).toHaveBeenCalledWith(
       jobs.filter((item) => item.status === 'failed').map((item) => item.id),
+      true,
     );
   });
 

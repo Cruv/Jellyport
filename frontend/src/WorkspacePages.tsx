@@ -829,7 +829,11 @@ export function ActivityPage({
   openJob,
   navigate,
   clearHistory,
-}: Common & { jobs: Job[]; refresh: () => void; clearHistory?: (filteredIds: string[]) => void }) {
+}: Common & {
+  jobs: Job[];
+  refresh: () => void;
+  clearHistory?: (filteredIds: string[], filtered: boolean) => void;
+}) {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('all');
   const filtered = jobs.filter(
@@ -855,7 +859,12 @@ export function ActivityPage({
             {clearHistory && (
               <button
                 className="btn btn-quiet"
-                onClick={() => clearHistory(filtered.map((job) => job.id))}
+                onClick={() =>
+                  clearHistory(
+                    filtered.map((job) => job.id),
+                    status !== 'all' || query.trim() !== '',
+                  )
+                }
                 disabled={!jobs.length}
               >
                 Clear history…

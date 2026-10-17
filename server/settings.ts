@@ -7,6 +7,11 @@ export const SECRET_FIELDS = ['emby_api_key', 'jellyfin_api_key', 'discord_bot_t
 const snowflake = /^[0-9]{5,22}$/;
 const control = /[\x00-\x1f]/;
 
+export function validateActivityRetentionDays(value: unknown): asserts value is number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 3650)
+    throw new ServiceError('Activity retention must be a whole number from 0 to 3650 days.');
+}
+
 export function validateSettings(input: unknown): asserts input is Settings {
   if (!input || typeof input !== 'object' || Array.isArray(input))
     throw new ServiceError('Settings must be an object.');

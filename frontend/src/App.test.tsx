@@ -127,6 +127,15 @@ beforeEach(() => {
     '/api/users': { emby: [], jellyfin: [] },
     '/api/user-mappings': { mappings: [] },
     '/api/account-roles': { roles: [], assignments: [] },
+    '/api/jobs/retention': {
+      retention_days: 0,
+      interval_seconds: 60,
+      batch_limit: 100,
+      last_run_at: null,
+      last_removed: 0,
+      last_kept: 0,
+      error: null,
+    },
     '/api/source-snapshots': {
       available: false,
       capture_method: 'sqlite_online_backup',
@@ -222,6 +231,14 @@ describe('Activity report cleanup', () => {
     });
     fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
     const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('combobox', { name: 'Reports to review' })).toHaveProperty(
+      'value',
+      'filtered',
+    );
+    expect(within(dialog).getByRole('combobox', { name: 'Recorded before' })).toHaveProperty(
+      'value',
+      'all',
+    );
     fireEvent.change(within(dialog).getByRole('combobox', { name: 'Reports to review' }), {
       target: { value: 'filtered' },
     });
@@ -261,6 +278,60 @@ describe('Activity report cleanup', () => {
       (within(dialog).getByRole('button', { name: 'Clear 1 report' }) as HTMLButtonElement)
         .disabled,
     ).toBe(false);
+  });
+
+  it.each(['failed', 'partial'])(
+    'defaults a filtered %s review to all ages without including unrelated reports',
+    async (status) => {
+      const target = { ...past('selected', status), finished_at: '2099-01-01T00:00:00Z' };
+      responses['/api/jobs'] = { jobs: [target, past('unrelated')] };
+      responses['/api/jobs/cleanup'] = { removed_ids: ['selected'], skipped: [] };
+      render(<App />);
+      fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+      fireEvent.change(await screen.findByRole('combobox', { name: 'Status' }), {
+        target: { value: status },
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
+      const dialog = await screen.findByRole('dialog');
+      expect(within(dialog).getByRole('combobox', { name: 'Reports to review' })).toHaveProperty(
+        'value',
+        'filtered',
+      );
+      expect(within(dialog).getByRole('combobox', { name: 'Recorded before' })).toHaveProperty(
+        'value',
+        'all',
+      );
+      expect(
+        within(dialog).getByText(/Finished reports include Failed and Needs review/),
+      ).toBeTruthy();
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
+      await within(dialog).findByText('1 report cleared. 0 kept.');
+      expect(JSON.parse(cleanupRequests()[0].options!.body as string)).toEqual({
+        job_ids: ['selected'],
+      });
+    },
+  );
+
+  it('defaults a search-only review to the matching reports at any age', async () => {
+    responses['/api/jobs'] = { jobs: [past('selected'), past('unrelated')] };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+    fireEvent.change(await screen.findByRole('searchbox', { name: 'Search operations' }), {
+      target: { value: 'private-selected' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('combobox', { name: 'Reports to review' })).toHaveProperty(
+      'value',
+      'filtered',
+    );
+    expect(within(dialog).getByRole('combobox', { name: 'Recorded before' })).toHaveProperty(
+      'value',
+      'all',
+    );
+    expect(within(dialog).getByRole('button', { name: 'Clear 1 report' })).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(cleanupRequests()).toHaveLength(0);
   });
 
   it('refuses an oversized review instead of silently truncating it', async () => {
@@ -2253,7 +2324,34 @@ describe('React account safeguards', () => {
     expect(tab.defaultPrevented).toBe(false);
     expect(document.activeElement).toBe(toggle);
   });
-  it.each(['media', 'accounts', 'discord', 'automation', 'history'])(
+  it('saves independent activity retention through the authenticated CSRF-protected API', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await selectSettingsTab('Activity');
+    await screen.findByText('Automatic cleanup off');
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Enable automatic activity cleanup' }));
+    fireEvent.change(screen.getByRole('spinbutton', { name: 'Keep reports for this many days' }), {
+      target: { value: '14' },
+    });
+    responses['/api/jobs/retention'] = {
+      ...(responses['/api/jobs/retention'] as object),
+      retention_days: 14,
+    };
+    fireEvent.click(screen.getByRole('button', { name: 'Save activity retention' }));
+    await screen.findByText('Automatic activity cleanup saved.');
+    const request = requests.find(
+      (request) => request.path === '/api/jobs/retention' && request.options?.method === 'PUT',
+    )!;
+    expect((request.options?.headers as Record<string, string>)['X-CSRF-Token']).toBe('test-csrf');
+    expect(JSON.parse(request.options!.body as string)).toEqual({ retention_days: 14 });
+    expect(
+      requests.some(
+        (request) => request.path === '/api/settings' && request.options?.method === 'PUT',
+      ),
+    ).toBe(false);
+  });
+
+  it.each(['media', 'accounts', 'discord', 'automation', 'history', 'activity'])(
     'opens a bookmarked %s settings section and clears its anchor when navigating elsewhere',
     async (section) => {
       const original = window.location.href;
@@ -2268,6 +2366,7 @@ describe('React account safeguards', () => {
           discord: 'Discord',
           automation: 'Automation',
           history: 'Saved history',
+          activity: 'Activity',
         };
         expect(
           within(sections)

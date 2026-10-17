@@ -14,6 +14,8 @@ API clients may omit `migration_scope` or send `"watched_only"`. The legacy `"co
 
 Both live and saved-history sources use reusable matching metadata. Live source state is obtained through bounded explicit-ID batches; saved sources use the indexed private projection and retain only played playable items for transfer. Each account's destination candidates are checked through fresh user-scoped reads, including accessible items with no prior personal state. No user's permissions or activity are reused for another account.
 
+For TV episodes, matching first looks for a common, nonconflicting public show identity and the complete season/episode number range. That full context takes precedence over an episode provider ID that also appears on another numbered episode. For example, a stray shared episode ID on S02E10 no longer blocks a uniquely matching S02E13 in the same verified show. Episode provider IDs must still be compatible within the selected context; contradictory show identities, conflicting episode metadata, incomplete numbering and multiple equally valid editions remain subject to the existing ambiguity safeguards. An exact mapped path can distinguish otherwise compatible editions. Show names and episode titles are display context, not proof of identity by themselves, so identically named remakes are not merged. This reuses the existing candidate indexes and account-scoped access checks without another catalog scan.
+
 ## What can move
 
 | Data                                                                              | Behavior and limitations                                                                                                                                                                     |
@@ -88,6 +90,10 @@ season/episode numbers and episode title. The reason distinguishes conflicting
 provider identities or numbering from duplicate matches; a single conflicting
 candidate can also be ambiguous. Expand a comparison to see the source and each
 retained Jellyfin candidate, including their recorded paths and provider IDs.
+The outer count is the number of Emby source items requiring review. Each
+comparison separately counts Jellyfin candidates; the Emby reference card is not
+an additional destination choice. For example, two Jellyfin candidates plus the
+Emby reference produce three cards for one source item.
 An exact path does not override contradictory identity metadata, and no history
 flag is assigned to an ambiguous item. Optional labels are display context only;
 they do not alter matching. Show names reuse saved parent metadata or already-read

@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { migrateItemState, migrationDetails } from '../server/migration.js';
+import { migrateItemState, migrationDetails, statePlan } from '../server/migration.js';
+import { createMatcher } from '../server/matching.js';
+import { DEFAULT_SETTINGS } from '../server/types.js';
 import {
   captureExpectation,
   evaluateExpectation,
@@ -527,4 +529,136 @@ describe('strict public played-flag writer', () => {
       expect(migrationCapabilities).not.toHaveBeenCalled();
     },
   );
+});
+
+describe('episode identity collisions through played-state migration', () => {
+  function episodeFixture(alreadyPlayed = false) {
+    const source: MediaItem = {
+      Id: 'source-episode-13',
+      Type: 'Episode',
+      SeriesName: 'Workshop Rescue',
+      Name: 'The third check-in',
+      ParentIndexNumber: 2,
+      IndexNumber: 13,
+      SeriesProviderIds: { Tvdb: '770000', Imdb: 'tt7700000' },
+      ProviderIds: { Tvdb: '770013', Imdb: 'tt7700013' },
+      Path: '/source-tv/Workshop Rescue/Season 02/episode-13.mkv',
+      UserData: { Played: true, IsFavorite: true, PlayCount: 99, PlaybackPositionTicks: 500 },
+    };
+    const correct: MediaItem = {
+      ...source,
+      Id: 'target-episode-13',
+      Path: '/target-tv/Workshop Rescue/Season 02/episode-13.mkv',
+      UserData: {
+        Played: alreadyPlayed,
+        IsFavorite: false,
+        PlayCount: 2,
+        PlaybackPositionTicks: 42,
+        LastPlayedDate: '2026-10-17T01:00:00Z',
+      },
+    };
+    const wrong: MediaItem = {
+      ...correct,
+      Id: 'target-episode-10',
+      Name: 'The second check-in',
+      IndexNumber: 10,
+      ProviderIds: { Tvdb: '770010', Imdb: 'tt7700013' },
+      Path: '/target-tv/Workshop Rescue/Season 02/episode-10.mkv',
+      UserData: { Played: false, PlaybackPositionTicks: 7, IsFavorite: true },
+    };
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      path_mappings: [{ source: '/source-tv', target: '/target-tv' }],
+    };
+    return { source, correct, wrong, settings };
+  }
+
+  it.each([false, true])(
+    'writes only the correct same-show episode despite a reused ID (reversed=%s)',
+    async (reversed) => {
+      const { source, correct, wrong, settings } = episodeFixture();
+      const targets = reversed ? [correct, wrong] : [wrong, correct];
+      const selected = statePlan([source], targets, settings, 'watched_only');
+      expect(selected.matches.map((match) => match.target.Id)).toEqual([correct.Id]);
+      expect(selected.ambiguous).toEqual([]);
+      const originalCorrect = structuredClone(correct.UserData);
+      const originalWrong = structuredClone(wrong.UserData);
+      const states = new Map(
+        targets.map((target) => [target.Id, structuredClone(target.UserData)]),
+      );
+      const updateUserData = vi.fn(async (_user: string, id: string, patch: MediaUserDataPatch) => {
+        states.set(id, { ...states.get(id), ...patch });
+      });
+      const expectations: VerificationExpectation[] = [];
+      expect(
+        await migrateItemState(
+          client({ updateUserData }),
+          'synthetic-recipient',
+          selected,
+          migrationDetails(),
+          () => {},
+          () => {},
+          { expectation: (target, patch) => expectations.push(captureExpectation(target, patch)) },
+        ),
+      ).toBe(1);
+      expect(updateUserData).toHaveBeenCalledExactlyOnceWith('synthetic-recipient', correct.Id, {
+        Played: true,
+      });
+      expect(states.get(correct.Id)).toEqual({ ...originalCorrect, Played: true });
+      expect(states.get(wrong.Id)).toEqual(originalWrong);
+      expect(
+        evaluateExpectation(expectations[0]!, { ...correct, UserData: states.get(correct.Id) })
+          .status,
+      ).toBe('verified');
+      expect(
+        evaluateExpectation(expectations[0]!, {
+          ...wrong,
+          Id: correct.Id,
+          UserData: { Played: true },
+        }),
+      ).toMatchObject({ status: 'mismatch', identity_mismatch: true });
+    },
+  );
+
+  it('keeps newer destination state and avoids a write for an already played correct episode', async () => {
+    const { source, correct, wrong, settings } = episodeFixture(true);
+    const before = structuredClone([correct, wrong]);
+    const updateUserData = vi.fn(async () => {});
+    const selected = statePlan([source], [wrong, correct], settings, 'watched_only');
+    expect(selected.matches.map((match) => match.target.Id)).toEqual([correct.Id]);
+    expect(
+      await migrateItemState(
+        client({ updateUserData }),
+        'synthetic-recipient',
+        selected,
+        migrationDetails(),
+        () => {},
+        () => {},
+      ),
+    ).toBe(0);
+    expect(updateUserData).not.toHaveBeenCalled();
+    expect([correct, wrong]).toEqual(before);
+  });
+
+  it('never substitutes the wrong numbered episode when the correct candidate is inaccessible', async () => {
+    const { source, correct, wrong, settings } = episodeFixture();
+    const neutral = createMatcher([wrong, correct], settings.path_mappings);
+    expect(neutral.candidates([source]).map((item) => item.Id)).toEqual([wrong.Id, correct.Id]);
+    const accessible = [wrong];
+    const selected = statePlan([source], accessible, settings, 'watched_only');
+    expect(selected.matches).toEqual([]);
+    expect(selected.ambiguous).toHaveLength(1);
+    const updateUserData = vi.fn(async () => {});
+    expect(
+      await migrateItemState(
+        client({ updateUserData }),
+        'synthetic-recipient',
+        selected,
+        migrationDetails(),
+        () => {},
+        () => {},
+      ),
+    ).toBe(0);
+    expect(updateUserData).not.toHaveBeenCalled();
+  });
 });

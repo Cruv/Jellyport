@@ -441,6 +441,9 @@ const matchingMethods: Record<string, string> = {
   path: 'Exact mapped file path',
   'provider_id+path': 'Provider ID + exact mapped file path',
   'series_episode+path': 'Show ID + season and episode + exact mapped file path',
+  'series_episode+provider_id': 'Show ID + season and episode + episode provider ID',
+  'series_episode+provider_id+path':
+    'Show ID + season and episode + episode provider ID + exact mapped file path',
   'series_season+path': 'Show ID + season + exact mapped file path',
 };
 function issueReason(item: ItemIssue): string {
@@ -507,16 +510,22 @@ function IssueIdentityCard({ label, item }: { label: string; item: ItemIdentityS
 }
 function IssueCandidates({ item }: { item: ItemIssue }) {
   const [expanded, setExpanded] = useState(false);
-  const candidates = Array.isArray(item.candidates)
-    ? item.candidates.filter((candidate) => candidate && typeof candidate === 'object').slice(0, 20)
+  const savedCandidates = Array.isArray(item.candidates)
+    ? item.candidates.filter(
+        (candidate) => candidate && typeof candidate === 'object' && !Array.isArray(candidate),
+      )
     : [];
-  const ids = Array.isArray(item.candidate_ids)
-    ? item.candidate_ids
-        .map((id) => issueText(id))
-        .filter(Boolean)
-        .slice(0, 20)
+  const candidates = savedCandidates.slice(0, 20);
+  const savedIds = Array.isArray(item.candidate_ids)
+    ? item.candidate_ids.map((id) => issueText(id)).filter(Boolean)
     : [];
-  const count = Math.max(issueNumber(item.candidate_count) || 0, candidates.length, ids.length);
+  const ids = savedIds.slice(0, 20);
+  const count = Math.max(
+    issueNumber(item.candidate_count) || 0,
+    savedCandidates.length,
+    savedIds.length,
+  );
+  const shown = candidates.length || ids.length;
   return (
     <details
       className="issue-candidates"
@@ -524,11 +533,16 @@ function IssueCandidates({ item }: { item: ItemIssue }) {
     >
       <summary>
         {candidates.length
-          ? `Compare ${num(count)} Jellyfin ${count === 1 ? 'candidate' : 'candidates'}`
-          : 'View saved item details'}
+          ? `Compare 1 Emby item with ${num(count)} Jellyfin ${count === 1 ? 'candidate' : 'candidates'}`
+          : count
+            ? `View Emby source and ${num(count)} saved Jellyfin ${count === 1 ? 'candidate' : 'candidates'}`
+            : 'View saved Emby source details'}
       </summary>
       {expanded && (
         <>
+          <p className="issue-note">
+            The Emby source is a reference, not an additional Jellyfin match.
+          </p>
           <div className="issue-identity-grid">
             <IssueIdentityCard label="Emby source" item={issueIdentity(item)} />
             {candidates.map((candidate, index) => (
@@ -545,10 +559,13 @@ function IssueCandidates({ item }: { item: ItemIssue }) {
               {ids.length ? ` Jellyfin candidate IDs: ${ids.join(', ')}.` : ''}
             </p>
           )}
-          {count > Math.max(candidates.length, ids.length) && (
+          {count > shown && (
             <p className="issue-note">
-              Showing {num(Math.max(candidates.length, ids.length))} of {num(count)} candidates.
-              Details are limited to 20 candidates per item; matching checks every candidate.
+              Showing {num(shown)} of {num(count)} Jellyfin candidate{' '}
+              {candidates.length ? 'cards' : 'IDs'}.{' '}
+              {count > 20
+                ? 'Details are limited to 20 candidates per item; matching checks every candidate.'
+                : 'The remaining candidate details were not saved with this operation.'}
             </p>
           )}
         </>
@@ -573,7 +590,8 @@ export function Issues({
   return (
     <details className="disclosure">
       <summary>
-        {label} ({num(total)})
+        {label} ({num(total)}
+        {ambiguous ? ` Emby ${total === 1 ? 'item' : 'items'}` : ''})
       </summary>
       {displayed.length ? (
         <ul className="issue-list">

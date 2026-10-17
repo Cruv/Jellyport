@@ -230,6 +230,33 @@ export function catalogCandidateKeys(
   if (value) keys.add(JSON.stringify(['path', type, value]));
   return [...keys];
 }
+function providerConflict(a: Map<string, Set<string>>, b: Map<string, Set<string>>): boolean {
+  // Contradictory aliases must not silently overwrite one another, even for a path match.
+  return (
+    [...a.values(), ...b.values()].some((ids) => ids.size > 1) ||
+    [...a].some(([key, ids]) => b.has(key) && !b.get(key)!.has([...ids][0]!))
+  );
+}
+function providersAgree(a: Map<string, Set<string>>, b: Map<string, Set<string>>): boolean {
+  return [...a].some(([key, ids]) => [...ids].some((id) => b.get(key)?.has(id)));
+}
+function episodeContext(item: MediaItem): {
+  numbers: number[];
+  series: Map<string, Set<string>>;
+} | null {
+  if (kind(item) !== 'episode') return null;
+  const numbers = episodeRange(item);
+  if (
+    !numbers ||
+    (item.IndexNumberEnd !== undefined &&
+      item.IndexNumberEnd !== null &&
+      number(item.IndexNumberEnd) === null)
+  )
+    return null;
+  const series = providers(item, 'SeriesProviderIds');
+  if (!series.size || [...series.values()].some((ids) => ids.size > 1)) return null;
+  return { numbers, series };
+}
 function compatibilityReasons(source: MediaItem, target: MediaItem): AmbiguityReasonCode[] {
   if (kind(source) !== kind(target)) return ['media_type_conflict'];
   const reasons: AmbiguityReasonCode[] = [];
@@ -243,11 +270,7 @@ function compatibilityReasons(source: MediaItem, target: MediaItem): AmbiguityRe
   for (const field of fields) {
     const a = providers(source, field),
       b = providers(target, field);
-    // Contradictory aliases must not silently overwrite one another, even for a path match.
-    if (
-      [...a.values(), ...b.values()].some((ids) => ids.size > 1) ||
-      [...a].some(([key, ids]) => b.has(key) && !b.get(key)!.has([...ids][0]!))
-    ) {
+    if (providerConflict(a, b)) {
       reasons.push('provider_conflict');
       break;
     }
@@ -331,7 +354,37 @@ export function createMatcher(
       let candidates = new Set<number>(),
         method = 'provider_id';
       let duplicateProvider = false;
-      if (type !== 'season')
+      let preferredEpisodeContext = false;
+      const context = type === 'episode' ? episodeContext(item) : null;
+      if (context) {
+        const contextual = new Set<number>();
+        const visited = new Set<number>();
+        for (const [provider, ids] of context.series)
+          for (const id of ids)
+            for (const index of lookup(seriesIndex, [type, provider, id, ...context.numbers])) {
+              if (visited.has(index)) continue;
+              visited.add(index);
+              const other = episodeContext(target[index]!);
+              if (
+                other &&
+                context.numbers.join(',') === other.numbers.join(',') &&
+                providersAgree(context.series, other.series) &&
+                !providerConflict(context.series, other.series)
+              )
+                contextual.add(index);
+            }
+        if (contextual.size) {
+          // A reused episode ID on a different numbered episode is not evidence
+          // against a complete, nonconflicting series/season/episode identity.
+          // Own episode-ID contradictions INSIDE this context still fail closed.
+          candidates = contextual;
+          method = 'series_episode';
+          preferredEpisodeContext = true;
+        }
+      }
+      // A stale episode ID can occur on many differently numbered episodes. Do
+      // not expand that collision bucket when the complete context already wins.
+      if (!preferredEpisodeContext && type !== 'season')
         for (const [provider, id] of providerEntries(item, 'ProviderIds')) {
           const bucket = lookup(providerIndex, [type, provider, id]);
           if (bucket.size > 1) duplicateProvider = true;
@@ -399,9 +452,15 @@ export function createMatcher(
           method += '+path';
         }
       }
-      if (candidates.size === 1)
-        result.matches.push({ source: item, target: target[[...candidates][0]!]!, method });
-      else if (candidates.size) {
+      if (candidates.size === 1) {
+        const selected = target[[...candidates][0]!]!;
+        if (
+          preferredEpisodeContext &&
+          providersAgree(providers(item, 'ProviderIds'), providers(selected, 'ProviderIds'))
+        )
+          method = `series_episode+provider_id${method.endsWith('+path') ? '+path' : ''}`;
+        result.matches.push({ source: item, target: selected, method });
+      } else if (candidates.size) {
         const atPath = [...candidates].filter((index) => pathCandidates.has(index)).length;
         const pathResolution: AmbiguityPathResolution = !value
           ? 'missing_source_path'
@@ -485,7 +544,7 @@ export function createMatcher(
   });
 }
 
-/** Type-scoped provider identity, complete series numbering, then exact mapped path; never titles. */
+/** Episodes prefer complete validated series numbering; other types use scoped provider identity. Never titles. */
 export function matchItems(
   source: MediaItem[],
   target: MediaItem[],

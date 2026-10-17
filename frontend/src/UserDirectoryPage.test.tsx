@@ -143,12 +143,154 @@ function page(custom?: Api, values = settings) {
     navigate,
   };
 }
+async function accountAction(name: string) {
+  const username = name.slice(name.lastIndexOf(' for ') + 5);
+  fireEvent.click(await screen.findByRole('button', { name: `Manage ${username}` }));
+  return screen.getByRole('button', { name });
+}
+function organization() {
+  fireEvent.click(screen.getByRole('tab', { name: 'Discord organization' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Configure roles' }));
+}
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
 });
 
 describe('User directory and Discord organization', () => {
+  const largeDirectory = (count = 103): DirectoryUser[] =>
+    Array.from({ length: count }, (_, index) => ({
+      id: `member-${index + 1}`,
+      emby: [],
+      jellyfin: [
+        {
+          id: `jf-member-${index + 1}`,
+          name: `Member ${String(index + 1).padStart(3, '0')}`,
+          disabled: false,
+          protected: false,
+        },
+      ],
+      discord_user_id: null,
+      discord_username: null,
+      access_mode: 'standalone',
+      account_limit: null,
+      protected: false,
+    }));
+
+  it('bounds large directories to one page and resets pagination when filters or row size change', async () => {
+    const api = vi.fn(async () => ({ users: largeDirectory() })) as Api;
+    page(api);
+    const table = await screen.findByRole('table', {
+      name: 'Media accounts and confirmed ownership',
+    });
+    expect(within(table).getAllByRole('row')).toHaveLength(26);
+    expect(screen.getByText('1–25 of 103')).toBeTruthy();
+    expect(screen.queryByText('Member 026')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(screen.getByText('Member 026')).toBeTruthy();
+    expect(screen.queryByText('Member 001')).toBeNull();
+    expect(screen.getByText('26–50 of 103')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Search users'), { target: { value: 'Member 10' } });
+    expect(screen.getByText('1–4 of 4')).toBeTruthy();
+    expect(screen.getByText('Page 1 of 1')).toBeTruthy();
+    expect(within(table).getAllByRole('row')).toHaveLength(5);
+    fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
+    expect(screen.getByText('Member 001')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Users per page'), { target: { value: '10' } });
+    expect(screen.getByText('1–10 of 103')).toBeTruthy();
+    expect(within(table).getAllByRole('row')).toHaveLength(11);
+    expect(api).toHaveBeenCalledTimes(1);
+  });
+
+  it('clamps the current page after refresh removes users without showing an empty page', async () => {
+    let values = largeDirectory();
+    const api = vi.fn(async () => ({ users: values })) as Api;
+    page(api);
+    await screen.findByText('Member 001');
+    for (let index = 0; index < 4; index++)
+      fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(screen.getByText('101–103 of 103')).toBeTruthy();
+    values = largeDirectory(30);
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    await screen.findByText('26–30 of 30');
+    expect(screen.getByText('Page 2 of 2')).toBeTruthy();
+    expect(screen.getByText('Member 026')).toBeTruthy();
+    expect(screen.queryByText('Member 101')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Next page' })).toHaveProperty('disabled', true);
+    expect(api).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps directory filters and unsaved organization settings when switching task tabs', async () => {
+    const { requests } = page();
+    await screen.findByText('Child');
+    expect(screen.queryByRole('heading', { name: 'Discord organization roles' })).toBeNull();
+    expect(screen.queryByRole('combobox', { name: 'Access policy' })).toBeNull();
+    fireEvent.change(screen.getByLabelText('Search users'), { target: { value: 'Child' } });
+    organization();
+    await screen.findByLabelText('Emby-only role');
+    fireEvent.click(
+      screen.getByLabelText('Reserve the Emby role for owners who have only Emby accounts'),
+    );
+    expect(screen.getByText('Unsaved changes')).toBeTruthy();
+    expect(screen.queryByRole('table')).toBeNull();
+    fireEvent.click(screen.getByRole('tab', { name: /^Directory/ }));
+    expect(screen.getByLabelText('Search users')).toHaveProperty('value', 'Child');
+    expect(screen.getByText('Child')).toBeTruthy();
+    fireEvent.click(screen.getByRole('tab', { name: 'Discord organization' }));
+    expect(
+      screen.getByLabelText('Reserve the Emby role for owners who have only Emby accounts'),
+    ).toHaveProperty('checked', false);
+    expect(screen.getByRole('button', { name: 'Preview role changes' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(requests.filter((entry) => entry.options?.method)).toHaveLength(0);
+    expect(requests.filter((entry) => entry.path === '/api/user-directory')).toHaveLength(1);
+  });
+
+  it('opens one compact management disclosure at a time and closes it with Escape without changing accounts', async () => {
+    const { requests } = page();
+    const childButton = await screen.findByRole('button', { name: 'Manage Child' });
+    expect(screen.queryByRole('button', { name: 'Manage account access for Child' })).toBeNull();
+    fireEvent.click(childButton);
+    expect(childButton).toHaveProperty('ariaExpanded', 'true');
+    fireEvent.click(screen.getByRole('button', { name: 'Manage Family' }));
+    expect(screen.queryByRole('button', { name: 'Manage account access for Child' })).toBeNull();
+    const familyAction = screen.getByRole('button', { name: 'Manage account access for Family' });
+    familyAction.focus();
+    fireEvent.keyDown(familyAction, { key: 'Escape' });
+    expect(screen.queryByRole('button', { name: 'Manage account access for Family' })).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Manage Family' }));
+    expect(requests.filter((entry) => entry.options?.method)).toHaveLength(0);
+  });
+
+  it('reviews and updates the exact account selected on a later page', async () => {
+    const requests: { path: string; options?: ApiOptions }[] = [];
+    const api = vi.fn(async (path: string, options?: ApiOptions) => {
+      requests.push({ path, options });
+      return path === '/api/user-directory' ? { users: largeDirectory() } : {};
+    }) as Api;
+    const { notify } = page(api);
+    await screen.findByText('Member 001');
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    fireEvent.click(await accountAction('Manage account access for Member 026'));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByLabelText('Media account')).toHaveProperty(
+      'value',
+      JSON.stringify(['jellyfin', 'jf-member-26']),
+    );
+    expect(requests.filter((entry) => entry.options?.method)).toHaveLength(0);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Disable selected account' }));
+    await waitFor(() => expect(notify).toHaveBeenCalled());
+    expect(requests.find((entry) => entry.path === '/api/accounts/access')?.options?.body).toEqual({
+      kind: 'jellyfin',
+      user_id: 'jf-member-26',
+      disabled: true,
+      expected_username: 'Member 026',
+      expected_profile_revision: '',
+    });
+  });
+
   it('prioritizes account review and the directory before optional access guidance', async () => {
     page();
     const warning = await screen.findByText('1 user needs review');
@@ -160,6 +302,7 @@ describe('User directory and Discord organization', () => {
     expect(
       directory.compareDocumentPosition(guidance) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+    fireEvent.click(screen.getByText('About family accounts and account ownership'));
     expect(screen.getByRole('button', { name: 'Memberships' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Show users needing review' })).toBeTruthy();
   });
@@ -200,7 +343,7 @@ describe('User directory and Discord organization', () => {
 
   it('shows standalone family accounts and filters server presence and access independently', async () => {
     page();
-    await screen.findByRole('button', { name: 'Link Discord owner for Child' });
+    await accountAction('Link Discord owner for Child');
     expect(screen.queryByRole('button', { name: 'Link Discord owner for Admin' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Manage account access for Admin' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Family and owner notes for Admin' })).toBeNull();
@@ -210,6 +353,7 @@ describe('User directory and Discord organization', () => {
     expect(screen.getByText('Legacy')).toBeTruthy();
     expect(screen.queryByText('Child')).toBeNull();
     fireEvent.change(screen.getByLabelText('Server presence'), { target: { value: 'all' } });
+    fireEvent.click(screen.getByRole('button', { name: 'More filters' }));
     fireEvent.change(screen.getByLabelText('Access policy'), {
       target: { value: 'complimentary' },
     });
@@ -252,9 +396,7 @@ describe('User directory and Discord organization', () => {
         return path === '/api/user-directory' ? { users: [row] } : {};
       }) as Api;
       const { notify } = page(api);
-      fireEvent.click(
-        await screen.findByRole('button', { name: 'Family and owner notes for Shared' }),
-      );
+      fireEvent.click(await accountAction('Family and owner notes for Shared'));
       let dialog = screen.getByRole('dialog');
       let selector = within(dialog).getByLabelText('Media account');
       expect(within(selector).getAllByRole('option')).toHaveLength(1);
@@ -275,9 +417,7 @@ describe('User directory and Discord organization', () => {
         notes: '',
         expected_revision: '',
       });
-      fireEvent.click(
-        await screen.findByRole('button', { name: 'Manage account access for Shared' }),
-      );
+      fireEvent.click(await accountAction('Manage account access for Shared'));
       dialog = screen.getByRole('dialog');
       selector = within(dialog).getByLabelText('Media account');
       expect(within(selector).getAllByRole('option')).toHaveLength(1);
@@ -301,7 +441,7 @@ describe('User directory and Discord organization', () => {
 
   it('confirms an exact existing account ID and a queried non-paying Discord owner without changing passwords', async () => {
     const { requests, notify } = page();
-    fireEvent.click(await screen.findByRole('button', { name: 'Link Discord owner for Child' }));
+    fireEvent.click(await accountAction('Link Discord owner for Child'));
     const dialog = screen.getByRole('dialog');
     fireEvent.change(within(dialog).getByLabelText('Discord member'), {
       target: { value: 'family_owner' },
@@ -329,6 +469,7 @@ describe('User directory and Discord organization', () => {
     await screen.findByText('Owner: Sam');
     expect(screen.getByText('Family accounts', { selector: 'span' })).toBeTruthy();
     expect(screen.queryByText('Private family details')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'More filters' }));
     fireEvent.change(screen.getByLabelText('Family accounts'), { target: { value: 'family' } });
     expect(screen.getByText('@family_owner')).toBeTruthy();
     expect(screen.queryByText('Child')).toBeNull();
@@ -364,9 +505,7 @@ describe('User directory and Discord organization', () => {
         : user,
     );
     page(vi.fn(async () => ({ users: values })) as Api);
-    fireEvent.click(
-      await screen.findByRole('button', { name: 'Family and owner notes for Family' }),
-    );
+    fireEvent.click(await accountAction('Family and owner notes for Family'));
     const dialog = screen.getByRole('dialog');
     expect(within(dialog).getByLabelText('Family account')).toHaveProperty('checked', false);
     fireEvent.change(within(dialog).getByLabelText('Media account'), {
@@ -377,9 +516,7 @@ describe('User directory and Discord organization', () => {
 
   it('saves private metadata for the selected exact server account with its revision', async () => {
     const { requests, notify } = page();
-    fireEvent.click(
-      await screen.findByRole('button', { name: 'Family and owner notes for Family' }),
-    );
+    fireEvent.click(await accountAction('Family and owner notes for Family'));
     const dialog = screen.getByRole('dialog');
     expect(within(dialog).getByLabelText('Owner name')).toHaveProperty('value', 'Sam');
     expect(within(dialog).getByLabelText('Private owner notes')).toHaveProperty(
@@ -424,9 +561,7 @@ describe('User directory and Discord organization', () => {
 
   it('marks an independent child account as family without requiring a Discord owner', async () => {
     const { requests, notify } = page();
-    fireEvent.click(
-      await screen.findByRole('button', { name: 'Family and owner notes for Child' }),
-    );
+    fireEvent.click(await accountAction('Family and owner notes for Child'));
     const dialog = screen.getByRole('dialog');
     expect(within(dialog).queryByLabelText('Discord member')).toBeNull();
     expect(within(dialog).getByText(/No Discord membership or payment is required/)).toBeTruthy();
@@ -453,9 +588,7 @@ describe('User directory and Discord organization', () => {
 
   it('removes a family flag without requesting subscription management', async () => {
     const { requests, notify } = page();
-    fireEvent.click(
-      await screen.findByRole('button', { name: 'Family and owner notes for Family' }),
-    );
+    fireEvent.click(await accountAction('Family and owner notes for Family'));
     const dialog = screen.getByRole('dialog');
     expect(
       within(dialog).getByText(/Removing the family flag does not disable the account/),
@@ -475,9 +608,7 @@ describe('User directory and Discord organization', () => {
       throw new Error('Account profile changed. Refresh and review the latest details.');
     }) as Api;
     const { notify } = page(api);
-    fireEvent.click(
-      await screen.findByRole('button', { name: 'Family and owner notes for Child' }),
-    );
+    fireEvent.click(await accountAction('Family and owner notes for Child'));
     const dialog = screen.getByRole('dialog');
     fireEvent.change(within(dialog).getByLabelText('Private owner notes'), {
       target: { value: 'My unsaved private note' },
@@ -505,9 +636,7 @@ describe('User directory and Discord organization', () => {
       });
     }) as Api;
     const { unmount, notify } = page(api);
-    fireEvent.click(
-      await screen.findByRole('button', { name: 'Family and owner notes for Child' }),
-    );
+    fireEvent.click(await accountAction('Family and owner notes for Child'));
     fireEvent.click(screen.getByRole('button', { name: 'Save family and owner notes' }));
     unmount();
     expect(signal.aborted).toBe(true);
@@ -518,9 +647,7 @@ describe('User directory and Discord organization', () => {
 
   it('requires explicit account access review and disables only the selected exact account', async () => {
     const { requests, notify } = page();
-    fireEvent.click(
-      await screen.findByRole('button', { name: 'Manage account access for Family' }),
-    );
+    fireEvent.click(await accountAction('Manage account access for Family'));
     const dialog = screen.getByRole('dialog');
     expect(within(dialog).getByText('Currently enabled.')).toBeTruthy();
     expect(
@@ -567,7 +694,7 @@ describe('User directory and Discord organization', () => {
       return path === '/api/user-directory' ? { users: values } : {};
     }) as Api;
     const { notify } = page(api);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage account access for Child' }));
+    fireEvent.click(await accountAction('Manage account access for Child'));
     const dialog = screen.getByRole('dialog');
     expect(within(dialog).getByText('Currently disabled.')).toBeTruthy();
     expect(within(dialog).getByLabelText('Access change')).toHaveProperty('value', 'enable');
@@ -603,7 +730,7 @@ describe('User directory and Discord organization', () => {
       });
     }) as Api;
     const { unmount, notify } = page(api);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage account access for Child' }));
+    fireEvent.click(await accountAction('Manage account access for Child'));
     fireEvent.click(screen.getByRole('button', { name: 'Disable selected account' }));
     unmount();
     expect(signal.aborted).toBe(true);
@@ -614,7 +741,7 @@ describe('User directory and Discord organization', () => {
 
   it('previews organization role additions and removals before applying only the review token', async () => {
     const { requests, notify } = page();
-    fireEvent.click(screen.getByRole('button', { name: 'Configure roles' }));
+    organization();
     const previewButton = await screen.findByRole('button', { name: 'Preview role changes' });
     expect(
       screen
@@ -638,7 +765,7 @@ describe('User directory and Discord organization', () => {
 
   it('defaults to tagging every server when no exclusive preference is saved', async () => {
     page(undefined, { ...settings, discord_emby_only_role: undefined });
-    fireEvent.click(screen.getByRole('button', { name: 'Configure roles' }));
+    organization();
     expect(await screen.findByLabelText('Emby account role')).toBeTruthy();
     expect(
       screen.getByLabelText('Reserve the Emby role for owners who have only Emby accounts'),
@@ -647,7 +774,7 @@ describe('User directory and Discord organization', () => {
 
   it('requires saving edited role settings before preview and sends only organization settings', async () => {
     const { requests } = page();
-    fireEvent.click(screen.getByRole('button', { name: 'Configure roles' }));
+    organization();
     await screen.findByLabelText('Emby-only role');
     fireEvent.click(
       screen.getByLabelText('Reserve the Emby role for owners who have only Emby accounts'),
@@ -694,7 +821,7 @@ describe('User directory and Discord organization', () => {
       ...settings,
       bot_organization_invite_url: invite,
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Configure roles' }));
+    organization();
     const link = await screen.findByRole('link', { name: 'Update bot permissions' });
     expect(link.getAttribute('href')).toBe(invite);
     expect(link.getAttribute('target')).toBe('_blank');
@@ -722,7 +849,7 @@ describe('User directory and Discord organization', () => {
       };
     }) as Api;
     page(api);
-    fireEvent.click(screen.getByRole('button', { name: 'Configure roles' }));
+    organization();
     fireEvent.click(await screen.findByRole('button', { name: 'Preview role changes' }));
     expect(
       await screen.findByText(

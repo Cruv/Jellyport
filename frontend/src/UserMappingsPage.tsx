@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { Callout, Empty, Heading, Icon, Modal } from './components';
+import { Empty, Heading, Icon, Modal } from './components';
+import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import { UserWarnings } from './SettingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import type { Api, DiscordMember, Notify, UserMapping, Users } from './types';
@@ -22,6 +23,14 @@ export default function UserMappingsPage({
   refresh: () => Promise<void>;
   templateUserId?: string;
 }) {
+  const [view, setView] = useState('list');
+  const [query, setQuery] = useState('');
+  const filteredMappings = mappings.filter((mapping) =>
+    [mapping.source_username, mapping.target_username, mapping.discord_username || ''].some(
+      (name) => name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
+    ),
+  );
+  const mappingPage = usePagination(filteredMappings, 25, query);
   const [editing, setEditing] = useState<UserMapping | null>(null);
   const [sourceId, setSourceId] = useState('');
   const [targetId, setTargetId] = useState('');
@@ -60,6 +69,7 @@ export default function UserMappingsPage({
     setError('');
   }
   function edit(mapping: UserMapping) {
+    setView('editor');
     setEditing(mapping);
     setSourceId(mapping.source_user_id);
     setTargetId(mapping.target_user_id || '');
@@ -103,6 +113,7 @@ export default function UserMappingsPage({
       });
       if (!mounted.current) return;
       reset();
+      setView('list');
       notify('User mapping saved. Review a migration preview before starting.');
       await refresh();
     } catch (reason) {
@@ -122,7 +133,10 @@ export default function UserMappingsPage({
         method: 'DELETE',
       });
       if (!mounted.current) return;
-      if (editing?.id === removing.id) reset();
+      if (editing?.id === removing.id) {
+        reset();
+        setView('list');
+      }
       setRemoving(null);
       notify('User mapping removed. The server accounts were preserved.');
       await refresh();
@@ -155,13 +169,129 @@ export default function UserMappingsPage({
         }
       />
       <UserWarnings users={users} />
-      <Callout icon="shield" title="Mappings are approved by you.">
-        Usernames can differ across Emby, Jellyfin, and Discord. Search for a Discord member to link
-        their stable identity automatically. Saving a mapping does not create an account or send a
-        message.
-      </Callout>
-      <div className="form-layout">
+      <Tabs
+        id="mapping-views"
+        label="User mapping tasks"
+        tabs={[
+          { id: 'list', label: 'Saved mappings', count: mappings.length },
+          {
+            id: 'editor',
+            label: editing ? 'Edit mapping' : changed ? 'Mapping draft' : 'Add mapping',
+          },
+        ]}
+        value={view}
+        onChange={setView}
+      />
+      <TabPanel id="mapping-views" tabId="list" active={view === 'list'}>
         <section className="panel">
+          <div className="panel-header">
+            <div>
+              <h2>Saved mappings</h2>
+              <p>Select a mapping to review or edit its approved destination.</p>
+            </div>
+            <span className="status">{mappings.length}</span>
+          </div>
+          <div className="panel-body directory-toolbar">
+            <div className="field">
+              <label htmlFor="mapping-search">Find mappings</label>
+              <input
+                id="mapping-search"
+                type="search"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search Emby, Jellyfin, or Discord usernames"
+              />
+            </div>
+            <button
+              className="btn btn-primary"
+              onClick={() => {
+                reset();
+                setView('editor');
+              }}
+              disabled={busy}
+            >
+              Add mapping
+            </button>
+          </div>
+          {filteredMappings.length ? (
+            <div className="panel-body summary-list record-list" aria-label="Saved mappings">
+              {mappingPage.items.map((mapping) => (
+                <article
+                  className={`summary-card${editing?.id === mapping.id ? ' selected' : ''}`}
+                  key={mapping.id}
+                >
+                  <dl>
+                    <div>
+                      <dt>Emby</dt>
+                      <dd>
+                        <strong>{mapping.source_username}</strong>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Jellyfin</dt>
+                      <dd>
+                        <strong>{mapping.target_username}</strong>
+                        <small>
+                          {mapping.target_user_id ? 'Existing account' : 'Create during migration'}
+                        </small>
+                      </dd>
+                    </div>
+                    <div>
+                      <dt>Discord</dt>
+                      <dd>
+                        {mapping.discord_username || 'No username label'}
+                        <small>
+                          {mapping.discord_user_id
+                            ? `Verified user ID: ${mapping.discord_user_id} · Account slot ${mapping.membership_slot || 1}`
+                            : 'No verified Discord identity'}
+                        </small>
+                      </dd>
+                    </div>
+                  </dl>
+                  <div className="toolbar">
+                    <button
+                      className="btn btn-quiet"
+                      onClick={() => edit(mapping)}
+                      disabled={busy}
+                      aria-label={`Edit mapping for ${mapping.source_username}`}
+                      aria-pressed={editing?.id === mapping.id}
+                    >
+                      Edit
+                    </button>
+                    <button
+                      className="btn btn-quiet"
+                      onClick={() => {
+                        setError('');
+                        setRemoving(mapping);
+                      }}
+                      disabled={busy}
+                      aria-label={`Remove mapping for ${mapping.source_username}`}
+                    >
+                      <Icon name="trash" /> Remove
+                    </button>
+                  </div>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <Empty
+              icon="link"
+              title={mappings.length ? 'No matching mappings' : 'No saved mappings'}
+              text="Add a mapping when media accounts or Discord identities use different usernames."
+            />
+          )}
+          <Pagination
+            label="Mappings"
+            page={mappingPage.page}
+            total={mappingPage.total}
+            pageSize={mappingPage.pageSize}
+            onPageChange={mappingPage.setPage}
+            onPageSizeChange={mappingPage.setPageSize}
+          />
+        </section>
+      </TabPanel>
+      <TabPanel id="mapping-views" tabId="editor" active={view === 'editor'}>
+        <section className="panel task-panel">
           <div className="panel-header">
             <div>
               <h2>{editing ? 'Edit user mapping' : 'Add a user mapping'}</h2>
@@ -172,6 +302,14 @@ export default function UserMappingsPage({
             </span>
           </div>
           <div className="panel-body">
+            <details className="help-details">
+              <summary>How user mappings work</summary>
+              <p>
+                Mappings connect differently named accounts. Saving a mapping does not create
+                accounts or send messages. Existing Jellyfin accounts retain their username,
+                password, and permissions.
+              </p>
+            </details>
             <form className="form-stack" onSubmit={(event) => void save(event)}>
               {error && !removing && (
                 <div className="error-block" role="alert">
@@ -339,9 +477,30 @@ export default function UserMappingsPage({
                 </div>
               </details>
               <div className="form-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    reset();
+                    setView('list');
+                  }}
+                  disabled={busy}
+                >
+                  {editing ? 'Cancel edit' : 'Cancel'}
+                </button>
                 {editing && (
-                  <button type="button" className="btn" onClick={reset} disabled={busy}>
-                    Cancel edit
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => {
+                      setError('');
+                      setRemoving(editing);
+                    }}
+                    disabled={busy}
+                    aria-label={`Remove mapping for ${editing.source_username}`}
+                  >
+                    <Icon name="trash" />
+                    Remove
                   </button>
                 )}
                 <button type="submit" className="btn btn-primary" disabled={busy || !sourceId}>
@@ -352,83 +511,7 @@ export default function UserMappingsPage({
             </form>
           </div>
         </section>
-        <section className="panel">
-          <div className="panel-header">
-            <div>
-              <h2>Saved mappings</h2>
-              <p>Select a mapping to review or edit its approved destination.</p>
-            </div>
-            <span className="status">{mappings.length}</span>
-          </div>
-          {mappings.length ? (
-            <div className="panel-body summary-list mapping-list" aria-label="Saved mappings">
-              {mappings.map((mapping) => (
-                <article
-                  className={`summary-card${editing?.id === mapping.id ? ' selected' : ''}`}
-                  key={mapping.id}
-                >
-                  <dl>
-                    <div>
-                      <dt>Emby</dt>
-                      <dd>
-                        <strong>{mapping.source_username}</strong>
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>Jellyfin</dt>
-                      <dd>
-                        <strong>{mapping.target_username}</strong>
-                        <small>
-                          {mapping.target_user_id ? 'Existing account' : 'Create during migration'}
-                        </small>
-                      </dd>
-                    </div>
-                    <div>
-                      <dt>Discord</dt>
-                      <dd>
-                        {mapping.discord_username || 'No username label'}
-                        <small>
-                          {mapping.discord_user_id
-                            ? `Verified user ID: ${mapping.discord_user_id} · Account slot ${mapping.membership_slot || 1}`
-                            : 'No verified Discord identity'}
-                        </small>
-                      </dd>
-                    </div>
-                  </dl>
-                  <div className="toolbar">
-                    <button
-                      className="btn btn-quiet"
-                      onClick={() => edit(mapping)}
-                      disabled={busy}
-                      aria-label={`Edit mapping for ${mapping.source_username}`}
-                      aria-pressed={editing?.id === mapping.id}
-                    >
-                      Edit
-                    </button>
-                    <button
-                      className="btn btn-quiet"
-                      onClick={() => {
-                        setError('');
-                        setRemoving(mapping);
-                      }}
-                      disabled={busy}
-                      aria-label={`Remove mapping for ${mapping.source_username}`}
-                    >
-                      <Icon name="trash" /> Remove
-                    </button>
-                  </div>
-                </article>
-              ))}
-            </div>
-          ) : (
-            <Empty
-              icon="link"
-              title="No saved mappings"
-              text="Add a mapping when media accounts or Discord identities use different usernames."
-            />
-          )}
-        </section>
-      </div>
+      </TabPanel>
       {removing && (
         <Modal
           title="Remove this user mapping?"

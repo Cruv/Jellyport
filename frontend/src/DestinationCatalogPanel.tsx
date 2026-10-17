@@ -190,12 +190,15 @@ export default function DestinationCatalogPanel({
         </div>
       </div>
       <div className="panel-body form-stack">
-        <p className="muted text-small">
-          The saved catalog supplies item identities for matching, avoiding a live library scan.
-          Current Jellyfin watch history and account access are still checked through its API;
-          history updates and verification also use the live server. No saved Jellyfin user history
-          is imported.
-        </p>
+        <details className="help-disclosure">
+          <summary>How saved Jellyfin matching works</summary>
+          <p className="muted text-small">
+            The saved catalog supplies item identities for matching, avoiding a live library scan.
+            Current Jellyfin watch history and account access are still checked through its API;
+            history updates and verification also use the live server. No saved Jellyfin user
+            history is imported.
+          </p>
+        </details>
         <Callout icon="info" title="Original backup time controls expiry.">
           Import a completed database backup from the linked Jellyfin server. Importing it again
           does not make the catalog newer. Changes to library identities after the backup require a

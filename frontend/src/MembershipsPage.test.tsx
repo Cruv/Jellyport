@@ -60,6 +60,8 @@ function page(memberships: Membership[] = [], customApi?: Api) {
   const view = render(
     <MembershipsPage settings={settings} api={api} notify={notify} created={created} />,
   );
+  if (!memberships.length && !customApi)
+    fireEvent.click(screen.getByRole('tab', { name: 'Add member' }));
   return { ...view, api, requests, notify, created };
 }
 const mutations = (requests: { path: string; options?: ApiOptions }[]) =>
@@ -73,6 +75,35 @@ afterEach(() => {
 });
 
 describe('Discord membership account allowances', () => {
+  it('pages and filters the membership directory while keeping an unfinished member policy', async () => {
+    const many = Array.from({ length: 61 }, (_, index) => ({
+      ...membership,
+      discord_user_id: String(BigInt(ownerId) + BigInt(index)),
+      base_username: `Member ${index}`,
+      links: [],
+      access_mode: index % 2 ? ('complimentary' as const) : ('subscription' as const),
+    }));
+    const { requests } = page(many);
+    const directory = await screen.findByRole('tabpanel', { name: /Managed memberships/ });
+    await waitFor(() => expect(within(directory).getAllByRole('article')).toHaveLength(25));
+    expect(screen.queryByRole('button', { name: 'Save access policy' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(within(directory).getByText('Member 25')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Find memberships'), { target: { value: 'Member 60' } });
+    expect(within(directory).getAllByRole('article')).toHaveLength(1);
+    expect(within(directory).getByText('Page 1 of 1')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Access type'), { target: { value: 'complimentary' } });
+    expect(within(directory).queryByRole('article')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Access type'), { target: { value: 'all' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Manage membership for Member 60' }));
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
+    fireEvent.click(screen.getByRole('tab', { name: /Managed memberships/ }));
+    expect(screen.queryByRole('button', { name: 'Review membership update' })).toBeNull();
+    fireEvent.click(screen.getByRole('tab', { name: 'Manage member' }));
+    expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'brigantine');
+    expect(mutations(requests)).toHaveLength(0);
+  });
+
   it('cancels a membership review without writing and rebuilds it from the newly selected allowance', async () => {
     const { requests, created } = page([membership]);
     fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
@@ -153,13 +184,13 @@ describe('Discord membership account allowances', () => {
     expect(created).not.toHaveBeenCalled();
   });
 
-  it('pairs the member editor with access guidance while keeping policy and provisioning actions distinct', async () => {
+  it('separates the member editor from the directory and keeps policy and provisioning distinct', async () => {
     const p = page();
     expect(screen.getByRole('heading', { name: 'Memberships', level: 1 })).toBeTruthy();
     await screen.findByText('Give each member their account allowance.');
-    const guidance = screen.getByRole('complementary', { name: 'Membership access guidance' });
-    expect(within(guidance).getByText(/without changing media accounts/)).toBeTruthy();
-    expect(within(guidance).getByText(/checks the account slots before/)).toBeTruthy();
+    expect(screen.getByText('Access rules and available actions')).toBeTruthy();
+    expect(screen.getByText(/without changing media accounts/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Manage membership for Jim' })).toBeNull();
     expect(screen.getByRole('button', { name: 'Save access policy' })).toHaveProperty(
       'disabled',
       true,
@@ -191,6 +222,7 @@ describe('Discord membership account allowances', () => {
     }) as Api;
     page([], api);
     await screen.findByText('Give each member their account allowance.');
+    fireEvent.click(screen.getByRole('tab', { name: 'Add member' }));
     fireEvent.change(screen.getByLabelText('Discord member'), { target: { value: 'Jim' } });
     fireEvent.click(await screen.findByRole('button', { name: 'Select @Jim' }));
     fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'galleon' } });
@@ -282,7 +314,7 @@ describe('Discord membership account allowances', () => {
         })),
       },
     ]);
-    await screen.findByText('Inactive membership');
+    await screen.findByText(/Inactive membership/);
     fireEvent.click(screen.getByRole('button', { name: 'Manage membership for Jim' }));
     fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
     fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
@@ -449,6 +481,7 @@ describe('Discord membership account allowances', () => {
     }) as Api;
     const { notify, created } = page([], api);
     await screen.findByText('Give each member their account allowance.');
+    fireEvent.click(screen.getByRole('tab', { name: 'Add member' }));
     fireEvent.change(screen.getByLabelText('Access policy'), {
       target: { value: 'complimentary' },
     });

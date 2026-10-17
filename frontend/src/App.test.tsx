@@ -108,6 +108,7 @@ let responses: Record<string, unknown>;
 let statuses: Record<string, number>;
 let requests: { path: string; options?: RequestInit }[];
 beforeEach(() => {
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
   requests = [];
   statuses = {};
   responses = {
@@ -175,6 +176,11 @@ async function openJob() {
   await screen.findByRole('heading', { name: 'Overview', level: 1 });
   fireEvent.click(screen.getByRole('button', { name: 'View operation details' }));
   return screen.findByRole('dialog');
+}
+async function selectSettingsTab(section: string, subsection?: string) {
+  const tabs = await screen.findByRole('tablist', { name: 'Settings sections' });
+  fireEvent.click(within(tabs).getByRole('tab', { name: section }));
+  if (subsection) fireEvent.click(await screen.findByRole('tab', { name: subsection }));
 }
 const runningPreviewTask = {
   id: 'preview-task-1',
@@ -355,7 +361,9 @@ describe('React account safeguards', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
     await screen.findByLabelText('Use saved Emby snapshot');
     fireEvent.click(
-      within(screen.getByRole('navigation')).getByRole('button', { name: 'Overview' }),
+      within(screen.getByRole('complementary', { name: 'Main navigation' })).getByRole('button', {
+        name: 'Overview',
+      }),
     );
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
     expect(signal?.aborted).toBe(true);
@@ -375,7 +383,8 @@ describe('React account safeguards', () => {
   it('loads editable tier defaults and only saves their definitions without provisioning accounts', async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
-    await screen.findByText('Membership tiers');
+    await selectSettingsTab('Automation');
+    await screen.findByRole('heading', { name: 'Membership tiers' });
     const tiers = screen.getAllByLabelText('Tier name');
     const limits = screen.getAllByLabelText('Account allowance');
     expect(tiers.map((input) => (input as HTMLInputElement).value)).toEqual([
@@ -384,6 +393,7 @@ describe('React account safeguards', () => {
       'Galleon',
     ]);
     expect(limits.map((input) => (input as HTMLSelectElement).value)).toEqual(['1', '2', '3']);
+    fireEvent.change(screen.getByLabelText('Edit membership tier'), { target: { value: '1' } });
     fireEvent.change(tiers[1], { target: { value: 'Brigantine Crew' } });
     fireEvent.change(screen.getAllByLabelText('Subscription plan name')[1], {
       target: { value: 'Brigantine Paid Plan' },
@@ -470,6 +480,7 @@ describe('React account safeguards', () => {
     };
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await selectSettingsTab('Account defaults');
     await screen.findByRole('option', { name: 'Crew defaults' });
     fireEvent.change(screen.getByLabelText('Default account role'), {
       target: { value: 'role-1' },
@@ -489,7 +500,9 @@ describe('React account safeguards', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Account roles' }));
     await screen.findByRole('heading', { name: 'Account roles', level: 1 });
-    await screen.findByText('Create an account role');
+    await screen.findByRole('heading', { name: 'No saved roles' });
+    fireEvent.click(screen.getByRole('button', { name: 'Create role' }));
+    expect(screen.getByRole('heading', { name: 'Create an account role' })).toBeTruthy();
     expect(requests.some((request) => request.path === '/api/account-roles')).toBe(true);
   });
   it('keeps the saved default selected when role names finish loading later', async () => {
@@ -511,6 +524,7 @@ describe('React account safeguards', () => {
     });
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await selectSettingsTab('Account defaults');
     await screen.findByRole('option', { name: 'Saved default role' });
     expect((screen.getByLabelText('Default account role') as HTMLSelectElement).value).toBe(
       'role-1',
@@ -617,7 +631,7 @@ describe('React account safeguards', () => {
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
     fireEvent.click(screen.getByRole('button', { name: 'Create account' }));
     await screen.findByRole('heading', { name: 'Create account', level: 1 });
-    fireEvent.click(screen.getByText('Recover an interrupted account creation'));
+    fireEvent.click(screen.getByRole('tab', { name: 'Recover interrupted creation' }));
     fireEvent.change(screen.getByLabelText('Account to inspect'), { target: { value: 'alex' } });
     fireEvent.click(screen.getByRole('button', { name: 'Inspect account' }));
     await screen.findByText('alex · Eligible for recovery');
@@ -697,7 +711,7 @@ describe('React account safeguards', () => {
     };
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Create account' }));
-    fireEvent.click(await screen.findByText('Recover an interrupted account creation'));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Recover interrupted creation' }));
     fireEvent.change(screen.getByLabelText('Account to inspect'), { target: { value: 'alex' } });
     fireEvent.focus(screen.getByLabelText('Recovery Discord member (optional)'));
     await screen.findByRole('button', { name: 'Select @alex' });
@@ -1967,7 +1981,7 @@ describe('React account safeguards', () => {
     expect(tab.defaultPrevented).toBe(false);
     expect(document.activeElement).toBe(toggle);
   });
-  it.each(['media', 'accounts', 'discord', 'history'])(
+  it.each(['media', 'accounts', 'discord', 'automation', 'history'])(
     'opens a bookmarked %s settings section and clears its anchor when navigating elsewhere',
     async (section) => {
       const original = window.location.href;
@@ -1975,7 +1989,19 @@ describe('React account safeguards', () => {
       try {
         render(<App />);
         await screen.findByRole('heading', { name: 'Settings', level: 1 });
-        expect(screen.getByRole('navigation', { name: 'Settings sections' })).toBeTruthy();
+        const sections = screen.getByRole('tablist', { name: 'Settings sections' });
+        const labels: Record<string, string> = {
+          media: 'Servers',
+          accounts: 'Account defaults',
+          discord: 'Discord',
+          automation: 'Automation',
+          history: 'Saved history',
+        };
+        expect(
+          within(sections)
+            .getByRole('tab', { name: labels[section] })
+            .getAttribute('aria-selected'),
+        ).toBe('true');
         fireEvent.click(screen.getByRole('button', { name: 'Overview' }));
         await screen.findByRole('heading', { name: 'Overview', level: 1 });
         expect(window.location.hash).toBe('');
@@ -2290,6 +2316,7 @@ describe('Jellyfin administrator sign-in and setup', () => {
     render(<App />);
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    await selectSettingsTab('Servers', 'Jellyfin');
     await screen.findByRole('heading', { name: 'Settings', level: 1 });
     const server = document.querySelector<HTMLInputElement>('#setting-jellyfin_url')!;
     expect(server.readOnly).toBe(true);
@@ -2409,6 +2436,7 @@ describe('Jellyfin administrator sign-in and setup', () => {
     statuses['/api/auth/service-key'] = 400;
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await selectSettingsTab('Servers', 'Jellyfin');
     const keyField = (await screen.findByLabelText(
       'Replacement Jellyfin API key',
     )) as HTMLInputElement;
@@ -2436,6 +2464,7 @@ describe('Jellyfin administrator sign-in and setup', () => {
     };
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await selectSettingsTab('Servers', 'Jellyfin');
     const keyField = (await screen.findByLabelText(
       'Replacement Jellyfin API key',
     )) as HTMLInputElement;
@@ -2454,6 +2483,7 @@ describe('Jellyfin administrator sign-in and setup', () => {
     responses['/api/settings'] = { ...settings, jellyfin_auth_managed: true };
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await selectSettingsTab('Servers', 'Jellyfin');
     const keyField = (await screen.findByLabelText(
       'Replacement Jellyfin API key',
     )) as HTMLInputElement;
@@ -2481,6 +2511,7 @@ describe('Jellyfin administrator sign-in and setup', () => {
     responses['/api/settings'] = { ...settings, jellyfin_auth_managed: true };
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
+    await selectSettingsTab('Servers', 'Jellyfin');
     const keyField = (await screen.findByLabelText(
       'Replacement Jellyfin API key',
     )) as HTMLInputElement;

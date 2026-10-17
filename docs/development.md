@@ -83,10 +83,10 @@ npm run test:e2e
 ```
 
 The [Playwright suite](https://playwright.dev/docs/intro) checks all ten workspace
-pages at desktop and mobile widths, document overflow, Settings section links,
-keyboard focus, filtering, sign-in/out, credential reveal, and explicit migration
-approval. It uses the built interface and real Jellyport API with simulated media
-servers. These are behavioral and layout checks, not pixel-baseline comparisons
+pages at desktop and mobile widths, document overflow, focused Settings tabs,
+retained drafts, keyboard focus, pagination and filtering with large synthetic
+directories, sign-in/out, credential reveal, and explicit migration approval.
+It uses the built interface and real Jellyport API with simulated media servers. These are behavioral and layout checks, not pixel-baseline comparisons
 or a guarantee of support for every browser.
 
 The runner creates and removes its own temporary demo data, binds only to

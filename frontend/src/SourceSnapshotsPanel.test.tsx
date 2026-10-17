@@ -71,6 +71,53 @@ afterEach(() => {
 });
 
 describe('Saved Emby database capture settings', () => {
+  it('keeps the schedule collapsed until requested and preserves its draft across closing', async () => {
+    const api = vi.fn(async () => pluginStatus) as Api;
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    const time = await screen.findByLabelText('Import time');
+    const summary = screen.getByText('Daily schedule', { selector: 'summary' });
+    const disclosure = summary.closest('details')!;
+    expect(disclosure.open).toBe(false);
+    fireEvent.click(summary);
+    expect(disclosure.open).toBe(true);
+    fireEvent.change(time, { target: { value: '04:20' } });
+    fireEvent.click(summary);
+    fireEvent.click(summary);
+    expect(time).toHaveProperty('value', '04:20');
+    expect(api).toHaveBeenCalledOnce();
+    expect(screen.getByRole('button', { name: 'Import latest backup' })).toBeTruthy();
+  });
+
+  it('bounds the capture inventory and paginates it without additional API work', async () => {
+    const large = {
+      ...status,
+      snapshots: 47,
+      records: Array.from({ length: 47 }, (_, index) => ({
+        ...status.records[0]!,
+        id: `synthetic-capture-${index}`,
+        source_username: `Example account ${index + 1}`,
+      })),
+    };
+    const api = vi.fn(async () => large) as Api;
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    const summary = await screen.findByText('Saved captures (47)', { selector: 'summary' });
+    expect(summary.closest('details')!.open).toBe(false);
+    fireEvent.click(summary);
+    expect(screen.getAllByRole('row')).toHaveLength(11);
+    expect(screen.getByText('Example account 1')).toBeTruthy();
+    expect(screen.queryByText('Example account 11')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(screen.getAllByRole('row')).toHaveLength(11);
+    expect(screen.getByText('Example account 11')).toBeTruthy();
+    expect(screen.queryByText('Example account 1')).toBeNull();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Saved captures per page' }), {
+      target: { value: '25' },
+    });
+    expect(screen.getAllByRole('row')).toHaveLength(26);
+    expect(screen.getByText('Example account 1')).toBeTruthy();
+    expect(api).toHaveBeenCalledOnce();
+  });
+
   it('shows plugin history age from the original backup and separately labels the later import', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-10-15T04:00:00Z'));
     const api: Api = async <T,>() => pluginStatus as T;

@@ -138,7 +138,10 @@ export default function SourceSnapshotsPanel({
             >
               Docker deployment guide
             </a>
-            , then refresh status. Saved captures remain listed below.
+            , then refresh status.{' '}
+            {status.records.length
+              ? 'Saved captures remain listed below.'
+              : 'No saved Emby history is available yet.'}
           </Callout>
         )}
         <ImportStatus

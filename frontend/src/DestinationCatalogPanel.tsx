@@ -118,7 +118,10 @@ export default function DestinationCatalogPanel({
             }
           >
             Import a recent, completed Jellyfin database backup before starting a migration with
-            saved matching data. The last imported catalog remains listed for review.
+            saved matching data.{' '}
+            {record
+              ? 'The last imported catalog remains listed for review.'
+              : 'No matching catalog has been imported yet.'}
           </Callout>
         )}
         <ImportStatus

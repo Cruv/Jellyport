@@ -45,6 +45,38 @@ afterEach(() => {
 });
 
 describe('saved destination catalog settings', () => {
+  it.each([false, true])(
+    'does not imply retained matching data exists in the empty state (retained=%s)',
+    async (retained) => {
+      vi.spyOn(Date, 'now').mockReturnValue(now);
+      const api: Api = async <T,>() =>
+        ({
+          ...status,
+          configured: retained,
+          available: false,
+          usable: false,
+          record: retained ? status.record : null,
+        }) as T;
+      render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+      await screen.findByText('Saved matching catalog unavailable.');
+      if (retained) {
+        expect(
+          screen.getByText(/The last imported catalog remains listed for review/),
+        ).toBeTruthy();
+        expect(screen.getByRole('table', { name: 'Imported Jellyfin catalog' })).toBeTruthy();
+        expect(screen.queryByText(/No matching catalog has been imported yet/)).toBeNull();
+      } else {
+        expect(screen.getByText(/No matching catalog has been imported yet/)).toBeTruthy();
+        expect(
+          screen.queryByText(/The last imported catalog remains listed for review/),
+        ).toBeNull();
+        expect(screen.queryByRole('table', { name: 'Imported Jellyfin catalog' })).toBeNull();
+        expect(
+          screen.getByRole('button', { name: 'Import latest Jellyfin backup' }),
+        ).toHaveProperty('disabled', true);
+      }
+    },
+  );
   it('saves a revision-checked daily import schedule without starting an import, then leaves it unchanged during manual import', async () => {
     let value = { ...status };
     const calls: Array<{ path: string; options?: ApiOptions }> = [];

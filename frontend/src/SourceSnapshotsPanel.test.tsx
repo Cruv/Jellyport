@@ -71,6 +71,33 @@ afterEach(() => {
 });
 
 describe('Saved Emby database capture settings', () => {
+  it.each([false, true])(
+    'shows retained source data guidance only when saved captures exist (retained=%s)',
+    async (retained) => {
+      const api: Api = async <T,>() =>
+        ({
+          ...pluginStatus,
+          available: false,
+          snapshots: retained ? 1 : 0,
+          records: retained ? pluginStatus.records : [],
+        }) as T;
+      render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+      await screen.findByText('Emby backup source is unavailable.');
+      if (retained) {
+        expect(screen.getByText(/Saved captures remain listed below/)).toBeTruthy();
+        expect(screen.getByText('All Emby users')).toBeTruthy();
+        expect(screen.queryByText(/No saved Emby history is available yet/)).toBeNull();
+      } else {
+        expect(screen.getByText(/No saved Emby history is available yet/)).toBeTruthy();
+        expect(screen.queryByText(/Saved captures remain listed below/)).toBeNull();
+        expect(screen.queryByText('All Emby users')).toBeNull();
+        expect(screen.getByRole('button', { name: 'Import latest backup' })).toHaveProperty(
+          'disabled',
+          true,
+        );
+      }
+    },
+  );
   it('updates original-backup freshness at the exact expiry without another status request', async () => {
     vi.useFakeTimers();
     vi.setSystemTime('2026-10-16T02:59:59Z');

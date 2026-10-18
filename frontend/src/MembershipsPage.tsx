@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useRouteTab } from './routing';
 import { Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import DiscordMemberPicker from './DiscordMemberPicker';
@@ -37,7 +38,7 @@ export default function MembershipsPage({
   created: (job: Job) => void;
 }) {
   const tiers = settings.membership_tiers || defaultMembershipTiers;
-  const [view, setView] = useState('list');
+  const [view, setView] = useRouteTab('memberships');
   const [query, setQuery] = useState('');
   const [accessFilter, setAccessFilter] = useState('all');
   const [memberships, setMemberships] = useState<Membership[]>([]);
@@ -53,6 +54,9 @@ export default function MembershipsPage({
   const [review, setReview] = useState<MembershipReview | null>(null);
   const mounted = useRef(true);
   const busyRef = useRef(false);
+  useEffect(() => {
+    if (!busyRef.current) setReview(null);
+  }, [view]);
   const generation = useRef(0);
   const loadController = useRef<AbortController | null>(null);
   const controllers = useRef(new Set<AbortController>());

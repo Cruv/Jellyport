@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   type Job,
   activeJob,
+  finishedJob,
   date,
   num,
   type ItemIdentitySummary,
@@ -259,12 +260,14 @@ export function JobsTable({
   openJob,
   migrate,
   filtered = false,
+  clearReport,
 }: {
   jobs: Job[];
   compact?: boolean;
   openJob: (id: string) => void;
   migrate: () => void;
   filtered?: boolean;
+  clearReport?: (job: Job) => void;
 }) {
   const names: Record<string, string> = {
     migrate: 'User migration',
@@ -303,7 +306,7 @@ export function JobsTable({
             <th>Status</th>
             {!compact && <th>Users</th>}
             <th>Started</th>
-            <th className="right">Details</th>
+            <th className="right">{clearReport ? 'Actions' : 'Details'}</th>
           </tr>
         </thead>
         <tbody>
@@ -340,15 +343,29 @@ export function JobsTable({
               <td className="nowrap" data-label="Started">
                 {date(job.created_at)}
               </td>
-              <td className="right" data-label="Details">
-                <button
-                  className="icon-button"
-                  onClick={() => openJob(job.id)}
-                  aria-label="View operation details"
-                  title="View details"
-                >
-                  <Icon name="arrow" />
-                </button>
+              <td className="right" data-label={clearReport ? 'Actions' : 'Details'}>
+                <div className={clearReport ? 'row-actions' : undefined}>
+                  <button
+                    className={clearReport ? 'btn btn-small btn-quiet' : 'icon-button'}
+                    onClick={() => openJob(job.id)}
+                    aria-label="View operation details"
+                    title="View details"
+                  >
+                    <Icon name="arrow" />
+                    {clearReport && 'View'}
+                  </button>
+                  {clearReport && finishedJob(job) && (
+                    <button
+                      className="btn btn-small btn-quiet"
+                      onClick={() => clearReport(job)}
+                      aria-label={`Delete activity report ${job.id}`}
+                      title="Review deletion of this report"
+                    >
+                      <Icon name="trash" />
+                      Delete
+                    </button>
+                  )}
+                </div>
               </td>
             </tr>
           ))}

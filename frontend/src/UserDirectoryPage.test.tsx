@@ -154,10 +154,147 @@ function organization() {
 }
 afterEach(() => {
   cleanup();
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
   vi.restoreAllMocks();
 });
 
 describe('User directory and Discord organization', () => {
+  it('restores the organization tab from its route without configuring or changing roles', async () => {
+    window.history.replaceState(null, '', '#/users/organization');
+    const first = page();
+    await screen.findByRole('heading', { name: 'Discord organization roles' });
+    expect(
+      screen.getByRole('tab', { name: 'Discord organization' }).getAttribute('aria-selected'),
+    ).toBe('true');
+    expect(screen.getByRole('button', { name: 'Configure roles' })).toBeTruthy();
+    expect(first.requests.filter((entry) => entry.options?.method)).toHaveLength(0);
+    expect(first.requests.filter((entry) => entry.path.includes('/discord/'))).toHaveLength(0);
+    first.unmount();
+    const reloaded = page();
+    await screen.findByRole('heading', { name: 'Discord organization roles' });
+    expect(window.location.hash).toBe('#/users/organization');
+    expect(reloaded.requests.filter((entry) => entry.options?.method)).toHaveLength(0);
+  });
+
+  it('uses Back and Forward for tabs while retaining filters and dismissing unsubmitted account dialogs', async () => {
+    window.history.replaceState(null, '', '#/users');
+    const p = page();
+    await screen.findByText('Child');
+    fireEvent.change(screen.getByLabelText('Search users'), { target: { value: 'Family' } });
+    fireEvent.click(screen.getByRole('tab', { name: 'Discord organization' }));
+    expect(window.location.hash).toBe('#/users/organization');
+    act(() => window.history.back());
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /^Directory/ }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    expect(screen.getByLabelText('Search users')).toHaveProperty('value', 'Family');
+    fireEvent.click(await accountAction('Family and owner notes for Family'));
+    expect(screen.getByRole('dialog')).toBeTruthy();
+    act(() => window.history.forward());
+    await waitFor(() =>
+      expect(
+        screen.getByRole('tab', { name: 'Discord organization' }).getAttribute('aria-selected'),
+      ).toBe('true'),
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(p.requests.filter((entry) => entry.options?.method)).toHaveLength(0);
+    expect(window.location.hash).toBe('#/users/organization');
+    expect(localStorage.length + sessionStorage.length).toBe(0);
+  });
+
+  it.each([
+    ['success', false],
+    ['error', false],
+    ['success', true],
+  ] as const)(
+    'ignores a stale %s role preview after tab navigation (returned before reply: %s)',
+    async (outcome, returnedBeforeReply) => {
+      window.history.replaceState(null, '', '#/users');
+      let finish!: (value: unknown) => void;
+      let reject!: (reason: Error) => void;
+      const api = vi.fn(async (path: string) => {
+        if (path === '/api/user-directory') return { users };
+        if (path === '/api/discord/tag-roles')
+          return {
+            can_manage_roles: true,
+            roles: [
+              { id: 'role-emby', name: 'Emby only', manageable: true },
+              { id: 'role-jellyfin', name: 'Jellyfin', manageable: true },
+            ],
+          };
+        if (path === '/api/discord/tags/preview')
+          return await new Promise((resolve, fail) => {
+            finish = resolve;
+            reject = fail;
+          });
+        throw new Error(`Unexpected operation: ${path}`);
+      }) as Api;
+      const p = page(api);
+      await screen.findByText('Child');
+      organization();
+      await screen.findByLabelText('Emby-only role');
+      fireEvent.click(screen.getByRole('button', { name: 'Preview role changes' }));
+      await waitFor(() => expect(finish).toBeTypeOf('function'));
+      act(() => window.history.back());
+      await waitFor(() =>
+        expect(screen.getByRole('tab', { name: /^Directory/ }).getAttribute('aria-selected')).toBe(
+          'true',
+        ),
+      );
+      if (returnedBeforeReply) {
+        act(() => window.history.forward());
+        await waitFor(() =>
+          expect(
+            screen.getByRole('tab', { name: 'Discord organization' }).getAttribute('aria-selected'),
+          ).toBe('true'),
+        );
+      }
+      await act(async () => {
+        if (outcome === 'error') reject(new Error('Stale preview error must not appear.'));
+        else
+          finish({
+            token: 'stale-review-token',
+            changes: [
+              {
+                discord_user_id: discordId,
+                username: 'family_owner',
+                add: ['role-jellyfin'],
+                remove: [],
+              },
+            ],
+            unchanged: 0,
+            unlinked: 0,
+          });
+      });
+      expect(screen.queryByRole('dialog')).toBeNull();
+      if (!returnedBeforeReply) {
+        act(() => window.history.forward());
+        await waitFor(() =>
+          expect(
+            screen.getByRole('tab', { name: 'Discord organization' }).getAttribute('aria-selected'),
+          ).toBe('true'),
+        );
+      }
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Preview role changes' })).toHaveProperty(
+          'disabled',
+          false,
+        ),
+      );
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(screen.queryByText('Stale preview error must not appear.')).toBeNull();
+      expect(
+        vi.mocked(api).mock.calls.filter(([path]) => path === '/api/discord/tags/preview'),
+      ).toHaveLength(1);
+      expect(vi.mocked(api).mock.calls.some(([path]) => path === '/api/discord/tags/apply')).toBe(
+        false,
+      );
+      expect(p.notify).not.toHaveBeenCalled();
+    },
+  );
+
   const largeDirectory = (count = 103): DirectoryUser[] =>
     Array.from({ length: count }, (_, index) => ({
       id: `member-${index + 1}`,

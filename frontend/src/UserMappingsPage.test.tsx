@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import UserMappingsPage from './UserMappingsPage';
 import App from './App';
 import type { Api, ApiOptions, UserMapping, Users } from './types';
@@ -50,11 +50,74 @@ function page(mappings: UserMapping[] = [], customApi?: Api) {
 }
 afterEach(() => {
   cleanup();
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
 
 describe('Manual user mappings', () => {
+  it('restores the editor tab without putting account identities or a draft in the route', async () => {
+    window.history.replaceState(null, '', '#/mappings');
+    const first = page([mapping]);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit mapping for Mr. Complex Name !' }));
+    fireEvent.change(screen.getByLabelText(/Discord username/), {
+      target: { value: 'private.mapping.draft' },
+    });
+    expect(window.location.hash).toBe('#/mappings/editor');
+    act(() => window.history.back());
+    await waitFor(() =>
+      expect(
+        screen.getByRole('tab', { name: /Saved mappings/ }).getAttribute('aria-selected'),
+      ).toBe('true'),
+    );
+    act(() => window.history.forward());
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Edit mapping' }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    expect(screen.getByLabelText(/Discord username/)).toHaveProperty(
+      'value',
+      'private.mapping.draft',
+    );
+    first.unmount();
+    const reloaded = page([mapping]);
+    expect(screen.getByRole('tab', { name: 'Add mapping' }).getAttribute('aria-selected')).toBe(
+      'true',
+    );
+    expect(screen.getByLabelText('Emby account')).toHaveProperty('value', '');
+    expect(screen.getByLabelText(/Discord username/)).toHaveProperty('value', '');
+    expect(reloaded.api).not.toHaveBeenCalled();
+    expect(localStorage.length + sessionStorage.length).toBe(0);
+  });
+
+  it('keeps an approved pending removal visible when browser history changes its task tab', async () => {
+    window.history.replaceState(null, '', '#/mappings');
+    let reject!: (reason: Error) => void;
+    const api = vi.fn(
+      async () =>
+        await new Promise((_, fail) => {
+          reject = fail;
+        }),
+    ) as Api;
+    const p = page([mapping], api);
+    fireEvent.click(screen.getByRole('button', { name: 'Edit mapping for Mr. Complex Name !' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Remove mapping for Mr. Complex Name !' }));
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Remove mapping' }),
+    );
+    await waitFor(() => expect(reject).toBeTypeOf('function'));
+    act(() => window.history.back());
+    await waitFor(() => expect(window.location.hash).toBe('#/mappings'));
+    expect(screen.getByRole('dialog')).toBeTruthy();
+    await act(async () => reject(new Error('Removal could not be confirmed.')));
+    expect(
+      within(screen.getByRole('dialog')).getByText('Removal could not be confirmed.'),
+    ).toBeTruthy();
+    expect(api).toHaveBeenCalledOnce();
+    expect(p.refresh).not.toHaveBeenCalled();
+  });
+
   it('starts with a bounded searchable mapping directory and resets pagination after filtering', () => {
     const many = Array.from({ length: 61 }, (_, index) => ({
       ...mapping,

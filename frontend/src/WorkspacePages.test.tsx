@@ -56,6 +56,7 @@ function page(api: Api) {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
 });
 
 describe('Account page request lifecycle', () => {
@@ -355,11 +356,47 @@ describe('Workspace navigation and migration controls', () => {
       target: { value: 'failed' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete activity…' }));
     expect(clearHistory).toHaveBeenCalledWith(
       jobs.filter((item) => item.status === 'failed').map((item) => item.id),
       true,
     );
+  });
+
+  it('offers direct reviewed deletion for each finished report while protecting unfinished work', () => {
+    const clearHistory = vi.fn();
+    const statuses = [
+      'completed',
+      'partial',
+      'failed',
+      'canceled',
+      'cancelled',
+      'interrupted',
+      'queued',
+      'running',
+      'unknown',
+    ];
+    const jobs = statuses.map((status) => ({ ...job, id: `report-${status}`, status }));
+    const openJob = vi.fn();
+    render(
+      <ActivityPage
+        jobs={jobs}
+        navigate={vi.fn()}
+        openJob={openJob}
+        refresh={vi.fn()}
+        clearHistory={clearHistory}
+      />,
+    );
+    for (const status of statuses.slice(0, 6)) {
+      const report = jobs.find((value) => value.status === status)!;
+      fireEvent.click(screen.getByRole('button', { name: `Delete activity report ${report.id}` }));
+      expect(clearHistory).toHaveBeenLastCalledWith([report.id], true, report);
+    }
+    for (const status of ['queued', 'running', 'unknown'])
+      expect(
+        screen.queryByRole('button', { name: `Delete activity report report-${status}` }),
+      ).toBeNull();
+    expect(openJob).not.toHaveBeenCalled();
   });
 
   it('shows cleared subscription reports without offering a broken operation link', () => {

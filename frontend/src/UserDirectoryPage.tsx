@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useRouteTab } from './routing';
 import { Callout, Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import DiscordMemberPicker from './DiscordMemberPicker';
@@ -70,9 +71,13 @@ export default function UserDirectoryPage({
   const [access, setAccess] = useState('all');
   const [family, setFamily] = useState('all');
   const [review, setReview] = useState('all');
-  const [section, setSection] = useState('directory');
+  const [section, setSection] = useRouteTab('users');
+  const sectionGeneration = useRef({ section, version: 0 });
+  if (sectionGeneration.current.section !== section)
+    sectionGeneration.current = { section, version: sectionGeneration.current.version + 1 };
   const [advanced, setAdvanced] = useState(false);
   const [actionUser, setActionUser] = useState('');
+  useEffect(() => setActionUser(''), [section]);
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState<DirectoryUser | null>(null);
   const [profileTarget, setProfileTarget] = useState('');
@@ -105,6 +110,13 @@ export default function UserDirectoryPage({
   const organizationInvite = safeUrl(settings.bot_organization_invite_url);
   const mounted = useRef(true);
   const busyRef = useRef(false);
+  useEffect(() => {
+    if (busyRef.current) return;
+    setEditing(null);
+    setAccessReview(null);
+    setLinking(null);
+    setPreview(null);
+  }, [section]);
   const generation = useRef(0);
   const controllers = useRef(new Set<AbortController>());
   const loadController = useRef<AbortController | null>(null);
@@ -301,13 +313,21 @@ export default function UserDirectoryPage({
     }, true);
   }
   function previewRoles() {
+    const version = sectionGeneration.current.version;
+    const currentSection = () =>
+      sectionGeneration.current.version === version &&
+      sectionGeneration.current.section === 'organization';
     void run(async (signal) => {
-      const result = await api<DiscordTagPreview>('/api/discord/tags/preview', {
-        method: 'POST',
-        body: {},
-        signal,
-      });
-      if (mounted.current && !signal.aborted) setPreview(result);
+      try {
+        const result = await api<DiscordTagPreview>('/api/discord/tags/preview', {
+          method: 'POST',
+          body: {},
+          signal,
+        });
+        if (mounted.current && !signal.aborted && currentSection()) setPreview(result);
+      } catch (reason) {
+        if (currentSection()) throw reason;
+      }
     }, true);
   }
   function applyRoles() {

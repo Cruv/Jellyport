@@ -85,7 +85,10 @@ npm run test:e2e
 The [Playwright suite](https://playwright.dev/docs/intro) checks all ten workspace
 pages at desktop and mobile widths, document overflow, focused Settings tabs,
 retained drafts, keyboard focus, pagination and filtering with large synthetic
-directories, sign-in/out, credential reveal, and explicit migration approval.
+directories, page/tab restoration after reload and browser Back/Forward,
+sign-in/out, credential reveal, explicit migration approval, and reviewed
+single/bulk activity deletion. Bookmark tests check that private fields are not
+serialized and that returning to a view never replays an action.
 It uses the built interface and real Jellyport API with simulated media servers. These are behavioral and layout checks, not pixel-baseline comparisons
 or a guarantee of support for every browser.
 

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useRouteTab } from './routing';
 import { Empty, Heading, Icon, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import { UserWarnings } from './SettingsPage';
@@ -23,7 +24,7 @@ export default function UserMappingsPage({
   refresh: () => Promise<void>;
   templateUserId?: string;
 }) {
-  const [view, setView] = useState('list');
+  const [view, setView] = useRouteTab('mappings');
   const [query, setQuery] = useState('');
   const filteredMappings = mappings.filter((mapping) =>
     [mapping.source_username, mapping.target_username, mapping.discord_username || ''].some(
@@ -43,6 +44,9 @@ export default function UserMappingsPage({
   const busyRef = useRef(false);
   const [error, setError] = useState('');
   const [removing, setRemoving] = useState<UserMapping | null>(null);
+  useEffect(() => {
+    if (!busyRef.current) setRemoving(null);
+  }, [view]);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useRouteTab } from './routing';
 import { Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import { UserWarnings } from './SettingsPage';
@@ -97,7 +98,7 @@ export default function AccountRolesPage({
   templateUserId?: string;
   defaultRoleId?: string;
 }) {
-  const [view, setView] = useState('list');
+  const [view, setView] = useRouteTab('roles');
   const [roleQuery, setRoleQuery] = useState('');
   const [roles, setRoles] = useState<AccountRole[]>([]);
   const [assignments, setAssignments] = useState<RoleAssignment[]>([]);
@@ -119,6 +120,11 @@ export default function AccountRolesPage({
   const [removing, setRemoving] = useState<AccountRole | null>(null);
   const mounted = useRef(true);
   const busyRef = useRef(false);
+  useEffect(() => {
+    if (busyRef.current) return;
+    setReview(null);
+    setRemoving(null);
+  }, [view]);
   const loadGeneration = useRef(0);
   const importGeneration = useRef(0);
   const loadController = useRef<AbortController | null>(null);

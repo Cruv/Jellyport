@@ -5,11 +5,18 @@ import { Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { crc32 } from 'node:zlib';
-import { parser, type Token } from 'stream-json/parser.js';
+import type { Token } from 'stream-json/parser.js';
+import { batch } from 'stream-json/utils/batch.js';
+import { withParser } from 'stream-json/utils/with-parser.js';
 import { fromFdPromise, type Entry, type ZipFile } from 'yauzl';
-import { ServiceError } from './errors.js';
 import { projectCatalogItem, type MediaItem } from './media.js';
 import { jellyfinAsciiPathKey } from './jellyfin-library-membership.js';
+import {
+  DestinationCatalogError,
+  DESTINATION_CATALOG_MAX_AGE,
+  destinationCatalogErrorCode,
+  normalizedServerVersion,
+} from './destination-catalog-files.js';
 
 export const JELLYFIN_BACKUP_PROJECTION_FORMAT = 'jellyfin-backup-catalog-v2';
 const VERSION = '12.2.0.0';
@@ -27,6 +34,7 @@ const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_ROOTS = 100_000;
 const MAX_LIBRARIES = 1000;
 const MAX_LIBRARY_ROOTS = 1000;
+const TOKEN_BATCH_SIZE = 256;
 const MANIFEST = 'manifest.json';
 const ITEMS = 'Database/BaseItems.json';
 const PROVIDERS = 'Database/BaseItemProviders.json';
@@ -78,14 +86,17 @@ export interface JellyfinBackupProgress extends JellyfinBackupStats {
 export interface JellyfinBackupReadOptions {
   signal?: AbortSignal;
   onProgress?: (progress: JellyfinBackupProgress) => void;
+  /** The worker supplies its verified live version; reject stale input before table reads. */
+  expectedServerVersion?: string;
+  /** Deterministic private clock for synthetic tests, never accepted over IPC. */
+  now?: number;
 }
 export interface JellyfinBackupCatalogResult {
   manifest: JellyfinBackupManifest;
   stats: JellyfinBackupStats;
 }
-const invalid = () =>
-  new ServiceError('The Jellyfin backup has an unsupported or invalid catalog.');
-const canceled = () => new ServiceError('Jellyfin backup import canceled.');
+const invalid = () => new DestinationCatalogError('backup_invalid');
+const canceled = () => new DestinationCatalogError('canceled');
 const isObject = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 function check(signal?: AbortSignal): void {
@@ -135,6 +146,8 @@ function unchanged(first: BigIntStats, second: BigIntStats): boolean {
 }
 function readManifest(bytes: Buffer): JellyfinBackupManifest {
   const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  if (isObject(value) && typeof value.ServerVersion === 'string' && value.ServerVersion !== VERSION)
+    throw new DestinationCatalogError('version_mismatch');
   if (
     !isObject(value) ||
     value.ServerVersion !== VERSION ||
@@ -191,101 +204,107 @@ function rowProjection(
   };
   return new Writable({
     objectMode: true,
-    highWaterMark: 16,
-    write(token: Token, _encoding, callback) {
-      try {
-        if (!rootSeen) {
-          if (token.name !== 'startArray') throw invalid();
-          rootSeen = true;
-        }
-        if (token.name === 'startArray' || token.name === 'startObject') {
-          if (depth === 1 && token.name !== 'startObject') throw invalid();
-          if (++depth > 16) throw invalid();
-          if (depth === 2) {
-            row = Object.create(null);
-            keys = new Set();
-            size = 0;
+    highWaterMark: 1,
+    write(tokens: Token[], _encoding, callback) {
+      let index = 0;
+      const advance = () => {
+        try {
+          if (!Array.isArray(tokens) || tokens.length < 1 || tokens.length > TOKEN_BATCH_SIZE)
+            throw invalid();
+          while (index < tokens.length) {
+            const token = tokens[index++]!;
+            if (!rootSeen) {
+              if (token.name !== 'startArray') throw invalid();
+              rootSeen = true;
+            }
+            if (token.name === 'startArray' || token.name === 'startObject') {
+              if (depth === 1 && token.name !== 'startObject') throw invalid();
+              if (++depth > 16) throw invalid();
+              if (depth === 2) {
+                row = Object.create(null);
+                keys = new Set();
+                size = 0;
+              }
+              size += 2;
+            } else if (token.name === 'endArray' || token.name === 'endObject') {
+              if (depth === 2) {
+                if (token.name !== 'endObject' || !row) throw invalid();
+                const completed = row;
+                row = undefined;
+                depth--;
+                void consume(completed).then(advance, (error: unknown) => callback(error as Error));
+                return;
+              }
+              depth--;
+            } else if (token.name === 'startKey') {
+              readingKey = true;
+              keyText = '';
+            } else if (token.name === 'endKey') {
+              size += 3;
+              if (depth === 2) {
+                if (keys.has(keyText) || keys.size >= 512) throw invalid();
+                keys.add(keyText);
+                key = keyText;
+              }
+              readingKey = false;
+              keyText = '';
+            } else if (token.name === 'startString') {
+              readingString = depth === 2 && fields.has(key);
+              text = '';
+            } else if (token.name === 'stringChunk') {
+              size += Buffer.byteLength(token.value);
+              if (size > MAX_ROW_BYTES) throw invalid();
+              if (readingKey) {
+                keyText += token.value;
+                if (keyText.length > 1024) throw invalid();
+              } else if (readingString) text += token.value;
+            } else if (token.name === 'endString') {
+              if (readingString) value(text);
+              readingString = false;
+              text = '';
+            } else if (token.name === 'startNumber') {
+              readingNumber = depth === 2 && fields.has(key);
+              numberText = '';
+              numberSize = 0;
+            } else if (token.name === 'numberChunk') {
+              size += token.value.length;
+              numberSize += token.value.length;
+              if (numberSize > 64 || size > MAX_ROW_BYTES) throw invalid();
+              if (readingNumber) numberText += token.value;
+            } else if (token.name === 'endNumber') {
+              if (readingNumber) value(Number(numberText));
+              readingNumber = false;
+              numberText = '';
+            } else if (
+              token.name === 'keyValue' ||
+              token.name === 'numberValue' ||
+              token.name === 'stringValue'
+            ) {
+              // Packing would allocate a malicious scalar before its size can be checked.
+              throw invalid();
+            } else if (
+              token.name === 'nullValue' ||
+              token.name === 'trueValue' ||
+              token.name === 'falseValue'
+            ) {
+              size += 5;
+              value(token.value);
+            }
+            if (
+              size > MAX_ROW_BYTES ||
+              depth < 0 ||
+              (depth === 1 && !['endObject', 'endArray'].includes(token.name))
+            ) {
+              // At the root, only object rows are valid. The opening array is special.
+              if (!(token.name === 'startArray' && depth === 1)) throw invalid();
+            }
           }
-          size += 2;
-        } else if (token.name === 'endArray' || token.name === 'endObject') {
-          if (depth === 2) {
-            if (token.name !== 'endObject' || !row) throw invalid();
-            const completed = row;
-            row = undefined;
-            depth--;
-            void consume(completed).then(
-              () => callback(),
-              (error: unknown) => callback(error as Error),
-            );
-            return;
-          }
-          depth--;
-        } else if (token.name === 'startKey') {
-          readingKey = true;
-          keyText = '';
-        } else if (token.name === 'endKey') {
-          size += 3;
-          if (depth === 2) {
-            if (keys.has(keyText) || keys.size >= 512) throw invalid();
-            keys.add(keyText);
-            key = keyText;
-          }
-          readingKey = false;
-          keyText = '';
-        } else if (token.name === 'startString') {
-          readingString = depth === 2 && fields.has(key);
-          text = '';
-        } else if (token.name === 'stringChunk') {
-          size += Buffer.byteLength(token.value);
-          if (size > MAX_ROW_BYTES) throw invalid();
-          if (readingKey) {
-            keyText += token.value;
-            if (keyText.length > 1024) throw invalid();
-          } else if (readingString) text += token.value;
-        } else if (token.name === 'endString') {
-          if (readingString) value(text);
-          readingString = false;
-          text = '';
-        } else if (token.name === 'startNumber') {
-          readingNumber = depth === 2 && fields.has(key);
-          numberText = '';
-          numberSize = 0;
-        } else if (token.name === 'numberChunk') {
-          size += token.value.length;
-          numberSize += token.value.length;
-          if (numberSize > 64 || size > MAX_ROW_BYTES) throw invalid();
-          if (readingNumber) numberText += token.value;
-        } else if (token.name === 'endNumber') {
-          if (readingNumber) value(Number(numberText));
-          readingNumber = false;
-          numberText = '';
-        } else if (
-          token.name === 'keyValue' ||
-          token.name === 'numberValue' ||
-          token.name === 'stringValue'
-        ) {
-          // Packing would allocate a malicious scalar before its size can be checked.
-          throw invalid();
-        } else if (
-          token.name === 'nullValue' ||
-          token.name === 'trueValue' ||
-          token.name === 'falseValue'
-        ) {
-          size += 5;
-          value(token.value);
+          callback();
+        } catch (error) {
+          callback(error as Error);
         }
-        if (
-          size > MAX_ROW_BYTES ||
-          depth < 0 ||
-          (depth === 1 && !['endObject', 'endArray'].includes(token.name))
-        ) {
-          // At the root, only object rows are valid. The opening array is special.
-          if (!(token.name === 'startArray' && depth === 1)) throw invalid();
-        }
-        callback();
-      } catch (error) {
-        callback(error as Error);
-      }
+      };
+      advance();
     },
     final(callback) {
       callback(rootSeen && depth === 0 ? undefined : invalid());
@@ -391,7 +410,13 @@ async function entryPipeline(
       input,
       integrity,
       utf8,
-      parser.asStream({
+      // Fuse supported tokenizer + fixed batching before the Node stream boundary.
+      // Scalars stay unpacked and every token passes the same validation above.
+      withParser.asStream(batch<Token>, {
+        batchSize: TOKEN_BATCH_SIZE,
+        readableHighWaterMark: 1,
+        writableHighWaterMark: 64 * 1024,
+        decodeStrings: false,
         packKeys: false,
         streamKeys: true,
         packStrings: false,
@@ -473,6 +498,18 @@ export async function importJellyfinBackupCatalog(
       options,
     );
     const manifest = readManifest(Buffer.concat(buffers));
+    if (options.expectedServerVersion !== undefined) {
+      const now = options.now ?? Date.now();
+      const created = Date.parse(manifest.createdAt);
+      if (
+        normalizedServerVersion(options.expectedServerVersion) !==
+        normalizedServerVersion(manifest.serverVersion)
+      )
+        throw new DestinationCatalogError('version_mismatch');
+      if (created > now + 60_000) throw new DestinationCatalogError('backup_future');
+      if (now - created > DESTINATION_CATALOG_MAX_AGE)
+        throw new DestinationCatalogError('backup_expired');
+    }
     const outputFd = openSync(
       outputPath,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -513,13 +550,20 @@ export async function importJellyfinBackupCatalog(
     let transactionRows = 0;
     const checkpoint = async (phase: JellyfinBackupProgress['phase']) => {
       check(options.signal);
-      report(phase);
+      // Keep the first parsed row observable even after the new phase-start event.
+      report(
+        phase,
+        phase === 'items'
+          ? stats.sourceRows === 1
+          : phase === 'providers' && stats.providerRows === 1,
+      );
       if (++transactionRows % 10_000 === 0) database!.exec('COMMIT; BEGIN IMMEDIATE;');
       if (transactionRows % 1000 === 0) {
         await yieldTurn();
         check(options.signal);
       }
     };
+    report('items', true);
     await entryPipeline(
       zip,
       entries.get(ITEMS)!,
@@ -639,6 +683,7 @@ export async function importJellyfinBackupCatalog(
     const insertProvider = database.prepare(
       'INSERT INTO providers(id,provider_key,provider_value) VALUES(?,?,?)',
     );
+    report('providers', true);
     await entryPipeline(
       zip,
       entries.get(PROVIDERS)!,
@@ -674,6 +719,7 @@ export async function importJellyfinBackupCatalog(
     );
     const updateItem = database.prepare('UPDATE catalog_items SET item=? WHERE id=?');
     const series = database.prepare('SELECT item FROM catalog_items WHERE id=?');
+    report('enriching', true);
     let cursor = '';
     while (true) {
       check(options.signal);
@@ -730,14 +776,14 @@ export async function importJellyfinBackupCatalog(
       !unchanged(initial, fstatSync(fd, { bigint: true })) ||
       !unchanged(initial, lstatSync(archivePath, { bigint: true }))
     )
-      throw invalid();
+      throw new DestinationCatalogError('backup_changed');
     report('enriching', true);
     completed = true;
     return { manifest, stats };
   } catch (error) {
     if (options.signal?.aborted) throw canceled();
-    if (error instanceof ServiceError) throw error;
-    throw invalid();
+    if (error instanceof DestinationCatalogError) throw error;
+    throw new DestinationCatalogError(destinationCatalogErrorCode(error));
   } finally {
     database?.close();
     if (zip)

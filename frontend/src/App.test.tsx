@@ -996,6 +996,10 @@ describe('React account safeguards', () => {
     );
     const url = screen.getByLabelText(/Public sign-in URL/) as HTMLInputElement;
     fireEvent.change(url, { target: { value: 'https://synthetic-draft.example.invalid' } });
+    expect(url.isConnected).toBe(true);
+    expect(screen.getByLabelText(/Public sign-in URL/)).toBe(url);
+    expect(url.value).toBe('https://synthetic-draft.example.invalid');
+    expect(screen.getByText('Unsaved changes · save all settings together.')).toBeTruthy();
     await selectSettingsTab('Account defaults', 'Passwords & messages');
     expect(window.location.hash).toBe('#/settings/accounts/passwords');
     await act(async () => window.history.back());
@@ -1010,6 +1014,8 @@ describe('React account safeguards', () => {
         'true',
       ),
     );
+    expect(url.isConnected).toBe(true);
+    expect(screen.getByLabelText(/Public sign-in URL/)).toBe(url);
     expect(url.value).toBe('https://synthetic-draft.example.invalid');
     await act(async () => window.history.forward());
     await waitFor(() =>
@@ -1023,6 +1029,8 @@ describe('React account safeguards', () => {
         screen.getByRole('tab', { name: 'Passwords & messages' }).getAttribute('aria-selected'),
       ).toBe('true'),
     );
+    expect(url.isConnected).toBe(true);
+    expect(screen.getByLabelText(/Public sign-in URL/)).toBe(url);
     expect(url.value).toBe('https://synthetic-draft.example.invalid');
     view.unmount();
     render(<App />);
@@ -1370,12 +1378,14 @@ describe('React account safeguards', () => {
     });
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
-    await selectSettingsTab('Account defaults');
+    // Wait for this deferred read to start so Settings and its routing effects
+    // are mounted before interacting with a tab from its first rendered frame.
+    await waitFor(() => expect(resolveRoles).toBeTypeOf('function'));
+    await act(async () => selectSettingsTab('Account defaults'));
     await screen.findByRole('option', { name: 'Saved default role' });
     expect((screen.getByLabelText('Default account role') as HTMLSelectElement).value).toBe(
       'role-1',
     );
-    await waitFor(() => expect(resolveRoles).toBeTypeOf('function'));
     await act(async () =>
       resolveRoles({ roles: [{ id: 'role-1', name: 'Crew defaults' }], assignments: [] }),
     );

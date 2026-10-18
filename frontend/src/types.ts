@@ -302,12 +302,45 @@ export interface ImportWorkflowStatus {
 export interface SourceSnapshotConfig extends ImportScheduleConfig {
   scope: SnapshotCaptureScope;
 }
+export type DestinationCatalogStage =
+  | 'validating_backup'
+  | 'reading_items'
+  | 'reading_providers'
+  | 'enriching'
+  | 'indexing'
+  | 'fingerprinting'
+  | 'encrypting'
+  | 'validating_catalog';
+export interface DestinationCatalogDiagnostic {
+  stage: DestinationCatalogStage;
+  started_at: string;
+  updated_at: string;
+  source_rows: number;
+  provider_rows: number;
+  items: number;
+  keys: number;
+  bytes: number;
+}
+export type DestinationCatalogErrorCode =
+  | 'backup_missing'
+  | 'backup_expired'
+  | 'backup_future'
+  | 'version_mismatch'
+  | 'backup_invalid'
+  | 'backup_changed'
+  | 'storage_error'
+  | 'timeout'
+  | 'interrupted'
+  | 'canceled'
+  | 'worker_failed';
 export interface DestinationCatalogStatus extends ImportWorkflowStatus {
   config: ImportScheduleConfig;
   usable?: boolean;
   configured: boolean;
   available: boolean;
   record: DestinationCatalogMetadata | null;
+  diagnostic?: DestinationCatalogDiagnostic | null;
+  error_code?: DestinationCatalogErrorCode | null;
 }
 export interface SourceSnapshotStatus extends ImportWorkflowStatus {
   available?: boolean;

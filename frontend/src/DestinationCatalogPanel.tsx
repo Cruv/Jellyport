@@ -2,6 +2,7 @@ import { Callout, Icon } from './components';
 import DailyImportSchedule from './DailyImportSchedule';
 import {
   ImportStatus,
+  importDuration,
   importAge as age,
   importTimestamp as timestamp,
   useImportClock,
@@ -9,9 +10,6 @@ import {
 } from './ImportWorkflow';
 import type { Api, Notify, DestinationCatalogStatus } from './types';
 export type { DestinationCatalogStatus } from './types';
-
-const duration = (milliseconds: number) =>
-  milliseconds < 1000 ? `${Math.round(milliseconds)} ms` : `${(milliseconds / 1000).toFixed(1)} s`;
 
 export default function DestinationCatalogPanel({
   api,
@@ -126,6 +124,9 @@ export default function DestinationCatalogPanel({
         )}
         <ImportStatus
           status={status}
+          importDiagnostic={status?.diagnostic}
+          importErrorCode={status?.error_code}
+          showAttemptDuration
           hasRetainedData={status ? !!record : undefined}
           loading={loading}
           starting={busy === 'import'}
@@ -218,7 +219,9 @@ export default function DestinationCatalogPanel({
                     <strong>{timestamp(record.backup_created_at)}</strong>
                     <small>{age(record.backup_created_at, now)}</small>
                     <small>Imported {timestamp(record.imported_at)}</small>
-                    <small>Import duration {duration(record.import_elapsed_ms)}</small>
+                    <small>
+                      Saved catalog import duration {importDuration(record.import_elapsed_ms)}
+                    </small>
                   </td>
                   <td data-label="Contents">
                     <strong>{record.items.toLocaleString()} matching items</strong>

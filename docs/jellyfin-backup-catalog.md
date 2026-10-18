@@ -10,6 +10,7 @@ Fresh destination account access and playback activity remain authoritative.
 
 1. In Jellyfin's admin dashboard, create a **database-only backup**. Metadata,
    subtitles and trickplay are unnecessary. Wait until Jellyfin reports completion.
+   The completed backup must be no more than 48 hours old when imported and used.
    Creating this backup can consume server resources; Jellyport does not trigger
    backups or schedule them on the media server.
 2. Mount only the actual directory containing completed
@@ -68,9 +69,26 @@ Timing rules are the same for both import schedules:
 Starting an import is an acknowledgement, not a successful completion. Follow its
 running status until the outcome is shown. If a request or status refresh fails,
 refresh status to reconcile what actually happened before retrying. A failed new
-import preserves the last validated copy. Original backup time continues to
-control the 48-hour freshness limit; reimporting an old backup does not renew it.
-The progress indicator stays indeterminate when the helper has no measured total.
+import preserves any previously validated catalog, which may already be expired;
+a failed first import does not create a usable catalog. Original backup time
+controls the 48-hour freshness limit. If it expires, create a fresh completed
+database backup in Jellyfin, then import it. Reimporting unchanged old content or
+enabling a daily import schedule cannot refresh its age.
+
+The helper checks the manifest's original age, future timestamp and linked server
+version before creating the projection or reading the large catalog tables. A
+timestamp more than one minute in the future is rejected. Freshness and file
+integrity are checked again before publishing the completed catalog.
+
+Current helpers report the attempt's elapsed time, current or last observed stage,
+aggregate row/item/key counts and processed bytes. Stages distinguish backup
+validation, reading items and providers, enriching data, indexing, integrity checks,
+encryption and final validation. Failure reasons identify expired or missing
+backups, incompatible or changed files, storage problems, interruption and timeout.
+The saved catalog's import duration belongs to that earlier successful catalog;
+it is separate from the latest attempt's duration. Missing progress from an older
+helper is shown without inventing counts or a completion percentage. Diagnostics
+contain no private paths, item identities, credentials or playback details.
 
 The initial adapter supports the inspected **Jellyfin 12.2.0.0 / backup engine
 0.2.0** schema only. Other versions fail explicitly until their format is verified.
@@ -89,7 +107,8 @@ replace a v2 projection with an older format.
 
 1. Complete both backups and import the Emby source history and Jellyfin matching
    catalog. Record their original dates and shared import durations separately.
-   Reimport after library changes or before the 48-hour age limit expires.
+   Create and import fresh backups after library changes or before the 48-hour age
+   limit expires.
 2. Preview a user or batch with saved Emby history, inspect account identities and
    mappings, then approve. Preview is lightweight; detailed matching is deferred.
    Approval pins the current destination catalog across that job.
@@ -110,7 +129,9 @@ Only `manifest.json`, `Database/BaseItems.json` and
 `Database/BaseItemProviders.json` are decompressed. Selected streams have bounded
 sizes, row depth, field sizes, CRC and declared-length validation. IDs must be
 unique; provider relationships and supported media types are checked. JSON strings
-are streamed and catalog/index storage is disk-backed. The archive must remain a
+remain unpacked and are processed in fixed batches of 256 tokens with bounded
+stream backpressure; existing row/field limits are unchanged. Catalog/index
+storage is disk-backed. The archive must remain a
 regular, unchanged file through import and fingerprinting. No raw archive entries
 are extracted to paths, and no authentication/user-history tables are parsed.
 The projection contains only allowlisted matching metadata, names, runtime and
@@ -127,7 +148,7 @@ from another server is unsupported even if versions match.
 Backup creation and later library changes are not one atomic operation with live
 migration. New items are absent until another backup, and metadata edits can make
 fresh identity validation fail. A pinned backup cannot renew itself, and failure
-never switches automatically to a live crawl. Import failures preserve the last
+never switches automatically to a live crawl. Import failures preserve any last
 good generation; reimporting unchanged content does not renew its age. Clearing is
 refused while imports or jobs pin data. Retention keeps the latest two generations
 and active job pins, with at most eight; idle decrypted generations are removed.

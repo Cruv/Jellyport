@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import DestinationCatalogPanel, { type DestinationCatalogStatus } from './DestinationCatalogPanel';
-import type { Api, ApiOptions } from './types';
+import type { Api, ApiOptions, DestinationCatalogDiagnostic } from './types';
 
 const now = Date.parse('2026-01-02T04:00:00Z');
 const status: DestinationCatalogStatus = {
@@ -45,6 +45,95 @@ afterEach(() => {
 });
 
 describe('saved destination catalog settings', () => {
+  it.each([false, true])(
+    'explains an expired-backup failure separately from a retained expired catalog (retained=%s)',
+    async (retained) => {
+      vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-01-04T04:00:00Z'));
+      const diagnostic: DestinationCatalogDiagnostic = {
+        stage: 'validating_backup',
+        started_at: '2026-01-04T03:59:59.750Z',
+        updated_at: '2026-01-04T04:00:00Z',
+        source_rows: 0,
+        provider_rows: 0,
+        items: 0,
+        keys: 0,
+        bytes: 0,
+      };
+      const api: Api = async <T,>() =>
+        ({
+          ...status,
+          last_attempt_at: diagnostic.started_at,
+          last_finished_at: diagnostic.updated_at,
+          last_outcome: 'failed',
+          last_error: 'The completed backup is too old.',
+          error_code: 'backup_expired',
+          diagnostic,
+          record: retained ? status.record : null,
+        }) as T;
+      render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+      expect((await screen.findByRole('alert')).textContent).toBe(
+        'The completed backup is too old.',
+      );
+      expect(screen.getByText('Backup expired')).toBeTruthy();
+      expect(
+        screen.getByText('Create a fresh database backup in Jellyfin, then import it.'),
+      ).toBeTruthy();
+      expect(screen.getByText('Validating backup')).toBeTruthy();
+      expect(screen.getByText('Latest attempt duration: 250 ms')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Import latest Jellyfin backup' })).toHaveProperty(
+        'disabled',
+        false,
+      );
+      if (retained) {
+        expect(screen.getByText('Expired')).toBeTruthy();
+        expect(screen.queryByText('Available')).toBeNull();
+        expect(screen.getByText('Saved catalog import duration 1.5 s')).toBeTruthy();
+        expect(screen.getByText('Previous saved data is retained.')).toBeTruthy();
+      } else {
+        expect(screen.getByText('No previous saved data is available.')).toBeTruthy();
+        expect(screen.queryByRole('table', { name: 'Imported Jellyfin catalog' })).toBeNull();
+      }
+    },
+  );
+  it('shows running work and a slow-progress observation without enabling a duplicate import', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(now);
+    let reads = 0;
+    const diagnostic: DestinationCatalogDiagnostic = {
+      stage: 'indexing',
+      started_at: '2026-01-02T03:56:16Z',
+      updated_at: '2026-01-02T03:59:30Z',
+      source_rows: 120000,
+      provider_rows: 220000,
+      items: 120000,
+      keys: 220000,
+      bytes: 3 * 1024 ** 2,
+    };
+    const api: Api = async <T,>() =>
+      ({
+        ...status,
+        running: true,
+        last_outcome: 'running',
+        last_attempt_at: diagnostic.started_at,
+        last_finished_at: null,
+        diagnostic: {
+          ...diagnostic,
+          updated_at: ++reads === 1 ? diagnostic.updated_at : '2026-01-02T03:59:59Z',
+        },
+      }) as T;
+    render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+    await screen.findByText('Building matching index');
+    expect(screen.getByText('Current attempt elapsed: 3m 44s')).toBeTruthy();
+    expect(screen.getByText(/No recent progress update/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Import latest Jellyfin backup' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(screen.getByRole('progressbar').hasAttribute('value')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+    await act(async () => {});
+    expect(screen.queryByText(/No recent progress update/)).toBeNull();
+    expect(reads).toBe(2);
+  });
   it.each(
     (['failed', 'interrupted'] as const).flatMap((outcome) =>
       (['none', 'current', 'expired'] as const).map((retained) => ({ outcome, retained })),
@@ -219,7 +308,7 @@ describe('saved destination catalog settings', () => {
     expect(
       within(table).getByText(`Imported ${new Date(status.record!.imported_at).toLocaleString()}`),
     ).toBeTruthy();
-    expect(within(table).getByText('Import duration 1.5 s')).toBeTruthy();
+    expect(within(table).getByText('Saved catalog import duration 1.5 s')).toBeTruthy();
     expect(within(table).getByText('120,000 matching items')).toBeTruthy();
     expect(within(table).getByText('220,000 matching keys · 3.0 MiB')).toBeTruthy();
     expect(within(table).getByText('Available')).toBeTruthy();

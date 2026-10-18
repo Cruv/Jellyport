@@ -3,7 +3,14 @@ import { StrictMode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { ImportStatus, useImportClock, useImportWorkflow } from './ImportWorkflow';
-import type { Api, ApiOptions, ImportWorkflowStatus, Notify } from './types';
+import type {
+  Api,
+  ApiOptions,
+  ImportWorkflowStatus,
+  Notify,
+  DestinationCatalogDiagnostic,
+  DestinationCatalogErrorCode,
+} from './types';
 
 const idle: ImportWorkflowStatus = {
   running: false,
@@ -367,5 +374,117 @@ describe('truthful import status', () => {
       });
       expect(screen.getByText(`${remaining} current`)).toBeTruthy();
     }
+  });
+});
+
+describe('bounded destination import diagnostics', () => {
+  const diagnostic: DestinationCatalogDiagnostic = {
+    stage: 'reading_items',
+    started_at: '2026-01-02T03:56:16Z',
+    updated_at: '2026-01-02T03:59:58Z',
+    source_rows: 120_000,
+    provider_rows: 30_000,
+    items: 90_000,
+    keys: 180_000,
+    bytes: 9 * 1024 ** 2,
+  };
+  function renderStatus(props: Partial<Parameters<typeof ImportStatus>[0]> = {}) {
+    return render(
+      <ImportStatus
+        status={{ ...idle, running: true, last_attempt_at: diagnostic.started_at }}
+        loading={false}
+        starting={false}
+        initialLabel="Loading"
+        runningLabel="Importing"
+        progressLabel="Catalog import progress"
+        summary="Saved catalog"
+        error=""
+        stale={false}
+        uncertain={false}
+        importDiagnostic={diagnostic}
+        showAttemptDuration
+        {...props}
+      />,
+    );
+  }
+  it('shows only actual aggregate work and stage with elapsed time while keeping overall progress indeterminate', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-01-02T04:00:00Z'));
+    renderStatus();
+    expect(screen.getByText('Reading media items')).toBeTruthy();
+    expect(screen.getByText('Current attempt elapsed: 3m 44s')).toBeTruthy();
+    expect(screen.getByText(/120,000 media rows read/).textContent).toContain(
+      '30,000 provider rows read',
+    );
+    expect(screen.getByText(/90,000 matching items/).textContent).toContain(
+      '180,000 matching keys',
+    );
+    expect(screen.getByText(/Processed bytes: 9.0 MiB/)).toBeTruthy();
+    expect(screen.getByRole('progressbar').hasAttribute('value')).toBe(false);
+    expect(screen.getByRole('progressbar').hasAttribute('max')).toBe(false);
+    expect(screen.queryByText(/%/)).toBeNull();
+    expect(screen.queryByText(/No recent progress update/)).toBeNull();
+  });
+  it('calls delayed progress an observation gap without inventing a failed outcome', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-01-02T04:00:20Z'));
+    renderStatus({ importDiagnostic: { ...diagnostic, stage: 'indexing' } });
+    expect(screen.getByText('Building matching index')).toBeTruthy();
+    expect(screen.getByText(/No recent progress update/)).toBeTruthy();
+    expect(screen.getByText('Running')).toBeTruthy();
+    expect(screen.queryByText('Failed')).toBeNull();
+  });
+  it('keeps the last observed stage and latest attempt duration after failure', () => {
+    renderStatus({
+      status: {
+        ...idle,
+        last_attempt_at: diagnostic.started_at,
+        last_finished_at: '2026-01-02T04:00:00Z',
+        last_outcome: 'failed',
+        last_error: 'Import failed.',
+      },
+      importDiagnostic: { ...diagnostic, stage: 'fingerprinting' },
+      hasRetainedData: true,
+    });
+    expect(screen.getByText(/Last observed stage/)).toBeTruthy();
+    expect(screen.getByText('Checking backup integrity')).toBeTruthy();
+    expect(screen.getByText('Latest attempt duration: 3m 44s')).toBeTruthy();
+    expect(screen.getByText('Previous saved data is retained.')).toBeTruthy();
+    expect(screen.queryByRole('progressbar')).toBeNull();
+    expect(screen.queryByText(/No recent progress update/)).toBeNull();
+  });
+  it.each([
+    { started_at: 'PRIVATE_INVALID_TIMESTAMP' },
+    { updated_at: '2026-01-01T00:00:00Z' },
+    { source_rows: -1 },
+    { bytes: 8 * 1024 ** 3 + 1 },
+    { stage: 'PRIVATE_BACKUP_PATH' },
+  ])('ignores malformed diagnostics without exposing arbitrary fields: %j', (patch) => {
+    renderStatus({
+      status: { ...idle, running: true, last_attempt_at: 'PRIVATE_START' },
+      importDiagnostic: { ...diagnostic, ...patch } as DestinationCatalogDiagnostic,
+    });
+    expect(screen.queryByText(/Current stage/)).toBeNull();
+    expect(screen.queryByText(/Processed bytes/)).toBeNull();
+    expect(screen.queryByText(/PRIVATE_/)).toBeNull();
+    expect(screen.queryByText(/NaN|Invalid Date/)).toBeNull();
+    expect(screen.getByRole('progressbar').hasAttribute('value')).toBe(false);
+  });
+  it('does not show an old attempt diagnostic during a new start or for a later attempt', () => {
+    const view = renderStatus({ starting: true });
+    expect(screen.queryByText(/Current stage|Last observed stage/)).toBeNull();
+    expect(screen.queryByText(/attempt elapsed|attempt duration/)).toBeNull();
+    view.unmount();
+    renderStatus({ status: { ...idle, running: true, last_attempt_at: '2026-01-02T04:01:00Z' } });
+    expect(screen.queryByText(/Current stage|Last observed stage/)).toBeNull();
+  });
+  it('keeps legacy/source status unchanged and never prints unknown error codes or extra private fields', () => {
+    renderStatus({
+      importDiagnostic: undefined,
+      showAttemptDuration: false,
+      importErrorCode: 'PRIVATE_ERROR' as DestinationCatalogErrorCode,
+      status: { ...idle, last_error: 'Import failed.', last_outcome: 'failed' },
+    });
+    expect(screen.getByText('Failed')).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toBe('Import failed.');
+    expect(screen.queryByText(/stage|attempt duration|Failure reason|PRIVATE_ERROR/)).toBeNull();
   });
 });

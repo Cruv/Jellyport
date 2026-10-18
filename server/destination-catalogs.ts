@@ -29,6 +29,13 @@ import {
   destinationCatalogPrefix,
   normalizedServerVersion,
   validDestinationResult,
+  validDestinationDiagnostic,
+  validDestinationProgress,
+  validDestinationErrorCode,
+  destinationCatalogFailureMessage,
+  type DestinationCatalogDiagnostic,
+  type DestinationCatalogErrorCode,
+  type DestinationCatalogProgress,
   type DestinationCatalogMetadata,
   type DestinationCatalogRequest,
   type DestinationCatalogResult,
@@ -47,6 +54,8 @@ interface State {
   last_finished_at?: string | null;
   last_outcome?: ImportOutcome;
   last_scheduled_date?: string;
+  last_diagnostic?: DestinationCatalogDiagnostic;
+  last_error_code?: DestinationCatalogErrorCode | null;
 }
 interface DatabaseEntry {
   promise: Promise<string>;
@@ -186,6 +195,8 @@ export class DestinationCatalogs {
           last_error: null,
         };
     this.imports = options.imports ?? new ImportCoordinator();
+    if (!validDestinationDiagnostic(this.state.last_diagnostic)) delete this.state.last_diagnostic;
+    if (!validDestinationErrorCode(this.state.last_error_code)) delete this.state.last_error_code;
     if (this.state.active) this.imports.restore(`jellyfin:${this.state.active.id}`);
     if (!this.state.config) {
       this.state.config = {
@@ -199,6 +210,7 @@ export class DestinationCatalogs {
     }
     if (!this.state.active && this.state.last_outcome === 'running') {
       this.state.last_outcome = 'interrupted';
+      this.state.last_error_code = 'interrupted';
       this.state.last_finished_at = new Date().toISOString();
       this.state.last_error =
         'Jellyfin import preparation was interrupted before a helper request was saved. Check status before starting a new import. Any previously saved catalog is preserved.';
@@ -298,6 +310,8 @@ export class DestinationCatalogs {
           ? (this.state.generations[0]?.finished_at ?? null)
           : this.state.last_finished_at,
       last_error: this.state.last_error,
+      error_code: this.state.last_error_code ?? null,
+      diagnostic: this.state.last_diagnostic ?? null,
       last_outcome:
         this.starting || this.state.active
           ? ('running' as const)
@@ -361,6 +375,8 @@ export class DestinationCatalogs {
     this.state.last_finished_at = null;
     this.state.last_outcome = 'running';
     this.state.last_error = null;
+    this.state.last_error_code = null;
+    delete this.state.last_diagnostic;
     try {
       const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
       if (due) this.state.last_scheduled_date = due.date;
@@ -563,8 +579,42 @@ export class DestinationCatalogs {
     }
   }
   private async generationFiles(id: string): Promise<void> {
-    for (const suffix of ['request', 'result', 'db.enc'])
+    for (const suffix of ['request', 'result', 'progress', 'db.enc'])
       await rm(join(this.directory, `${destinationCatalogPrefix(id)}.${suffix}`), { force: true });
+  }
+  private acceptDiagnostic(value: unknown, request: DestinationCatalogRequest): boolean {
+    if (!validDestinationDiagnostic(value)) return false;
+    const updated = Date.parse(value.updated_at);
+    const requested = Date.parse(request.requested_at);
+    if (
+      Date.parse(value.started_at) < requested - 60_000 ||
+      updated < requested ||
+      updated > Date.now() + 60_000 ||
+      (this.state.last_diagnostic && updated < Date.parse(this.state.last_diagnostic.updated_at))
+    )
+      return false;
+    if (JSON.stringify(value) === JSON.stringify(this.state.last_diagnostic)) return false;
+    this.state.last_diagnostic = { ...value };
+    return true;
+  }
+  private async readProgress(active: DestinationCatalogRequest): Promise<void> {
+    try {
+      const progress = await readEnvelope<DestinationCatalogProgress>(
+        join(this.directory, `${destinationCatalogPrefix(active.id)}.progress`),
+        this.key!,
+      );
+      if (
+        validDestinationProgress(progress) &&
+        progress.id === active.id &&
+        progress.requested_at === active.requested_at &&
+        sameBinding(progress.binding, active.binding) &&
+        this.acceptDiagnostic(progress.diagnostic, active)
+      )
+        this.save();
+    } catch {
+      // Progress is optional. Missing, stale or invalid observations cannot fail
+      // an import, extend its deadline, or become a successful result.
+    }
   }
   private async tick(): Promise<void> {
     if (!this.key || this.ticking || this.stopping || this.clearing || this.starting) return;
@@ -573,6 +623,7 @@ export class DestinationCatalogs {
       await this.helper();
       const active = this.state.active;
       if (active) {
+        await this.readProgress(active);
         const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
         if (due) {
           this.state.last_scheduled_date = due.date;
@@ -592,14 +643,28 @@ export class DestinationCatalogs {
           sameBinding(value.binding, active.binding)
         ) {
           let adopted = false;
-          if (value.ok === false)
-            this.state.last_error = value.error?.includes('was interrupted')
-              ? 'Jellyfin backup import was interrupted. Check the helper, then import the completed backup again. Any previously saved catalog is preserved.'
-              : 'Jellyfin backup import failed. Check the completed backup, mounted folder, version and permissions. Any previously saved catalog is preserved.';
-          else if (!current(value) || !(await this.completeFile(value)))
-            this.state.last_error =
-              'The Jellyfin backup could not be validated. Any previously saved catalog is preserved.';
-          else {
+          this.acceptDiagnostic(value.diagnostic, active);
+          this.state.last_error_code = null;
+          if (value.ok === false) {
+            this.state.last_error_code = validDestinationErrorCode(value.error_code)
+              ? value.error_code
+              : value.error?.includes('was interrupted')
+                ? 'interrupted'
+                : 'backup_invalid';
+            this.state.last_error = destinationCatalogFailureMessage(this.state.last_error_code);
+          } else if (!current(value) || !(await this.completeFile(value))) {
+            const created =
+              typeof value.backup_created_at === 'string'
+                ? Date.parse(value.backup_created_at)
+                : NaN;
+            this.state.last_error_code =
+              validDestinationResult(value) && Date.now() - created > DESTINATION_CATALOG_MAX_AGE
+                ? 'backup_expired'
+                : Number.isFinite(created) && created > Date.now() + 60_000
+                  ? 'backup_future'
+                  : 'backup_invalid';
+            this.state.last_error = destinationCatalogFailureMessage(this.state.last_error_code);
+          } else {
             const previous = this.state.generations.find((record) =>
               sameBinding(record.binding, value!.binding),
             );
@@ -628,13 +693,16 @@ export class DestinationCatalogs {
             ? value.finished_at
             : new Date().toISOString();
           this.state.last_outcome = this.state.last_error
-            ? value.ok === false && value.error?.includes('was interrupted')
+            ? this.state.last_error_code === 'interrupted'
               ? 'interrupted'
               : 'failed'
             : 'succeeded';
           delete this.state.active;
           this.imports.release(`jellyfin:${active.id}`);
           this.save();
+          await rm(join(this.directory, `${destinationCatalogPrefix(active.id)}.progress`), {
+            force: true,
+          });
           if (!adopted) await this.generationFiles(active.id);
         } else if (
           Date.now() - Date.parse(active.requested_at) >
@@ -642,8 +710,8 @@ export class DestinationCatalogs {
         ) {
           delete this.state.active;
           this.imports.release(`jellyfin:${active.id}`);
-          this.state.last_error =
-            'Jellyfin catalog import timed out. Any previously saved catalog is preserved.';
+          this.state.last_error_code = 'timeout';
+          this.state.last_error = destinationCatalogFailureMessage('timeout');
           this.state.last_finished_at = new Date().toISOString();
           this.state.last_outcome = 'failed';
           this.save();
@@ -718,7 +786,7 @@ export class DestinationCatalogs {
     this.save();
     if (this.state.active) keep.add(this.state.active.id);
     for (const name of await readdir(this.directory)) {
-      const match = /^jellyfin-([a-f0-9-]{36})\.(?:request|result|db\.enc)$/.exec(name);
+      const match = /^jellyfin-([a-f0-9-]{36})\.(?:request|result|progress|db\.enc)$/.exec(name);
       if (!match || keep.has(match[1]!)) continue;
       const path = join(this.directory, name),
         stat = await lstat(path);
@@ -744,6 +812,7 @@ export class DestinationCatalogs {
       for (const value of this.state.generations) await this.generationFiles(value.id);
       this.state.generations = [];
       this.state.last_error = null;
+      this.state.last_error_code = null;
       this.save();
     } finally {
       this.clearing = false;

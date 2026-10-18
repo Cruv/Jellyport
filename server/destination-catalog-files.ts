@@ -1,9 +1,131 @@
 import type { SnapshotBinding } from './snapshot-files.js';
 import { snapshotId } from './snapshot-files.js';
+import { ServiceError } from './errors.js';
 
 export const DESTINATION_CATALOG_MAX_AGE = 48 * 60 * 60_000;
 export const DESTINATION_CATALOG_DEADLINE = 5 * 60_000;
 export const DESTINATION_CATALOG_FORMAT = 2;
+export const DESTINATION_CATALOG_STAGES = [
+  'validating_backup',
+  'reading_items',
+  'reading_providers',
+  'enriching',
+  'indexing',
+  'fingerprinting',
+  'encrypting',
+  'validating_catalog',
+] as const;
+export type DestinationCatalogStage = (typeof DESTINATION_CATALOG_STAGES)[number];
+export const DESTINATION_CATALOG_ERROR_CODES = [
+  'backup_missing',
+  'backup_expired',
+  'backup_future',
+  'version_mismatch',
+  'backup_invalid',
+  'backup_changed',
+  'storage_error',
+  'timeout',
+  'interrupted',
+  'canceled',
+  'worker_failed',
+] as const;
+export type DestinationCatalogErrorCode = (typeof DESTINATION_CATALOG_ERROR_CODES)[number];
+export interface DestinationCatalogDiagnostic {
+  stage: DestinationCatalogStage;
+  started_at: string;
+  updated_at: string;
+  source_rows: number;
+  provider_rows: number;
+  items: number;
+  keys: number;
+  bytes: number;
+}
+const failureMessages: Record<DestinationCatalogErrorCode, string> = {
+  backup_missing:
+    'No completed Jellyfin backup was found. Create a database backup and check the mounted backup folder.',
+  backup_expired:
+    'The latest Jellyfin backup is older than 48 hours. Create a new database backup and import it.',
+  backup_future:
+    'The Jellyfin backup time is in the future. Check the server clocks and create a new database backup.',
+  version_mismatch:
+    'The Jellyfin backup version does not match the linked server. Create a database backup from that server.',
+  backup_invalid:
+    'The Jellyfin backup has an unsupported or invalid catalog. It could not be validated. Create a completed database backup and import it again.',
+  backup_changed:
+    'The Jellyfin backup changed during import. Wait for backup creation to finish and import it again.',
+  storage_error:
+    'The Jellyfin import could not use its private storage. Check free space and helper folder permissions.',
+  timeout:
+    'Jellyfin backup import timed out after its five-minute limit. Check helper resources before trying again.',
+  interrupted:
+    'Jellyfin backup import was interrupted. Check the helper, then import the completed backup again.',
+  canceled: 'Jellyfin backup import canceled.',
+  worker_failed:
+    'The Jellyfin import worker stopped unexpectedly. Check helper status before trying again.',
+};
+export function validDestinationErrorCode(value: unknown): value is DestinationCatalogErrorCode {
+  return DESTINATION_CATALOG_ERROR_CODES.includes(value as DestinationCatalogErrorCode);
+}
+export const destinationCatalogFailureMessage = (code: DestinationCatalogErrorCode): string =>
+  failureMessages[code];
+export class DestinationCatalogError extends ServiceError {
+  constructor(
+    readonly error_code: DestinationCatalogErrorCode,
+    readonly diagnostic?: DestinationCatalogDiagnostic,
+  ) {
+    super(destinationCatalogFailureMessage(error_code));
+  }
+}
+export function destinationCatalogErrorCode(error: unknown): DestinationCatalogErrorCode {
+  if (error instanceof DestinationCatalogError) return error.error_code;
+  if (error && typeof error === 'object' && 'code' in error) {
+    if (
+      ['ENOSPC', 'EACCES', 'EPERM', 'EROFS', 'EDQUOT', 'SQLITE_FULL', 'SQLITE_IOERR'].includes(
+        String(error.code),
+      )
+    )
+      return 'storage_error';
+    if (
+      error.code === 'ERR_SQLITE_ERROR' &&
+      'errcode' in error &&
+      typeof error.errcode === 'number' &&
+      [3, 8, 10, 13, 14].includes(error.errcode & 0xff)
+    )
+      return 'storage_error';
+  }
+  return 'backup_invalid';
+}
+export function validDestinationDiagnostic(value: unknown): value is DestinationCatalogDiagnostic {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  const bounds = {
+    source_rows: 5_000_000,
+    provider_rows: 10_000_000,
+    items: 2_000_000,
+    keys: 20_000_000,
+    bytes: 8 * 1024 ** 3,
+  };
+  return (
+    Object.keys(entry).length === 8 &&
+    DESTINATION_CATALOG_STAGES.includes(entry.stage as DestinationCatalogStage) &&
+    typeof entry.started_at === 'string' &&
+    typeof entry.updated_at === 'string' &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(entry.started_at) &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(entry.updated_at) &&
+    Number.isFinite(Date.parse(entry.started_at)) &&
+    new Date(entry.started_at).toISOString() === entry.started_at &&
+    Number.isFinite(Date.parse(entry.updated_at)) &&
+    new Date(entry.updated_at).toISOString() === entry.updated_at &&
+    Date.parse(entry.updated_at) >= Date.parse(entry.started_at) &&
+    Object.entries(bounds).every(
+      ([name, maximum]) =>
+        typeof entry[name] === 'number' &&
+        Number.isSafeInteger(entry[name]) &&
+        Number(entry[name]) >= 0 &&
+        Number(entry[name]) <= maximum,
+    )
+  );
+}
 export interface DestinationCatalogRequest {
   purpose: 'jellyfin_catalog';
   id: string;
@@ -23,6 +145,19 @@ export interface DestinationCatalogResult extends DestinationCatalogRequest {
   backup_engine_version?: string;
   projection_format?: number;
   error?: string;
+  error_code?: DestinationCatalogErrorCode;
+  diagnostic?: DestinationCatalogDiagnostic;
+}
+export interface DestinationCatalogProgress extends DestinationCatalogRequest {
+  diagnostic: DestinationCatalogDiagnostic;
+}
+export function validDestinationProgress(value: unknown): value is DestinationCatalogProgress {
+  return !!(
+    value &&
+    typeof value === 'object' &&
+    validDestinationRequest(value as DestinationCatalogRequest) &&
+    validDestinationDiagnostic((value as DestinationCatalogProgress).diagnostic)
+  );
 }
 export interface DestinationCatalogMetadata {
   id: string;
@@ -74,6 +209,8 @@ export function validDestinationResult(value: DestinationCatalogResult): boolean
   return !!(
     validDestinationRequest(value) &&
     value.ok === true &&
+    value.error_code === undefined &&
+    (value.diagnostic === undefined || validDestinationDiagnostic(value.diagnostic)) &&
     (value.projection_format === 1 || value.projection_format === DESTINATION_CATALOG_FORMAT) &&
     typeof value.bytes === 'number' &&
     Number.isSafeInteger(value.bytes) &&

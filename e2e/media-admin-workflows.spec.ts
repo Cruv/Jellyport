@@ -473,7 +473,12 @@ test('unsubmitted editor drafts survive main navigation and Back but disappear a
   await expect(page.getByRole('textbox', { name: 'Role name', exact: true })).toHaveValue(
     'Unsubmitted browser role',
   );
-  await page.getByRole('button', { name: 'Sign out', exact: true }).click();
+  const toggle = page.getByRole('button', { name: 'Toggle navigation', exact: true });
+  if (await toggle.isVisible()) await toggle.click();
+  await page
+    .getByRole('complementary', { name: 'Main navigation', exact: true })
+    .getByRole('button', { name: 'Sign out', exact: true })
+    .click();
   await page.getByRole('textbox', { name: 'Jellyfin username', exact: true }).fill('admin');
   await page.getByLabel('Jellyfin password', { exact: true }).fill('synthetic-admin-password');
   await page.getByRole('button', { name: 'Sign in', exact: true }).click();

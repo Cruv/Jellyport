@@ -1,174 +1,67 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { Callout, Icon } from './components';
 import { Pagination, usePagination } from './ui-layout';
-import type {
-  Api,
-  Notify,
-  SourceSnapshotConfig,
-  SourceSnapshotMetadata,
-  SourceSnapshotStatus,
-} from './types';
+import DailyImportSchedule from './DailyImportSchedule';
+import {
+  ImportStatus,
+  importAge,
+  importTimestamp as timestamp,
+  useImportClock,
+  useImportWorkflow,
+} from './ImportWorkflow';
+import type { Api, Notify, SourceSnapshotMetadata, SourceSnapshotStatus } from './types';
 
-const clock = (config: SourceSnapshotConfig) =>
-  `${String(config.hour).padStart(2, '0')}:${String(config.minute).padStart(2, '0')}`;
-const timestamp = (value: string | undefined) =>
-  value ? new Date(value).toLocaleString() : 'Time unavailable';
 const historyDate = (record: SourceSnapshotMetadata) =>
   record.source_type === 'plugin_backup' ? record.backup_created_at : record.finished_at;
-const age = (value: string | undefined) => {
-  if (!value) return 'Age unavailable';
-  const minutes = Math.max(0, Math.floor((Date.now() - new Date(value).getTime()) / 60_000));
-  if (!Number.isFinite(minutes)) return 'Age unavailable';
-  return minutes < 1
-    ? 'Just now'
-    : minutes < 60
-      ? `${minutes}m old`
-      : `${Math.floor(minutes / 60)}h ${minutes % 60}m old`;
-};
 
 export default function SourceSnapshotsPanel({
   api,
   notify,
   demo,
+  active = true,
 }: {
   api: Api;
   notify: Notify;
   demo: boolean;
+  active?: boolean;
 }) {
-  const [status, setStatus] = useState<SourceSnapshotStatus | null>(null);
-  const [draft, setDraft] = useState<SourceSnapshotConfig | null>(null);
-  const [captureTime, setCaptureTime] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState('');
-  const mounted = useRef(false);
-  const active = useRef<AbortController | null>(null);
-  const requestVersion = useRef(0);
-  const changing = useRef(false);
-  const initialized = useRef(false);
-
-  const load = useCallback(async () => {
-    if (changing.current) return;
-    active.current?.abort();
-    const controller = new AbortController();
-    active.current = controller;
-    const version = ++requestVersion.current;
-    try {
-      const value = await api<SourceSnapshotStatus>('/api/source-snapshots', {
-        signal: controller.signal,
-      });
-      if (!mounted.current || controller.signal.aborted || requestVersion.current !== version)
-        return;
-      setStatus(value);
-      if (!initialized.current) {
-        initialized.current = true;
-        setDraft({ ...value.config });
-        setCaptureTime(clock(value.config));
-      }
-      setError('');
-    } catch {
-      if (mounted.current && !controller.signal.aborted && requestVersion.current === version)
-        setError('Saved snapshot status could not be loaded. Refresh status to try again.');
-    }
-  }, [api]);
-  useEffect(() => {
-    mounted.current = true;
-    void load();
-    return () => {
-      mounted.current = false;
-      requestVersion.current++;
-      active.current?.abort();
-    };
-  }, [load]);
-  useEffect(() => {
-    if (!status?.running || busy) return;
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      await load();
-      if (!stopped) timer = setTimeout(() => void poll(), 2000);
-    };
-    timer = setTimeout(() => void poll(), 2000);
-    return () => {
-      stopped = true;
-      clearTimeout(timer);
-    };
-  }, [status?.running, busy, load]);
-
-  async function change(kind: 'schedule' | 'capture' | 'clear', body?: unknown) {
-    if (demo || changing.current || !status) return;
-    changing.current = true;
-    active.current?.abort();
-    const controller = new AbortController();
-    active.current = controller;
-    const version = ++requestVersion.current;
-    setBusy(kind);
-    setError('');
-    try {
-      const path =
-        kind === 'schedule'
-          ? '/api/source-snapshots/schedule'
-          : kind === 'capture'
-            ? '/api/source-snapshots/refresh'
-            : '/api/source-snapshots';
-      const value = await api<SourceSnapshotStatus>(path, {
-        method: kind === 'schedule' ? 'PUT' : kind === 'capture' ? 'POST' : 'DELETE',
-        ...(body === undefined ? {} : { body }),
-        signal: controller.signal,
-      });
-      if (!mounted.current || controller.signal.aborted || requestVersion.current !== version)
-        return;
-      setStatus(value);
-      if (kind === 'schedule') {
-        setDraft({ ...value.config });
-        setCaptureTime(clock(value.config));
-      }
-      notify(
-        kind === 'schedule'
-          ? pluginBackup
-            ? 'Backup import schedule saved.'
-            : 'Database capture schedule saved.'
-          : kind === 'capture'
-            ? pluginBackup
-              ? 'Backup import started. You can follow its status here.'
-              : 'Database capture started. You can follow its status here.'
-            : 'Saved database captures cleared.',
-      );
-    } catch {
-      if (mounted.current && !controller.signal.aborted && requestVersion.current === version)
-        setError(
-          kind === 'schedule'
-            ? pluginBackup
-              ? 'The import schedule could not be saved. Refresh status and reload the saved schedule before trying again.'
-              : 'The capture schedule could not be saved. Refresh status and reload the saved schedule before trying again.'
-            : kind === 'capture'
-              ? pluginBackup
-                ? 'Backup import could not start. Check the backup folder and refresh status.'
-                : 'Database capture could not start. Check the read-only source mount and refresh status.'
-              : 'Saved captures could not be cleared. A capture or migration may still be using them. Refresh status and try again.',
-        );
-    } finally {
-      changing.current = false;
-      if (mounted.current && requestVersion.current === version) setBusy('');
-    }
-  }
-  function save(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!draft || !/^\d{2}:\d{2}$/.test(captureTime)) return;
-    const [hour, minute] = captureTime.split(':').map(Number);
-    void change('schedule', {
-      enabled: draft.enabled,
-      hour,
-      minute,
-      time_zone: draft.time_zone.trim(),
-      scope: draft.scope,
-      expected_revision: draft.revision,
+  const { status, busy, loading, error, uncertain, stale, load, change } =
+    useImportWorkflow<SourceSnapshotStatus>({
+      api,
+      notify,
+      demo,
+      active,
+      path: '/api/source-snapshots',
+      statusError: 'Saved snapshot status could not be loaded. Refresh status to try again.',
     });
-  }
-  function resetDraft() {
-    if (!status) return;
-    setDraft({ ...status.config });
-    setCaptureTime(clock(status.config));
-    setError('');
+  const now = useImportClock(
+    [
+      ...(status?.records.map((record) => record.expires_at) || []),
+      ...(status?.next_run_at ? [status.next_run_at] : []),
+    ],
+    active,
+  );
+  const age = (value?: string) => (value ? importAge(value, now) : 'Age unavailable');
+  async function manual(kind: 'import' | 'clear') {
+    if (
+      !status ||
+      (kind === 'import' && status.available === false) ||
+      (kind === 'clear' && !status.snapshots)
+    )
+      return;
+    await change(
+      kind,
+      { method: kind === 'import' ? 'POST' : 'DELETE' },
+      kind === 'import'
+        ? pluginBackup
+          ? 'Backup import started. You can follow its status here.'
+          : 'Database capture started. You can follow its status here.'
+        : 'Saved database captures cleared.',
+      kind === 'import'
+        ? pluginBackup
+          ? 'Backup import could not start. Check the backup folder and refresh status.'
+          : 'Database capture could not start. Check the read-only source mount and refresh status.'
+        : 'Saved captures could not be cleared. A capture or migration may still be using them. Refresh status and try again.',
+    );
   }
   const fileCopy = status?.capture_method === 'file_copy';
   const pluginBackup = status?.capture_method === 'plugin_backup';
@@ -177,6 +70,8 @@ export default function SourceSnapshotsPanel({
   const hasPluginBackups =
     pluginBackup || status?.records.some((record) => record.source_type === 'plugin_backup');
   const captures = usePagination(status?.records || [], 10);
+  const currentCaptures =
+    status?.records.filter((record) => Date.parse(record.expires_at) > now).length || 0;
   return (
     <section className="panel" aria-label="Saved Emby database snapshots">
       <div className="panel-header">
@@ -246,57 +141,41 @@ export default function SourceSnapshotsPanel({
             , then refresh status. Saved captures remain listed below.
           </Callout>
         )}
-        {error && (
-          <p className="error-block" role="alert">
-            {error}
-          </p>
-        )}
+        <ImportStatus
+          status={status}
+          loading={loading}
+          starting={busy === 'import'}
+          error={error}
+          stale={stale}
+          uncertain={uncertain}
+          initialLabel="Loading Emby history status…"
+          runningLabel={pluginBackup ? 'Importing Emby backup…' : 'Capturing Emby database…'}
+          progressLabel={pluginBackup ? 'Backup import progress' : 'Database capture progress'}
+          capture={!pluginBackup}
+          measured={
+            status ? { total: status.users_total, processed: status.users_processed } : undefined
+          }
+          summary={
+            status
+              ? currentCaptures
+                ? 'Saved Emby history available'
+                : status.records.length
+                  ? 'Saved Emby history expired'
+                  : 'No saved Emby history'
+              : ''
+          }
+        />
         {status && (
-          <div className="status-summary form-stack" aria-live="polite">
-            <p className="muted text-small">
-              History source:{' '}
-              <strong>
-                {pluginBackup
-                  ? 'Emby plugin backup'
-                  : fileCopy
-                    ? 'Scheduled file copy'
-                    : 'SQLite online backup'}
-              </strong>
-            </p>
+          <p className="muted text-small">
+            History source:{' '}
             <strong>
-              {status.running
-                ? pluginBackup
-                  ? 'Importing Emby backup…'
-                  : 'Capturing Emby database…'
-                : `${status.snapshots} saved database ${status.snapshots === 1 ? 'capture' : 'captures'}`}
+              {pluginBackup
+                ? 'Emby plugin backup'
+                : fileCopy
+                  ? 'Scheduled file copy'
+                  : 'SQLite online backup'}
             </strong>
-            {status.running && (
-              <progress
-                className="progress-track"
-                aria-label={pluginBackup ? 'Backup import progress' : 'Database capture progress'}
-              />
-            )}
-            {status.users_total > 0 && (
-              <p className="muted text-small">
-                {status.users_processed} of {status.users_total} accounts checked ·{' '}
-                {status.users_succeeded} succeeded · {status.users_failed} failed
-              </p>
-            )}
-            {status.last_attempt_at && (
-              <p className="muted text-small">Last attempt {timestamp(status.last_attempt_at)}</p>
-            )}
-            {status.last_finished_at && (
-              <p className="muted text-small">
-                {pluginBackup ? 'Last import' : 'Last finished'}{' '}
-                {timestamp(status.last_finished_at)}
-              </p>
-            )}
-            {status.last_error && (
-              <p className="error-block">
-                {status.last_error} Previous valid captures are retained.
-              </p>
-            )}
-          </div>
+          </p>
         )}
         <div className="section-heading">
           <h4>{pluginBackup ? 'Import a backup now' : 'Capture database now'}</h4>
@@ -307,26 +186,36 @@ export default function SourceSnapshotsPanel({
             className="btn btn-quiet"
             type="button"
             onClick={() => void load()}
-            disabled={!!busy}
+            disabled={!!busy || loading}
           >
             <Icon name="refresh" />
-            Refresh snapshot status
+            {loading ? 'Refreshing status…' : 'Refresh status'}
           </button>
           <button
             className="btn btn-quiet"
             type="button"
-            onClick={() => void change('clear')}
-            disabled={demo || !!busy || !status || status.running || !status.snapshots}
+            onClick={() => void manual('clear')}
+            disabled={
+              demo || !!busy || uncertain || stale || !status || status.running || !status.snapshots
+            }
           >
             {busy === 'clear' ? 'Clearing captures…' : 'Clear saved captures'}
           </button>
           <button
             className="btn btn-primary"
             type="button"
-            onClick={() => void change('capture')}
-            disabled={demo || !!busy || !status || status.running || status.available === false}
+            onClick={() => void manual('import')}
+            disabled={
+              demo ||
+              !!busy ||
+              uncertain ||
+              stale ||
+              !status ||
+              status.running ||
+              status.available === false
+            }
           >
-            {busy === 'capture'
+            {busy === 'import'
               ? pluginBackup
                 ? 'Starting import…'
                 : 'Starting capture…'
@@ -338,94 +227,30 @@ export default function SourceSnapshotsPanel({
         {demo && (
           <p className="muted text-small">Demo mode: database capture changes are disabled.</p>
         )}
-        {draft && status && (
-          <details className="help-disclosure">
-            <summary>Daily schedule</summary>
-            <form
-              onSubmit={save}
-              className="inline-panel form-stack"
-              aria-label={pluginBackup ? 'Backup import schedule' : 'Database capture schedule'}
-            >
-              <div className="section-heading">
-                <h4>{pluginBackup ? 'Daily import schedule' : 'Daily capture schedule'}</h4>
-                <p>Save this schedule independently from connection and account settings.</p>
-              </div>
-              <label className="check-label">
-                <input
-                  className="checkbox"
-                  type="checkbox"
-                  checked={draft.enabled}
-                  onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
-                  disabled={demo || !!busy}
-                />
-                {pluginBackup ? 'Enable daily backup import' : 'Enable daily database capture'}
-              </label>
-              <div className="field-row">
-                <div className="field">
-                  <label htmlFor="snapshot-time">
-                    {pluginBackup ? 'Import time' : 'Capture time'}
-                  </label>
-                  <input
-                    id="snapshot-time"
-                    type="time"
-                    required
-                    value={captureTime}
-                    onChange={(event) => setCaptureTime(event.target.value)}
-                    disabled={demo || !!busy}
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor="snapshot-zone">Time zone</label>
-                  <input
-                    id="snapshot-zone"
-                    required
-                    value={draft.time_zone}
-                    onChange={(event) => setDraft({ ...draft, time_zone: event.target.value })}
-                    disabled={demo || !!busy}
-                    aria-describedby="snapshot-schedule-help"
-                  />
-                </div>
-              </div>
-              <small id="snapshot-schedule-help">
-                Scheduling starts off. Times use the time zone shown here, supplied by the server.{' '}
-                {pluginBackup
-                  ? 'Schedule imports after Emby’s backup task finishes. This does not change Emby’s backup schedule.'
-                  : 'Each capture supplies played flags for migration.'}
-              </small>
-              {draft.revision !== status.config.revision && (
-                <p className="error-block">
-                  The saved schedule changed. Reload it before saving your changes.
-                </p>
-              )}
-              <div className="form-actions">
-                <button
-                  className="btn btn-quiet"
-                  type="button"
-                  onClick={resetDraft}
-                  disabled={!!busy}
-                >
-                  Reload saved schedule
-                </button>
-                <button
-                  className="btn btn-primary"
-                  type="submit"
-                  disabled={demo || !!busy || draft.revision !== status.config.revision}
-                >
-                  {busy === 'schedule'
-                    ? 'Saving schedule…'
-                    : pluginBackup
-                      ? 'Save import schedule'
-                      : 'Save capture schedule'}
-                </button>
-              </div>
-            </form>
-          </details>
+        {status?.config && (
+          <DailyImportSchedule
+            id="emby-import"
+            config={status.config}
+            nextRun={status.next_run_at}
+            busy={busy}
+            demo={demo}
+            capture={!pluginBackup}
+            onSave={async (input) => {
+              const value = await change(
+                'schedule',
+                { method: 'PUT', body: { ...input, scope: status.config.scope } },
+                pluginBackup ? 'Backup import schedule saved.' : 'Database capture schedule saved.',
+                'The schedule could not be saved. Your changes are kept; refresh status to verify the saved schedule before retrying.',
+              );
+              return value?.config;
+            }}
+          />
         )}
         {!!status?.records.length && (
           <details className="help-disclosure">
             <summary>Saved captures ({status.records.length.toLocaleString()})</summary>
             <div className="table-wrap">
-              <table>
+              <table className="responsive-table" aria-label="Saved Emby captures">
                 <thead>
                   <tr>
                     <th>Source</th>
@@ -437,7 +262,7 @@ export default function SourceSnapshotsPanel({
                 <tbody>
                   {captures.items.map((record) => (
                     <tr key={`${record.id}:${record.source_user_id}`}>
-                      <td>
+                      <td data-label="Source">
                         <strong>{record.source_username || 'All Emby users'}</strong>
                         <small>
                           Emby {record.source_server_version}
@@ -445,7 +270,7 @@ export default function SourceSnapshotsPanel({
                         </small>
                         <small>Source {record.source_server_id}</small>
                       </td>
-                      <td>
+                      <td data-label="History date">
                         <strong>{timestamp(historyDate(record))}</strong>
                         <small>{age(historyDate(record))}</small>
                         <small>
@@ -454,7 +279,7 @@ export default function SourceSnapshotsPanel({
                             : `Read window ${timestamp(record.started_at)} – ${timestamp(record.finished_at)}`}
                         </small>
                       </td>
-                      <td>
+                      <td data-label="Contents">
                         <strong>
                           {record.source_type === 'plugin_backup'
                             ? 'Emby plugin backup'
@@ -475,11 +300,12 @@ export default function SourceSnapshotsPanel({
                         )}
                         <small>{Math.ceil(record.bytes / 1024).toLocaleString()} KiB</small>
                       </td>
-                      <td>
+                      <td data-label="Availability">
                         <span
-                          className={`status ${new Date(record.expires_at).getTime() <= Date.now() ? 'warn' : 'good'}`}
+                          className={`status ${!Number.isFinite(Date.parse(record.expires_at)) || Date.parse(record.expires_at) <= now ? 'warn' : 'good'}`}
                         >
-                          {new Date(record.expires_at).getTime() <= Date.now()
+                          {!Number.isFinite(Date.parse(record.expires_at)) ||
+                          Date.parse(record.expires_at) <= now
                             ? 'Expired'
                             : 'Available'}
                         </span>

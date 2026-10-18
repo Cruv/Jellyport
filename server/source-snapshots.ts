@@ -9,6 +9,14 @@ import { ServiceError } from './errors.js';
 import { snapshotProcess } from './snapshot-process.js';
 import type { SnapshotHistoryDiagnostics } from './emby-snapshot-reader.js';
 import {
+  dailyImportSchedule,
+  dailyImportDate,
+  ImportCoordinator,
+  validateDailyImportConfig,
+  type DailyImportConfig,
+  type ImportOutcome,
+} from './daily-import-schedule.js';
+import {
   decryptDatabase,
   readEnvelope,
   snapshotId,
@@ -30,13 +38,8 @@ import {
 const MAX_AGE = SNAPSHOT_MAX_AGE;
 const CLEANUP_ERROR =
   'Temporary snapshot cleanup failed. Clear saved data or review private storage permissions.';
-interface Config {
-  enabled: boolean;
-  hour: number;
-  minute: number;
-  time_zone: string;
+interface Config extends DailyImportConfig {
   scope: MigrationScope;
-  revision: string;
 }
 export interface SnapshotMetadata {
   id: string;
@@ -70,6 +73,7 @@ interface State {
   last_attempt_at: string | null;
   last_finished_at: string | null;
   last_error: string | null;
+  last_outcome?: ImportOutcome;
   last_scheduled_date?: string;
 }
 const sourceUrl = (settings: Settings) => new URL(settings.emby_url).toString().replace(/\/$/, '');
@@ -81,6 +85,8 @@ export class SourceSnapshots {
   private ticking = false;
   private stopping = false;
   private clearing = false;
+  private starting = false;
+  private readonly imports: ImportCoordinator;
   private readonly reads = new AbortController();
   private readonly previewPins = new Map<string, number>();
   private readonly jobReaders = new Map<string, number>();
@@ -96,7 +102,11 @@ export class SourceSnapshots {
   >();
   constructor(
     private readonly store: Store,
-    private readonly options: { demo?: boolean; clientFactory: () => ClientFactory },
+    private readonly options: {
+      demo?: boolean;
+      clientFactory: () => ClientFactory;
+      imports?: ImportCoordinator;
+    },
   ) {
     const row = store.db.prepare('SELECT encrypted FROM source_snapshot_state WHERE id=1').get();
     this.state = row
@@ -115,6 +125,29 @@ export class SourceSnapshots {
           last_finished_at: null,
           last_error: null,
         };
+    this.imports = options.imports ?? new ImportCoordinator();
+    if (this.state.active) this.imports.restore(`emby:${this.state.active.id}`);
+    if (!this.state.active && this.state.last_outcome === 'running') {
+      this.state.last_outcome = 'interrupted';
+      this.state.last_finished_at = new Date().toISOString();
+      this.state.last_error =
+        'Emby import preparation was interrupted before a helper request was saved. Check status before starting a new import. The last good copy is preserved.';
+      this.save();
+    }
+    // Older installations used the last attempt's local date before durable
+    // scheduled-date claims were introduced. Preserve that no-repeat behavior.
+    if (
+      this.state.config.enabled &&
+      !this.state.last_scheduled_date &&
+      this.state.last_attempt_at &&
+      Number.isFinite(Date.parse(this.state.last_attempt_at))
+    ) {
+      this.state.last_scheduled_date = dailyImportDate(
+        Date.parse(this.state.last_attempt_at),
+        this.state.config.time_zone,
+      );
+      this.save();
+    }
   }
   private save() {
     this.store.db
@@ -247,13 +280,20 @@ export class SourceSnapshots {
       records[0]?.source_type;
     return {
       config: this.state.config,
+      next_run_at: dailyImportSchedule(this.state.config, this.state.last_scheduled_date)
+        .next_run_at,
       available: helper !== null,
       capture_method: snapshotCaptureMethod(rememberedMethod),
       history_source_known: !this.key || rememberedMethod !== undefined,
-      running: !!this.state.active,
+      running: this.starting || !!this.state.active,
       last_attempt_at: this.state.last_attempt_at,
       last_finished_at: this.state.last_finished_at,
       last_error: this.state.last_error,
+      last_outcome:
+        this.starting || this.state.active
+          ? ('running' as const)
+          : (this.state.last_outcome ??
+            (this.state.last_error ? 'failed' : this.state.last_finished_at ? 'succeeded' : null)),
       users_total: 0,
       users_processed: 0,
       users_succeeded: 0,
@@ -267,11 +307,7 @@ export class SourceSnapshots {
     if (this.options.demo) throw new ServiceError('Snapshot changes are unavailable in demo mode.');
     if (input.expected_revision !== this.state.config.revision)
       throw new ServiceError('The snapshot schedule changed. Reload it before saving.');
-    try {
-      new Intl.DateTimeFormat('en', { timeZone: input.time_zone }).format();
-    } catch {
-      throw new ServiceError('Choose a valid IANA time zone.');
-    }
+    validateDailyImportConfig(input);
     if (input.enabled && !this.key)
       throw new ServiceError('Configure the snapshot helper and shared directory first.');
     if (
@@ -298,75 +334,109 @@ export class SourceSnapshots {
   async refresh() {
     if (this.clearing || this.stopping)
       throw new ServiceError('Snapshot changes are in progress. Retry shortly.');
-    const helper = await this.helperStatus();
-    if (this.options.demo || !this.key || !helper)
+    const id = randomUUID();
+    const owner = `emby:${id}`;
+    if (this.state.active || !this.imports.acquire(owner))
       throw new ServiceError(
-        'The snapshot helper is unavailable. Check its same-host read-only mount and shared directory.',
+        'A backup import or capture is already running. Wait for it to finish.',
       );
-    if (this.state.active || this.clearing || this.stopping)
-      throw new ServiceError('A database capture or change is already running.');
-    await this.prune();
-    if (this.state.generations.length >= 8)
-      throw new ServiceError(
-        'Older captures are still used by queued or running jobs. Finish those jobs before capturing again.',
-      );
-    const settings = this.store.settings();
-    const client = this.options.clientFactory()(settings.emby_url, settings.emby_api_key, 'emby');
-    let binding: SnapshotBinding;
-    let userIds: string[];
-    try {
-      const info = await client.systemInfo();
-      if (info.Version !== SNAPSHOT_VERSION || typeof info.Id !== 'string' || !info.Id)
-        throw new ServiceError('Database snapshots currently support verified Emby 4.10.1.0 only.');
-      binding = { url: sourceUrl(settings), server_id: info.Id, version: info.Version };
-      userIds = (await client.users()).map((user) => user.Id.toLowerCase().replaceAll('-', ''));
-      if (
-        !userIds.length ||
-        userIds.length > 1000 ||
-        userIds.some((id) => !/^[a-f0-9]{32}$/.test(id))
-      )
-        throw new ServiceError(
-          'Emby returned unsupported user identities. Database capture was not started.',
-        );
-    } finally {
-      await client.close();
-    }
-    // Recheck after the network read: two concurrent administrator requests cannot enqueue two copies.
-    if (this.state.active || this.clearing || this.stopping)
-      throw new ServiceError('A database capture or change is already running.');
-    const latestSettings = this.store.settings();
-    if (
-      latestSettings.emby_url !== settings.emby_url ||
-      latestSettings.emby_api_key !== settings.emby_api_key
-    )
-      throw new ServiceError('The Emby connection changed. Review it before capturing.');
-    const request: CaptureRequest = {
-      id: randomUUID(),
-      requested_at: new Date().toISOString(),
-      binding,
-      user_ids: userIds,
-      capture_method: helper.capture_method,
-    };
-    this.state.active = request;
-    this.state.last_attempt_at = request.requested_at;
+    this.starting = true;
+    this.state.last_attempt_at = new Date().toISOString();
+    this.state.last_finished_at = null;
+    this.state.last_outcome = 'running';
     this.state.last_error = null;
-    this.save();
     try {
-      await writeEnvelope(join(this.directory, `${request.id}.request`), request, this.key);
-    } catch {
-      delete this.state.active;
-      this.state.last_error = 'Unable to request a database capture.';
+      const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
+      if (due) this.state.last_scheduled_date = due.date;
       this.save();
-      throw new ServiceError(this.state.last_error);
+      const helper = await this.helperStatus();
+      if (this.options.demo || !this.key || !helper)
+        throw new ServiceError(
+          'The snapshot helper is unavailable. Check its same-host read-only mount and shared directory.',
+        );
+      if (this.state.active || this.clearing || this.stopping)
+        throw new ServiceError('A database capture or change is already running.');
+      await this.prune();
+      if (this.state.generations.length >= 8)
+        throw new ServiceError(
+          'Older captures are still used by queued or running jobs. Finish those jobs before capturing again.',
+        );
+      const settings = this.store.settings();
+      const client = this.options.clientFactory()(settings.emby_url, settings.emby_api_key, 'emby');
+      let binding: SnapshotBinding;
+      let userIds: string[];
+      try {
+        const info = await client.systemInfo();
+        if (info.Version !== SNAPSHOT_VERSION || typeof info.Id !== 'string' || !info.Id)
+          throw new ServiceError(
+            'Database snapshots currently support verified Emby 4.10.1.0 only.',
+          );
+        binding = { url: sourceUrl(settings), server_id: info.Id, version: info.Version };
+        userIds = (await client.users()).map((user) => user.Id.toLowerCase().replaceAll('-', ''));
+        if (
+          !userIds.length ||
+          userIds.length > 1000 ||
+          userIds.some((id) => !/^[a-f0-9]{32}$/.test(id))
+        )
+          throw new ServiceError(
+            'Emby returned unsupported user identities. Database capture was not started.',
+          );
+      } finally {
+        await client.close();
+      }
+      // Recheck after the network read: two concurrent administrator requests cannot enqueue two copies.
+      if (this.state.active || this.clearing || this.stopping)
+        throw new ServiceError('A database capture or change is already running.');
+      const latestSettings = this.store.settings();
+      if (
+        latestSettings.emby_url !== settings.emby_url ||
+        latestSettings.emby_api_key !== settings.emby_api_key
+      )
+        throw new ServiceError('The Emby connection changed. Review it before capturing.');
+      const request: CaptureRequest = {
+        id,
+        requested_at: new Date().toISOString(),
+        binding,
+        user_ids: userIds,
+        capture_method: helper.capture_method,
+      };
+      this.state.active = request;
+      this.state.last_attempt_at = request.requested_at;
+      this.state.last_error = null;
+      this.save();
+      try {
+        await writeEnvelope(join(this.directory, `${request.id}.request`), request, this.key);
+      } catch {
+        delete this.state.active;
+        this.state.last_error = 'Unable to request a database capture.';
+        this.save();
+        throw new ServiceError(this.state.last_error);
+      }
+      return this.status();
+    } catch (error) {
+      delete this.state.active;
+      this.state.last_finished_at = new Date().toISOString();
+      this.state.last_outcome = 'failed';
+      this.state.last_error =
+        'Emby backup import or capture could not start. Check the helper and configured Emby connection. The last good copy is preserved.';
+      this.save();
+      throw error;
+    } finally {
+      this.starting = false;
+      if (!this.state.active) this.imports.release(owner);
     }
-    return this.status();
   }
   private async tick(): Promise<void> {
-    if (this.ticking || this.stopping || this.clearing || !this.key) return;
+    if (this.ticking || this.stopping || this.clearing || this.starting || !this.key) return;
     this.ticking = true;
     try {
       const active = this.state.active;
       if (active) {
+        const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
+        if (due) {
+          this.state.last_scheduled_date = due.date;
+          this.save();
+        }
         let result: CaptureResult | undefined;
         try {
           result = await readEnvelope<CaptureResult>(
@@ -405,60 +475,42 @@ export class SourceSnapshots {
           } else
             this.state.last_error =
               result.error || 'Database capture failed; the last good copy is preserved.';
+          this.state.last_finished_at = Number.isFinite(Date.parse(result.finished_at))
+            ? result.finished_at
+            : new Date().toISOString();
+          this.state.last_outcome = result.ok
+            ? 'succeeded'
+            : result.error?.includes('was interrupted')
+              ? 'interrupted'
+              : 'failed';
           delete this.state.active;
+          this.imports.release(`emby:${active.id}`);
           this.save();
           await this.prune();
         } else if (Date.now() - Date.parse(active.requested_at) > 10 * 60_000) {
           this.state.last_error =
             'Database capture timed out. Check the helper; the last good copy is preserved.';
+          this.state.last_finished_at = new Date().toISOString();
+          this.state.last_outcome = 'failed';
           delete this.state.active;
+          this.imports.release(`emby:${active.id}`);
           this.save();
           await rm(join(this.directory, `${active.id}.request`), { force: true });
         }
-      } else if (this.state.config.enabled) {
-        const config = this.state.config;
-        const parts = (time: number) =>
-          Object.fromEntries(
-            new Intl.DateTimeFormat('en-CA', {
-              timeZone: config.time_zone,
-              year: 'numeric',
-              month: '2-digit',
-              day: '2-digit',
-              hour: '2-digit',
-              minute: '2-digit',
-              hourCycle: 'h23',
-            })
-              .formatToParts(time)
-              .map((part) => [part.type, part.value]),
-          );
-        const current = parts(Date.now()),
-          last = this.state.last_attempt_at ? parts(Date.parse(this.state.last_attempt_at)) : null;
-        const day = (value: Record<string, string>) => `${value.year}-${value.month}-${value.day}`;
-        const minute = Number(current.hour) * 60 + Number(current.minute),
-          scheduled = config.hour * 60 + config.minute;
-        const elapsed = (minute - scheduled + 1440) % 1440;
-        const occurrence =
-          minute >= scheduled
-            ? day(current)
-            : new Date(
-                Date.UTC(Number(current.year), Number(current.month) - 1, Number(current.day) - 1),
-              )
-                .toISOString()
-                .slice(0, 10);
-        if (
-          elapsed < 60 &&
-          this.state.last_scheduled_date !== occurrence &&
-          (!last || this.state.last_scheduled_date !== undefined || day(last) !== occurrence)
-        ) {
-          this.state.last_scheduled_date = occurrence;
+      }
+      if (this.state.config.enabled) {
+        const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
+        if (due && this.state.active) {
+          // A manual import spanning the scheduled time satisfies today's run.
+          this.state.last_scheduled_date = due.date;
+          this.save();
+        } else if (due && !this.imports.busy) {
+          this.state.last_scheduled_date = due.date;
           this.save();
           try {
             await this.refresh();
           } catch {
-            this.state.last_attempt_at = new Date().toISOString();
-            this.state.last_error =
-              'Scheduled database capture could not start. Check helper availability and Emby version.';
-            this.save();
+            /* refresh records a sanitized failed attempt. */
           }
         }
       }
@@ -466,7 +518,10 @@ export class SourceSnapshots {
       const failed = this.state.active;
       this.state.last_error =
         'Database capture could not be validated. The last good copy is preserved.';
+      this.state.last_finished_at = new Date().toISOString();
+      this.state.last_outcome = 'failed';
       delete this.state.active;
+      if (failed) this.imports.release(`emby:${failed.id}`);
       this.save();
       if (failed)
         await Promise.allSettled(
@@ -770,6 +825,7 @@ export class SourceSnapshots {
     if (this.options.demo) throw new ServiceError('Snapshot changes are unavailable in demo mode.');
     if (
       this.clearing ||
+      this.starting ||
       this.state.active ||
       this.jobReaders.size ||
       this.pins().size ||

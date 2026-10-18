@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Store, DEFAULT_SETTINGS } from '../server/store.js';
 import { SourceSnapshots } from '../server/source-snapshots.js';
+import { ImportCoordinator } from '../server/daily-import-schedule.js';
 import type { ClientFactory, MediaAPI, MediaItem } from '../server/media.js';
 import type { Job } from '../server/service.js';
 import {
@@ -41,7 +42,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-async function fixture(demo = false) {
+async function fixture(demo = false, imports?: ImportCoordinator) {
   const directory = await mkdtemp(join(tmpdir(), 'jellyport-snapshot-manager-'));
   const shared = join(directory, 'snapshots');
   vi.stubEnv('JELLYPORT_SNAPSHOT_DIR', shared);
@@ -61,7 +62,7 @@ async function fixture(demo = false) {
     close: vi.fn(async () => {}),
   };
   const factory = vi.fn<ClientFactory>(() => client as unknown as MediaAPI);
-  let manager = new SourceSnapshots(store, { demo, clientFactory: () => factory });
+  let manager = new SourceSnapshots(store, { demo, clientFactory: () => factory, imports });
   const resource = { manager, store, directory };
   resources.push(resource);
   await manager.start();
@@ -124,7 +125,7 @@ async function fixture(demo = false) {
   }
   async function restart() {
     await manager.stop();
-    manager = new SourceSnapshots(store, { demo, clientFactory: () => factory });
+    manager = new SourceSnapshots(store, { demo, clientFactory: () => factory, imports });
     resource.manager = manager;
     await manager.start();
     clearInterval((manager as unknown as { timer?: ReturnType<typeof setInterval> }).timer);
@@ -439,7 +440,9 @@ it('adopts a capable projection of the same plugin backup while preserving legac
       capable.id,
       legacy.id,
     ]);
-    expect((await f.manager.status()).last_finished_at).toBe(capable.finished_at);
+    const status = await f.manager.status();
+    expect(status.last_finished_at).toBe(duplicate.finished_at);
+    expect(status.records[0]?.finished_at).toBe(capable.finished_at);
     await expect(stat(join(f.shared, `${duplicate.id}.db.enc`))).rejects.toMatchObject({
       code: 'ENOENT',
     });
@@ -467,8 +470,10 @@ it('deduplicates the same plugin backup without replacing its generation or rene
   const duplicate = await pluginCapture(f, { backup_created_at: good.backup_created_at });
   expect(await f.manager.status()).toMatchObject({
     snapshots: 1,
-    records: [{ id: good.id, backup_created_at: good.backup_created_at }],
-    last_finished_at: good.finished_at,
+    records: [
+      { id: good.id, backup_created_at: good.backup_created_at, finished_at: good.finished_at },
+    ],
+    last_finished_at: duplicate.finished_at,
     last_error: null,
   });
   await expect(stat(join(f.shared, `${duplicate.id}.db.enc`))).rejects.toMatchObject({
@@ -1278,4 +1283,116 @@ it('catches up a late-night schedule after midnight once across restart and perm
   await f.tick();
   expect(f.factory).toHaveBeenCalledTimes(2);
   expect(await f.pendingRequest()).toMatchObject({ requested_at: '2026-10-09T23:30:00.000Z' });
+});
+
+it('owns the shared helper throughout asynchronous identity lookup and releases it only after completion', async () => {
+  const imports = new ImportCoordinator();
+  const f = await fixture(false, imports);
+  await f.heartbeat();
+  let release!: (value: { Id: string; Version: string }) => void;
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  f.client.systemInfo.mockImplementationOnce(() => {
+    entered();
+    return new Promise((resolve) => {
+      release = resolve;
+    });
+  });
+  const request = f.manager.refresh();
+  await started;
+  expect((await f.manager.status()).running).toBe(true);
+  expect(imports.acquire('jellyfin:synthetic-other-import')).toBe(false);
+  await expect(f.manager.refresh()).rejects.toThrow('already running');
+  release({ Id: 'fixture-emby-server', Version: SNAPSHOT_VERSION });
+  await request;
+  expect(imports.busy).toBe(true);
+  await f.finish(await f.pendingRequest());
+  expect(imports.busy).toBe(false);
+  expect((await f.manager.status()).last_outcome).toBe('succeeded');
+});
+
+it('records a failed scheduled start once and retains its schedule/outcome through restart', async () => {
+  vi.setSystemTime(new Date('2026-10-09T02:00:00Z'));
+  const imports = new ImportCoordinator();
+  const f = await fixture(false, imports);
+  const config = (await f.manager.status()).config;
+  const saved = await f.manager.configure({
+    ...config,
+    enabled: true,
+    expected_revision: config.revision,
+  });
+  vi.setSystemTime(new Date('2026-10-09T03:20:00Z'));
+  await f.tick();
+  expect(await f.manager.status()).toMatchObject({
+    last_outcome: 'failed',
+    last_attempt_at: '2026-10-09T03:20:00.000Z',
+    last_finished_at: '2026-10-09T03:20:00.000Z',
+    next_run_at: '2026-10-10T03:00:00.000Z',
+  });
+  expect(imports.busy).toBe(false);
+  await f.heartbeat();
+  await f.restart();
+  await f.tick();
+  expect(f.factory).not.toHaveBeenCalled();
+  expect((await f.manager.status()).config).toEqual(saved.config);
+});
+
+it('reports interrupted source preparation across restart without adopting or replaying any work', async () => {
+  const f = await fixture();
+  const good = await f.complete();
+  const row = f.store.db.prepare('SELECT encrypted FROM source_snapshot_state WHERE id=1').get()!;
+  const state = f.store.decrypt<Record<string, unknown>>(row.encrypted as Uint8Array);
+  state.last_outcome = 'running';
+  state.last_finished_at = null;
+  f.store.db
+    .prepare('UPDATE source_snapshot_state SET encrypted=? WHERE id=1')
+    .run(f.store.encrypt(state));
+  await f.restart();
+  expect(await f.manager.status()).toMatchObject({
+    running: false,
+    last_outcome: 'interrupted',
+    records: [{ id: good.id, finished_at: good.finished_at }],
+  });
+  expect(f.factory).toHaveBeenCalledOnce();
+});
+
+it('treats a manual capture spanning its scheduled occurrence as the one daily attempt', async () => {
+  vi.setSystemTime(new Date('2026-10-09T02:00:00Z'));
+  const f = await fixture();
+  const config = (await f.manager.status()).config;
+  const saved = await f.manager.configure({
+    ...config,
+    enabled: true,
+    expected_revision: config.revision,
+  });
+  vi.setSystemTime(new Date('2026-10-09T02:59:00Z'));
+  const request = await f.request();
+  vi.setSystemTime(new Date('2026-10-09T03:01:00Z'));
+  await f.heartbeat();
+  await f.finish(request);
+  await f.tick();
+  expect(f.factory).toHaveBeenCalledOnce();
+  expect((await f.manager.status()).config).toEqual(saved.config);
+  expect((await f.manager.status()).next_run_at).toBe('2026-10-10T03:00:00.000Z');
+});
+
+it('skips a nonexistent spring-forward wall-clock time in the actual scheduler', async () => {
+  vi.setSystemTime(new Date('2026-03-08T05:00:00Z'));
+  const f = await fixture();
+  const config = (await f.manager.status()).config;
+  await f.manager.configure({
+    ...config,
+    enabled: true,
+    hour: 2,
+    minute: 30,
+    time_zone: 'America/New_York',
+    expected_revision: config.revision,
+  });
+  vi.setSystemTime(new Date('2026-03-08T07:00:00Z'));
+  await f.heartbeat();
+  await f.tick();
+  expect(f.factory).not.toHaveBeenCalled();
+  expect((await f.manager.status()).next_run_at).toBe('2026-03-09T06:30:00.000Z');
 });

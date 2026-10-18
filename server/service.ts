@@ -56,6 +56,7 @@ import { AccountProfiles, type AccountProfileInput } from './account-profiles.js
 import { AdminAlerts } from './admin-alerts.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { SourceSnapshots, type SnapshotMetadata } from './source-snapshots.js';
+import { ImportCoordinator } from './daily-import-schedule.js';
 import { DestinationCatalogs } from './destination-catalogs.js';
 import type { DestinationCatalogMetadata } from './destination-catalog-files.js';
 import {
@@ -529,13 +530,16 @@ export class Service {
     this.memberships = new Memberships(store);
     this.profiles = new AccountProfiles(store);
     this.adminAlerts = new AdminAlerts(store);
+    const imports = new ImportCoordinator();
     this.sourceSnapshots = new SourceSnapshots(store, {
       demo: this.demo,
       clientFactory: () => this.clientFactory,
+      imports,
     });
     this.destinationSnapshots = new DestinationCatalogs(store, {
       demo: this.demo,
       clientFactory: () => this.clientFactory,
+      imports,
     });
   }
   resolveDiscordMapping(discordId: string): UserMapping | null {

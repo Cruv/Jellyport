@@ -434,3 +434,81 @@ it('protects saved destination catalog status and mutations with admin revalidat
   expect(refresh).not.toHaveBeenCalled();
   expect(clear).not.toHaveBeenCalled();
 });
+
+it('saves only the strictly typed Jellyfin schedule with current administrator authorization and CSRF', async () => {
+  const { app, headers, revoke } = await setup();
+  const manager = app.jellyport.service.destinationSnapshots;
+  const state = await manager.status();
+  const configure = vi.spyOn(manager, 'configure').mockResolvedValue(state);
+  const input = {
+    enabled: true,
+    hour: 3,
+    minute: 15,
+    time_zone: 'Etc/UTC',
+    expected_revision: state.config.revision,
+  };
+  const request = {
+    method: 'PUT' as const,
+    url: '/api/destination-catalog/schedule',
+    payload: input,
+  };
+  expect((await app.inject(request)).statusCode).toBe(401);
+  expect((await app.inject({ ...request, headers: { cookie: headers.cookie } })).statusCode).toBe(
+    403,
+  );
+  expect(
+    (await app.inject({ ...request, headers: { ...headers, origin: 'https://attacker.example' } }))
+      .statusCode,
+  ).toBe(403);
+  const saved = await app.inject({ ...request, headers });
+  expect(saved.statusCode).toBe(200);
+  expect(saved.headers['cache-control']).toBe('no-store');
+  expect(saved.json()).toEqual(state);
+  expect(configure).toHaveBeenCalledExactlyOnceWith(input);
+  configure.mockClear();
+  for (const invalid of [
+    { enabled: 'true' },
+    { hour: 24 },
+    { hour: 1.5 },
+    { hour: '3' },
+    { minute: -1 },
+    { minute: 60 },
+    { time_zone: '' },
+    { time_zone: 'x'.repeat(129) },
+    { expected_revision: '' },
+    { scope: 'complete' },
+    { api_key: 'synthetic-private-submitted-secret' },
+  ]) {
+    const rejected = await app.inject({ ...request, headers, payload: { ...input, ...invalid } });
+    expect(rejected.statusCode).toBe(422);
+    expect(rejected.body).not.toContain('synthetic-private-submitted-secret');
+  }
+  for (const omitted of Object.keys(input)) {
+    const missing: Record<string, unknown> = { ...input };
+    delete missing[omitted];
+    expect((await app.inject({ ...request, headers, payload: missing })).statusCode).toBe(422);
+  }
+  expect(configure).not.toHaveBeenCalled();
+  revoke();
+  expect((await app.inject({ ...request, headers })).statusCode).toBe(401);
+  expect(configure).not.toHaveBeenCalled();
+});
+
+it('keeps the Jellyfin schedule readable in demo mode but never enables a real scheduled importer', async () => {
+  const { app, headers } = await setup(true);
+  const state = (await app.inject({ url: '/api/destination-catalog', headers })).json();
+  expect(state).toMatchObject({ config: { enabled: false }, next_run_at: null });
+  const response = await app.inject({
+    method: 'PUT',
+    url: '/api/destination-catalog/schedule',
+    headers,
+    payload: {
+      ...state.config,
+      enabled: true,
+      expected_revision: state.config.revision,
+      revision: undefined,
+    },
+  });
+  expect(response.statusCode).toBe(400);
+  expect((await app.jellyport.service.destinationSnapshots.status()).config.enabled).toBe(false);
+});

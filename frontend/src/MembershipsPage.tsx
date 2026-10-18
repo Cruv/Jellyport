@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { useRouteTab } from './routing';
+import { useWorkspaceDraftState } from './workspace-drafts';
 import { Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import DiscordMemberPicker from './DiscordMemberPicker';
@@ -43,10 +44,19 @@ export default function MembershipsPage({
   const [accessFilter, setAccessFilter] = useState('all');
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [mappings, setMappings] = useState<UserMapping[]>([]);
-  const [member, setMember] = useState<DiscordMember | null>(null);
-  const [accessMode, setAccessMode] = useState<'subscription' | 'complimentary'>('subscription');
-  const [complimentaryLimit, setComplimentaryLimit] = useState(1);
-  const [tierId, setTierId] = useState(tiers[0]?.id || '');
+  const [member, setMember] = useWorkspaceDraftState<DiscordMember | null>(
+    'memberships.member',
+    null,
+  );
+  const [accessMode, setAccessMode] = useWorkspaceDraftState<'subscription' | 'complimentary'>(
+    'memberships.accessMode',
+    'subscription',
+  );
+  const [complimentaryLimit, setComplimentaryLimit] = useWorkspaceDraftState(
+    'memberships.complimentaryLimit',
+    1,
+  );
+  const [tierId, setTierId] = useWorkspaceDraftState('memberships.tierId', tiers[0]?.id || '');
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);

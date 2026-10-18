@@ -6,6 +6,10 @@ import type { Api, ApiOptions } from './types';
 
 const now = Date.parse('2026-01-02T04:00:00Z');
 const status: DestinationCatalogStatus = {
+  config: { enabled: false, hour: 3, minute: 0, time_zone: 'UTC', revision: 'catalog-revision-1' },
+  next_run_at: null,
+  last_finished_at: '2026-01-02T03:59:59Z',
+  last_outcome: 'succeeded',
   configured: true,
   available: true,
   running: false,
@@ -41,6 +45,94 @@ afterEach(() => {
 });
 
 describe('saved destination catalog settings', () => {
+  it('saves a revision-checked daily import schedule without starting an import, then leaves it unchanged during manual import', async () => {
+    let value = { ...status };
+    const calls: Array<{ path: string; options?: ApiOptions }> = [];
+    const api: Api = async <T,>(path: string, options?: ApiOptions) => {
+      calls.push({ path, options });
+      if (options?.method === 'PUT')
+        value = {
+          ...value,
+          config: {
+            enabled: true,
+            hour: 4,
+            minute: 15,
+            time_zone: 'America/New_York',
+            revision: 'catalog-revision-2',
+          },
+          next_run_at: '2026-10-19T08:15:00Z',
+        };
+      if (options?.method === 'POST') value = { ...value, running: true, last_outcome: 'running' };
+      return value as T;
+    };
+    const notify = vi.fn();
+    render(<DestinationCatalogPanel api={api} notify={notify} demo={false} />);
+    const time = await screen.findByLabelText('Import time');
+    fireEvent.click(screen.getByLabelText('Enable daily backup import'));
+    fireEvent.change(time, { target: { value: '04:15' } });
+    fireEvent.change(screen.getByLabelText('Time zone'), { target: { value: 'America/New_York' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save import schedule' }));
+    await act(async () => {});
+    expect(calls.find((call) => call.options?.method === 'PUT')).toMatchObject({
+      path: '/api/destination-catalog/schedule',
+      options: {
+        body: {
+          enabled: true,
+          hour: 4,
+          minute: 15,
+          time_zone: 'America/New_York',
+          expected_revision: 'catalog-revision-1',
+        },
+      },
+    });
+    expect(calls.filter((call) => call.options?.method === 'POST')).toHaveLength(0);
+    expect(notify).toHaveBeenCalledWith('Jellyfin backup import schedule saved.');
+    expect(screen.getByText('Daily at 04:15 (America/New_York)')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Import latest Jellyfin backup' }));
+    await act(async () => {});
+    expect(screen.getByLabelText('Import time')).toHaveProperty('value', '04:15');
+    expect(calls.filter((call) => call.options?.method === 'PUT')).toHaveLength(1);
+    expect(calls.find((call) => call.options?.method === 'POST')?.options?.body).toBeUndefined();
+    expect(screen.getByText('Running')).toBeTruthy();
+    expect(screen.queryByText('Completed')).toBeNull();
+  });
+
+  it('retains unsaved schedule edits through hidden tabs and reconciles a newer saved revision without replaying actions', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime('2026-10-18T04:00:00Z');
+    let reads = 0;
+    const api: Api = async <T,>() =>
+      ({
+        ...status,
+        running: true,
+        config:
+          ++reads === 1
+            ? status.config
+            : { ...status.config, hour: 5, revision: 'catalog-revision-2' },
+      }) as T;
+    const view = render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+    await act(async () => {});
+    fireEvent.change(screen.getByLabelText('Import time'), { target: { value: '04:20' } });
+    view.rerender(
+      <DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} active={false} />,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6000);
+    });
+    expect(reads).toBe(1);
+    view.rerender(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+    await act(async () => {});
+    expect(reads).toBe(2);
+    expect(screen.getByLabelText('Import time')).toHaveProperty('value', '04:20');
+    expect(screen.getByText(/The saved schedule changed/)).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Save import schedule' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Reload saved schedule' }));
+    expect(screen.getByLabelText('Import time')).toHaveProperty('value', '05:00');
+    expect(reads).toBe(2);
+  });
   it('labels original backup age separately from import time and describes live activity safeguards', async () => {
     vi.spyOn(Date, 'now').mockReturnValue(now);
     const api: Api = async <T,>() => status as T;
@@ -154,10 +246,7 @@ describe('saved destination catalog settings', () => {
       'disabled',
       true,
     );
-    expect(screen.getByRole('button', { name: 'Refresh catalog status' })).toHaveProperty(
-      'disabled',
-      true,
-    );
+    expect(screen.getByRole('button', { name: 'Refresh status' })).toHaveProperty('disabled', true);
     expect(screen.getByRole('button', { name: 'Clear matching catalog' })).toHaveProperty(
       'disabled',
       true,
@@ -235,7 +324,7 @@ describe('saved destination catalog settings', () => {
     };
     render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
     await screen.findByRole('table');
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh catalog status' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
     await waitFor(() => expect(staleSignal).toBeDefined());
     fireEvent.click(screen.getByRole('button', { name: 'Import latest Jellyfin backup' }));
     await screen.findByText('Importing Jellyfin backup…');
@@ -367,9 +456,9 @@ describe('saved destination catalog settings', () => {
     await screen.findByText(
       'Jellyfin catalog status could not be loaded. Refresh status to try again.',
     );
-    expect(screen.getByText('Jellyfin catalog status unavailable')).toBeTruthy();
+    expect(screen.getByText('Import status unavailable')).toBeTruthy();
     expect(screen.queryByText('PRIVATE_NETWORK_DETAIL')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh catalog status' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
     await screen.findByRole('table');
     expect(screen.queryByRole('alert')).toBeNull();
   });
@@ -384,7 +473,7 @@ describe('saved destination catalog settings', () => {
       fireEvent.click(button);
     }
     expect(vi.mocked(api)).toHaveBeenCalledOnce();
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh catalog status' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
     await waitFor(() => expect(vi.mocked(api)).toHaveBeenCalledTimes(2));
     expect(vi.mocked(api).mock.calls.every(([, options]) => !options?.method)).toBe(true);
   });

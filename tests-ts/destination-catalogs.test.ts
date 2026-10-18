@@ -20,6 +20,7 @@ import { snapshotProcess } from '../server/snapshot-process.js';
 import { DEFAULT_SETTINGS, Store } from '../server/store.js';
 import type { MediaAPI, MediaItem } from '../server/media.js';
 import type { Job } from '../server/service.js';
+import { ImportCoordinator } from '../server/daily-import-schedule.js';
 
 vi.mock('../server/snapshot-process.js', () => ({ snapshotProcess: vi.fn() }));
 const worker = vi.mocked(snapshotProcess);
@@ -37,6 +38,222 @@ beforeEach(() => {
   worker.mockReset();
   worker.mockResolvedValue([item]);
   vi.stubEnv('JELLYPORT_JELLYFIN_CATALOG_MODE', undefined);
+  vi.stubEnv('TZ', 'Etc/UTC');
+});
+
+describe('Jellyfin daily backup import schedule', () => {
+  async function enable(
+    f: Awaited<ReturnType<typeof fixture>>,
+    extra: Record<string, unknown> = {},
+  ) {
+    const config = (await f.manager.status()).config;
+    return f.manager.configure({
+      ...config,
+      enabled: true,
+      expected_revision: config.revision,
+      ...extra,
+    });
+  }
+  it('starts an enabled daily import through the actual background timer without an inline save mutation', async () => {
+    vi.setSystemTime(new Date('2026-10-09T03:20:00Z'));
+    const f = await fixture('backup', undefined, true);
+    await f.heartbeat();
+    await enable(f);
+    expect(f.factory).not.toHaveBeenCalled();
+    await vi.waitFor(
+      async () => {
+        expect((await readdir(f.shared)).filter((name) => name.endsWith('.request'))).toHaveLength(
+          1,
+        );
+      },
+      { timeout: 5000, interval: 20 },
+    );
+    expect(f.factory).toHaveBeenCalledOnce();
+    expect((await f.manager.status()).last_outcome).toBe('running');
+  });
+  it('upgrades legacy state with a disabled schedule while retaining the validated catalog', async () => {
+    const f = await fixture('backup');
+    const good = await f.complete();
+    f.store.db.prepare('INSERT OR REPLACE INTO destination_catalog_state VALUES(1,?)').run(
+      f.store.encrypt({
+        configured: true,
+        generations: [good],
+        last_attempt_at: good.requested_at,
+        last_error: null,
+      }),
+    );
+    await f.restart();
+    expect(await f.manager.status()).toMatchObject({
+      config: { enabled: false, hour: 3, minute: 0, time_zone: 'Etc/UTC' },
+      next_run_at: null,
+      record: { id: good.id },
+      last_outcome: 'succeeded',
+    });
+    expect(f.factory).toHaveBeenCalledOnce();
+  });
+  it('reports preparation interrupted across restart when no helper request had been saved', async () => {
+    const f = await fixture('backup');
+    const good = await f.complete();
+    const row = f.store.db
+      .prepare('SELECT encrypted FROM destination_catalog_state WHERE id=1')
+      .get()!;
+    const state = f.store.decrypt<Record<string, unknown>>(row.encrypted as Uint8Array);
+    state.last_outcome = 'running';
+    state.last_finished_at = null;
+    f.store.db
+      .prepare('UPDATE destination_catalog_state SET encrypted=? WHERE id=1')
+      .run(f.store.encrypt(state));
+    await f.restart();
+    expect(await f.manager.status()).toMatchObject({
+      running: false,
+      last_outcome: 'interrupted',
+      record: { id: good.id, backup_created_at: good.backup_created_at },
+    });
+    expect(f.factory).toHaveBeenCalledOnce();
+  });
+  it('independently saves revisioned settings, persists restart and leaves global settings unchanged', async () => {
+    vi.setSystemTime(new Date('2026-10-09T02:00:00Z'));
+    const f = await fixture('backup');
+    const oldSettings = f.store.settings();
+    const saved = await enable(f, { hour: 4, minute: 15, time_zone: 'America/New_York' });
+    expect(saved.next_run_at).toBe('2026-10-09T08:15:00.000Z');
+    expect(f.factory).not.toHaveBeenCalled();
+    await expect(
+      f.manager.configure({ ...saved.config, expected_revision: 'stale' }),
+    ).rejects.toThrow('schedule changed');
+    await expect(
+      f.manager.configure({
+        ...saved.config,
+        time_zone: 'Invalid/Zone',
+        expected_revision: saved.config.revision,
+      }),
+    ).rejects.toThrow('valid IANA');
+    await f.restart();
+    expect((await f.manager.status()).config).toEqual(saved.config);
+    expect(f.store.settings()).toEqual(oldSettings);
+  });
+  it('runs the real encrypted request workflow once and recovers its active owner across restart', async () => {
+    vi.setSystemTime(new Date('2026-10-09T02:00:00Z'));
+    const imports = new ImportCoordinator();
+    const f = await fixture('backup', imports);
+    const saved = await enable(f);
+    vi.setSystemTime(new Date('2026-10-09T03:20:00Z'));
+    await f.heartbeat();
+    await f.tick();
+    const names = (await readdir(f.shared)).filter((name) => name.endsWith('.request'));
+    expect(names).toHaveLength(1);
+    const request = await readEnvelope<DestinationCatalogRequest>(join(f.shared, names[0]!), f.key);
+    expect(await f.manager.status()).toMatchObject({
+      running: true,
+      last_outcome: 'running',
+      last_finished_at: null,
+    });
+    await f.restart();
+    expect(f.factory).toHaveBeenCalledOnce();
+    expect(imports.busy).toBe(true);
+    await f.finish(request);
+    expect(await f.manager.status()).toMatchObject({
+      running: false,
+      last_outcome: 'succeeded',
+      config: saved.config,
+      record: { id: request.id },
+    });
+    expect(imports.busy).toBe(false);
+    await f.tick();
+    expect(f.factory).toHaveBeenCalledOnce();
+  });
+  it('records unavailable-helper failure once without automatically retrying that daily occurrence', async () => {
+    vi.setSystemTime(new Date('2026-10-09T02:00:00Z'));
+    const imports = new ImportCoordinator();
+    const f = await fixture('backup', imports);
+    await enable(f);
+    vi.setSystemTime(new Date('2026-10-09T03:20:00Z'));
+    await f.tick();
+    expect(await f.manager.status()).toMatchObject({
+      running: false,
+      last_outcome: 'failed',
+      last_attempt_at: '2026-10-09T03:20:00.000Z',
+      last_finished_at: '2026-10-09T03:20:00.000Z',
+      next_run_at: '2026-10-10T03:00:00.000Z',
+    });
+    expect(imports.busy).toBe(false);
+    await f.heartbeat();
+    await f.restart();
+    await f.tick();
+    expect(f.factory).not.toHaveBeenCalled();
+    expect((await f.manager.status()).last_outcome).toBe('failed');
+  });
+  it('defers while another import owns the helper without claiming or queueing the occurrence', async () => {
+    vi.setSystemTime(new Date('2026-10-09T02:00:00Z'));
+    const imports = new ImportCoordinator();
+    const f = await fixture('backup', imports);
+    await enable(f);
+    imports.restore('emby:synthetic-running');
+    vi.setSystemTime(new Date('2026-10-09T03:20:00Z'));
+    await f.heartbeat();
+    await f.tick();
+    expect((await f.manager.status()).next_run_at).toBe('2026-10-09T03:00:00.000Z');
+    expect(f.factory).not.toHaveBeenCalled();
+    await expect(f.manager.refresh()).rejects.toThrow('already running');
+    imports.release('emby:synthetic-running');
+    await f.tick();
+    expect(f.factory).toHaveBeenCalledOnce();
+  });
+  it('does not replay a missed run or mutate its saved schedule during a manual import', async () => {
+    vi.setSystemTime(new Date('2026-10-09T02:00:00Z'));
+    const f = await fixture('backup');
+    const saved = await enable(f);
+    vi.setSystemTime(new Date('2026-10-09T04:00:00Z'));
+    await f.heartbeat();
+    await f.tick();
+    expect(f.factory).not.toHaveBeenCalled();
+    const imported = await f.complete();
+    expect((await f.manager.status()).config).toEqual(saved.config);
+    expect((await f.manager.status()).last_finished_at).toBe(imported.finished_at);
+    const disabled = await f.manager.configure({
+      ...saved.config,
+      enabled: false,
+      expected_revision: saved.config.revision,
+    });
+    expect(disabled.next_run_at).toBeNull();
+    await f.restart();
+    expect((await f.manager.status()).config.enabled).toBe(false);
+  });
+  it('lets a manual import spanning the schedule satisfy the occurrence without a duplicate import', async () => {
+    vi.setSystemTime(new Date('2026-10-09T02:00:00Z'));
+    const f = await fixture('backup');
+    await enable(f);
+    vi.setSystemTime(new Date('2026-10-09T02:59:00Z'));
+    const request = await f.request();
+    vi.setSystemTime(new Date('2026-10-09T03:01:00Z'));
+    await f.heartbeat();
+    await f.finish(request);
+    await f.tick();
+    expect(f.factory).toHaveBeenCalledOnce();
+    expect((await f.manager.status()).next_run_at).toBe('2026-10-10T03:00:00.000Z');
+  });
+  it('contains lookup failures and interrupted results while preserving the last valid catalog', async () => {
+    const imports = new ImportCoordinator();
+    const f = await fixture('backup', imports);
+    const good = await f.complete();
+    f.client.systemInfo.mockRejectedValueOnce(new Error('synthetic-private-diagnostic'));
+    await expect(f.manager.refresh()).rejects.toThrow();
+    expect(await f.manager.status()).toMatchObject({
+      last_outcome: 'failed',
+      record: { id: good.id },
+    });
+    expect(JSON.stringify(await f.manager.status())).not.toContain('synthetic-private-diagnostic');
+    expect(imports.busy).toBe(false);
+    await f.finish(await f.request(), {
+      ok: false,
+      error: 'Jellyfin backup import was interrupted.',
+    });
+    expect(await f.manager.status()).toMatchObject({
+      last_outcome: 'interrupted',
+      record: { id: good.id, backup_created_at: good.backup_created_at },
+    });
+    expect(imports.busy).toBe(false);
+  });
 });
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -46,8 +263,9 @@ afterEach(async () => {
     await rm(resource.directory, { recursive: true, force: true });
   }
   vi.unstubAllEnvs();
+  vi.useRealTimers();
 });
-async function fixture(mode?: string) {
+async function fixture(mode?: string, imports?: ImportCoordinator, keepTimer = false) {
   vi.stubEnv('JELLYPORT_JELLYFIN_CATALOG_MODE', mode);
   const directory = await mkdtemp(join(tmpdir(), 'jellyport-synthetic-destination-catalogs-'));
   const shared = join(directory, 'shared');
@@ -64,11 +282,12 @@ async function fixture(mode?: string) {
     close: vi.fn(async () => {}),
   };
   const factory = vi.fn(() => client as unknown as MediaAPI);
-  let manager = new DestinationCatalogs(store, { clientFactory: () => factory });
+  let manager = new DestinationCatalogs(store, { clientFactory: () => factory, imports });
   const resource = { manager, store, directory };
   resources.push(resource);
   await manager.start();
-  clearInterval((manager as unknown as { timer: ReturnType<typeof setInterval> }).timer);
+  if (!keepTimer)
+    clearInterval((manager as unknown as { timer: ReturnType<typeof setInterval> }).timer);
   const key = await snapshotKey(shared);
   async function heartbeat(updatedAt = new Date(Date.now()).toISOString()) {
     await writeEnvelope(
@@ -144,7 +363,7 @@ async function fixture(mode?: string) {
   }
   async function restart() {
     await manager.stop();
-    manager = new DestinationCatalogs(store, { clientFactory: () => factory });
+    manager = new DestinationCatalogs(store, { clientFactory: () => factory, imports });
     resource.manager = manager;
     await manager.start();
     clearInterval((manager as unknown as { timer: ReturnType<typeof setInterval> }).timer);

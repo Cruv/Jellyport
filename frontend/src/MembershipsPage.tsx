@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { useRouteTab } from './routing';
+import { navigateWorkspace, useRouteTab } from './routing';
+import { useWorkspaceDraftState } from './workspace-drafts';
 import { Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import DiscordMemberPicker from './DiscordMemberPicker';
@@ -43,10 +44,19 @@ export default function MembershipsPage({
   const [accessFilter, setAccessFilter] = useState('all');
   const [memberships, setMemberships] = useState<Membership[]>([]);
   const [mappings, setMappings] = useState<UserMapping[]>([]);
-  const [member, setMember] = useState<DiscordMember | null>(null);
-  const [accessMode, setAccessMode] = useState<'subscription' | 'complimentary'>('subscription');
-  const [complimentaryLimit, setComplimentaryLimit] = useState(1);
-  const [tierId, setTierId] = useState(tiers[0]?.id || '');
+  const [member, setMember] = useWorkspaceDraftState<DiscordMember | null>(
+    'memberships.member',
+    null,
+  );
+  const [accessMode, setAccessMode] = useWorkspaceDraftState<'subscription' | 'complimentary'>(
+    'memberships.accessMode',
+    'subscription',
+  );
+  const [complimentaryLimit, setComplimentaryLimit] = useWorkspaceDraftState(
+    'memberships.complimentaryLimit',
+    1,
+  );
+  const [tierId, setTierId] = useWorkspaceDraftState('memberships.tierId', tiers[0]?.id || '');
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -247,7 +257,11 @@ export default function MembershipsPage({
         title="Memberships"
         description="Manage paid and complimentary access, account allowances, and each Discord owner’s linked accounts."
         actions={
-          <button className="btn" onClick={() => void reload()} disabled={busy || loading}>
+          <button
+            className="btn btn-quiet"
+            onClick={() => void reload()}
+            disabled={busy || loading}
+          >
             <Icon name="refresh" /> Refresh
           </button>
         }
@@ -426,7 +440,15 @@ export default function MembershipsPage({
                     </select>
                     <small>
                       Use complimentary access for family and other non-paying Discord members.
-                      Users without Discord can have independent accounts from Create account.
+                      Users without Discord can have independent accounts from{' '}
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={() => navigateWorkspace({ page: 'accounts' })}
+                      >
+                        Create account
+                      </button>
+                      .
                     </small>
                   </div>
                   {accessMode === 'subscription' ? (

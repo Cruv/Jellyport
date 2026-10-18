@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { version as appVersion } from '../../package.json';
 import { useClientLayout, useVisualViewport } from './client-layout';
 import { navigateWorkspace, useWorkspaceRoute, workspaceRouteHash } from './routing';
+import { WorkspaceDraftProvider } from './workspace-drafts';
+import { WorkspaceNotice, WorkspaceNoticeProvider } from './workspace-notices';
 import {
   DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
   renderCredentialMessage,
@@ -145,7 +147,6 @@ export default function App() {
   const [users, setUsers] = useState<Users>(emptyUsers);
   const [mappings, setMappings] = useState<UserMapping[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
-  const [settingsVersion, setSettingsVersion] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const jobsRef = useRef(jobs);
   const historyRevision = useRef(0);
@@ -214,6 +215,8 @@ export default function App() {
   const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
   const loadVersion = useRef(0);
   const [pollPaused, setPollPaused] = useState(false);
+  const settingsSaveOwner = useRef<symbol | null>(null);
+  const [settingsSavePending, setSettingsSavePending] = useState(false);
   const notify = useCallback((text: string, error = false) => {
     const id = ++toastId.current;
     setToasts((current) => [...current, { id, message: text, error }]);
@@ -281,6 +284,8 @@ export default function App() {
     setUsers(emptyUsers);
     setMappings([]);
     setSettings(null);
+    settingsSaveOwner.current = null;
+    setSettingsSavePending(false);
     setJobs([]);
     setEvents([]);
     setSelected(new Set());
@@ -298,68 +303,85 @@ export default function App() {
   }, []);
   const api: Api = useCallback(
     async <T,>(path: string, options: ApiOptions = {}): Promise<T> => {
-      const generation = authGeneration.current;
-      const headers: Record<string, string> = { Accept: 'application/json' };
-      if (options.body !== undefined) headers['Content-Type'] = 'application/json';
-      if (options.method && options.method !== 'GET' && sessionRef.current?.csrf_token)
-        headers['X-CSRF-Token'] = sessionRef.current.csrf_token;
-      let response: Response;
-      try {
-        response = await fetch(path, {
-          ...options,
-          headers,
-          credentials: 'same-origin',
-          body: options.body === undefined ? undefined : JSON.stringify(options.body),
-        });
-      } catch (error) {
-        if (error instanceof Error && error.name === 'AbortError') throw error;
+      const savingSettings = path === '/api/settings' && options.method === 'PUT';
+      if (savingSettings && settingsSaveOwner.current)
         throw new Error(
-          'Could not reach Jellyport. Check that the application is running and try again.',
+          'A settings save is still in progress. Wait for it to finish before saving another draft.',
         );
+      const owner = savingSettings ? Symbol('settings-save') : null;
+      if (owner) {
+        settingsSaveOwner.current = owner;
+        setSettingsSavePending(true);
       }
-      let data: unknown;
       try {
-        data = await response.json();
-      } catch (error) {
-        if (response.ok) {
-          // A reload can cancel body reading after successful response headers.
-          // Never turn an unreadable success into a fabricated typed object.
+        const generation = authGeneration.current;
+        const headers: Record<string, string> = { Accept: 'application/json' };
+        if (options.body !== undefined) headers['Content-Type'] = 'application/json';
+        if (options.method && options.method !== 'GET' && sessionRef.current?.csrf_token)
+          headers['X-CSRF-Token'] = sessionRef.current.csrf_token;
+        let response: Response;
+        try {
+          response = await fetch(path, {
+            ...options,
+            headers,
+            credentials: 'same-origin',
+            body: options.body === undefined ? undefined : JSON.stringify(options.body),
+          });
+        } catch (error) {
           if (error instanceof Error && error.name === 'AbortError') throw error;
           throw new Error(
-            'Jellyport’s response could not be read. Refresh to check its status before retrying.',
+            'Could not reach Jellyport. Check that the application is running and try again.',
           );
         }
-        // Failed responses can have empty/non-JSON bodies; keep their status and
-        // authentication handling without exposing a raw parser/body diagnostic.
-        data = {};
+        let data: unknown;
+        try {
+          data = await response.json();
+        } catch (error) {
+          if (response.ok) {
+            // A reload can cancel body reading after successful response headers.
+            // Never turn an unreadable success into a fabricated typed object.
+            if (error instanceof Error && error.name === 'AbortError') throw error;
+            throw new Error(
+              'Jellyport’s response could not be read. Refresh to check its status before retrying.',
+            );
+          }
+          // Failed responses can have empty/non-JSON bodies; keep their status and
+          // authentication handling without exposing a raw parser/body diagnostic.
+          data = {};
+        }
+        if (generation !== authGeneration.current)
+          throw new Error(
+            'This request belongs to a previous session. Sign in and refresh to see its status.',
+          );
+        if (!response.ok) {
+          if (response.status === 401 && path !== '/api/login' && path !== '/api/setup/connect')
+            clearSession();
+          const body =
+            data && typeof data === 'object'
+              ? (data as { detail?: unknown; error?: unknown; message?: unknown })
+              : {};
+          let detail = body.detail || body.error || body.message;
+          if (Array.isArray(detail))
+            detail = detail
+              .map((item) =>
+                typeof item === 'object' && item && 'msg' in item
+                  ? String(item.msg)
+                  : 'Invalid input',
+              )
+              .join('; ');
+          if (detail && typeof detail === 'object')
+            detail = 'message' in detail ? String(detail.message) : JSON.stringify(detail);
+          throw new Error(
+            typeof detail === 'string' ? detail : `Request failed (${response.status}).`,
+          );
+        }
+        return data as T;
+      } finally {
+        if (owner && settingsSaveOwner.current === owner) {
+          settingsSaveOwner.current = null;
+          setSettingsSavePending(false);
+        }
       }
-      if (generation !== authGeneration.current)
-        throw new Error(
-          'This request belongs to a previous session. Sign in and refresh to see its status.',
-        );
-      if (!response.ok) {
-        if (response.status === 401 && path !== '/api/login' && path !== '/api/setup/connect')
-          clearSession();
-        const body =
-          data && typeof data === 'object'
-            ? (data as { detail?: unknown; error?: unknown; message?: unknown })
-            : {};
-        let detail = body.detail || body.error || body.message;
-        if (Array.isArray(detail))
-          detail = detail
-            .map((item) =>
-              typeof item === 'object' && item && 'msg' in item
-                ? String(item.msg)
-                : 'Invalid input',
-            )
-            .join('; ');
-        if (detail && typeof detail === 'object')
-          detail = 'message' in detail ? String(detail.message) : JSON.stringify(detail);
-        throw new Error(
-          typeof detail === 'string' ? detail : `Request failed (${response.status}).`,
-        );
-      }
-      return data as T;
     },
     [clearSession],
   );
@@ -488,7 +510,6 @@ export default function App() {
           }
           if (version === loadVersion.current) {
             setSettings(value);
-            setSettingsVersion((current) => current + 1);
             setUsers(listed);
           }
         }
@@ -934,7 +955,11 @@ export default function App() {
       notify(
         result.status === 'failed'
           ? result.error || 'The subscription event could not be applied.'
-          : 'Subscription event processed.',
+          : result.status === 'processing'
+            ? 'Subscription processing is in progress. Follow its operation before retrying.'
+            : result.status === 'applied'
+              ? 'Subscription event applied.'
+              : 'Subscription event status refreshed.',
         result.status === 'failed',
       );
       await load('subscriptions');
@@ -1064,13 +1089,13 @@ export default function App() {
   else if (page === 'settings' && settings)
     content = (
       <SettingsPage
-        key={settingsVersion}
         settings={settings}
         users={users}
         demo={!!session?.demo}
         api={api}
         notify={notify}
         refresh={() => load('settings')}
+        pendingSave={settingsSavePending}
       />
     );
   else if (page === 'activity')
@@ -1097,7 +1122,7 @@ export default function App() {
     );
   else content = <Loading />;
   return (
-    <>
+    <WorkspaceNoticeProvider notice={toasts.at(-1)} dismiss={() => setToasts([])}>
       {booting ? (
         <div className="boot-screen">
           <span className="spinner" />
@@ -1111,136 +1136,155 @@ export default function App() {
           onSession={acceptSession}
         />
       ) : (
-        <div className="shell">
-          <a
-            className="skip-link"
-            href="#workspace-content"
-            onClick={(event) => {
-              event.preventDefault();
-              const content = document.getElementById('workspace-content');
-              content?.focus();
-              content?.scrollIntoView?.({ block: 'start' });
-            }}
-          >
-            Skip to content
-          </a>
-          {mobileOpen && (
-            <button
-              className="nav-scrim"
-              aria-label="Close navigation"
-              onClick={() => setMobileOpen(false)}
-            />
-          )}
-          <aside
-            ref={navigation}
-            id="workspace-navigation"
-            className={`sidebar${mobileOpen ? ' mobile-open' : ''}`}
-            aria-label="Main navigation"
-          >
-            <div className="brand">
-              <span className="brand-icon">
-                <Icon name="logo" />
-              </span>
-              <div>
-                Jellyport<small>EMBY → JELLYFIN</small>
-              </div>
-            </div>
-            <nav className="nav">
-              {navigationGroups.map((group) => (
-                <div className="nav-group" key={group.title}>
-                  <div className="nav-label">{group.title}</div>
-                  {group.pages.map((key) => {
-                    const value = pages[key];
-                    return (
-                      <button
-                        className={`nav-button${page === key ? ' active' : ''}`}
-                        aria-current={page === key ? 'page' : undefined}
-                        onClick={() => navigate(key)}
-                        key={key}
-                      >
-                        <Icon name={value.icon} />
-                        {value.title}
-                        {page === key && <span className="nav-dot" />}
-                      </button>
-                    );
-                  })}
-                </div>
-              ))}
-            </nav>
-            <div className="sidebar-bottom">
-              <div className="operator-card">
-                <div className="avatar">
-                  {(session.user?.name || 'Admin').slice(0, 2).toUpperCase()}
-                </div>
-                <div>
-                  <strong>{session.user?.name || 'Administrator'}</strong>
-                  <span>Jellyfin administrator</span>
-                </div>
-                <button
-                  className="icon-button"
-                  onClick={logout}
-                  disabled={busy.has('logout')}
-                  aria-label="Sign out"
-                  title="Sign out"
-                >
-                  <Icon name="logout" />
-                </button>
-              </div>
-              <div className="sidebar-note" aria-label="Jellyport version">
-                v{appVersion}
-              </div>
-            </div>
-          </aside>
-          <main className="main" inert={mobileOpen && navigationDrawer}>
-            <header className="topbar">
+        <WorkspaceDraftProvider key={authGeneration.current}>
+          <div className="shell">
+            <a
+              className="skip-link"
+              href="#workspace-content"
+              onClick={(event) => {
+                event.preventDefault();
+                const content = document.getElementById('workspace-content');
+                content?.focus();
+                content?.scrollIntoView?.({ block: 'start' });
+              }}
+            >
+              Skip to content
+            </a>
+            {mobileOpen && (
               <button
-                ref={mobileToggle}
-                className="icon-button mobile-menu"
-                onClick={() => setMobileOpen((value) => !value)}
-                aria-label="Toggle navigation"
-                aria-expanded={mobileOpen}
-                aria-controls="workspace-navigation"
-              >
-                <Icon name="menu" />
-              </button>
-              <div className="breadcrumb">
-                <span>Workspace</span>
-                <span>/</span>
-                <span>{pages[page].title}</span>
-              </div>
-              <div className="topbar-right">
-                <span className="version-label">Emby → Jellyfin</span>
-                <span className="operator-label">Admin workspace</span>
-              </div>
-            </header>
-            <div className="content" id="workspace-content" tabIndex={-1}>
-              {session.demo && (
-                <div className="demo-banner">
-                  <Icon name="info" />
-                  Demo mode is active. Accounts, watch history, and Discord messages use sample
-                  data. Settings are read-only.
+                className="nav-scrim"
+                aria-label="Close navigation"
+                onClick={() => setMobileOpen(false)}
+              />
+            )}
+            <aside
+              ref={navigation}
+              id="workspace-navigation"
+              className={`sidebar${mobileOpen ? ' mobile-open' : ''}`}
+              aria-label="Main navigation"
+            >
+              <div className="brand">
+                <span className="brand-icon">
+                  <Icon name="logo" />
+                </span>
+                <div>
+                  Jellyport<small>EMBY → JELLYFIN</small>
                 </div>
-              )}
-              {page === 'migrate' && previewProgress && (
-                <div className="setup-server preview-progress mb-17" role="status">
-                  <span>
-                    Preparing migration review… {previewProgress.processed} of{' '}
-                    {previewProgress.total} {previewProgress.total === 1 ? 'user' : 'users'}{' '}
-                    complete.
-                  </span>
+              </div>
+              <nav className="nav">
+                {navigationGroups.map((group) => (
+                  <div className="nav-group" key={group.title}>
+                    <div className="nav-label">{group.title}</div>
+                    {group.pages.map((key) => {
+                      const value = pages[key];
+                      return (
+                        <button
+                          className={`nav-button${page === key ? ' active' : ''}`}
+                          aria-current={page === key ? 'page' : undefined}
+                          onClick={() => navigate(key)}
+                          key={key}
+                        >
+                          <Icon name={value.icon} />
+                          {value.title}
+                          {page === key && <span className="nav-dot" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </nav>
+              <div className="sidebar-bottom">
+                <div className="operator-card">
+                  <div className="avatar">
+                    {(session.user?.name || 'Admin').slice(0, 2).toUpperCase()}
+                  </div>
+                  <div>
+                    <strong>{session.user?.name || 'Administrator'}</strong>
+                    <span>Jellyfin administrator</span>
+                  </div>
                   <button
-                    className="text-button preview-cancel"
-                    type="button"
-                    onClick={cancelPreview}
+                    className="icon-button"
+                    onClick={logout}
+                    disabled={busy.has('logout')}
+                    aria-label="Sign out"
+                    title="Sign out"
                   >
-                    Cancel preview
+                    <Icon name="logout" />
                   </button>
                 </div>
-              )}
-              {content}
-            </div>
-          </main>
-        </div>
+                <div className="sidebar-note" aria-label="Jellyport version">
+                  v{appVersion}
+                </div>
+              </div>
+            </aside>
+            <main className="main" inert={mobileOpen && navigationDrawer}>
+              <header className="topbar">
+                <button
+                  ref={mobileToggle}
+                  className="icon-button mobile-menu"
+                  onClick={() => setMobileOpen((value) => !value)}
+                  aria-label="Toggle navigation"
+                  aria-expanded={mobileOpen}
+                  aria-controls="workspace-navigation"
+                >
+                  <Icon name="menu" />
+                </button>
+                <div className="breadcrumb">
+                  <span>Workspace</span>
+                  <span>/</span>
+                  <span>{pages[page].title}</span>
+                </div>
+                <div className="topbar-right">
+                  <span className="version-label">Emby → Jellyfin</span>
+                  <span className="operator-label">Admin workspace</span>
+                </div>
+              </header>
+              <div className="content" id="workspace-content" tabIndex={-1}>
+                {session.demo && (
+                  <div className="demo-banner">
+                    <Icon name="info" />
+                    Demo mode is active. Accounts, watch history, and Discord messages use sample
+                    data. Settings are read-only.
+                  </div>
+                )}
+                <WorkspaceNotice />
+                {page === 'migrate' && previewProgress && (
+                  <div className="setup-server preview-progress mb-17" role="status">
+                    <span>
+                      Preparing migration review… {previewProgress.processed} of{' '}
+                      {previewProgress.total} {previewProgress.total === 1 ? 'user' : 'users'}{' '}
+                      complete.
+                    </span>
+                    <button
+                      className="text-button preview-cancel"
+                      type="button"
+                      onClick={cancelPreview}
+                    >
+                      Cancel preview
+                    </button>
+                  </div>
+                )}
+                {pollPaused && hasActive && (
+                  <Callout warning title="Activity updates paused.">
+                    The last known operation status is shown. Refresh Activity to check whether work
+                    is still running before retrying an action.{' '}
+                    <button
+                      type="button"
+                      className="text-button"
+                      onClick={() => {
+                        if (page === 'activity') void load('activity');
+                        else navigate('activity');
+                      }}
+                    >
+                      Refresh Activity
+                    </button>
+                  </Callout>
+                )}
+                {content}
+              </div>
+            </main>
+          </div>
+        </WorkspaceDraftProvider>
       )}
       {session?.authenticated && dialog && (
         <DialogContent
@@ -1259,15 +1303,7 @@ export default function App() {
           notify={notify}
         />
       )}
-      <div className="toast-region" aria-live="polite">
-        {toasts.map((toast) => (
-          <div className={`toast${toast.error ? ' error' : ''}`} key={toast.id}>
-            <Icon name={toast.error ? 'warning' : 'check'} />
-            <span>{toast.message}</span>
-          </div>
-        ))}
-      </div>
-    </>
+    </WorkspaceNoticeProvider>
   );
 }
 function MigrationRecipient({ user, api }: { user: PreviewUser; api: Api }) {
@@ -1390,7 +1426,7 @@ function HistoryCleanupDialog({
   }
   return (
     <Modal
-      title={review.single ? 'Clear this report?' : 'Clear activity history?'}
+      title={review.single ? 'Delete this report?' : 'Delete activity history?'}
       description="Remove stored Jellyport activity and migration reports."
       close={() => {
         if (!pendingRef.current) close();
@@ -1413,8 +1449,8 @@ function HistoryCleanupDialog({
             >
               {pending && <span className="spinner" />}
               {pending
-                ? 'Clearing…'
-                : `Clear ${num(ids.length)} ${ids.length === 1 ? 'report' : 'reports'}`}
+                ? 'Deleting…'
+                : `Delete ${num(ids.length)} ${ids.length === 1 ? 'report' : 'reports'}`}
             </button>
           </>
         )
@@ -1434,7 +1470,7 @@ function HistoryCleanupDialog({
         <>
           <p role="status">
             {num(result.removed_ids.length)}{' '}
-            {result.removed_ids.length === 1 ? 'report cleared' : 'reports cleared'}.{' '}
+            {result.removed_ids.length === 1 ? 'report deleted' : 'reports deleted'}.{' '}
             {num(result.skipped.length)} kept.
           </p>
           {!!skipped.size && (
@@ -1490,8 +1526,8 @@ function HistoryCleanupDialog({
           )}
           {overLimit && (
             <p className="error-block" role="alert">
-              Clear at most 1,000 reports at a time. Use Activity filters or an older date to narrow
-              this review.
+              Delete at most 1,000 reports at a time. Use Activity filters or an older date to
+              narrow this review.
             </p>
           )}
           {error && (
@@ -1755,6 +1791,48 @@ function DialogContent({
           </Callout>
         )}
         <JobProgressDetails job={job} />
+        {['failed', 'partial', 'interrupted'].includes(job.status) && (
+          <Callout warning title="Review this operation before retrying.">
+            Inspect the recorded errors and verification below. A new request may repeat changes
+            that already reached the server.
+            <div className="button-row mt-12">
+              {job.kind === 'create' && (
+                <button
+                  type="button"
+                  className="btn btn-quiet"
+                  onClick={() => {
+                    close();
+                    navigateWorkspace({ page: 'accounts', tab: 'recover' });
+                  }}
+                >
+                  Inspect interrupted creation
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn btn-quiet"
+                onClick={() => {
+                  close();
+                  navigateWorkspace({ page: 'settings', tab: 'media', subtab: 'jellyfin' });
+                }}
+              >
+                Check Jellyfin connection
+              </button>
+              {migrationJob && (
+                <button
+                  type="button"
+                  className="btn btn-quiet"
+                  onClick={() => {
+                    close();
+                    navigateWorkspace({ page: 'mappings' });
+                  }}
+                >
+                  Review user mappings
+                </button>
+              )}
+            </div>
+          </Callout>
+        )}
         {migrationJob &&
           job.workflow_elapsed_ms !== undefined &&
           job.preview_timing &&

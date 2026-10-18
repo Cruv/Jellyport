@@ -1,43 +1,15 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
 import { Callout, Icon } from './components';
-import type { Api, Notify } from './types';
+import DailyImportSchedule from './DailyImportSchedule';
+import {
+  ImportStatus,
+  importAge as age,
+  importTimestamp as timestamp,
+  useImportClock,
+  useImportWorkflow,
+} from './ImportWorkflow';
+import type { Api, Notify, DestinationCatalogStatus } from './types';
+export type { DestinationCatalogStatus } from './types';
 
-export interface DestinationCatalogMetadata {
-  id: string;
-  items: number;
-  keys: number;
-  bytes: number;
-  server_version: string;
-  backup_engine_version: string;
-  backup_created_at: string;
-  imported_at: string;
-  import_elapsed_ms: number;
-  expires_at: string;
-}
-
-export interface DestinationCatalogStatus {
-  usable?: boolean;
-  configured: boolean;
-  available: boolean;
-  running: boolean;
-  record: DestinationCatalogMetadata | null;
-  last_error: string | null;
-  last_attempt_at: string | null;
-}
-
-const timestamp = (value: string) => {
-  const parsed = new Date(value);
-  return Number.isFinite(parsed.getTime()) ? parsed.toLocaleString() : 'Time unavailable';
-};
-const age = (value: string, now: number) => {
-  const minutes = Math.max(0, Math.floor((now - Date.parse(value)) / 60_000));
-  if (!Number.isFinite(minutes)) return 'Age unavailable';
-  return minutes < 1
-    ? 'Just now'
-    : minutes < 60
-      ? `${minutes}m old`
-      : `${Math.floor(minutes / 60)}h ${minutes % 60}m old`;
-};
 const duration = (milliseconds: number) =>
   milliseconds < 1000 ? `${Math.round(milliseconds)} ms` : `${(milliseconds / 1000).toFixed(1)} s`;
 
@@ -45,131 +17,44 @@ export default function DestinationCatalogPanel({
   api,
   notify,
   demo,
+  active = true,
 }: {
   api: Api;
   notify: Notify;
   demo: boolean;
+  active?: boolean;
 }) {
-  const [status, setStatus] = useState<DestinationCatalogStatus | null>(null);
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState<'import' | 'clear' | ''>('');
-  const [loading, setLoading] = useState(false);
-  const [now, setNow] = useState(Date.now);
-  const mounted = useRef(false);
-  const changing = useRef(false);
-  const active = useRef<AbortController | null>(null);
-  const requestVersion = useRef(0);
-
-  const load = useCallback(async () => {
-    if (changing.current) return;
-    active.current?.abort();
-    const controller = new AbortController();
-    active.current = controller;
-    const version = ++requestVersion.current;
-    setLoading(true);
-    try {
-      const value = await api<DestinationCatalogStatus>('/api/destination-catalog', {
-        signal: controller.signal,
-      });
-      if (!mounted.current || controller.signal.aborted || requestVersion.current !== version)
-        return;
-      setStatus(value);
-      setNow(Date.now());
-      setError('');
-    } catch {
-      if (mounted.current && !controller.signal.aborted && requestVersion.current === version)
-        setError('Jellyfin catalog status could not be loaded. Refresh status to try again.');
-    } finally {
-      if (mounted.current && requestVersion.current === version) setLoading(false);
-    }
-  }, [api]);
-
-  useEffect(() => {
-    mounted.current = true;
-    changing.current = false;
-    setBusy('');
-    void load();
-    return () => {
-      mounted.current = false;
-      changing.current = false;
-      requestVersion.current++;
-      active.current?.abort();
-    };
-  }, [load]);
-
-  useEffect(() => {
-    if (!status?.running || busy) return;
-    let stopped = false;
-    let timer: ReturnType<typeof setTimeout>;
-    const poll = async () => {
-      await load();
-      if (!stopped) timer = setTimeout(() => void poll(), 2000);
-    };
-    timer = setTimeout(() => void poll(), 2000);
-    return () => {
-      stopped = true;
-      clearTimeout(timer);
-    };
-  }, [status?.running, busy, load]);
-
+  const { status, busy, loading, error, uncertain, stale, load, change } =
+    useImportWorkflow<DestinationCatalogStatus>({
+      api,
+      notify,
+      demo,
+      active,
+      path: '/api/destination-catalog',
+      statusError: 'Jellyfin catalog status could not be loaded. Refresh status to try again.',
+    });
   const record = status?.record;
-  useEffect(() => {
-    if (!record) return;
-    const tick = () => setNow(Date.now());
-    const interval = setInterval(tick, 60_000);
-    const remaining = Date.parse(record.expires_at) - Date.now();
-    const expiry =
-      Number.isFinite(remaining) && remaining > 0 ? setTimeout(tick, remaining) : undefined;
-    return () => {
-      clearInterval(interval);
-      if (expiry !== undefined) clearTimeout(expiry);
-    };
-  }, [record?.id, record?.expires_at]);
-
-  async function change(kind: 'import' | 'clear') {
+  const now = useImportClock(
+    [...(record ? [record.expires_at] : []), ...(status?.next_run_at ? [status.next_run_at] : [])],
+    active,
+  );
+  async function manual(kind: 'import' | 'clear') {
     if (
-      demo ||
-      changing.current ||
       !status ||
-      status.running ||
-      (kind === 'import' ? !status.configured || !status.available : !status.record)
+      (kind === 'import' && (!status.configured || !status.available)) ||
+      (kind === 'clear' && !record)
     )
       return;
-    changing.current = true;
-    active.current?.abort();
-    const controller = new AbortController();
-    active.current = controller;
-    const version = ++requestVersion.current;
-    setBusy(kind);
-    setLoading(false);
-    setError('');
-    try {
-      const value = await api<DestinationCatalogStatus>(
-        kind === 'import' ? '/api/destination-catalog/refresh' : '/api/destination-catalog',
-        { method: kind === 'import' ? 'POST' : 'DELETE', signal: controller.signal },
-      );
-      if (!mounted.current || controller.signal.aborted || requestVersion.current !== version)
-        return;
-      setStatus(value);
-      setNow(Date.now());
-      notify(
-        kind === 'import'
-          ? 'Jellyfin backup import started. You can follow its status here.'
-          : 'Saved Jellyfin matching catalog cleared.',
-      );
-    } catch {
-      if (mounted.current && !controller.signal.aborted && requestVersion.current === version)
-        setError(
-          kind === 'import'
-            ? 'Jellyfin backup import could not start. Check the completed backup and refresh status.'
-            : 'The matching catalog could not be cleared. An import or migration may still be using it. Refresh status and try again.',
-        );
-    } finally {
-      if (requestVersion.current === version) {
-        changing.current = false;
-        if (mounted.current) setBusy('');
-      }
-    }
+    await change(
+      kind,
+      { method: kind === 'import' ? 'POST' : 'DELETE' },
+      kind === 'import'
+        ? 'Jellyfin backup import started. You can follow its status here.'
+        : 'Saved Jellyfin matching catalog cleared.',
+      kind === 'import'
+        ? 'Jellyfin backup import could not start. Check the completed backup and refresh status.'
+        : 'The matching catalog could not be cleared. An import or migration may still be using it. Refresh status and try again.',
+    );
   }
 
   const expired =
@@ -233,45 +118,92 @@ export default function DestinationCatalogPanel({
             }
           >
             Import a recent, completed Jellyfin database backup before starting a migration with
-            saved matching data. The last imported catalog remains listed for review.
+            saved matching data.{' '}
+            {record
+              ? 'The last imported catalog remains listed for review.'
+              : 'No matching catalog has been imported yet.'}
           </Callout>
         )}
-        {error && (
-          <p className="error-block" role="alert">
-            {error}
-          </p>
-        )}
-        {status?.last_error && (
-          <p className="error-block" role="alert">
-            {status.last_error}
-          </p>
-        )}
-        <div className="status-summary form-stack" role="status" aria-live="polite">
-          <strong>
-            {status?.running
-              ? 'Importing Jellyfin backup…'
-              : !status
-                ? loading
-                  ? 'Loading Jellyfin catalog status…'
-                  : 'Jellyfin catalog status unavailable'
-                : usable
-                  ? 'Saved matching catalog available'
-                  : record
-                    ? expired
-                      ? 'Saved matching catalog expired'
-                      : 'Saved matching catalog unavailable'
-                    : 'No saved Jellyfin matching catalog'}
-          </strong>
-          {status?.running && <progress aria-label="Jellyfin catalog import progress" />}
-          {status?.last_attempt_at && (
-            <p className="muted text-small">
-              Last import attempt {timestamp(status.last_attempt_at)}
-            </p>
-          )}
+        <ImportStatus
+          status={status}
+          loading={loading}
+          starting={busy === 'import'}
+          error={error}
+          stale={stale}
+          uncertain={uncertain}
+          initialLabel="Loading Jellyfin catalog status…"
+          runningLabel="Importing Jellyfin backup…"
+          progressLabel="Jellyfin catalog import progress"
+          summary={
+            usable
+              ? 'Saved matching catalog available'
+              : record
+                ? expired
+                  ? 'Saved matching catalog expired'
+                  : 'Saved matching catalog unavailable'
+                : 'No saved Jellyfin matching catalog'
+          }
+        />
+        <div className="section-heading">
+          <h4>Import a backup now</h4>
+          <p>Manual actions do not change the daily schedule.</p>
         </div>
+        <div className="form-actions">
+          <button
+            className="btn btn-quiet"
+            type="button"
+            onClick={() => void load()}
+            disabled={!!busy || loading}
+          >
+            <Icon name="refresh" />
+            {loading ? 'Refreshing status…' : 'Refresh status'}
+          </button>
+          <button
+            className="btn btn-quiet"
+            type="button"
+            onClick={() => void manual('clear')}
+            disabled={demo || !!busy || uncertain || stale || !record || !!status?.running}
+          >
+            {busy === 'clear' ? 'Clearing catalog…' : 'Clear matching catalog'}
+          </button>
+          <button
+            className="btn btn-primary"
+            type="button"
+            onClick={() => void manual('import')}
+            disabled={
+              demo ||
+              !!busy ||
+              uncertain ||
+              stale ||
+              !status?.configured ||
+              !status.available ||
+              status.running
+            }
+          >
+            {busy === 'import' ? 'Starting import…' : 'Import latest Jellyfin backup'}
+          </button>
+        </div>
+        {status?.config && (
+          <DailyImportSchedule
+            id="jellyfin-import"
+            config={status.config}
+            nextRun={status.next_run_at}
+            busy={busy}
+            demo={demo}
+            onSave={async (input) => {
+              const value = await change(
+                'schedule',
+                { method: 'PUT', body: input },
+                'Jellyfin backup import schedule saved.',
+                'The schedule could not be saved. Your changes are kept; refresh status to verify the saved schedule before retrying.',
+              );
+              return value?.config;
+            }}
+          />
+        )}
         {record && (
           <div className="table-wrap">
-            <table aria-label="Imported Jellyfin catalog">
+            <table className="responsive-table" aria-label="Imported Jellyfin catalog">
               <thead>
                 <tr>
                   <th>Original backup</th>
@@ -281,13 +213,13 @@ export default function DestinationCatalogPanel({
               </thead>
               <tbody>
                 <tr>
-                  <td>
+                  <td data-label="Original backup">
                     <strong>{timestamp(record.backup_created_at)}</strong>
                     <small>{age(record.backup_created_at, now)}</small>
                     <small>Imported {timestamp(record.imported_at)}</small>
                     <small>Import duration {duration(record.import_elapsed_ms)}</small>
                   </td>
-                  <td>
+                  <td data-label="Contents">
                     <strong>{record.items.toLocaleString()} matching items</strong>
                     <small>
                       {record.keys.toLocaleString()} matching keys ·{' '}
@@ -298,7 +230,7 @@ export default function DestinationCatalogPanel({
                       {record.backup_engine_version}
                     </small>
                   </td>
-                  <td>
+                  <td data-label="Availability">
                     <strong>{expired ? 'Expired' : usable ? 'Available' : 'Unavailable'}</strong>
                     <small>Expires {timestamp(record.expires_at)}</small>
                   </td>
@@ -307,33 +239,6 @@ export default function DestinationCatalogPanel({
             </table>
           </div>
         )}
-        <div className="form-actions">
-          <button
-            className="btn btn-quiet"
-            type="button"
-            onClick={() => void load()}
-            disabled={!!busy || loading}
-          >
-            <Icon name="refresh" />
-            {loading ? 'Refreshing catalog status…' : 'Refresh catalog status'}
-          </button>
-          <button
-            className="btn btn-quiet"
-            type="button"
-            onClick={() => void change('clear')}
-            disabled={demo || !!busy || !record || !!status?.running}
-          >
-            {busy === 'clear' ? 'Clearing catalog…' : 'Clear matching catalog'}
-          </button>
-          <button
-            className="btn btn-primary"
-            type="button"
-            onClick={() => void change('import')}
-            disabled={demo || !!busy || !status?.configured || !status.available || status.running}
-          >
-            {busy === 'import' ? 'Starting import…' : 'Import latest Jellyfin backup'}
-          </button>
-        </div>
         {demo && (
           <p className="muted text-small">Demo mode: Jellyfin catalog changes are disabled.</p>
         )}

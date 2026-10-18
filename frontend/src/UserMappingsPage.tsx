@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useRouteTab } from './routing';
+import { useWorkspaceDraftState } from './workspace-drafts';
 import { Empty, Heading, Icon, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import { UserWarnings } from './SettingsPage';
@@ -32,14 +33,20 @@ export default function UserMappingsPage({
     ),
   );
   const mappingPage = usePagination(filteredMappings, 25, query);
-  const [editing, setEditing] = useState<UserMapping | null>(null);
-  const [sourceId, setSourceId] = useState('');
-  const [targetId, setTargetId] = useState('');
-  const [targetName, setTargetName] = useState('');
-  const [discordName, setDiscordName] = useState('');
-  const [discordId, setDiscordId] = useState('');
-  const [membershipSlot, setMembershipSlot] = useState(1);
-  const [discordMember, setDiscordMember] = useState<DiscordMember | null>(null);
+  const [editing, setEditing] = useWorkspaceDraftState<UserMapping | null>(
+    'mappings.editing',
+    null,
+  );
+  const [sourceId, setSourceId] = useWorkspaceDraftState('mappings.sourceId', '');
+  const [targetId, setTargetId] = useWorkspaceDraftState('mappings.targetId', '');
+  const [targetName, setTargetName] = useWorkspaceDraftState('mappings.targetName', '');
+  const [discordName, setDiscordName] = useWorkspaceDraftState('mappings.discordName', '');
+  const [discordId, setDiscordId] = useWorkspaceDraftState('mappings.discordId', '');
+  const [membershipSlot, setMembershipSlot] = useWorkspaceDraftState('mappings.membershipSlot', 1);
+  const [discordMember, setDiscordMember] = useWorkspaceDraftState<DiscordMember | null>(
+    'mappings.discordMember',
+    null,
+  );
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const [error, setError] = useState('');
@@ -166,7 +173,7 @@ export default function UserMappingsPage({
         title="User mappings"
         description="Connect Emby, Jellyfin, and Discord identities when usernames differ."
         actions={
-          <button className="btn" onClick={() => void refresh()} disabled={busy}>
+          <button className="btn btn-quiet" onClick={() => void refresh()} disabled={busy}>
             <Icon name="refresh" />
             Refresh
           </button>

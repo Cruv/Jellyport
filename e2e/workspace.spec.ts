@@ -81,7 +81,10 @@ test('settings task tabs preserve drafts and independent schedules without expos
   await expect(page.getByRole('heading', { name: 'Saved Emby database snapshots' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Saved Jellyfin matching catalog' })).toBeHidden();
   await expect(page.getByRole('button', { name: 'Save settings', exact: true })).toBeHidden();
-  const schedule = page.locator('summary').filter({ hasText: /^Daily schedule$/ });
+  const schedule = page
+    .getByRole('region', { name: 'Saved Emby database snapshots', exact: true })
+    .locator('summary')
+    .filter({ hasText: /^Daily schedule$/ });
   await expect(schedule).toBeVisible();
   await schedule.click();
   const time = page.getByLabel('Capture time', { exact: true });
@@ -148,6 +151,16 @@ test('each focused Settings view has bounded content and a contained responsive 
     await nav.getByRole('tab', { name: main, exact: true }).click();
     await page.getByRole('tab', { name: sub, exact: true }).click();
     await expect(page.getByRole('heading', { name: heading, exact: true })).toBeVisible();
+    if (main === 'Saved history') {
+      const copy =
+        sub === 'Emby backup'
+          ? 'No saved Emby history is available yet.'
+          : 'No matching catalog has been imported yet.';
+      await expect(page.getByText(copy, { exact: false })).toBeVisible();
+      await expect(
+        page.getByText(/(?:Saved captures remain listed|The last imported catalog remains listed)/),
+      ).toHaveCount(0);
+    }
     await expect(page.getByRole('tabpanel')).toHaveCount(2);
     await expectContainedLayout(page);
     const contentHeight = await page

@@ -71,6 +71,84 @@ afterEach(() => {
 });
 
 describe('Saved Emby database capture settings', () => {
+  it.each([false, true])(
+    'shows retained source data guidance only when saved captures exist (retained=%s)',
+    async (retained) => {
+      const api: Api = async <T,>() =>
+        ({
+          ...pluginStatus,
+          available: false,
+          snapshots: retained ? 1 : 0,
+          records: retained ? pluginStatus.records : [],
+        }) as T;
+      render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+      await screen.findByText('Emby backup source is unavailable.');
+      if (retained) {
+        expect(screen.getByText(/Saved captures remain listed below/)).toBeTruthy();
+        expect(screen.getByText('All Emby users')).toBeTruthy();
+        expect(screen.queryByText(/No saved Emby history is available yet/)).toBeNull();
+      } else {
+        expect(screen.getByText(/No saved Emby history is available yet/)).toBeTruthy();
+        expect(screen.queryByText(/Saved captures remain listed below/)).toBeNull();
+        expect(screen.queryByText('All Emby users')).toBeNull();
+        expect(screen.getByRole('button', { name: 'Import latest backup' })).toHaveProperty(
+          'disabled',
+          true,
+        );
+      }
+    },
+  );
+  it('updates original-backup freshness at the exact expiry without another status request', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime('2026-10-16T02:59:59Z');
+    const api = vi.fn(async () => pluginStatus) as Api;
+    render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+    await act(async () => {});
+    expect(screen.getByText('Saved Emby history available')).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(screen.getByText('Saved Emby history expired')).toBeTruthy();
+    expect(screen.getByText('Expired')).toBeTruthy();
+    expect(vi.mocked(api)).toHaveBeenCalledOnce();
+  });
+
+  it('keeps an older session mutation from releasing a new request guard', async () => {
+    let resolveOld!: (value: SourceSnapshotStatus) => void,
+      resolveNew!: (value: SourceSnapshotStatus) => void;
+    const oldReply = new Promise<SourceSnapshotStatus>((resolve) => {
+      resolveOld = resolve;
+    });
+    const newReply = new Promise<SourceSnapshotStatus>((resolve) => {
+      resolveNew = resolve;
+    });
+    let newWrites = 0;
+    let oldSignal: AbortSignal | undefined;
+    const oldApi: Api = async <T,>(_path: string, options?: ApiOptions) => {
+      if (!options?.method) return pluginStatus as T;
+      oldSignal = options.signal;
+      return (await oldReply) as T;
+    };
+    const newApi: Api = async <T,>(_path: string, options?: ApiOptions) => {
+      if (!options?.method) return pluginStatus as T;
+      newWrites++;
+      return (await newReply) as T;
+    };
+    const notify = vi.fn();
+    const view = render(<SourceSnapshotsPanel api={oldApi} notify={notify} demo={false} />);
+    await screen.findByLabelText('Import time');
+    fireEvent.click(screen.getByRole('button', { name: 'Import latest backup' }));
+    view.rerender(<SourceSnapshotsPanel api={newApi} notify={notify} demo={false} />);
+    await screen.findByRole('button', { name: 'Import latest backup' });
+    expect(oldSignal?.aborted).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Import latest backup' }));
+    await act(async () => resolveOld({ ...pluginStatus, running: true }));
+    fireEvent.click(screen.getByRole('button', { name: 'Starting import…' }));
+    expect(newWrites).toBe(1);
+    expect(notify).not.toHaveBeenCalled();
+    await act(async () => resolveNew({ ...pluginStatus, running: true }));
+    expect(notify).toHaveBeenCalledOnce();
+  });
   it('keeps the schedule collapsed until requested and preserves its draft across closing', async () => {
     const api = vi.fn(async () => pluginStatus) as Api;
     render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
@@ -182,7 +260,7 @@ describe('Saved Emby database capture settings', () => {
     render(<SourceSnapshotsPanel api={api} notify={notify} demo={false} />);
     const time = await screen.findByLabelText('Import time');
     expect(screen.getByLabelText('Enable daily backup import')).toHaveProperty('checked', false);
-    expect(screen.getByText(/This does not change Emby’s backup schedule/)).toBeTruthy();
+    expect(screen.getByText(/Jellyport imports an existing completed backup/)).toBeTruthy();
     fireEvent.click(screen.getByLabelText('Enable daily backup import'));
     fireEvent.change(time, { target: { value: '04:15' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save import schedule' }));
@@ -278,9 +356,8 @@ describe('Saved Emby database capture settings', () => {
     expect(screen.getByText('SQLite online backup')).toBeTruthy();
     expect(screen.getByText(/consistent SQLite online backup is captured/)).toBeTruthy();
     expect(screen.getByText(/Live file copies are not transactional/)).toBeTruthy();
-    expect(
-      screen.getByText(/Database capture validation failed.*Previous valid captures are retained/),
-    ).toBeTruthy();
+    expect(screen.getByText('Database capture validation failed.')).toBeTruthy();
+    expect(screen.getByText('Previous valid saved data is retained.')).toBeTruthy();
     expect(screen.getByText(/Failed captures keep the last good copy/)).toBeTruthy();
     expect(screen.queryByText('Scheduled file copy')).toBeNull();
   });
@@ -387,11 +464,11 @@ describe('Saved Emby database capture settings', () => {
     render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
     await screen.findByText('All Emby users');
     expect(screen.getByText(/Unsupported Emby database schema/)).toBeTruthy();
-    expect(screen.getByText(/Previous valid captures are retained/)).toBeTruthy();
+    expect(screen.getByText(/Previous valid saved data is retained/)).toBeTruthy();
     expect(screen.getByText(/Emby 4.10.1.0/)).toBeTruthy();
     expect(screen.queryByText('http://emby:8096')).toBeNull();
     fail = true;
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh snapshot status' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
     await screen.findByRole('alert');
     expect(screen.getByText('All Emby users')).toBeTruthy();
     expect(screen.queryByText(/PRIVATE_DATABASE_PATH/)).toBeNull();

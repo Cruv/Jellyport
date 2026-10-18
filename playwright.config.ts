@@ -24,7 +24,11 @@ export default defineConfig({
     },
     {
       name: 'iphone-landscape',
-      testMatch: '**/iphone-admin.spec.ts',
+      testMatch: [
+        '**/iphone-admin.spec.ts',
+        '**/media-admin-*.spec.ts',
+        '**/history-cleanup.spec.ts',
+      ],
       use: { ...devices['iPhone 16 Pro Max landscape'], browserName: 'webkit' },
     },
   ],

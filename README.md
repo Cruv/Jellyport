@@ -186,6 +186,13 @@ The helper is optional, network-isolated and read-only against its source. Plugi
 
 Automatic capture/import scheduling is off by default. Plugin-backed web migrations default to saved history, including when the helper is unavailable; an unknown configured source requires an explicit choice. Legacy capture setups default to live reads. A saved preview pins the shown generations. Missing, incompatible, changed or expired history stops the review without switching to a live scan. History expires after 48 hours, measured from the original backup date for plugin imports.
 
+**Settings → Saved history** provides independent daily schedules for the Emby
+history import and Jellyfin matching catalog. Both show the saved time/zone, next
+run and last attempt/outcome, and share the same progress treatment. They import
+completed backups rather than creating backups on either server. See
+[daily scheduling and recovery](docs/jellyfin-backup-catalog.md#daily-import-scheduling)
+for daylight-saving, missed-run, restart and overlap behavior.
+
 Played-state migration can use saved history. It validates current source identity but does not read Emby preferences, images or playlists. Destination access and activity remain live. Existing broader saved projections remain readable, but only played flags are eligible for transfer. Protect the exchange and helper-work directories: the exchange contains encryption material, and raw copies can contain private account data. See [snapshot capabilities and retention](docs/migration-capabilities.md#saved-emby-source-snapshots--0120).
 
 ### Map accounts with different usernames
@@ -271,13 +278,15 @@ If a creation times out or stops before initialization finishes, inspect Jellyfi
 
 For an incomplete numbered account, inspect its exact username and select the same Discord owner for recovery. Jellyport checks the account slot against the member's active allowance before resetting a password or linking the account. Recovery cannot claim another member's account or reactivate a slot outside the current tier.
 
-## Clear activity and reports
+<a id="clear-activity-and-reports"></a>
+
+## Delete activity and reports
 
 Open **Activity → Delete activity…** to review finished operations from all history or the current Activity filters. The manual review defaults to **Any time**, including recent **Failed** and **Needs review** reports. You can restrict it to records older than 7, 30, or 90 days before confirming the displayed count. The finish date is used when available, otherwise the last update or creation date. The selection stays fixed while the confirmation is open. Each finished Activity row also has a **Delete** button for a single report; the same review is available from its details under **Delete report…**.
 
-Clearing permanently removes Jellyport's selected activity records and migration reports. It does not undo migrations or change accounts, permissions, passwords, or watch history on either media server. Running, queued, or still-finalizing operations are protected, as are reports needed for unexpired credential delivery, uncertain account recovery, or an in-progress subscription action. The result shows how many were cleared and why others were kept. Up to 1,000 reports can be cleared in one request; narrow larger selections by age or filters.
+Deletion permanently removes Jellyport's selected activity records and migration reports. It does not undo migrations or change accounts, permissions, passwords, or watch history on either media server. Running, queued, or still-finalizing operations are protected, as are reports needed for unexpired credential delivery, uncertain account recovery, or an in-progress subscription action. The result shows how many were deleted and why others were kept. Up to 1,000 reports can be deleted in one request; narrow larger selections by age or filters.
 
-Account and playlist recovery journals, identity links, membership records, and subscription deduplication remain intact. A subscription whose report was cleared keeps its event status and displays **Report cleared** instead of a broken report link. Existing backups are unchanged. SQLite can reuse space freed by cleanup, although the database file may not immediately shrink.
+Account and playlist recovery journals, identity links, membership records, and subscription deduplication remain intact. A subscription whose report was deleted keeps its event status and displays **Report deleted** instead of a broken report link. Existing backups are unchanged. SQLite can reuse space freed by cleanup, although the database file may not immediately shrink.
 
 For automatic cleanup, open **Settings → Activity**, enable retention, and choose how many days to keep reports (1–3,650 days; 30 is suggested). This saves independently from connection and account settings. Automatic cleanup is disabled by default, including after upgrading an existing installation. Once enabled, Jellyport checks every minute and considers up to 100 old finished reports per tick, using the same date preference and protections as manual cleanup. Ambiguous or malformed timestamps are kept for manual review. Failed and Needs review reports are eligible once old enough; protected reports stay until their delivery or recovery requirement is resolved. Large backlogs drain gradually, and protected records do not block later eligible reports. Disabling retention stops future automatic cleanup; it does not restore removed reports. The settings panel shows aggregate results from the latest check since app startup. Cleanup uses Jellyport's local database and makes no media-server requests.
 
@@ -383,6 +392,9 @@ The browser uses authenticated session cookies. Mutating API requests require th
 | Assign or unassign saved roles without remote writes | `POST /api/account-roles/assign`, `POST /api/account-roles/unassign` |
 | Queue selected role setting groups for assigned users | `POST /api/account-roles/apply` |
 | Test server connections | `POST /api/connections/test` |
+| Inspect saved Emby history or Jellyfin matching catalog imports | `GET /api/source-snapshots`, `GET /api/destination-catalog` |
+| Start an import of the latest completed backup | `POST /api/source-snapshots/refresh`, `POST /api/destination-catalog/refresh` (accepted background work) |
+| Save each independent daily import schedule | `PUT /api/source-snapshots/schedule`, `PUT /api/destination-catalog/schedule` with `enabled`, `hour`, `minute`, `time_zone`, `expected_revision`; Emby also requires `scope` |
 | List source and destination users | `GET /api/users` |
 | Read the combined user directory | `GET /api/user-directory` |
 | Save a selected account's family flag and private owner notes | `POST /api/account-profiles` |
@@ -401,7 +413,7 @@ The browser uses authenticated session cookies. Mutating API requests require th
 | Inspect or recover an incomplete creation | `GET /api/accounts/recovery`, `POST /api/accounts/recover` |
 | List or inspect jobs | `GET /api/jobs`, `GET /api/jobs/{job_id}` |
 | Cancel queued or running work and preserve applied changes | `POST /api/jobs/{job_id}/cancel` |
-| Clear reviewed finished activity and migration reports locally | `POST /api/jobs/cleanup` with `{"job_ids":["JOB_ID"]}` |
+| Delete reviewed finished activity and migration reports locally | `POST /api/jobs/cleanup` with `{"job_ids":["JOB_ID"]}` |
 | Inspect or configure automatic report retention | `GET /api/jobs/retention`, `PUT /api/jobs/retention` with `{"retention_days":30}` (`0` disables) |
 | Consume retained credentials | `POST /api/jobs/{job_id}/credentials` |
 | Review, apply, or ignore membership events | `GET /api/subscriptions`, `POST /api/subscriptions/{event_id}/apply`, `POST /api/subscriptions/{event_id}/ignore` |

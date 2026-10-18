@@ -537,3 +537,74 @@ describe('New account password and message settings', () => {
     expect(p.requests.every((request) => request.path === '/api/account-roles')).toBe(true);
   });
 });
+
+describe('Settings draft and submission safeguards', () => {
+  it('keeps dirty server/password/message/default drafts when newer settings arrive', () => {
+    const p = passwordPage({ ...oldSettings, default_role_id: 'old-role' });
+    fireEvent.change(screen.getByLabelText('Generated password length'), {
+      target: { value: '22' },
+    });
+    fireEvent.change(screen.getByLabelText('New account message'), {
+      target: { value: 'Draft {username}: {password} {server_url}' },
+    });
+    settingsTab('Servers');
+    fireEvent.change(document.getElementById('setting-emby_url')!, {
+      target: { value: 'http://draft-source.example.test' },
+    });
+    p.rerender(
+      <SettingsPage
+        {...p.props}
+        settings={{
+          ...oldSettings,
+          emby_url: 'http://newer-source.example.test',
+          password_length: 30,
+          credential_message_template: 'Newer {username} {password} {server_url}',
+          default_role_id: 'new-role',
+        }}
+      />,
+    );
+    expect((document.getElementById('setting-emby_url') as HTMLInputElement).value).toBe(
+      'http://draft-source.example.test',
+    );
+    settingsTab('Account defaults');
+    expect((screen.getByLabelText('Default account role') as HTMLSelectElement).value).toBe(
+      'old-role',
+    );
+    fireEvent.click(screen.getByRole('tab', { name: 'Passwords & messages' }));
+    expect((screen.getByLabelText('Generated password length') as HTMLInputElement).value).toBe(
+      '22',
+    );
+    expect((screen.getByLabelText('New account message') as HTMLTextAreaElement).value).toBe(
+      'Draft {username}: {password} {server_url}',
+    );
+    expect(p.requests.filter((r) => r.options?.method === 'PUT')).toHaveLength(0);
+  });
+  it('allows one settings submission at a time and protects submitted fields while pending', async () => {
+    let finish!: (value: unknown) => void;
+    const p = page(oldSettings, (async (path: string, options?: ApiOptions) => {
+      if (path === '/api/settings' && options?.method === 'PUT')
+        return new Promise<unknown>((resolve) => {
+          finish = resolve;
+        });
+      throw new Error('Unexpected request');
+    }) as Api);
+    fireEvent.change(document.getElementById('setting-emby_url')!, {
+      target: { value: 'http://saved-source.example.test' },
+    });
+    const form = screen.getByRole('button', { name: 'Save settings' }).closest('form')!;
+    fireEvent.submit(form);
+    fireEvent.submit(form);
+    await waitFor(() =>
+      expect(
+        p.requests.filter((r) => r.path === '/api/settings' && r.options?.method === 'PUT'),
+      ).toHaveLength(1),
+    );
+    expect(
+      (document.getElementById('setting-emby_url') as HTMLInputElement).closest('fieldset')!
+        .disabled,
+    ).toBe(true);
+    finish({});
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(screen.getByRole('button', { name: 'Save settings' })).toHaveProperty('disabled', false);
+  });
+});

@@ -89,6 +89,10 @@ directories, page/tab restoration after reload and browser Back/Forward,
 sign-in/out, credential reveal, explicit migration approval, and reviewed
 single/bulk activity deletion. Bookmark tests check that private fields are not
 serialized and that returning to a view never replays an action.
+Writable administration scenarios run isolated Fastify apps with temporary
+storage and fake media, authentication and bot adapters. They verify persisted
+mapping/role/account/membership outcomes, uncertain creation recovery and private
+in-memory draft lifetime; they cannot target a production server.
 It uses the built interface and real Jellyport API with simulated media servers. These are behavioral and layout checks, not pixel-baseline comparisons
 or a guarantee of support for every browser.
 

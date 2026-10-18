@@ -13,6 +13,13 @@ import {
 import type { Settings } from './types.js';
 import type { PathMapping } from './matching.js';
 import { ServiceError } from './errors.js';
+import {
+  dailyImportSchedule,
+  ImportCoordinator,
+  validateDailyImportConfig,
+  type DailyImportConfig,
+  type ImportOutcome,
+} from './daily-import-schedule.js';
 import { snapshotProcess } from './snapshot-process.js';
 import { decryptDatabase, readEnvelope, snapshotKey, writeEnvelope } from './snapshot-files.js';
 import {
@@ -31,11 +38,15 @@ const CLEANUP_ERROR =
   'Temporary Jellyfin catalog cleanup failed. Review private storage permissions before importing or reading more data.';
 const IDLE_MS = 60_000;
 interface State {
+  config: DailyImportConfig;
   configured: boolean;
   generations: DestinationCatalogResult[];
   active?: DestinationCatalogRequest;
   last_attempt_at: string | null;
   last_error: string | null;
+  last_finished_at?: string | null;
+  last_outcome?: ImportOutcome;
+  last_scheduled_date?: string;
 }
 interface DatabaseEntry {
   promise: Promise<string>;
@@ -139,6 +150,8 @@ export class DestinationCatalogs {
   private ticking = false;
   private stopping = false;
   private clearing = false;
+  private starting = false;
+  private readonly imports: ImportCoordinator;
   private revision = 0;
   private readonly reads = new AbortController();
   private readonly databases = new Map<string, DatabaseEntry>();
@@ -148,6 +161,7 @@ export class DestinationCatalogs {
     private readonly options: {
       demo?: boolean;
       clientFactory: () => ClientFactory;
+      imports?: ImportCoordinator;
     },
   ) {
     const mode = process.env.JELLYPORT_JELLYFIN_CATALOG_MODE;
@@ -159,11 +173,37 @@ export class DestinationCatalogs {
     this.state = row
       ? store.decrypt<State>(row.encrypted as Uint8Array)
       : {
+          config: {
+            enabled: false,
+            hour: 3,
+            minute: 0,
+            time_zone: process.env.TZ || 'Etc/UTC',
+            revision: randomUUID(),
+          },
           configured: false,
           generations: [],
           last_attempt_at: null,
           last_error: null,
         };
+    this.imports = options.imports ?? new ImportCoordinator();
+    if (this.state.active) this.imports.restore(`jellyfin:${this.state.active.id}`);
+    if (!this.state.config) {
+      this.state.config = {
+        enabled: false,
+        hour: 3,
+        minute: 0,
+        time_zone: process.env.TZ || 'Etc/UTC',
+        revision: randomUUID(),
+      };
+      this.save();
+    }
+    if (!this.state.active && this.state.last_outcome === 'running') {
+      this.state.last_outcome = 'interrupted';
+      this.state.last_finished_at = new Date().toISOString();
+      this.state.last_error =
+        'Jellyfin import preparation was interrupted before a helper request was saved. Check status before starting a new import. The last good catalog is preserved.';
+      this.save();
+    }
     if (mode === 'backup' && !this.state.configured) {
       this.state.configured = true;
       this.save();
@@ -244,14 +284,48 @@ export class DestinationCatalogs {
       /* An expired/missing record remains visible, but cannot be selected. */
     }
     return {
+      config: this.state.config,
+      next_run_at: dailyImportSchedule(this.state.config, this.state.last_scheduled_date)
+        .next_run_at,
       configured: this.state.configured,
       available,
       usable,
-      running: !!this.state.active,
+      running: this.starting || !!this.state.active,
       record,
       last_attempt_at: this.state.last_attempt_at,
+      last_finished_at:
+        this.state.last_finished_at === undefined
+          ? (this.state.generations[0]?.finished_at ?? null)
+          : this.state.last_finished_at,
       last_error: this.state.last_error,
+      last_outcome:
+        this.starting || this.state.active
+          ? ('running' as const)
+          : (this.state.last_outcome ??
+            (this.state.last_error
+              ? 'failed'
+              : this.state.generations.length
+                ? 'succeeded'
+                : null)),
     };
+  }
+  async configure(input: Omit<DailyImportConfig, 'revision'> & { expected_revision: string }) {
+    if (this.options.demo)
+      throw new ServiceError('Jellyfin import changes are unavailable in demo mode.');
+    if (input.expected_revision !== this.state.config.revision)
+      throw new ServiceError('The import schedule changed. Reload it before saving.');
+    validateDailyImportConfig(input);
+    if (input.enabled && (!this.key || !this.state.configured))
+      throw new ServiceError('Configure the Jellyfin backup helper and shared directory first.');
+    this.state.config = {
+      enabled: input.enabled,
+      hour: input.hour,
+      minute: input.minute,
+      time_zone: input.time_zone,
+      revision: randomUUID(),
+    };
+    this.save();
+    return this.status();
   }
   /** Queue pinning is synchronous; execution authenticates the file and live identity again. */
   queuedSelection(settings: Settings): string | undefined {
@@ -274,73 +348,111 @@ export class DestinationCatalogs {
   }
   async refresh() {
     const revision = this.revision;
-    if (this.stopping || this.clearing || this.options.demo || !this.key || !(await this.helper()))
+    if (this.stopping || this.clearing)
+      throw new ServiceError('The Jellyfin import is changing or stopping. Retry shortly.');
+    const id = randomUUID();
+    const owner = `jellyfin:${id}`;
+    if (this.state.active || !this.imports.acquire(owner))
       throw new ServiceError(
-        'The Jellyfin backup helper is unavailable. Check its backup folder and shared directory.',
+        'A backup import or capture is already running. Wait for it to finish.',
       );
-    if (this.state.active) throw new ServiceError('A Jellyfin catalog import is already running.');
-    await this.prune();
-    if (this.pendingCleanup.size) throw new ServiceError(CLEANUP_ERROR);
-    if (this.state.generations.length >= 8)
-      throw new ServiceError(
-        'Older Jellyfin catalogs are still used by jobs. Finish them before importing again.',
-      );
-    const settings = this.store.settings();
-    const client = this.options.clientFactory()(
-      settings.jellyfin_url,
-      settings.jellyfin_api_key,
-      'jellyfin',
-    );
-    let request: DestinationCatalogRequest;
-    try {
-      const info = await client.systemInfo();
-      if (
-        typeof info.Id !== 'string' ||
-        !/^[a-f0-9]{32}$/i.test(info.Id) ||
-        typeof info.Version !== 'string' ||
-        !normalizedServerVersion(info.Version)
-      )
-        throw new ServiceError('The linked Jellyfin server identity could not be verified.');
-      request = {
-        purpose: 'jellyfin_catalog',
-        id: randomUUID(),
-        requested_at: new Date().toISOString(),
-        binding: {
-          url: new URL(settings.jellyfin_url).toString(),
-          server_id: info.Id,
-          version: info.Version,
-        },
-      };
-    } finally {
-      await client.close();
-    }
-    if (
-      this.state.active ||
-      this.stopping ||
-      this.clearing ||
-      this.revision !== revision ||
-      this.pendingCleanup.size ||
-      this.store.settings().jellyfin_url !== settings.jellyfin_url ||
-      this.store.settings().jellyfin_api_key !== settings.jellyfin_api_key
-    )
-      throw new ServiceError('The Jellyfin connection or import changed. Reload before importing.');
-    this.state.active = request;
-    this.state.last_attempt_at = request.requested_at;
+    this.starting = true;
+    this.state.last_attempt_at = new Date().toISOString();
+    this.state.last_finished_at = null;
+    this.state.last_outcome = 'running';
     this.state.last_error = null;
-    this.save();
     try {
-      await writeEnvelope(
-        join(this.directory, `${destinationCatalogPrefix(request.id)}.request`),
-        request,
-        this.key,
-      );
-    } catch {
-      delete this.state.active;
-      this.state.last_error = 'Unable to request the Jellyfin catalog import.';
+      const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
+      if (due) this.state.last_scheduled_date = due.date;
       this.save();
-      throw new ServiceError(this.state.last_error);
+      if (
+        this.stopping ||
+        this.clearing ||
+        this.options.demo ||
+        !this.key ||
+        !(await this.helper())
+      )
+        throw new ServiceError(
+          'The Jellyfin backup helper is unavailable. Check its backup folder and shared directory.',
+        );
+      if (this.state.active)
+        throw new ServiceError('A Jellyfin catalog import is already running.');
+      await this.prune();
+      if (this.pendingCleanup.size) throw new ServiceError(CLEANUP_ERROR);
+      if (this.state.generations.length >= 8)
+        throw new ServiceError(
+          'Older Jellyfin catalogs are still used by jobs. Finish them before importing again.',
+        );
+      const settings = this.store.settings();
+      const client = this.options.clientFactory()(
+        settings.jellyfin_url,
+        settings.jellyfin_api_key,
+        'jellyfin',
+      );
+      let request: DestinationCatalogRequest;
+      try {
+        const info = await client.systemInfo();
+        if (
+          typeof info.Id !== 'string' ||
+          !/^[a-f0-9]{32}$/i.test(info.Id) ||
+          typeof info.Version !== 'string' ||
+          !normalizedServerVersion(info.Version)
+        )
+          throw new ServiceError('The linked Jellyfin server identity could not be verified.');
+        request = {
+          purpose: 'jellyfin_catalog',
+          id,
+          requested_at: new Date().toISOString(),
+          binding: {
+            url: new URL(settings.jellyfin_url).toString(),
+            server_id: info.Id,
+            version: info.Version,
+          },
+        };
+      } finally {
+        await client.close();
+      }
+      if (
+        this.state.active ||
+        this.stopping ||
+        this.clearing ||
+        this.revision !== revision ||
+        this.pendingCleanup.size ||
+        this.store.settings().jellyfin_url !== settings.jellyfin_url ||
+        this.store.settings().jellyfin_api_key !== settings.jellyfin_api_key
+      )
+        throw new ServiceError(
+          'The Jellyfin connection or import changed. Reload before importing.',
+        );
+      this.state.active = request;
+      this.state.last_attempt_at = request.requested_at;
+      this.state.last_error = null;
+      this.save();
+      try {
+        await writeEnvelope(
+          join(this.directory, `${destinationCatalogPrefix(request.id)}.request`),
+          request,
+          this.key,
+        );
+      } catch {
+        delete this.state.active;
+        this.state.last_error = 'Unable to request the Jellyfin catalog import.';
+        this.save();
+        throw new ServiceError(this.state.last_error);
+      }
+      return this.status();
+    } catch (error) {
+      delete this.state.active;
+      this.state.last_finished_at = new Date().toISOString();
+      this.state.last_outcome = 'failed';
+      this.state.last_error =
+        'Jellyfin catalog import could not start. Check the helper and configured Jellyfin connection. The last good catalog is preserved.';
+      this.save();
+      throw error;
+    } finally {
+      this.starting = false;
+      if (!this.state.active) this.imports.release(owner);
     }
-    return this.status();
   }
   private async validated(
     id: string,
@@ -455,12 +567,17 @@ export class DestinationCatalogs {
       await rm(join(this.directory, `${destinationCatalogPrefix(id)}.${suffix}`), { force: true });
   }
   private async tick(): Promise<void> {
-    if (!this.key || this.ticking || this.stopping || this.clearing) return;
+    if (!this.key || this.ticking || this.stopping || this.clearing || this.starting) return;
     this.ticking = true;
     try {
       await this.helper();
       const active = this.state.active;
       if (active) {
+        const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
+        if (due) {
+          this.state.last_scheduled_date = due.date;
+          this.save();
+        }
         let value: DestinationCatalogResult | undefined;
         try {
           value = await readEnvelope(
@@ -475,7 +592,11 @@ export class DestinationCatalogs {
           sameBinding(value.binding, active.binding)
         ) {
           let adopted = false;
-          if (!current(value) || !(await this.completeFile(value)))
+          if (value.ok === false)
+            this.state.last_error = value.error?.includes('was interrupted')
+              ? 'Jellyfin backup import was interrupted. Check the helper, then import the completed backup again. The last good catalog is preserved.'
+              : 'Jellyfin backup import failed. Check the completed backup, mounted folder, version and permissions. The last good catalog is preserved.';
+          else if (!current(value) || !(await this.completeFile(value)))
             this.state.last_error =
               'The Jellyfin backup could not be validated. The last good catalog is preserved.';
           else {
@@ -503,7 +624,16 @@ export class DestinationCatalogs {
               adopted = true;
             }
           }
+          this.state.last_finished_at = Number.isFinite(Date.parse(value.finished_at))
+            ? value.finished_at
+            : new Date().toISOString();
+          this.state.last_outcome = this.state.last_error
+            ? value.ok === false && value.error?.includes('was interrupted')
+              ? 'interrupted'
+              : 'failed'
+            : 'succeeded';
           delete this.state.active;
+          this.imports.release(`jellyfin:${active.id}`);
           this.save();
           if (!adopted) await this.generationFiles(active.id);
         } else if (
@@ -511,10 +641,26 @@ export class DestinationCatalogs {
           DESTINATION_CATALOG_DEADLINE + 60_000
         ) {
           delete this.state.active;
+          this.imports.release(`jellyfin:${active.id}`);
           this.state.last_error =
             'Jellyfin catalog import timed out. The last good catalog is preserved.';
+          this.state.last_finished_at = new Date().toISOString();
+          this.state.last_outcome = 'failed';
           this.save();
           await this.generationFiles(active.id);
+        }
+      }
+      const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
+      if (due && this.state.active) {
+        this.state.last_scheduled_date = due.date;
+        this.save();
+      } else if (due && !this.imports.busy) {
+        this.state.last_scheduled_date = due.date;
+        this.save();
+        try {
+          await this.refresh();
+        } catch {
+          /* refresh records a sanitized failed attempt. */
         }
       }
       await this.prune();

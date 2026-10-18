@@ -283,15 +283,33 @@ export interface SourceSnapshotMetadata {
   bytes: number;
   avatar: boolean;
 }
-export interface SourceSnapshotConfig {
+export interface ImportScheduleConfig {
   enabled: boolean;
   hour: number;
   minute: number;
   time_zone: string;
-  scope: SnapshotCaptureScope;
   revision: string;
 }
-export interface SourceSnapshotStatus {
+export type ImportOutcome = 'running' | 'succeeded' | 'failed' | 'interrupted' | null;
+export interface ImportWorkflowStatus {
+  running: boolean;
+  last_attempt_at: string | null;
+  last_finished_at?: string | null;
+  last_outcome?: ImportOutcome;
+  next_run_at?: string | null;
+  last_error: string | null;
+}
+export interface SourceSnapshotConfig extends ImportScheduleConfig {
+  scope: SnapshotCaptureScope;
+}
+export interface DestinationCatalogStatus extends ImportWorkflowStatus {
+  config: ImportScheduleConfig;
+  usable?: boolean;
+  configured: boolean;
+  available: boolean;
+  record: DestinationCatalogMetadata | null;
+}
+export interface SourceSnapshotStatus extends ImportWorkflowStatus {
   available?: boolean;
   history_source_known?: boolean;
   capture_method?: 'sqlite_online_backup' | 'file_copy' | 'plugin_backup';

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { useRouteTab } from './routing';
+import { useWorkspaceDraftState } from './workspace-drafts';
 import { Callout, Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import DiscordMemberPicker from './DiscordMemberPicker';
@@ -96,11 +97,23 @@ export default function UserDirectoryPage({
   const [rolesLoaded, setRolesLoaded] = useState(false);
   const [canManage, setCanManage] = useState(false);
   const [roleError, setRoleError] = useState('');
-  const [embyRole, setEmbyRole] = useState(settings.discord_emby_role_id || '');
-  const [jellyfinRole, setJellyfinRole] = useState(settings.discord_jellyfin_role_id || '');
-  const [autoSync, setAutoSync] = useState(!!settings.discord_auto_role_sync);
-  const [embyOnly, setEmbyOnly] = useState(settings.discord_emby_only_role === true);
-  const [savedRoles, setSavedRoles] = useState({
+  const [embyRole, setEmbyRole] = useWorkspaceDraftState(
+    'organization.embyRole',
+    settings.discord_emby_role_id || '',
+  );
+  const [jellyfinRole, setJellyfinRole] = useWorkspaceDraftState(
+    'organization.jellyfinRole',
+    settings.discord_jellyfin_role_id || '',
+  );
+  const [autoSync, setAutoSync] = useWorkspaceDraftState(
+    'organization.autoSync',
+    !!settings.discord_auto_role_sync,
+  );
+  const [embyOnly, setEmbyOnly] = useWorkspaceDraftState(
+    'organization.embyOnly',
+    settings.discord_emby_only_role === true,
+  );
+  const [savedRoles, setSavedRoles] = useWorkspaceDraftState('organization.savedRoles', {
     embyRole: settings.discord_emby_role_id || '',
     jellyfinRole: settings.discord_jellyfin_role_id || '',
     autoSync: !!settings.discord_auto_role_sync,
@@ -383,7 +396,11 @@ export default function UserDirectoryPage({
         description="Review accounts across Emby and Jellyfin, confirm ownership, and manage access."
         actions={
           <>
-            <button className="btn" disabled={busy || loading} onClick={() => void reload()}>
+            <button
+              className="btn btn-quiet"
+              disabled={busy || loading}
+              onClick={() => void reload()}
+            >
               <Icon name="refresh" /> Refresh
             </button>
             <button className="btn btn-primary" onClick={() => navigate('accounts')}>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { useRouteTab } from './routing';
+import { useWorkspaceDraftState } from './workspace-drafts';
 import { Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import { UserWarnings } from './SettingsPage';
@@ -106,13 +107,16 @@ export default function AccountRolesPage({
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [roleId, setRoleId] = useState('');
-  const [revision, setRevision] = useState('');
-  const [name, setName] = useState('');
-  const [parameters, setParameters] = useState<RoleParameters | null>(null);
-  const [sourceId, setSourceId] = useState('');
-  const [warnings, setWarnings] = useState<string[]>([]);
-  const [dirty, setDirty] = useState(false);
+  const [roleId, setRoleId] = useWorkspaceDraftState('roles.roleId', '');
+  const [revision, setRevision] = useWorkspaceDraftState('roles.revision', '');
+  const [name, setName] = useWorkspaceDraftState('roles.name', '');
+  const [parameters, setParameters] = useWorkspaceDraftState<RoleParameters | null>(
+    'roles.parameters',
+    null,
+  );
+  const [sourceId, setSourceId] = useWorkspaceDraftState('roles.sourceId', '');
+  const [warnings, setWarnings] = useWorkspaceDraftState<string[]>('roles.importNotes', []);
+  const [dirty, setDirty] = useWorkspaceDraftState('roles.dirty', false);
   const [selected, setSelected] = useState<string[]>([]);
   const [query, setQuery] = useState('');
   const [chosenSections, setChosenSections] = useState<RoleSection[]>([]);
@@ -356,7 +360,7 @@ export default function AccountRolesPage({
         description="Save reusable permissions and preferences, then review changes before applying them."
         actions={
           <button
-            className="btn"
+            className="btn btn-quiet"
             disabled={busy || loading}
             onClick={() => {
               setError('');

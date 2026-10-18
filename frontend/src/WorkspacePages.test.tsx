@@ -422,7 +422,7 @@ describe('Workspace navigation and migration controls', () => {
       />,
     );
     fireEvent.click(screen.getByRole('tab', { name: 'Processed' }));
-    expect(screen.getByText('Report cleared')).toBeTruthy();
+    expect(screen.getByText('Report deleted')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'View operation' })).toBeNull();
     expect(openJob).not.toHaveBeenCalled();
   });
@@ -616,5 +616,101 @@ describe('Workspace navigation and migration controls', () => {
     expect((screen.getByRole('button', { name: 'Ignore' }) as HTMLButtonElement).disabled).toBe(
       true,
     );
+  });
+});
+
+describe('Daily administration corrective routes', () => {
+  it('routes each offline server to its own controls and preserves readiness detail', () => {
+    render(
+      <OverviewPage
+        overview={{
+          ...overview,
+          connections: {
+            emby: { configured: true, connected: false, error: 'Synthetic source unreachable' },
+            jellyfin: {
+              configured: true,
+              connected: false,
+              error: 'Synthetic destination unreachable',
+            },
+            discord: { enabled: true, connected: false, error: 'Synthetic bot offline' },
+          },
+        }}
+        navigate={vi.fn()}
+        openJob={vi.fn()}
+        refresh={vi.fn()}
+      />,
+    );
+    for (const [name, route] of [
+      ['Emby', '#/settings/media/emby'],
+      ['Jellyfin', '#/settings/media/jellyfin'],
+      ['Discord', '#/settings/discord/connection'],
+    ] as const) {
+      fireEvent.click(screen.getByRole('button', { name: `Configure ${name} connection` }));
+      expect(window.location.hash).toBe(route);
+    }
+    expect(screen.getByText('Synthetic source unreachable')).toBeTruthy();
+  });
+  it('counts failed subscription events as needing attention and routes setup precisely', () => {
+    const events = [
+      {
+        id: 'failed-event',
+        action: 'subscribe',
+        status: 'failed',
+        username: 'SyntheticCrew',
+        created_at: '2026-10-18T00:00:00Z',
+      },
+    ] as SubscriptionEvent[];
+    const { rerender } = render(
+      <SubscriptionsPage
+        events={events}
+        navigate={vi.fn()}
+        openJob={vi.fn()}
+        refresh={vi.fn()}
+        review={vi.fn()}
+        ignore={vi.fn()}
+        busy={false}
+      />,
+    );
+    expect(screen.getByText('1 event needs review · 0 pending · 1 failed.')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Automation settings' }));
+    expect(window.location.hash).toBe('#/settings/automation/rules');
+    rerender(
+      <SubscriptionsPage
+        events={[]}
+        navigate={vi.fn()}
+        openJob={vi.fn()}
+        refresh={vi.fn()}
+        review={vi.fn()}
+        ignore={vi.fn()}
+        busy={false}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Configure Discord' }));
+    expect(window.location.hash).toBe('#/settings/discord/connection');
+  });
+  it('defers mapping identity resolution until preview instead of promising account creation', () => {
+    render(
+      <MigratePage
+        users={{
+          emby: [{ Id: 'source', Name: 'DifferentName' }],
+          jellyfin: [{ Id: 'mapped-target', Name: 'Simplified' }],
+        }}
+        overview={overview}
+        selected={new Set()}
+        select={vi.fn()}
+        search=""
+        setSearch={vi.fn()}
+        preview={vi.fn()}
+        useSnapshots={true}
+        setUseSnapshots={vi.fn()}
+        busy={false}
+        navigate={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText('Will be created')).toBeNull();
+    expect(screen.getByText('Destination checked in review')).toBeTruthy();
+    expect(screen.getByText(/Preview resolves saved mappings/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Manage saved history' }));
+    expect(window.location.hash).toBe('#/settings/history/emby');
   });
 });

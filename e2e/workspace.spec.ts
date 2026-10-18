@@ -106,7 +106,7 @@ test('settings task tabs preserve drafts and independent schedules without expos
   await expect(key).toHaveValue('synthetic-draft-only-key');
   await nav.getByRole('tab', { name: 'Saved history', exact: true }).click();
   await page.reload();
-  await expect(page).toHaveURL(/#settings-history$/);
+  await expect(page).toHaveURL(/#\/settings\/history\/emby$/);
   await expect(nav.getByRole('tab', { name: 'Saved history' })).toHaveAttribute(
     'aria-selected',
     'true',
@@ -119,7 +119,7 @@ test('settings task tabs preserve drafts and independent schedules without expos
   await expect(nav.getByRole('tab', { name: 'Account defaults' })).toBeFocused();
   await expect(page.getByRole('heading', { name: 'New account permissions' })).toBeVisible();
   await navigate(page, 'Users');
-  await expect(page).not.toHaveURL(/#settings-/);
+  await expect(page).toHaveURL(/#\/users$/);
   expect(mutations).toEqual([]);
 });
 

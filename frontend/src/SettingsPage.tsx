@@ -5,6 +5,7 @@ import AdminAlertsPanel from './AdminAlertsPanel';
 import SourceSnapshotsPanel from './SourceSnapshotsPanel';
 import DestinationCatalogPanel from './DestinationCatalogPanel';
 import ActivityRetentionPanel from './ActivityRetentionPanel';
+import { navigateWorkspace, useRouteTab } from './routing';
 import {
   DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
   MAX_CREDENTIAL_MESSAGE_TEMPLATE_LENGTH,
@@ -31,10 +32,6 @@ const settingsTabs = [
   { id: 'history', label: 'Saved history' },
   { id: 'activity', label: 'Activity' },
 ];
-function settingsTabFromHash() {
-  const value = window.location.hash.replace('#settings-', '');
-  return settingsTabs.some((tab) => tab.id === value) ? value : 'media';
-}
 const toggleNames = [
   'discord_enabled',
   'discord_role_events',
@@ -217,23 +214,18 @@ export default function SettingsPage({
   notify: Notify;
   refresh: () => Promise<void>;
 }) {
-  const [activeTab, setActiveTab] = useState(settingsTabFromHash);
-  const [serverTab, setServerTab] = useState('emby');
-  const [accountTab, setAccountTab] = useState('permissions');
-  const [discordTab, setDiscordTab] = useState('connection');
-  const [automationTab, setAutomationTab] = useState('tiers');
+  const [activeTab] = useRouteTab('settings');
+  const [serverTab, setServerTab] = useRouteTab('settings', 'media');
+  const [accountTab, setAccountTab] = useRouteTab('settings', 'accounts');
+  const [discordTab, setDiscordTab] = useRouteTab('settings', 'discord');
+  const [automationTab, setAutomationTab] = useRouteTab('settings', 'automation');
   const [selectedTier, setSelectedTier] = useState(0);
-  const [historyTab, setHistoryTab] = useState('emby');
+  const [historyTab, setHistoryTab] = useRouteTab('settings', 'history');
   const [dirty, setDirty] = useState(false);
   const [validationRevision, setValidationRevision] = useState(0);
   const pendingFocus = useRef<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null>(
     null,
   );
-  useEffect(() => {
-    const update = () => setActiveTab(settingsTabFromHash());
-    window.addEventListener('hashchange', update);
-    return () => window.removeEventListener('hashchange', update);
-  }, []);
   useEffect(() => {
     const element = pendingFocus.current;
     if (!element) return;
@@ -241,22 +233,22 @@ export default function SettingsPage({
     element.focus();
     element.reportValidity();
   }, [validationRevision]);
-  function selectTab(value: string) {
-    setActiveTab(value);
-    window.history.replaceState(null, '', `#settings-${value}`);
+  function selectTab(value: string, subsection?: string) {
+    const remembered: Record<string, string> = {
+      media: serverTab,
+      accounts: accountTab,
+      discord: discordTab,
+      automation: automationTab,
+      history: historyTab,
+    };
+    navigateWorkspace({ page: 'settings', tab: value, subtab: subsection ?? remembered[value] });
   }
   function revealField(element: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null) {
     if (!element) return;
     const group = element.closest<HTMLElement>('[data-settings-main]')?.dataset.settingsMain;
     const subsection = element.closest<HTMLElement>('[data-settings-sub]')?.dataset.settingsSub;
     const tier = element.closest<HTMLElement>('[data-settings-tier]')?.dataset.settingsTier;
-    if (group) selectTab(group);
-    if (subsection) {
-      if (group === 'media') setServerTab(subsection);
-      if (group === 'accounts') setAccountTab(subsection);
-      if (group === 'discord') setDiscordTab(subsection);
-      if (group === 'automation') setAutomationTab(subsection);
-    }
+    if (group) selectTab(group, subsection);
     if (tier !== undefined) setSelectedTier(Number(tier));
     pendingFocus.current = element;
     setValidationRevision((value) => value + 1);
@@ -370,8 +362,7 @@ export default function SettingsPage({
         account_limit: tier.account_limit,
       }));
       if (!membershipTiers.length) {
-        selectTab('automation');
-        setAutomationTab('tiers');
+        selectTab('automation', 'tiers');
         throw new Error('Configure at least one membership tier.');
       }
       if (

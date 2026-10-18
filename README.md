@@ -17,6 +17,12 @@ kept when the layout changes. Larger touch controls, readable form inputs,
 safe-area spacing, and dialogs that follow the visible viewport support quick
 administration from a phone. Layout detection stays in the browser.
 
+Workspace pages and tabs have bookmarkable addresses, so reload and browser
+Back/Forward restore the selected view. Addresses contain only page and tab
+names; account identities, search filters, unsaved forms and credentials are not
+stored in them. Reload opens editors with fresh fields and does not repeat an
+operation or its approval.
+
 Automated browser coverage includes the iPhone 16 Pro Max Safari/WebKit device
 profile in portrait and landscape, alongside desktop and generic mobile Chromium
 checks. See [interface regression testing](docs/development.md#automated-interface-regressions)
@@ -267,7 +273,7 @@ For an incomplete numbered account, inspect its exact username and select the sa
 
 ## Clear activity and reports
 
-Open **Activity → Clear history…** to review finished operations from all history or the current Activity filters. Choose records older than 7, 30, or 90 days, or **Any time**, then confirm the displayed count. Without filters, the default is 30 days. With a search or status filter, the review defaults to those matching reports from any time, including **Failed** and **Needs review**. The finish date is used when available, otherwise the last update or creation date. The selection stays fixed while the confirmation is open. To remove one operation, open its details and choose **Clear report…**.
+Open **Activity → Delete activity…** to review finished operations from all history or the current Activity filters. The manual review defaults to **Any time**, including recent **Failed** and **Needs review** reports. You can restrict it to records older than 7, 30, or 90 days before confirming the displayed count. The finish date is used when available, otherwise the last update or creation date. The selection stays fixed while the confirmation is open. Each finished Activity row also has a **Delete** button for a single report; the same review is available from its details under **Delete report…**.
 
 Clearing permanently removes Jellyport's selected activity records and migration reports. It does not undo migrations or change accounts, permissions, passwords, or watch history on either media server. Running, queued, or still-finalizing operations are protected, as are reports needed for unexpired credential delivery, uncertain account recovery, or an in-progress subscription action. The result shows how many were cleared and why others were kept. Up to 1,000 reports can be cleared in one request; narrow larger selections by age or filters.
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { version as appVersion } from '../../package.json';
 import { useClientLayout, useVisualViewport } from './client-layout';
+import { navigateWorkspace, useWorkspaceRoute, workspaceRouteHash } from './routing';
 import {
   DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
   renderCredentialMessage,
@@ -132,14 +133,12 @@ export default function App() {
   const sessionRef = useRef<Session | null>(null);
   const authGeneration = useRef(0);
   const [booting, setBooting] = useState(true);
-  const [page, setPage] = useState<Page>(() =>
-    /^#settings-(media|accounts|discord|automation|history|activity)$/.test(window.location.hash)
-      ? 'settings'
-      : 'overview',
-  );
+  const route = useWorkspaceRoute();
+  const page = route.page;
   const pageRef = useRef(page);
   pageRef.current = page;
   const [loading, setLoading] = useState(false);
+  const [loadedPage, setLoadedPage] = useState<Page | null>(null);
   const [pageError, setPageError] = useState('');
   const [loginError, setLoginError] = useState('');
   const [overview, setOverview] = useState<Overview | null>(null);
@@ -277,6 +276,7 @@ export default function App() {
     sessionRef.current = null;
     cancelPreview();
     setSession(null);
+    setLoadedPage(null);
     setOverview(null);
     setUsers(emptyUsers);
     setMappings([]);
@@ -320,7 +320,17 @@ export default function App() {
       let data: unknown;
       try {
         data = await response.json();
-      } catch {
+      } catch (error) {
+        if (response.ok) {
+          // A reload can cancel body reading after successful response headers.
+          // Never turn an unreadable success into a fabricated typed object.
+          if (error instanceof Error && error.name === 'AbortError') throw error;
+          throw new Error(
+            'Jellyport’s response could not be read. Refresh to check its status before retrying.',
+          );
+        }
+        // Failed responses can have empty/non-JSON bodies; keep their status and
+        // authentication handling without exposing a raw parser/body diagnostic.
         data = {};
       }
       if (generation !== authGeneration.current)
@@ -330,7 +340,10 @@ export default function App() {
       if (!response.ok) {
         if (response.status === 401 && path !== '/api/login' && path !== '/api/setup/connect')
           clearSession();
-        const body = data as { detail?: unknown; error?: unknown; message?: unknown };
+        const body =
+          data && typeof data === 'object'
+            ? (data as { detail?: unknown; error?: unknown; message?: unknown })
+            : {};
         let detail = body.detail || body.error || body.message;
         if (Array.isArray(detail))
           detail = detail
@@ -400,6 +413,7 @@ export default function App() {
   }
   const load = useCallback(
     async (target: Page) => {
+      if (target !== pageRef.current) return;
       const version = ++loadVersion.current;
       const historyVersion = historyRevision.current;
       setLoading(true);
@@ -482,7 +496,10 @@ export default function App() {
         if (version === loadVersion.current && sessionRef.current?.authenticated)
           setPageError(message(error));
       } finally {
-        if (version === loadVersion.current) setLoading(false);
+        if (version === loadVersion.current) {
+          setLoadedPage(target);
+          setLoading(false);
+        }
       }
     },
     [api, notify],
@@ -508,20 +525,24 @@ export default function App() {
     if (session?.authenticated) void load(page);
   }, [session?.authenticated, page, load]);
   function navigate(target: Page) {
-    if (
-      target !== 'settings' &&
-      /^#settings-(media|accounts|discord|automation|history|activity)$/.test(window.location.hash)
-    )
-      window.history.replaceState(null, '', window.location.pathname + window.location.search);
     if (target !== 'migrate') cancelPreview();
     closeDialog();
     setMobileOpen(false);
     if (target === page) void load(target);
     else {
       setLoading(true);
-      setPage(target);
+      navigateWorkspace({ page: target });
     }
   }
+  const previousRoute = useRef(workspaceRouteHash(route));
+  const routeHash = workspaceRouteHash(route);
+  useEffect(() => {
+    if (previousRoute.current === routeHash) return;
+    previousRoute.current = routeHash;
+    if (page !== 'migrate') cancelPreview();
+    closeDialog();
+    setMobileOpen(false);
+  }, [routeHash, page, cancelPreview, closeDialog]);
   const hasActive =
     jobs.some(activeJob) ||
     overview?.recent_jobs.some(activeJob) ||
@@ -598,12 +619,21 @@ export default function App() {
     showDialog({ kind: 'job', job });
     setPollPaused(false);
   };
-  const openJob = (id: string) =>
+  const openJob = (id: string) => {
+    const version = dialogVersion.current;
+    const generation = authGeneration.current;
     void work('job', async () => {
       const value = await api<Job>(`/api/jobs/${encodeURIComponent(id)}`);
+      if (
+        version !== dialogVersion.current ||
+        generation !== authGeneration.current ||
+        !sessionRef.current?.authenticated
+      )
+        return;
       showDialog({ kind: 'job', job: value });
       setPollPaused(false);
     });
+  };
   function preview(sourceUserIds = [...selected], savedSource = useSnapshots) {
     if (busyRef.current.has('preview')) return;
     if (!sourceChosen.current && sourceDefaults !== 'ready') {
@@ -921,7 +951,7 @@ export default function App() {
     });
   }
   let content;
-  if (loading) content = <Loading />;
+  if (loading || loadedPage !== page) content = <Loading />;
   else if (pageError)
     content = (
       <>
@@ -1082,7 +1112,16 @@ export default function App() {
         />
       ) : (
         <div className="shell">
-          <a className="skip-link" href="#workspace-content">
+          <a
+            className="skip-link"
+            href="#workspace-content"
+            onClick={(event) => {
+              event.preventDefault();
+              const content = document.getElementById('workspace-content');
+              content?.focus();
+              content?.scrollIntoView?.({ block: 'start' });
+            }}
+          >
             Skip to content
           </a>
           {mobileOpen && (
@@ -1296,7 +1335,7 @@ function HistoryCleanupDialog({
   submit: (ids: string[]) => Promise<HistoryCleanupResult | undefined>;
 }) {
   const [scope, setScope] = useState(review.filtered ? 'filtered' : 'all');
-  const [age, setAge] = useState(review.single || review.filtered ? 'all' : '30');
+  const [age, setAge] = useState('all');
   const [pending, setPending] = useState(false);
   const pendingRef = useRef(false);
   const [error, setError] = useState('');
@@ -1677,7 +1716,7 @@ function DialogContent({
             </button>
             {finishedJob(job) && (
               <button className="btn btn-quiet" onClick={() => clearReport(job)}>
-                Clear report…
+                Delete report…
               </button>
             )}
             {activeJob(job) && (

@@ -22,7 +22,7 @@ test('activity retention has an independent compact settings view and starts off
   await expectContainedLayout(page);
   await page.screenshot({ path: info.outputPath('activity-retention.png'), fullPage: true });
   await navigate(page, 'Activity');
-  expect(new URL(page.url()).hash).toBe('');
+  expect(new URL(page.url()).hash).toBe('#/activity');
   expect(mutations).not.toContain('PUT /api/jobs/retention');
 });
 
@@ -58,7 +58,7 @@ test('failed and review-needed filters select recent finished reports for manual
   await navigate(page, 'Activity');
   for (const status of ['failed', 'partial']) {
     await page.getByRole('combobox', { name: 'Status', exact: true }).selectOption(status);
-    await page.getByRole('button', { name: 'Clear history…' }).click();
+    await page.getByRole('button', { name: 'Delete activity…' }).click();
     const confirmation = page.getByRole('dialog', { name: 'Clear activity history?' });
     await expect(confirmation.getByRole('combobox', { name: 'Reports to review' })).toHaveValue(
       'filtered',

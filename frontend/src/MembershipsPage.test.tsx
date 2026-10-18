@@ -69,12 +69,54 @@ const mutations = (requests: { path: string; options?: ApiOptions }[]) =>
 
 afterEach(() => {
   cleanup();
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
   vi.restoreAllMocks();
   localStorage.clear();
   sessionStorage.clear();
 });
 
 describe('Discord membership account allowances', () => {
+  it('restores the member editor from its route without selecting or provisioning an owner', async () => {
+    window.history.replaceState(null, '', '#/memberships/editor');
+    const p = page([membership]);
+    await waitFor(() =>
+      expect(screen.getByLabelText('Access policy')).toHaveProperty('disabled', false),
+    );
+    expect(screen.getByRole('tab', { name: 'Add member' }).getAttribute('aria-selected')).toBe(
+      'true',
+    );
+    expect(screen.getByRole('searchbox', { name: 'Discord member' })).toHaveProperty('value', '');
+    expect(mutations(p.requests)).toHaveLength(0);
+    expect(p.created).not.toHaveBeenCalled();
+  });
+
+  it('retains a selected member policy across history navigation while reloading without the private owner selection', async () => {
+    window.history.replaceState(null, '', '#/memberships');
+    const first = page([membership]);
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
+    expect(window.location.hash).toBe('#/memberships/editor');
+    act(() => window.history.back());
+    await waitFor(() =>
+      expect(
+        screen.getByRole('tab', { name: /Managed memberships/ }).getAttribute('aria-selected'),
+      ).toBe('true'),
+    );
+    act(() => window.history.forward());
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Manage member' }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'brigantine');
+    first.unmount();
+    const reloaded = page([membership]);
+    await screen.findByRole('searchbox', { name: 'Discord member' });
+    expect(screen.getByRole('searchbox', { name: 'Discord member' })).toHaveProperty('value', '');
+    expect(mutations(reloaded.requests)).toHaveLength(0);
+    expect(localStorage.length + sessionStorage.length).toBe(0);
+  });
+
   it('pages and filters the membership directory while keeping an unfinished member policy', async () => {
     const many = Array.from({ length: 61 }, (_, index) => ({
       ...membership,

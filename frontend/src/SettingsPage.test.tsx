@@ -239,7 +239,7 @@ describe('Settings layout and navigation', () => {
       settingsTab(name);
       expect(screen.getAllByRole('tabpanel')).toHaveLength(2);
     }
-    expect(window.location.hash).toBe('#settings-media');
+    expect(window.location.hash).toBe('#/settings/media/emby');
     expect(sourceUrl.isConnected).toBe(true);
     expect(sourceUrl).toHaveProperty('value', 'https://source.example.test');
     expect(key).toHaveProperty('value', 'synthetic-unsaved-secret');

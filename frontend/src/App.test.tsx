@@ -192,7 +192,7 @@ describe('Activity report cleanup', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
-    fireEvent.click(await screen.findByRole('button', { name: 'Clear history…' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete activity…' }));
     return screen.findByRole('dialog', { name: 'Clear activity history?' });
   }
   const cleanupRequests = () => requests.filter((request) => request.path === '/api/jobs/cleanup');
@@ -229,7 +229,7 @@ describe('Activity report cleanup', () => {
     fireEvent.change(await screen.findByRole('combobox', { name: 'Status' }), {
       target: { value: 'failed' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete activity…' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByRole('combobox', { name: 'Reports to review' })).toHaveProperty(
       'value',
@@ -264,20 +264,24 @@ describe('Activity report cleanup', () => {
     expect(screen.queryByText('private-old-1')).toBeNull();
   });
 
-  it('keeps recent completed reports by default and allows an explicit any-time choice', async () => {
+  it('includes recent completed reports by default and offers an explicit older-report filter', async () => {
     const recent = { ...past('recent'), finished_at: '2099-01-01T00:00:00Z' };
     const dialog = await review([recent]);
-    expect(
-      (within(dialog).getByRole('button', { name: 'Clear 0 reports' }) as HTMLButtonElement)
-        .disabled,
-    ).toBe(true);
-    fireEvent.change(within(dialog).getByRole('combobox', { name: 'Recorded before' }), {
-      target: { value: 'all' },
-    });
+    expect(within(dialog).getByRole('combobox', { name: 'Recorded before' })).toHaveProperty(
+      'value',
+      'all',
+    );
     expect(
       (within(dialog).getByRole('button', { name: 'Clear 1 report' }) as HTMLButtonElement)
         .disabled,
     ).toBe(false);
+    fireEvent.change(within(dialog).getByRole('combobox', { name: 'Recorded before' }), {
+      target: { value: '30' },
+    });
+    expect(
+      (within(dialog).getByRole('button', { name: 'Clear 0 reports' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
   });
 
   it.each(['failed', 'partial'])(
@@ -291,7 +295,7 @@ describe('Activity report cleanup', () => {
       fireEvent.change(await screen.findByRole('combobox', { name: 'Status' }), {
         target: { value: status },
       });
-      fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
+      fireEvent.click(screen.getByRole('button', { name: 'Delete activity…' }));
       const dialog = await screen.findByRole('dialog');
       expect(within(dialog).getByRole('combobox', { name: 'Reports to review' })).toHaveProperty(
         'value',
@@ -319,7 +323,7 @@ describe('Activity report cleanup', () => {
     fireEvent.change(await screen.findByRole('searchbox', { name: 'Search operations' }), {
       target: { value: 'private-selected' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete activity…' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByRole('combobox', { name: 'Reports to review' })).toHaveProperty(
       'value',
@@ -474,7 +478,7 @@ describe('Activity report cleanup', () => {
       skipped: [],
     } satisfies HistoryCleanupResult;
     const detail = await openJob();
-    fireEvent.click(within(detail).getByRole('button', { name: 'Clear report…' }));
+    fireEvent.click(within(detail).getByRole('button', { name: 'Delete report…' }));
     const dialog = await screen.findByRole('dialog', { name: 'Clear this report?' });
     expect(within(dialog).queryByRole('combobox')).toBeNull();
     fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
@@ -489,7 +493,7 @@ describe('Activity report cleanup', () => {
   it('never offers single-report deletion for an active or unknown operation', async () => {
     responses['/api/jobs/job-1'] = { ...job, status: 'finalizing' };
     const dialog = await openJob();
-    expect(within(dialog).queryByRole('button', { name: 'Clear report…' })).toBeNull();
+    expect(within(dialog).queryByRole('button', { name: 'Delete report…' })).toBeNull();
   });
 
   it('completes report deletion with StrictMode effect replay enabled', async () => {
@@ -502,7 +506,7 @@ describe('Activity report cleanup', () => {
     );
     fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
-    fireEvent.click(screen.getByRole('button', { name: 'Clear history…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Delete activity…' }));
     const dialog = await screen.findByRole('dialog');
     fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
     await within(dialog).findByText('1 report cleared. 0 kept.');
@@ -566,6 +570,306 @@ async function selectAndPreviewReady() {
   await screen.findByRole('dialog');
 }
 describe('React account safeguards', () => {
+  it.each([
+    {
+      name: 'unreadable JSON',
+      error: new SyntaxError('synthetic-private-body-fragment'),
+      message:
+        'Jellyport’s response could not be read. Refresh to check its status before retrying.',
+    },
+    {
+      name: 'canceled response body',
+      error: Object.assign(new Error('Response reading was canceled.'), { name: 'AbortError' }),
+      message: 'Response reading was canceled.',
+    },
+  ])(
+    'keeps role collections intact when a 200 response has $name, and permits an explicit successful refresh',
+    async ({ error, message: failure }) => {
+      window.history.replaceState(null, '', '#/roles');
+      render(<App />);
+      await screen.findByRole('searchbox', { name: 'Find saved roles' });
+      const original = fetch;
+      let unreadable = true;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((path: string, options?: RequestInit) => {
+          if (path === '/api/account-roles' && unreadable) {
+            unreadable = false;
+            return Promise.resolve(
+              Object.assign(new Response(null, { status: 200 }), {
+                json: async () => {
+                  throw error;
+                },
+              }),
+            );
+          }
+          return original(path, options);
+        }),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh roles' }));
+      await screen.findByText(failure);
+      expect(screen.getByRole('heading', { name: 'Account roles', level: 1 })).toBeTruthy();
+      expect(screen.getByRole('searchbox', { name: 'Find saved roles' })).toBeTruthy();
+      expect(document.body.textContent).not.toContain('synthetic-private-body-fragment');
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh roles' }));
+      await screen.findByRole('searchbox', { name: 'Find saved roles' });
+      expect(screen.queryByText(failure)).toBeNull();
+      expect(screen.getByRole('heading', { name: 'Account roles', level: 1 })).toBeTruthy();
+      expect(
+        requests.filter((request) => request.options?.method && request.options.method !== 'GET'),
+      ).toEqual([]);
+    },
+  );
+  it('loads a bookmarked or restored page once, after its own parent data is ready', async () => {
+    const original = fetch;
+    let deferSettings = true;
+    let reply: ((response: Response) => void) | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((path: string, options?: RequestInit) => {
+        if (path === '/api/settings' && deferSettings) {
+          deferSettings = false;
+          return new Promise<Response>((resolve) => {
+            reply = resolve;
+          });
+        }
+        return original(path, options);
+      }),
+    );
+    const roleRequests = () => requests.filter((request) => request.path === '/api/account-roles');
+    const completeSettings = async () => {
+      await waitFor(() => expect(reply).toBeTypeOf('function'));
+      expect(screen.queryByRole('heading', { name: 'Account roles', level: 1 })).toBeNull();
+      await act(async () => {
+        reply!(new Response(JSON.stringify(settings), { status: 200 }));
+      });
+      await screen.findByRole('searchbox', { name: 'Find saved roles' });
+    };
+
+    window.history.replaceState(null, '', '#/roles');
+    render(<App />);
+    await waitFor(() => expect(reply).toBeTypeOf('function'));
+    expect(roleRequests()).toHaveLength(0);
+    await completeSettings();
+    expect(roleRequests()).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Overview' }));
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    deferSettings = true;
+    reply = undefined;
+    await act(async () => window.history.back());
+    await waitFor(() => expect(reply).toBeTypeOf('function'));
+    expect(window.location.hash).toBe('#/roles');
+    expect(roleRequests()).toHaveLength(1);
+    await completeSettings();
+    expect(roleRequests()).toHaveLength(2);
+  });
+  it.each(['unreadable', 'null', 'primitive'])(
+    'still clears the administrator session when an unauthorized response has a %s body',
+    async (body) => {
+      window.history.replaceState(null, '', '#/roles');
+      render(<App />);
+      await screen.findByRole('searchbox', { name: 'Find saved roles' });
+      const original = fetch;
+      responses['/api/session'] = { ...session, authenticated: false, user: undefined };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((path: string, options?: RequestInit) => {
+          if (path === '/api/account-roles')
+            return Promise.resolve(
+              Object.assign(new Response(null, { status: 401 }), {
+                json: async () => {
+                  if (body === 'unreadable') throw new SyntaxError('synthetic-private-error-body');
+                  return body === 'null' ? null : 'synthetic-private-error-body';
+                },
+              }),
+            );
+          return original(path, options);
+        }),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Refresh roles' }));
+      await screen.findByLabelText('Jellyfin username');
+      expect(screen.queryByRole('heading', { name: 'Account roles', level: 1 })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Sign out' })).toBeNull();
+      expect(document.body.textContent).not.toContain('synthetic-private-error-body');
+      expect(window.location.hash).toBe('#/roles');
+    },
+  );
+  it.each([
+    ['overview', 'Overview'],
+    ['users', 'Users'],
+    ['migrate', 'Migrate users'],
+    ['mappings', 'User mappings'],
+    ['roles', 'Account roles'],
+    ['accounts', 'Create account'],
+    ['memberships', 'Memberships'],
+    ['subscriptions', 'Subscriptions'],
+    ['activity', 'Activity'],
+    ['settings', 'Settings'],
+  ])(
+    'restores the bookmarked %s page after a reload without replaying actions',
+    async (target, title) => {
+      responses['/api/user-directory'] = { users: [] };
+      responses['/api/memberships'] = { memberships: [] };
+      responses['/api/subscriptions'] = { events: [] };
+      window.history.replaceState(null, '', `#/${target}`);
+      const view = render(<App />);
+      await screen.findByRole('heading', { name: title, level: 1 });
+      expect(window.location.hash).toBe(
+        target === 'settings' ? '#/settings/media/emby' : `#/${target}`,
+      );
+      view.unmount();
+      render(<App />);
+      await screen.findByRole('heading', { name: title, level: 1 });
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(
+        requests.filter((request) => request.options?.method && request.options.method !== 'GET'),
+      ).toEqual([]);
+      expect(window.history.state).toBeNull();
+      expect(localStorage.length).toBe(0);
+      expect(sessionStorage.length).toBe(0);
+    },
+  );
+  it('uses Back and Forward for pages without restoring an open operation dialog', async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    expect(window.location.hash).toBe('#/activity');
+    fireEvent.click(screen.getByRole('button', { name: 'View operation details' }));
+    await screen.findByRole('dialog');
+    await act(async () => window.history.back());
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    await act(async () => window.history.forward());
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(
+      requests.filter((request) => request.options?.method && request.options.method !== 'GET'),
+    ).toEqual([]);
+  });
+  it.each(['Back', 'main navigation'])(
+    'does not reopen a deferred operation report after %s changes the page',
+    async (action) => {
+      const original = fetch;
+      let reply!: (response: Response) => void;
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((path: string, options?: RequestInit) => {
+          if (path === '/api/jobs/job-1')
+            return new Promise<Response>((resolve) => {
+              reply = resolve;
+            });
+          return original(path, options);
+        }),
+      );
+      render(<App />);
+      fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+      await screen.findByRole('heading', { name: 'Activity', level: 1 });
+      fireEvent.click(screen.getByRole('button', { name: 'View operation details' }));
+      if (action === 'Back') await act(async () => window.history.back());
+      else fireEvent.click(screen.getByRole('button', { name: 'Overview' }));
+      await screen.findByRole('heading', { name: 'Overview', level: 1 });
+      await act(async () => {
+        reply({ ok: true, status: 200, json: async () => job } as Response);
+      });
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(document.body.classList.contains('modal-open')).toBe(false);
+      expect(window.location.hash).toBe('#/overview');
+      expect(
+        requests.filter((request) => request.options?.method && request.options.method !== 'GET'),
+      ).toEqual([]);
+    },
+  );
+  it('keeps the active route when using Skip to content', async () => {
+    window.history.replaceState(null, '', '#/activity');
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    fireEvent.click(screen.getByRole('link', { name: 'Skip to content' }));
+    expect(window.location.hash).toBe('#/activity');
+    expect(document.activeElement?.id).toBe('workspace-content');
+  });
+  it('restores nested Settings tabs and preserves unsaved fields through Back and Forward', async () => {
+    window.history.replaceState(null, '', '#/settings/media/jellyfin');
+    const view = render(<App />);
+    await screen.findByRole('heading', { name: 'Settings', level: 1 });
+    expect(screen.getByRole('tab', { name: 'Jellyfin' }).getAttribute('aria-selected')).toBe(
+      'true',
+    );
+    const url = screen.getByLabelText(/Public sign-in URL/) as HTMLInputElement;
+    fireEvent.change(url, { target: { value: 'https://synthetic-draft.example.invalid' } });
+    await selectSettingsTab('Account defaults', 'Passwords & messages');
+    expect(window.location.hash).toBe('#/settings/accounts/passwords');
+    await act(async () => window.history.back());
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Permissions' }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    await act(async () => window.history.back());
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Jellyfin' }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    expect(url.value).toBe('https://synthetic-draft.example.invalid');
+    await act(async () => window.history.forward());
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Permissions' }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    await act(async () => window.history.forward());
+    await waitFor(() =>
+      expect(
+        screen.getByRole('tab', { name: 'Passwords & messages' }).getAttribute('aria-selected'),
+      ).toBe('true'),
+    );
+    expect(url.value).toBe('https://synthetic-draft.example.invalid');
+    view.unmount();
+    render(<App />);
+    await screen.findByRole('tab', { name: 'Passwords & messages' });
+    expect(
+      screen.getByRole('tab', { name: 'Passwords & messages' }).getAttribute('aria-selected'),
+    ).toBe('true');
+    expect((document.querySelector('#setting-jellyfin_public_url') as HTMLInputElement).value).toBe(
+      '',
+    );
+    expect(
+      requests.filter((request) => request.options?.method && request.options.method !== 'GET'),
+    ).toEqual([]);
+  });
+  it('keeps a requested page behind administrator authentication without encoding credentials', async () => {
+    const anonymousSession = { ...session, authenticated: false, user: undefined };
+    responses['/api/session'] = anonymousSession;
+    responses['/api/login'] = session;
+    window.history.replaceState(null, '', '#/accounts/recover');
+    render(<App />);
+    await screen.findByLabelText('Jellyfin username');
+    expect(screen.queryByRole('heading', { name: 'Create account', level: 1 })).toBeNull();
+    expect(window.location.hash).toBe('#/accounts/recover');
+    fireEvent.change(screen.getByLabelText('Jellyfin username'), {
+      target: { value: 'synthetic-admin' },
+    });
+    fireEvent.change(screen.getByLabelText('Jellyfin password'), {
+      target: { value: 'synthetic-password' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    await screen.findByRole('heading', { name: 'Create account', level: 1 });
+    expect(
+      screen
+        .getByRole('tab', { name: 'Recover interrupted creation' })
+        .getAttribute('aria-selected'),
+    ).toBe('true');
+    expect(screen.getByLabelText('Account to inspect')).toHaveProperty('value', '');
+    expect(window.location.hash).toBe('#/accounts/recover');
+    expect(
+      requests
+        .filter((request) => request.options?.method && request.options.method !== 'GET')
+        .map((request) => request.path),
+    ).toEqual(['/api/login']);
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
   it('defaults plugin migrations to saved history even before any backup has been imported', async () => {
     prepareRunningPreview();
     responses['/api/source-snapshots'] = {
@@ -2468,7 +2772,7 @@ describe('React account safeguards', () => {
   });
 
   it.each(['media', 'accounts', 'discord', 'automation', 'history', 'activity'])(
-    'opens a bookmarked %s settings section and clears its anchor when navigating elsewhere',
+    'opens a legacy bookmarked %s settings section and writes a durable route when navigating elsewhere',
     async (section) => {
       const original = window.location.href;
       window.history.replaceState(null, '', `#settings-${section}`);
@@ -2491,7 +2795,7 @@ describe('React account safeguards', () => {
         ).toBe('true');
         fireEvent.click(screen.getByRole('button', { name: 'Overview' }));
         await screen.findByRole('heading', { name: 'Overview', level: 1 });
-        expect(window.location.hash).toBe('');
+        expect(window.location.hash).toBe('#/overview');
       } finally {
         window.history.replaceState(null, '', original);
       }

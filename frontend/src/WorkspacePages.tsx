@@ -3,6 +3,7 @@ import { Callout, Empty, Heading, Icon, JobsTable, Status, UserCell } from './co
 import { ConnectionRows, UserWarnings } from './SettingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import { Pagination, Tabs, TabPanel, usePagination } from './ui-layout';
+import { navigateWorkspace, useRouteTab } from './routing';
 import {
   activeJob,
   date,
@@ -448,7 +449,7 @@ export function AccountsPage({
   navigate: (page: Page) => void;
 }) {
   const [busy, setBusy] = useState('');
-  const [task, setTask] = useState('create');
+  const [task, setTask] = useRouteTab('accounts');
   const [accountUsername, setAccountUsername] = useState('');
   const [accountMember, setAccountMember] = useState<DiscordMember | null>(null);
   const [recoveryUsername, setRecoveryUsername] = useState('');
@@ -838,7 +839,7 @@ export function ActivityPage({
 }: Common & {
   jobs: Job[];
   refresh: () => void;
-  clearHistory?: (filteredIds: string[], filtered: boolean) => void;
+  clearHistory?: (filteredIds: string[], filtered: boolean, single?: Job) => void;
 }) {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('all');
@@ -855,7 +856,7 @@ export function ActivityPage({
     <div className="page-stack">
       <Heading
         title="Activity"
-        description="Review migrations, new accounts, and any items that need your attention."
+        description="Review operation reports and delete finished activity. Running work is kept."
         actions={
           <>
             <button className="btn btn-quiet" onClick={refresh}>
@@ -864,7 +865,7 @@ export function ActivityPage({
             </button>
             {clearHistory && (
               <button
-                className="btn btn-quiet"
+                className="btn btn-danger"
                 onClick={() =>
                   clearHistory(
                     filtered.map((job) => job.id),
@@ -873,7 +874,8 @@ export function ActivityPage({
                 }
                 disabled={!jobs.length}
               >
-                Clear history…
+                <Icon name="trash" />
+                Delete activity…
               </button>
             )}
           </>
@@ -886,7 +888,7 @@ export function ActivityPage({
             <p>
               {count
                 ? `${num(count)} ${count === 1 ? 'operation is' : 'operations are'} running. Progress updates automatically.`
-                : 'Open an operation to see its results and account delivery.'}
+                : 'View results or delete individual reports below.'}
             </p>
           </div>
           <span className="status">
@@ -920,6 +922,7 @@ export function ActivityPage({
           filtered={query.trim() !== '' || status !== 'all'}
           openJob={openJob}
           migrate={() => navigate('migrate')}
+          clearReport={clearHistory ? (job) => clearHistory([job.id], true, job) : undefined}
         />
         <Pagination
           label="Operations"
@@ -931,7 +934,13 @@ export function ActivityPage({
         />
         <div className="table-footer">
           <span>Newest first</span>
-          <span>Credentials are available through an explicit, one-time reveal.</span>
+          <button
+            type="button"
+            className="text-button"
+            onClick={() => navigateWorkspace({ page: 'settings', tab: 'activity' })}
+          >
+            Configure automatic cleanup
+          </button>
         </div>
       </section>
     </div>
@@ -952,7 +961,7 @@ export function SubscriptionsPage({
   ignore: (event: SubscriptionEvent) => void;
   busy: boolean;
 }) {
-  const [scope, setScope] = useState('review');
+  const [scope, setScope] = useRouteTab('subscriptions');
   const [query, setQuery] = useState('');
   const needsReview = (event: SubscriptionEvent) => ['pending', 'failed'].includes(event.status);
   const filtered = events.filter(

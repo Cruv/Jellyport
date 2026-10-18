@@ -135,12 +135,84 @@ async function selectRole(view = 'apply') {
 
 afterEach(() => {
   cleanup();
+  window.history.replaceState(null, '', window.location.pathname + window.location.search);
   vi.restoreAllMocks();
   localStorage.clear();
   sessionStorage.clear();
 });
 
 describe('Account roles', () => {
+  it.each(['editor', 'apply'])(
+    'restores the %s role task with no selected identity or automatic writes',
+    async (view) => {
+      window.history.replaceState(null, '', `#/roles/${view}`);
+      const p = page();
+      await screen.findByLabelText('Saved role');
+      expect(
+        screen
+          .getByRole('tab', { name: view === 'apply' ? 'Apply role' : 'Role editor' })
+          .getAttribute('aria-selected'),
+      ).toBe('true');
+      expect(screen.getByLabelText('Saved role')).toHaveProperty('value', '');
+      expect(mutations(p.requests)).toHaveLength(0);
+      expect(p.created).not.toHaveBeenCalled();
+    },
+  );
+
+  it('retains role drafts through Back and Forward but reloads an empty editor instead of replaying an account import', async () => {
+    window.history.replaceState(null, '', '#/roles');
+    const first = page();
+    await screen.findByRole('button', { name: 'Edit role Crew' });
+    fireEvent.click(screen.getByRole('button', { name: 'Edit role Crew' }));
+    fireEvent.change(screen.getByLabelText('Role name'), {
+      target: { value: 'Private role draft' },
+    });
+    expect(window.location.hash).toBe('#/roles/editor');
+    act(() => window.history.back());
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: /Saved roles/ }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    act(() => window.history.forward());
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Role draft' }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    expect(screen.getByLabelText('Role name')).toHaveProperty('value', 'Private role draft');
+    first.unmount();
+    const reloaded = page();
+    await screen.findByLabelText('Role name');
+    expect(screen.getByLabelText('Role name')).toHaveProperty('value', '');
+    expect(screen.getByLabelText('Saved role')).toHaveProperty('value', '');
+    expect(mutations(reloaded.requests)).toHaveLength(0);
+    expect(localStorage.length + sessionStorage.length).toBe(0);
+  });
+
+  it('dismisses an unsubmitted role application review on history navigation without losing selected settings', async () => {
+    window.history.replaceState(null, '', '#/roles');
+    const p = page();
+    await selectRole();
+    fireEvent.click(screen.getByRole('checkbox', { name: /^alex/ }));
+    fireEvent.click(screen.getByRole('checkbox', { name: /^Permissions/ }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review changes' }));
+    expect(screen.getByRole('dialog')).toBeTruthy();
+    act(() => window.history.back());
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(mutations(p.requests)).toHaveLength(0);
+    act(() => window.history.forward());
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Apply role' }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    expect(screen.getByRole('checkbox', { name: /^alex/ })).toHaveProperty('checked', true);
+    expect(screen.getByRole('checkbox', { name: /^Permissions/ })).toHaveProperty('checked', true);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(p.created).not.toHaveBeenCalled();
+  });
+
   it('pages saved roles separately from the editor and preserves a draft when tasks change', async () => {
     const many = Array.from({ length: 61 }, (_, index) => ({
       ...role,

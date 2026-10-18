@@ -131,7 +131,7 @@ export class SourceSnapshots {
       this.state.last_outcome = 'interrupted';
       this.state.last_finished_at = new Date().toISOString();
       this.state.last_error =
-        'Emby import preparation was interrupted before a helper request was saved. Check status before starting a new import. The last good copy is preserved.';
+        'Emby import preparation was interrupted before a helper request was saved. Check status before starting a new import. Any previously saved copy is preserved.';
       this.save();
     }
     // Older installations used the last attempt's local date before durable
@@ -418,7 +418,7 @@ export class SourceSnapshots {
       this.state.last_finished_at = new Date().toISOString();
       this.state.last_outcome = 'failed';
       this.state.last_error =
-        'Emby backup import or capture could not start. Check the helper and configured Emby connection. The last good copy is preserved.';
+        'Emby backup import or capture could not start. Check the helper and configured Emby connection. Any previously saved copy is preserved.';
       this.save();
       throw error;
     } finally {
@@ -474,7 +474,7 @@ export class SourceSnapshots {
             this.state.last_error = null;
           } else
             this.state.last_error =
-              result.error || 'Database capture failed; the last good copy is preserved.';
+              result.error || 'Database capture failed; any previously saved copy is preserved.';
           this.state.last_finished_at = Number.isFinite(Date.parse(result.finished_at))
             ? result.finished_at
             : new Date().toISOString();
@@ -489,7 +489,7 @@ export class SourceSnapshots {
           await this.prune();
         } else if (Date.now() - Date.parse(active.requested_at) > 10 * 60_000) {
           this.state.last_error =
-            'Database capture timed out. Check the helper; the last good copy is preserved.';
+            'Database capture timed out. Check the helper; any previously saved copy is preserved.';
           this.state.last_finished_at = new Date().toISOString();
           this.state.last_outcome = 'failed';
           delete this.state.active;
@@ -517,7 +517,7 @@ export class SourceSnapshots {
     } catch {
       const failed = this.state.active;
       this.state.last_error =
-        'Database capture could not be validated. The last good copy is preserved.';
+        'Database capture could not be validated. Any previously saved copy is preserved.';
       this.state.last_finished_at = new Date().toISOString();
       this.state.last_outcome = 'failed';
       delete this.state.active;

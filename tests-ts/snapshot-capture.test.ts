@@ -1,6 +1,6 @@
 import { afterEach, expect, it } from 'vitest';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
@@ -209,7 +209,7 @@ it('recovers interrupted encryption immediately while preserving queued work and
     ...request,
     ok: false,
     error:
-      'Database capture was interrupted. The last good capture is preserved. Capture Emby again.',
+      'Database capture was interrupted. Any previously saved capture is preserved. Capture Emby again.',
   });
   expect(Number.isFinite(Date.parse(result.finished_at))).toBe(true);
   expect(result.finished_at).toBe(result.started_at);
@@ -220,6 +220,24 @@ it('recovers interrupted encryption immediately while preserving queued work and
   const resultBytes = await readFile(join(path, `${request.id}.result`));
   await recoverSnapshotHelper(path, key);
   expect(await readFile(join(path, `${request.id}.result`))).toEqual(resultBytes);
+});
+
+it('reports conditional failure retention for an interrupted first capture without inventing a completed generation', async () => {
+  const path = await directory();
+  const key = randomBytes(32);
+  const request = recoveryRequest();
+  await writeEnvelope(join(path, `${request.id}.working`), request, key);
+  await writeFile(join(path, `${request.id}.db.enc.pending`), 'partial-ciphertext');
+  await recoverSnapshotHelper(path, key);
+  const result = await readEnvelope<CaptureResult>(join(path, `${request.id}.result`), key);
+  expect(result).toMatchObject({
+    id: request.id,
+    ok: false,
+    error:
+      'Database capture was interrupted. Any previously saved capture is preserved. Capture Emby again.',
+  });
+  expect((await readdir(path)).filter((name) => name.endsWith('.db.enc'))).toEqual([]);
+  expect((await readdir(path)).filter((name) => /\.(working|pending)$/.test(name))).toEqual([]);
 });
 
 it('preserves an authenticated completed capture result and removes only its interrupted markers', async () => {

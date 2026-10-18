@@ -115,7 +115,7 @@ async function reject(
   await expect(
     importPluginBackup(value.root, value.output, SERVER, { now: NOW, ...options }),
   ).rejects.toThrow(
-    'The Emby plugin backup could not be validated. The last good capture is preserved.',
+    'The Emby plugin backup could not be validated. Any previously saved capture is preserved.',
   );
   expect(await readdir(value.work)).toEqual([]);
   await absent(value.output);

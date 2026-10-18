@@ -295,7 +295,7 @@ describe('isolated destination catalog worker and helper', () => {
     );
     expect(recovered).toMatchObject({
       ok: false,
-      error: 'Jellyfin backup import was interrupted. The last good catalog is preserved.',
+      error: 'Jellyfin backup import was interrupted. Any previously saved catalog is preserved.',
     });
     const output = join(value.directory, 'decrypted.db');
     await decryptDatabase(

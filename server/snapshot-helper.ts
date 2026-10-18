@@ -191,7 +191,9 @@ while (!stopping) {
           started_at,
           finished_at: new Date().toISOString(),
           error:
-            'Database capture failed. Check the helper mount, version, permissions and WAL files. The last good capture is preserved.',
+            captureMethod === 'plugin_backup'
+              ? 'Emby backup import failed. Check the completed backup, mounted backup folder, version and permissions. Any previously saved capture is preserved.'
+              : 'Database capture failed. Check the helper mount, version, permissions and WAL files. Any previously saved capture is preserved.',
         };
         await rm(join(directory, `${id}.db.enc`), { force: true });
       } finally {

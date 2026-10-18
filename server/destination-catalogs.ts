@@ -201,7 +201,7 @@ export class DestinationCatalogs {
       this.state.last_outcome = 'interrupted';
       this.state.last_finished_at = new Date().toISOString();
       this.state.last_error =
-        'Jellyfin import preparation was interrupted before a helper request was saved. Check status before starting a new import. The last good catalog is preserved.';
+        'Jellyfin import preparation was interrupted before a helper request was saved. Check status before starting a new import. Any previously saved catalog is preserved.';
       this.save();
     }
     if (mode === 'backup' && !this.state.configured) {
@@ -446,7 +446,7 @@ export class DestinationCatalogs {
       this.state.last_finished_at = new Date().toISOString();
       this.state.last_outcome = 'failed';
       this.state.last_error =
-        'Jellyfin catalog import could not start. Check the helper and configured Jellyfin connection. The last good catalog is preserved.';
+        'Jellyfin catalog import could not start. Check the helper and configured Jellyfin connection. Any previously saved catalog is preserved.';
       this.save();
       throw error;
     } finally {
@@ -594,11 +594,11 @@ export class DestinationCatalogs {
           let adopted = false;
           if (value.ok === false)
             this.state.last_error = value.error?.includes('was interrupted')
-              ? 'Jellyfin backup import was interrupted. Check the helper, then import the completed backup again. The last good catalog is preserved.'
-              : 'Jellyfin backup import failed. Check the completed backup, mounted folder, version and permissions. The last good catalog is preserved.';
+              ? 'Jellyfin backup import was interrupted. Check the helper, then import the completed backup again. Any previously saved catalog is preserved.'
+              : 'Jellyfin backup import failed. Check the completed backup, mounted folder, version and permissions. Any previously saved catalog is preserved.';
           else if (!current(value) || !(await this.completeFile(value)))
             this.state.last_error =
-              'The Jellyfin backup could not be validated. The last good catalog is preserved.';
+              'The Jellyfin backup could not be validated. Any previously saved catalog is preserved.';
           else {
             const previous = this.state.generations.find((record) =>
               sameBinding(record.binding, value!.binding),
@@ -643,7 +643,7 @@ export class DestinationCatalogs {
           delete this.state.active;
           this.imports.release(`jellyfin:${active.id}`);
           this.state.last_error =
-            'Jellyfin catalog import timed out. The last good catalog is preserved.';
+            'Jellyfin catalog import timed out. Any previously saved catalog is preserved.';
           this.state.last_finished_at = new Date().toISOString();
           this.state.last_outcome = 'failed';
           this.save();
@@ -666,7 +666,7 @@ export class DestinationCatalogs {
       await this.prune();
     } catch {
       this.state.last_error =
-        'Jellyfin catalog status could not be validated. The last good catalog is preserved.';
+        'Jellyfin catalog status could not be validated. Any previously saved catalog is preserved.';
       this.save();
     } finally {
       this.ticking = false;

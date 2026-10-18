@@ -52,7 +52,12 @@ export function OverviewPage({
         <Callout title="Start by connecting your servers.">
           Add your Emby and Jellyfin API keys, then choose the Jellyfin user whose permissions new
           accounts should inherit.{' '}
-          <button className="text-button" onClick={() => navigate('settings')}>
+          <button
+            className="text-button"
+            onClick={() =>
+              navigateWorkspace({ page: 'settings', tab: 'media', subtab: 'jellyfin' })
+            }
+          >
             Open settings
           </button>
         </Callout>
@@ -100,7 +105,10 @@ export function OverviewPage({
               <h2>Server connections</h2>
               <p>Connection status for your media servers and Discord bot.</p>
             </div>
-            <button className="btn btn-small btn-quiet" onClick={() => navigate('settings')}>
+            <button
+              className="btn btn-small btn-quiet"
+              onClick={() => navigateWorkspace({ page: 'settings', tab: 'media' })}
+            >
               Manage
             </button>
           </div>
@@ -241,7 +249,16 @@ export function MigratePage({
       <UserWarnings users={users} />
       {!(overview.connections.emby.connected && overview.connections.jellyfin.connected) && (
         <Callout icon="warning" warning title="Both servers need to be connected.">
-          <button className="text-button" onClick={() => navigate('settings')}>
+          <button
+            className="text-button"
+            onClick={() =>
+              navigateWorkspace({
+                page: 'settings',
+                tab: 'media',
+                subtab: overview.connections.emby.connected ? 'jellyfin' : 'emby',
+              })
+            }
+          >
             Check your server settings
           </button>{' '}
           before starting a migration.
@@ -261,7 +278,14 @@ export function MigratePage({
         </label>
         <span id="migration-snapshot-help" className="section-note">
           Saved history must be current and cover every selected user. Missing data stops the
-          preview.
+          preview.{' '}
+          <button
+            type="button"
+            className="text-button"
+            onClick={() => navigateWorkspace({ page: 'settings', tab: 'history', subtab: 'emby' })}
+          >
+            Manage saved history
+          </button>
         </span>
       </div>
       <div className="page-stack">
@@ -269,7 +293,9 @@ export function MigratePage({
           <div className="panel-header">
             <div>
               <h2>Emby users</h2>
-              <p>Select up to 100 users for one migration.</p>
+              <p>
+                Select up to 100 users. Preview resolves saved mappings and checks account access.
+              </p>
             </div>
             <span className="status">{num(users.emby.length)} users</span>
           </div>
@@ -343,12 +369,10 @@ export function MigratePage({
                         <UserCell name={user.Name} />
                       </td>
                       <td data-label="Jellyfin">
-                        <span
-                          className={`status ${targets.has(user.Name.toLowerCase()) ? '' : 'good'}`}
-                        >
+                        <span className="status">
                           {targets.has(user.Name.toLowerCase())
-                            ? 'Already exists'
-                            : 'Will be created'}
+                            ? 'Username match'
+                            : 'Destination checked in review'}
                         </span>
                       </td>
                       <td className="right" data-label="Emby access">
@@ -376,7 +400,12 @@ export function MigratePage({
               }
             >
               {!search && (
-                <button className="btn btn-quiet" onClick={() => navigate('settings')}>
+                <button
+                  className="btn btn-quiet"
+                  onClick={() =>
+                    navigateWorkspace({ page: 'settings', tab: 'media', subtab: 'emby' })
+                  }
+                >
                   Connect Emby
                 </button>
               )}
@@ -582,7 +611,16 @@ export function AccountsPage({
       {!ready && (
         <Callout icon="warning" warning title="Finish your Jellyfin setup first.">
           Connect Jellyfin and choose a default account role or fallback template in{' '}
-          <button className="text-button" onClick={() => navigate('settings')}>
+          <button
+            className="text-button"
+            onClick={() =>
+              navigateWorkspace({
+                page: 'settings',
+                tab: overview.connections.jellyfin.connected ? 'accounts' : 'media',
+                subtab: overview.connections.jellyfin.connected ? 'permissions' : 'jellyfin',
+              })
+            }
+          >
             Settings
           </button>
           .
@@ -973,6 +1011,8 @@ export function SubscriptionsPage({
   );
   const pagination = usePagination(filtered, 25, `${scope}:${query}`);
   const pending = events.filter((event) => event.status === 'pending').length;
+  const failed = events.filter((event) => event.status === 'failed').length;
+  const attention = pending + failed;
   const names: Record<string, string> = {
     subscribe: 'Subscribed',
     cancel: 'Cancellation',
@@ -989,7 +1029,12 @@ export function SubscriptionsPage({
               <Icon name="refresh" />
               Refresh
             </button>
-            <button className="btn" onClick={() => navigate('settings')}>
+            <button
+              className="btn btn-quiet"
+              onClick={() =>
+                navigateWorkspace({ page: 'settings', tab: 'automation', subtab: 'rules' })
+              }
+            >
               Automation settings
             </button>
           </>
@@ -1025,12 +1070,14 @@ export function SubscriptionsPage({
                 <div>
                   <h2>Subscription events</h2>
                   <p>
-                    {pending
-                      ? `${num(pending)} ${pending === 1 ? 'event is' : 'events are'} waiting for review.`
+                    {attention
+                      ? `${num(attention)} ${attention === 1 ? 'event needs' : 'events need'} review · ${num(pending)} pending · ${num(failed)} failed.`
                       : 'Events appear when your configured Discord integration receives a membership change.'}
                   </p>
                 </div>
-                <span className={`status ${pending ? 'warn' : ''}`}>{num(pending)} pending</span>
+                <span className={`status ${attention ? 'warn' : ''}`}>
+                  {num(attention)} need review
+                </span>
               </div>
               {filtered.length ? (
                 <div className="table-wrap">
@@ -1101,7 +1148,7 @@ export function SubscriptionsPage({
                                 View operation
                               </button>
                             ) : event.report_cleared ? (
-                              <span className="subtle">Report cleared</span>
+                              <span className="subtle">Report deleted</span>
                             ) : (
                               '—'
                             )}
@@ -1130,7 +1177,16 @@ export function SubscriptionsPage({
                   }
                 >
                   {!events.length && (
-                    <button className="btn btn-quiet" onClick={() => navigate('settings')}>
+                    <button
+                      className="btn btn-quiet"
+                      onClick={() =>
+                        navigateWorkspace({
+                          page: 'settings',
+                          tab: 'discord',
+                          subtab: 'connection',
+                        })
+                      }
+                    >
                       Configure Discord
                     </button>
                   )}

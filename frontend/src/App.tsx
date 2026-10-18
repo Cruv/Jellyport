@@ -934,7 +934,11 @@ export default function App() {
       notify(
         result.status === 'failed'
           ? result.error || 'The subscription event could not be applied.'
-          : 'Subscription event processed.',
+          : result.status === 'processing'
+            ? 'Subscription processing is in progress. Follow its operation before retrying.'
+            : result.status === 'applied'
+              ? 'Subscription event applied.'
+              : 'Subscription event status refreshed.',
         result.status === 'failed',
       );
       await load('subscriptions');
@@ -1237,6 +1241,22 @@ export default function App() {
                   </button>
                 </div>
               )}
+              {pollPaused && hasActive && (
+                <Callout warning title="Activity updates paused.">
+                  The last known operation status is shown. Refresh Activity to check whether work
+                  is still running before retrying an action.{' '}
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => {
+                      if (page === 'activity') void load('activity');
+                      else navigate('activity');
+                    }}
+                  >
+                    Refresh Activity
+                  </button>
+                </Callout>
+              )}
               {content}
             </div>
           </main>
@@ -1390,7 +1410,7 @@ function HistoryCleanupDialog({
   }
   return (
     <Modal
-      title={review.single ? 'Clear this report?' : 'Clear activity history?'}
+      title={review.single ? 'Delete this report?' : 'Delete activity history?'}
       description="Remove stored Jellyport activity and migration reports."
       close={() => {
         if (!pendingRef.current) close();
@@ -1413,8 +1433,8 @@ function HistoryCleanupDialog({
             >
               {pending && <span className="spinner" />}
               {pending
-                ? 'Clearing…'
-                : `Clear ${num(ids.length)} ${ids.length === 1 ? 'report' : 'reports'}`}
+                ? 'Deleting…'
+                : `Delete ${num(ids.length)} ${ids.length === 1 ? 'report' : 'reports'}`}
             </button>
           </>
         )
@@ -1434,7 +1454,7 @@ function HistoryCleanupDialog({
         <>
           <p role="status">
             {num(result.removed_ids.length)}{' '}
-            {result.removed_ids.length === 1 ? 'report cleared' : 'reports cleared'}.{' '}
+            {result.removed_ids.length === 1 ? 'report deleted' : 'reports deleted'}.{' '}
             {num(result.skipped.length)} kept.
           </p>
           {!!skipped.size && (
@@ -1490,8 +1510,8 @@ function HistoryCleanupDialog({
           )}
           {overLimit && (
             <p className="error-block" role="alert">
-              Clear at most 1,000 reports at a time. Use Activity filters or an older date to narrow
-              this review.
+              Delete at most 1,000 reports at a time. Use Activity filters or an older date to
+              narrow this review.
             </p>
           )}
           {error && (

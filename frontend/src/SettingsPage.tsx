@@ -167,6 +167,22 @@ export function ConnectionRows({ connections }: { connections: Partial<Connectio
             <div className="server-name">
               <strong>{{ emby: 'Emby', jellyfin: 'Jellyfin', discord: 'Discord' }[key]}</strong>
               <small title={detail}>{detail}</small>
+              {!conn.connected && (
+                <button
+                  type="button"
+                  className="text-button"
+                  aria-label={`Configure ${key === 'emby' ? 'Emby' : key === 'jellyfin' ? 'Jellyfin' : 'Discord'} connection`}
+                  onClick={() =>
+                    navigateWorkspace({
+                      page: 'settings',
+                      tab: key === 'discord' ? 'discord' : 'media',
+                      subtab: key === 'discord' ? 'connection' : key,
+                    })
+                  }
+                >
+                  Configure
+                </button>
+              )}
             </div>
             <span className={`status ${conn.connected ? 'good' : configured ? 'warn' : ''}`}>
               {conn.connected
@@ -193,7 +209,21 @@ export function UserWarnings({ users }: { users: Users }) {
           warning
           title={`${server === 'jellyfin' ? 'Jellyfin' : 'Emby'} users could not be loaded.`}
         >
-          {message} Check the saved connection and try again.
+          {message}{' '}
+          <button
+            type="button"
+            className="text-button"
+            onClick={() =>
+              navigateWorkspace({
+                page: 'settings',
+                tab: 'media',
+                subtab: server === 'jellyfin' ? 'jellyfin' : 'emby',
+              })
+            }
+          >
+            Check the saved connection
+          </button>{' '}
+          and try again.
         </Callout>
       ))}
     </>

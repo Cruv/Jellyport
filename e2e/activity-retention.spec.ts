@@ -59,7 +59,7 @@ test('failed and review-needed filters select recent finished reports for manual
   for (const status of ['failed', 'partial']) {
     await page.getByRole('combobox', { name: 'Status', exact: true }).selectOption(status);
     await page.getByRole('button', { name: 'Delete activity…' }).click();
-    const confirmation = page.getByRole('dialog', { name: 'Clear activity history?' });
+    const confirmation = page.getByRole('dialog', { name: 'Delete activity history?' });
     await expect(confirmation.getByRole('combobox', { name: 'Reports to review' })).toHaveValue(
       'filtered',
     );

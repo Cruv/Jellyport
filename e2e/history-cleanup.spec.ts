@@ -94,7 +94,7 @@ test('clears a reviewed report after credentials are consumed, preserving the me
   let details = page.getByRole('dialog', { name: 'Operation details' });
   await expect(details.getByRole('button', { name: 'Delete report…', exact: true })).toBeVisible();
   await details.getByRole('button', { name: 'Delete report…', exact: true }).click();
-  let confirmation = page.getByRole('dialog', { name: 'Clear this report?' });
+  let confirmation = page.getByRole('dialog', { name: 'Delete this report?' });
   await expect(confirmation).toContainText(id);
   await expect(confirmation).toContainText('does not undo migrations');
   await confirmation.getByRole('button', { name: 'Cancel', exact: true }).click();
@@ -105,7 +105,7 @@ test('clears a reviewed report after credentials are consumed, preserving the me
   await expect(search).toHaveValue(id);
   await expect(page.getByRole('button', { name: 'View operation details' })).toHaveCount(1);
   await page.getByRole('button', { name: 'Delete activity…', exact: true }).click();
-  const bulk = page.getByRole('dialog', { name: 'Clear activity history?' });
+  const bulk = page.getByRole('dialog', { name: 'Delete activity history?' });
   await expect(bulk.getByRole('combobox', { name: 'Reports to review' })).toHaveValue('filtered');
   await expect(bulk.getByRole('combobox', { name: 'Recorded before' })).toHaveValue('all');
   await expect(bulk).toContainText('1 finished report selected.');
@@ -116,9 +116,9 @@ test('clears a reviewed report after credentials are consumed, preserving the me
   await page.getByRole('button', { name: 'View operation details' }).click();
   details = page.getByRole('dialog', { name: 'Operation details' });
   await details.getByRole('button', { name: 'Delete report…', exact: true }).click();
-  confirmation = page.getByRole('dialog', { name: 'Clear this report?' });
-  await confirmation.getByRole('button', { name: 'Clear 1 report', exact: true }).click();
-  await expect(confirmation).toContainText('0 reports cleared. 1 kept.');
+  confirmation = page.getByRole('dialog', { name: 'Delete this report?' });
+  await confirmation.getByRole('button', { name: 'Delete 1 report', exact: true }).click();
+  await expect(confirmation).toContainText('0 reports deleted. 1 kept.');
   await expect(confirmation).toContainText(
     'New credentials still await delivery or one-time reveal',
   );
@@ -139,11 +139,11 @@ test('clears a reviewed report after credentials are consumed, preserving the me
   await page.getByRole('button', { name: 'View operation details' }).click();
   details = page.getByRole('dialog', { name: 'Operation details' });
   await details.getByRole('button', { name: 'Delete report…', exact: true }).click();
-  confirmation = page.getByRole('dialog', { name: 'Clear this report?' });
+  confirmation = page.getByRole('dialog', { name: 'Delete this report?' });
   await expectContainedLayout(page);
   await page.screenshot({ path: info.outputPath('clear-report-review.png'), fullPage: true });
-  await confirmation.getByRole('button', { name: 'Clear 1 report', exact: true }).click();
-  await expect(confirmation).toContainText('1 report cleared. 0 kept.');
+  await confirmation.getByRole('button', { name: 'Delete 1 report', exact: true }).click();
+  await expect(confirmation).toContainText('1 report deleted. 0 kept.');
   await confirmation.getByRole('button', { name: 'Done', exact: true }).click();
   await expect(page.getByText('No matching operations', { exact: true })).toBeVisible();
   expect((await page.request.get(`/api/jobs/${id}`)).ok()).toBe(false);

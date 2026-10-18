@@ -175,7 +175,7 @@ test('creates an account, explicitly reveals credentials, and cancels clearing i
   await navigate(page, 'Activity');
   await page.getByRole('searchbox', { name: 'Search operations' }).fill(username);
   await page.getByRole('button', { name: 'Delete activity…', exact: true }).click();
-  const confirmation = page.getByRole('dialog', { name: 'Clear activity history?' });
+  const confirmation = page.getByRole('dialog', { name: 'Delete activity history?' });
   await expect(confirmation).toContainText('1 finished report selected.');
   const cancel = confirmation.getByRole('button', { name: 'Cancel', exact: true });
   await expectReachable(page, cancel);
@@ -274,7 +274,7 @@ test('synthetic safe-area insets keep drawer controls and confirmation footers r
   await page.keyboard.press('Escape');
   await navigate(page, 'Activity');
   await page.getByRole('button', { name: 'Delete activity…', exact: true }).click();
-  const dialog = page.getByRole('dialog', { name: 'Clear activity history?' });
+  const dialog = page.getByRole('dialog', { name: 'Delete activity history?' });
   const cancel = dialog.getByRole('button', { name: 'Cancel', exact: true });
   await expectReachable(page, cancel);
   const modal = await dialog.boundingBox();

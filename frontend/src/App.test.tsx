@@ -193,7 +193,7 @@ describe('Activity report cleanup', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
     fireEvent.click(await screen.findByRole('button', { name: 'Delete activity…' }));
-    return screen.findByRole('dialog', { name: 'Clear activity history?' });
+    return screen.findByRole('dialog', { name: 'Delete activity history?' });
   }
   const cleanupRequests = () => requests.filter((request) => request.path === '/api/jobs/cleanup');
 
@@ -242,13 +242,13 @@ describe('Activity report cleanup', () => {
     fireEvent.change(within(dialog).getByRole('combobox', { name: 'Reports to review' }), {
       target: { value: 'filtered' },
     });
-    expect(within(dialog).getByRole('button', { name: 'Clear 30 reports' })).toBeTruthy();
+    expect(within(dialog).getByRole('button', { name: 'Delete 30 reports' })).toBeTruthy();
     // A concurrent refresh finishes another matching job after this review opened.
     responses['/api/jobs'] = { jobs: [...jobs, past('newly-finished', 'failed')] };
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
     await waitFor(() => expect(screen.getByText('61 operations')).toBeTruthy());
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 30 reports' }));
-    await within(dialog).findByText('30 reports cleared. 0 kept.');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete 30 reports' }));
+    await within(dialog).findByText('30 reports deleted. 0 kept.');
     const request = cleanupRequests()[0];
     expect(request.options?.method).toBe('POST');
     expect(JSON.parse(request.options!.body as string)).toEqual({
@@ -272,14 +272,14 @@ describe('Activity report cleanup', () => {
       'all',
     );
     expect(
-      (within(dialog).getByRole('button', { name: 'Clear 1 report' }) as HTMLButtonElement)
+      (within(dialog).getByRole('button', { name: 'Delete 1 report' }) as HTMLButtonElement)
         .disabled,
     ).toBe(false);
     fireEvent.change(within(dialog).getByRole('combobox', { name: 'Recorded before' }), {
       target: { value: '30' },
     });
     expect(
-      (within(dialog).getByRole('button', { name: 'Clear 0 reports' }) as HTMLButtonElement)
+      (within(dialog).getByRole('button', { name: 'Delete 0 reports' }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
   });
@@ -308,8 +308,8 @@ describe('Activity report cleanup', () => {
       expect(
         within(dialog).getByText(/Finished reports include Failed and Needs review/),
       ).toBeTruthy();
-      fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
-      await within(dialog).findByText('1 report cleared. 0 kept.');
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Delete 1 report' }));
+      await within(dialog).findByText('1 report deleted. 0 kept.');
       expect(JSON.parse(cleanupRequests()[0].options!.body as string)).toEqual({
         job_ids: ['selected'],
       });
@@ -333,16 +333,16 @@ describe('Activity report cleanup', () => {
       'value',
       'all',
     );
-    expect(within(dialog).getByRole('button', { name: 'Clear 1 report' })).toBeTruthy();
+    expect(within(dialog).getByRole('button', { name: 'Delete 1 report' })).toBeTruthy();
     fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
     expect(cleanupRequests()).toHaveLength(0);
   });
 
   it('refuses an oversized review instead of silently truncating it', async () => {
     const dialog = await review(Array.from({ length: 1001 }, (_, i) => past(`old-${i}`)));
-    expect(within(dialog).getByRole('alert').textContent).toContain('Clear at most 1,000 reports');
+    expect(within(dialog).getByRole('alert').textContent).toContain('Delete at most 1,000 reports');
     expect(
-      (within(dialog).getByRole('button', { name: 'Clear 1,001 reports' }) as HTMLButtonElement)
+      (within(dialog).getByRole('button', { name: 'Delete 1,001 reports' }) as HTMLButtonElement)
         .disabled,
     ).toBe(true);
     expect(cleanupRequests()).toHaveLength(0);
@@ -352,10 +352,10 @@ describe('Activity report cleanup', () => {
     const dialog = await review([past('old'), past('protected')]);
     statuses['/api/jobs/cleanup'] = 503;
     responses['/api/jobs/cleanup'] = { detail: 'History cleanup is unavailable.' };
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 2 reports' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete 2 reports' }));
     await within(dialog).findByRole('alert');
     expect(
-      (within(dialog).getByRole('button', { name: 'Clear 2 reports' }) as HTMLButtonElement)
+      (within(dialog).getByRole('button', { name: 'Delete 2 reports' }) as HTMLButtonElement)
         .disabled,
     ).toBe(false);
     statuses['/api/jobs/cleanup'] = 200;
@@ -366,8 +366,8 @@ describe('Activity report cleanup', () => {
         { id: 'outside-review', reason: 'private-arbitrary-text' },
       ],
     };
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 2 reports' }));
-    await within(dialog).findByText('1 report cleared. 1 kept.');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete 2 reports' }));
+    await within(dialog).findByText('1 report deleted. 1 kept.');
     expect(
       within(dialog).getByText(/New credentials still await delivery or one-time reveal: 1/),
     ).toBeTruthy();
@@ -395,7 +395,7 @@ describe('Activity report cleanup', () => {
         });
       }),
     );
-    const clear = within(dialog).getByRole('button', { name: 'Clear 1 report' });
+    const clear = within(dialog).getByRole('button', { name: 'Delete 1 report' });
     fireEvent.click(clear);
     fireEvent.click(clear);
     expect(cleanupRequests()).toHaveLength(1);
@@ -428,7 +428,7 @@ describe('Activity report cleanup', () => {
           : original(path, options),
       ),
     );
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete 1 report' }));
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
     await screen.findByRole('heading', { name: 'Settings', level: 1 });
     await act(async () =>
@@ -438,7 +438,7 @@ describe('Activity report cleanup', () => {
         json: async () => ({ removed_ids: ['old'], skipped: [] }),
       } as Response),
     );
-    expect(screen.queryByText('1 report cleared. 0 kept.')).toBeNull();
+    expect(screen.queryByText('1 report deleted. 0 kept.')).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
   });
 
@@ -457,7 +457,7 @@ describe('Activity report cleanup', () => {
           : original(path, options),
       ),
     );
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete 1 report' }));
     fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     await screen.findByRole('heading', { name: 'Welcome back' });
     await act(async () =>
@@ -479,10 +479,10 @@ describe('Activity report cleanup', () => {
     } satisfies HistoryCleanupResult;
     const detail = await openJob();
     fireEvent.click(within(detail).getByRole('button', { name: 'Delete report…' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Clear this report?' });
+    const dialog = await screen.findByRole('dialog', { name: 'Delete this report?' });
     expect(within(dialog).queryByRole('combobox')).toBeNull();
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
-    await within(dialog).findByText('1 report cleared. 0 kept.');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete 1 report' }));
+    await within(dialog).findByText('1 report deleted. 0 kept.');
     fireEvent.click(within(dialog).getByRole('button', { name: 'Done' }));
     expect(screen.queryByRole('button', { name: 'View operation details' })).toBeNull();
     expect(JSON.parse(cleanupRequests()[0].options!.body as string)).toEqual({
@@ -508,8 +508,8 @@ describe('Activity report cleanup', () => {
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
     fireEvent.click(screen.getByRole('button', { name: 'Delete activity…' }));
     const dialog = await screen.findByRole('dialog');
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Clear 1 report' }));
-    await within(dialog).findByText('1 report cleared. 0 kept.');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Delete 1 report' }));
+    await within(dialog).findByText('1 report deleted. 0 kept.');
     expect(within(dialog).getByRole('button', { name: 'Done' })).toBeTruthy();
   });
 });
@@ -570,6 +570,64 @@ async function selectAndPreviewReady() {
   await screen.findByRole('dialog');
 }
 describe('React account safeguards', () => {
+  it('keeps a persistent last-known-status warning when job polling fails, then reconciles on refresh', async () => {
+    let poll: (() => Promise<void>) | undefined;
+    const realInterval = globalThis.setInterval;
+    vi.spyOn(globalThis, 'setInterval').mockImplementation(((
+      callback: TimerHandler,
+      timeout?: number,
+      ...args: unknown[]
+    ) => {
+      if (timeout === 3000) {
+        poll = callback as () => Promise<void>;
+        return 999 as unknown as ReturnType<typeof setInterval>;
+      }
+      return realInterval(callback, timeout, ...args);
+    }) as typeof setInterval);
+    const active = { ...job, status: 'running', results: [] };
+    responses['/api/overview'] = { ...overview, recent_jobs: [active] };
+    responses['/api/jobs'] = { jobs: [active] };
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    await waitFor(() => expect(poll).toBeTypeOf('function'));
+    statuses['/api/jobs'] = 503;
+    responses['/api/jobs'] = { detail: 'Synthetic temporary failure' };
+    await act(async () => {
+      await poll!();
+    });
+    expect(screen.getByText('Activity updates paused.')).toBeTruthy();
+    expect(screen.getByText(/The last known operation status is shown/)).toBeTruthy();
+    expect(requests.filter((r) => r.options?.method === 'POST')).toHaveLength(0);
+    statuses['/api/jobs'] = 200;
+    responses['/api/jobs'] = { jobs: [job] };
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    await waitFor(() => expect(screen.queryByText('Activity updates paused.')).toBeNull());
+    expect(screen.getByRole('button', { name: 'Delete activity…' })).toBeTruthy();
+  });
+  it('distinguishes a still-processing subscription from a completed access change', async () => {
+    const event = {
+      id: 'processing-event',
+      action: 'subscribe',
+      username: 'Crew',
+      status: 'pending',
+      created_at: '2026-10-18T00:00:00Z',
+    };
+    responses['/api/subscriptions'] = { events: [event] };
+    responses['/api/subscriptions/processing-event/apply'] = { ...event, status: 'processing' };
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Subscriptions' }));
+    await screen.findByRole('heading', { name: 'Subscriptions', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Review' }));
+    const dialog = await screen.findByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('button', { name: /Apply/ }));
+    await screen.findByText(
+      'Subscription processing is in progress. Follow its operation before retrying.',
+    );
+    expect(screen.queryByText('Subscription event processed.')).toBeNull();
+  });
+
   it.each([
     {
       name: 'unreadable JSON',

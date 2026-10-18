@@ -785,6 +785,34 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   );
   app.delete('/api/source-snapshots', noSnapshotBody, async () => service.sourceSnapshots.clear());
   app.get('/api/destination-catalog', async () => service.destinationSnapshots.status());
+  app.put<{
+    Body: {
+      enabled: boolean;
+      hour: number;
+      minute: number;
+      time_zone: string;
+      expected_revision: string;
+    };
+  }>(
+    '/api/destination-catalog/schedule',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['enabled', 'hour', 'minute', 'time_zone', 'expected_revision'],
+          properties: {
+            enabled: { type: 'boolean' },
+            hour: { type: 'integer', minimum: 0, maximum: 23 },
+            minute: { type: 'integer', minimum: 0, maximum: 59 },
+            time_zone: { type: 'string', minLength: 1, maxLength: 128 },
+            expected_revision: id,
+          },
+        },
+      },
+    },
+    async (request) => service.destinationSnapshots.configure(request.body),
+  );
   app.post('/api/destination-catalog/refresh', noSnapshotBody, async (_request, reply) =>
     reply.code(202).send(await service.destinationSnapshots.refresh()),
   );

@@ -44,7 +44,9 @@ export interface PluginBackupCaptureOptions {
   copied?: (name: SourceFile) => void | Promise<void>;
 }
 const failed = () =>
-  new Error('The Emby plugin backup could not be validated. The last good capture is preserved.');
+  new Error(
+    'The Emby plugin backup could not be validated. Any previously saved capture is preserved.',
+  );
 const missing = (error: unknown) =>
   error instanceof Error && 'code' in error && error.code === 'ENOENT';
 

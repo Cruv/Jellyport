@@ -319,7 +319,7 @@ export async function recoverSnapshotHelper(directory: string, key: Buffer): Pro
           started_at: now,
           finished_at: now,
           error:
-            'Database capture was interrupted. The last good capture is preserved. Capture Emby again.',
+            'Database capture was interrupted. Any previously saved capture is preserved. Capture Emby again.',
         } satisfies CaptureResult,
         key,
       );

@@ -165,6 +165,34 @@ async function pluginCapture(
   });
 }
 
+it.each([false, true])(
+  'reports conditional failure retention with a previous Emby capture: %s',
+  async (retained) => {
+    const f = await fixture();
+    const good = retained ? await pluginCapture(f) : undefined;
+    await pluginCapture(f, { schema: 'unsupported-schema' });
+    const status = await f.manager.status();
+    expect(status).toMatchObject({
+      running: false,
+      last_outcome: 'failed',
+      snapshots: retained ? 1 : 0,
+      last_error:
+        'Database capture could not be validated. Any previously saved copy is preserved.',
+    });
+    expect(status.records.map((record) => record.id)).toEqual(good ? [good.id] : []);
+    await f.restart();
+    expect((await f.manager.status()).records.map((record) => record.id)).toEqual(
+      good ? [good.id] : [],
+    );
+    if (good)
+      expect((await f.manager.select(userId, f.settings, 'fixture-emby-server')).id).toBe(good.id);
+    else
+      await expect(f.manager.select(userId, f.settings, 'fixture-emby-server')).rejects.toThrow(
+        'No completed',
+      );
+  },
+);
+
 it('imports plugin provenance with original history age and permits accounts created after the backup', async () => {
   const f = await fixture();
   f.client.users.mockResolvedValue([
@@ -214,7 +242,7 @@ it.each([
   expect(await f.manager.status()).toMatchObject({
     snapshots: 1,
     records: [{ id: good.id }],
-    last_error: 'Database capture could not be validated. The last good copy is preserved.',
+    last_error: 'Database capture could not be validated. Any previously saved copy is preserved.',
   });
   await expect(stat(join(f.shared, `${invalid.id}.db.enc`))).rejects.toMatchObject({
     code: 'ENOENT',
@@ -234,7 +262,7 @@ it.each([-49 * 60 * 60_000, 2 * 60_000])(
       backup_fingerprint: 'b'.repeat(64),
     });
     expect((await f.manager.status()).records.map((record) => record.id)).toEqual([good.id]);
-    expect((await f.manager.status()).last_error).toContain('last good copy is preserved');
+    expect((await f.manager.status()).last_error).toContain('previously saved copy is preserved');
   },
 );
 
@@ -389,7 +417,7 @@ it.each([null, 0, 2, '1'])(
     const good = await f.complete();
     const invalid = await f.complete({ orphan_identity_version: version as 1 });
     expect((await f.manager.status()).records.map((record) => record.id)).toEqual([good.id]);
-    expect((await f.manager.status()).last_error).toContain('last good copy is preserved');
+    expect((await f.manager.status()).last_error).toContain('previously saved copy is preserved');
     await expect(stat(join(f.shared, `${invalid.id}.db.enc`))).rejects.toMatchObject({
       code: 'ENOENT',
     });
@@ -691,7 +719,7 @@ it('rejects an authenticated result that silently changes file-copy capture to o
   expect(await f.manager.status()).toMatchObject({
     running: false,
     records: [{ id: good.id }],
-    last_error: 'Database capture could not be validated. The last good copy is preserved.',
+    last_error: 'Database capture could not be validated. Any previously saved copy is preserved.',
   });
 });
 
@@ -787,7 +815,7 @@ it('preserves the last good generation when a result is corrupt, unsupported or 
   expect(await f.manager.status()).toMatchObject({
     running: false,
     snapshots: 1,
-    last_error: 'Database capture could not be validated. The last good copy is preserved.',
+    last_error: 'Database capture could not be validated. Any previously saved copy is preserved.',
   });
   await f.complete({ identities: { [otherUserId]: 10 } });
   const status = await f.manager.status();

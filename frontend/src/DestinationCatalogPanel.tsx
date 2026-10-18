@@ -126,6 +126,7 @@ export default function DestinationCatalogPanel({
         )}
         <ImportStatus
           status={status}
+          hasRetainedData={status ? !!record : undefined}
           loading={loading}
           starting={busy === 'import'}
           error={error}

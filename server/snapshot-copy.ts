@@ -28,7 +28,9 @@ export interface FileCopyCaptureOptions {
   copied?: (name: CaptureFile) => void | Promise<void>;
 }
 const failed = () =>
-  new Error('The file-copy capture could not be validated. The last good capture is preserved.');
+  new Error(
+    'The file-copy capture could not be validated. Any previously saved capture is preserved.',
+  );
 const missing = (error: unknown) =>
   error instanceof Error && 'code' in error && error.code === 'ENOENT';
 

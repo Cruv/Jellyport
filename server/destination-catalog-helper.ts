@@ -14,7 +14,7 @@ import {
 
 const requestName = /^jellyfin-([a-f0-9-]{36})\.request$/;
 const failure =
-  'Jellyfin backup import failed. Check the completed backup, mounted folder, version and permissions. The last good catalog is preserved.';
+  'Jellyfin backup import failed. Check the completed backup, mounted folder, version and permissions. Any previously saved catalog is preserved.';
 function observe(value: Record<string, unknown>): void {
   try {
     console.info(JSON.stringify({ event: 'destination_catalog_import', ...value }));
@@ -146,7 +146,8 @@ export async function recoverDestinationCatalogHelper(
             ok: false,
             started_at: request.requested_at,
             finished_at: new Date().toISOString(),
-            error: 'Jellyfin backup import was interrupted. The last good catalog is preserved.',
+            error:
+              'Jellyfin backup import was interrupted. Any previously saved catalog is preserved.',
           },
           key,
         );

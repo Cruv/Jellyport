@@ -71,6 +71,49 @@ afterEach(() => {
 });
 
 describe('Saved Emby database capture settings', () => {
+  it.each(
+    (['failed', 'interrupted'] as const).flatMap((outcome) =>
+      (['none', 'current', 'expired'] as const).map((retained) => ({ outcome, retained })),
+    ),
+  )(
+    'reports retained-data knowledge truthfully after $outcome with $retained source history',
+    async ({ outcome, retained }) => {
+      vi.spyOn(Date, 'now').mockReturnValue(
+        Date.parse(retained === 'expired' ? '2026-10-17T04:00:00Z' : '2026-10-15T04:00:00Z'),
+      );
+      const api: Api = async <T,>() =>
+        ({
+          ...pluginStatus,
+          last_outcome: outcome,
+          last_error: 'Import attempt did not finish.',
+          snapshots: retained === 'none' ? 0 : 1,
+          records: retained === 'none' ? [] : pluginStatus.records,
+        }) as T;
+      render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
+      expect((await screen.findByRole('alert')).textContent).toBe('Import attempt did not finish.');
+      expect(screen.getByText(outcome === 'failed' ? 'Failed' : 'Interrupted')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Import latest backup' })).toHaveProperty(
+        'disabled',
+        false,
+      );
+      expect(screen.getByRole('button', { name: 'Refresh status' })).toHaveProperty(
+        'disabled',
+        false,
+      );
+      expect(screen.queryByText('Previous valid saved data is retained.')).toBeNull();
+      if (retained === 'none') {
+        expect(screen.getByText('No previous saved data is available.')).toBeTruthy();
+        expect(screen.queryByText('Previous saved data is retained.')).toBeNull();
+        expect(screen.queryByRole('table', { name: 'Saved Emby captures' })).toBeNull();
+      } else {
+        expect(screen.getByText('Previous saved data is retained.')).toBeTruthy();
+        expect(screen.queryByText('No previous saved data is available.')).toBeNull();
+        expect(screen.getByText(retained === 'expired' ? 'Expired' : 'Available')).toBeTruthy();
+        if (retained === 'expired')
+          expect(screen.queryByText('Saved Emby history available')).toBeNull();
+      }
+    },
+  );
   it.each([false, true])(
     'shows retained source data guidance only when saved captures exist (retained=%s)',
     async (retained) => {
@@ -357,7 +400,7 @@ describe('Saved Emby database capture settings', () => {
     expect(screen.getByText(/consistent SQLite online backup is captured/)).toBeTruthy();
     expect(screen.getByText(/Live file copies are not transactional/)).toBeTruthy();
     expect(screen.getByText('Database capture validation failed.')).toBeTruthy();
-    expect(screen.getByText('Previous valid saved data is retained.')).toBeTruthy();
+    expect(screen.getByText('Previous saved data is retained.')).toBeTruthy();
     expect(screen.getByText(/Failed captures keep the last good copy/)).toBeTruthy();
     expect(screen.queryByText('Scheduled file copy')).toBeNull();
   });
@@ -464,7 +507,7 @@ describe('Saved Emby database capture settings', () => {
     render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
     await screen.findByText('All Emby users');
     expect(screen.getByText(/Unsupported Emby database schema/)).toBeTruthy();
-    expect(screen.getByText(/Previous valid saved data is retained/)).toBeTruthy();
+    expect(screen.getByText(/Previous saved data is retained/)).toBeTruthy();
     expect(screen.getByText(/Emby 4.10.1.0/)).toBeTruthy();
     expect(screen.queryByText('http://emby:8096')).toBeNull();
     fail = true;

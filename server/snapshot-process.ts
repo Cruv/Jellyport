@@ -23,7 +23,7 @@ export function snapshotProcess<T>(
     };
     const timer = setTimeout(() => {
       error = new Error(
-        'Snapshot operation exceeded its time limit. The last good capture is preserved.',
+        'Snapshot operation exceeded its time limit. Any previously saved capture is preserved.',
       );
       child.kill('SIGKILL');
     }, timeout);

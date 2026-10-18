@@ -285,6 +285,26 @@ describe('Jellyfin daily backup import schedule', () => {
     });
     expect(imports.busy).toBe(false);
   });
+  it.each([false, true])(
+    'reports conditional failure retention with a previous Jellyfin catalog: %s',
+    async (retained) => {
+      const f = await fixture('backup');
+      const good = retained ? await f.complete() : undefined;
+      await f.finish(await f.request(), { ok: false, error: 'Synthetic backup import failed.' });
+      expect(await f.manager.status()).toMatchObject({
+        running: false,
+        last_outcome: 'failed',
+        usable: retained,
+        record: good ? { id: good.id, backup_created_at: good.backup_created_at } : null,
+        last_error:
+          'Jellyfin backup import failed. Check the completed backup, mounted folder, version and permissions. Any previously saved catalog is preserved.',
+      });
+      await f.restart();
+      expect((await f.manager.status()).record?.id).toBe(good?.id);
+      if (good) expect(f.manager.queuedSelection(f.settings)).toBe(good.id);
+      else expect(() => f.manager.queuedSelection(f.settings)).toThrow('current Jellyfin');
+    },
+  );
 });
 afterEach(async () => {
   vi.restoreAllMocks();

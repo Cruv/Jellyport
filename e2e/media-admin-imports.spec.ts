@@ -207,6 +207,46 @@ test('real backup imports, daily execution and restart preserve original freshne
   await expect(page.getByRole('dialog')).toContainText('completed', { ignoreCase: true });
 });
 
+test('first failed backup imports show no retained data and recover through the same import controls', async ({
+  page,
+  imports,
+}, testInfo) => {
+  test.setTimeout(60_000);
+  for (const kind of ['emby', 'jellyfin'] as const) {
+    await imports.backup(kind, 'missing');
+    const view = await importBackup(page, imports, kind, 'failed');
+    await expect(view.getByRole('alert')).not.toHaveCount(0);
+    await expect(view.getByText(/Previous.*saved data.*retained/i)).toHaveCount(0);
+    await expect(
+      view.getByText('No previous saved data is available.', { exact: true }),
+    ).toBeVisible();
+    if (kind === 'emby') {
+      const status = await imports.sourceStatus();
+      expect(status.records).toEqual([]);
+      expect(status.last_error).not.toMatch(/The last good .* is preserved/i);
+      await expect(view.getByText('No saved Emby history', { exact: true })).toBeVisible();
+    } else {
+      const status = await imports.destinationStatus();
+      expect(status.record).toBeNull();
+      expect(status.last_error).not.toMatch(/The last good .* is preserved/i);
+      await expect(
+        view.getByText('No saved Jellyfin matching catalog', { exact: true }),
+      ).toBeVisible();
+    }
+    await expectContainedLayout(page);
+    await page.screenshot({
+      path: testInfo.outputPath(`first-${kind}-import-failed.png`),
+      fullPage: true,
+    });
+    expect(imports.writes).toEqual([]);
+    await imports.backup(kind, 'valid');
+    await importBackup(page, imports, kind);
+  }
+  expect((await imports.sourceStatus()).records).toHaveLength(1);
+  expect((await imports.destinationStatus()).record).not.toBeNull();
+  expect(imports.writes).toEqual([]);
+});
+
 test('missing and invalid backups fail visibly, retain original valid history, and recover without live fallback', async ({
   page,
   imports,
@@ -221,9 +261,7 @@ test('missing and invalid backups fail visibly, retain original valid history, a
   const first = await importBoth(page, imports);
   await imports.backup('emby', 'missing');
   let view = await importBackup(page, imports, 'emby', 'failed');
-  await expect(
-    view.getByText('Previous valid saved data is retained.', { exact: true }),
-  ).toBeVisible();
+  await expect(view.getByText('Previous saved data is retained.', { exact: true })).toBeVisible();
   expect((await imports.sourceStatus()).records[0]).toMatchObject({
     id: first.source.id,
     backup_created_at: imports.backupAt,
@@ -235,9 +273,7 @@ test('missing and invalid backups fail visibly, retain original valid history, a
   // A newer incomplete native archive must fail; the older valid archive is not a fallback.
   await imports.backup('jellyfin', 'incomplete');
   view = await importBackup(page, imports, 'jellyfin', 'failed');
-  await expect(
-    view.getByText('Previous valid saved data is retained.', { exact: true }),
-  ).toBeVisible();
+  await expect(view.getByText('Previous saved data is retained.', { exact: true })).toBeVisible();
   expect((await imports.destinationStatus()).record).toMatchObject({
     id: first.destination.id,
     backup_created_at: imports.backupAt,

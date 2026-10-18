@@ -146,6 +146,7 @@ export default function SourceSnapshotsPanel({
         )}
         <ImportStatus
           status={status}
+          hasRetainedData={status ? status.records.length > 0 : undefined}
           loading={loading}
           starting={busy === 'import'}
           error={error}

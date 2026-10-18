@@ -1,7 +1,17 @@
 import { afterEach, expect, it, vi } from 'vitest';
 import { fork, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -59,7 +69,7 @@ async function hash(path: string): Promise<string> {
     .digest('hex');
 }
 
-it('captures a synthetic plugin backup through the real helper, encrypted exchange and worker history reader without network access', async () => {
+it('captures a synthetic plugin backup with conditional failure retention through the real helper without network access', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'jellyport-plugin-helper-test-'));
   directories.push(directory);
   const backups = join(directory, 'backups'),
@@ -173,10 +183,12 @@ syncBuiltinESMExports();
     id: randomUUID(),
     capture_method: 'file_copy',
   };
-  for (const value of [request, wrongMethod])
-    await writeEnvelope(join(exchange, `${value.id}.request`), value, key);
+  const firstFailure = { ...request, id: randomUUID() };
+  const withheld = join(directory, 'withheld-backup');
+  await rename(full, withheld);
+  await writeEnvelope(join(exchange, `${firstFailure.id}.request`), firstFailure, key);
   expect(
-    (await readFile(join(exchange, `${request.id}.request`))).includes(Buffer.from(GUID)),
+    (await readFile(join(exchange, `${firstFailure.id}.request`))).includes(Buffer.from(GUID)),
   ).toBe(false);
 
   let stderr = '';
@@ -210,6 +222,18 @@ syncBuiltinESMExports();
     readEnvelope<{ capture_method: string }>(join(exchange, 'helper.status'), key),
   );
   expect(status.capture_method).toBe('plugin_backup');
+  const firstRejected = await waitFor(() =>
+    readEnvelope<CaptureResult>(join(exchange, `${firstFailure.id}.result`), key),
+  );
+  expect(firstRejected).toMatchObject({
+    id: firstFailure.id,
+    ok: false,
+    error:
+      'Emby backup import failed. Check the completed backup, mounted backup folder, version and permissions. Any previously saved capture is preserved.',
+  });
+  expect((await readdir(exchange)).filter((name) => name.endsWith('.db.enc'))).toEqual([]);
+  await rename(withheld, full);
+  await writeEnvelope(join(exchange, `${request.id}.request`), request, key);
   const result = await waitFor(() =>
     readEnvelope<CaptureResult>(join(exchange, `${request.id}.result`), key),
   );
@@ -226,16 +250,22 @@ syncBuiltinESMExports();
   });
   expect(result.identities).not.toHaveProperty(NEW_USER);
   expect(result.backup_fingerprint).toMatch(/^[a-f0-9]{64}$/);
+  const encrypted = join(exchange, `${request.id}.db.enc`),
+    projection = join(directory, 'decrypted-projection.db');
+  const retainedHash = await hash(encrypted);
+  await writeEnvelope(join(exchange, `${wrongMethod.id}.request`), wrongMethod, key);
   const rejected = await waitFor(() =>
     readEnvelope<CaptureResult>(join(exchange, `${wrongMethod.id}.result`), key),
   );
-  expect(rejected).toMatchObject({ ok: false, capture_method: 'file_copy' });
+  expect(rejected).toMatchObject({
+    ok: false,
+    capture_method: 'file_copy',
+    error: firstRejected.error,
+  });
+  expect(await hash(encrypted)).toBe(retainedHash);
   await expect(stat(join(exchange, `${wrongMethod.id}.db.enc`))).rejects.toMatchObject({
     code: 'ENOENT',
   });
-
-  const encrypted = join(exchange, `${request.id}.db.enc`),
-    projection = join(directory, 'decrypted-projection.db');
   expect((await readFile(encrypted)).includes(Buffer.from(SECRET))).toBe(false);
   expect((await stat(encrypted)).mode & 0o777).toBe(0o600);
   await decryptDatabase(encrypted, projection, key, request.id);

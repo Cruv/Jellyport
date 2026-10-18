@@ -197,7 +197,7 @@ describe('best-effort ordinary Emby database copies', () => {
       const value = await fixture();
       await writeFile(join(value.source, name), Buffer.from(`corrupt-${privateText}`));
       await expect(captureFileCopy(value.source, value.output)).rejects.toThrow(
-        'The file-copy capture could not be validated. The last good capture is preserved.',
+        'The file-copy capture could not be validated. Any previously saved capture is preserved.',
       );
       expect(await readdir(value.work)).toEqual([]);
       await absent(value.output);

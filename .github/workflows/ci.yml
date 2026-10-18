@@ -59,7 +59,7 @@ jobs:
         if: needs.scope.outputs.docs_only != 'true'
       - name: Install browser for interface regression tests
         if: needs.scope.outputs.docs_only != 'true' && matrix.node == 24
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium webkit
       - name: Run desktop and mobile interface regression tests
         if: needs.scope.outputs.docs_only != 'true' && matrix.node == 24
         run: npm run test:e2e

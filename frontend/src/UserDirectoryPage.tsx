@@ -613,9 +613,13 @@ export default function UserDirectoryPage({
                               aria-expanded={actionUser === user.id}
                               aria-controls={`directory-actions-${encodeURIComponent(user.id)}`}
                               aria-label={`Manage ${profileAccounts(user)[0]?.account.name || user.jellyfin[0]?.name || user.emby[0]?.name}`}
-                              onClick={() =>
-                                setActionUser((value) => (value === user.id ? '' : user.id))
-                              }
+                              onClick={(event) => {
+                                // Safari does not focus buttons after a touch click.
+                                // Keep disclosure keyboard events with their owner,
+                                // rather than the search field previously in focus.
+                                event.currentTarget.focus({ preventScroll: true });
+                                setActionUser((value) => (value === user.id ? '' : user.id));
+                              }}
                             >
                               Manage <span aria-hidden="true">▾</span>
                             </button>

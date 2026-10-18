@@ -622,6 +622,9 @@ export function AccountsPage({
                     required
                     maxLength={64}
                     autoComplete="off"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
                   />
                   <small>
                     Selecting a Discord member fills in their actual username automatically.
@@ -725,6 +728,9 @@ export function AccountsPage({
                     maxLength={64}
                     placeholder="Exact Jellyfin username"
                     autoComplete="off"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
                   />
                 </div>
                 <DiscordMemberPicker

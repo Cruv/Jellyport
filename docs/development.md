@@ -69,7 +69,7 @@ reformat unrelated Markdown tables or foreign work. Finish owned changes with
 
 `npm test` includes behavioral unit/component regressions for navigation, filtered
 selections, stale recovery responses, independent saves, cancelled confirmations,
-and failed-save retries. The required Node 24 CI job also runs real Chromium
+and failed-save retries. The required Node 24 CI job also runs Chromium and WebKit
 browser tests after building the app. A browser failure fails that required job
 and prevents image publication. Node 22 continues to run the full unit/component
 suite and production build.
@@ -78,7 +78,7 @@ To run the browser suite locally:
 
 ```sh
 npm run build
-npx playwright install chromium
+npx playwright install chromium webkit
 npm run test:e2e
 ```
 
@@ -88,6 +88,15 @@ retained drafts, keyboard focus, pagination and filtering with large synthetic
 directories, sign-in/out, credential reveal, and explicit migration approval.
 It uses the built interface and real Jellyport API with simulated media servers. These are behavioral and layout checks, not pixel-baseline comparisons
 or a guarantee of support for every browser.
+
+iPhone coverage uses Playwright's iPhone 16 Pro Max touch/mobile WebKit profiles:
+the portrait screen is 440 × 956 CSS pixels with a 440 × 763 browser viewport,
+and the landscape viewport is 838 × 390. The profile models browser space rather
+than treating the entire phone screen as page content. Tests cover touch targets,
+form sizing, navigation, key admin flows, orientation changes and reduced visible
+height. Safe-area and keyboard-height simulations exercise layout behavior;
+native iOS browser chrome and the software keyboard still require a physical
+device check when investigating device-specific behavior.
 
 The runner creates and removes its own temporary demo data, binds only to
 `127.0.0.1:4179`, refuses to reuse an existing server, and ignores Jellyport

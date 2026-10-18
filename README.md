@@ -8,6 +8,20 @@ Automated tests and isolated demos cover the implemented workflows. The source A
 
 ![Jellyport demo dashboard](docs/jellyport-preview.jpg)
 
+## Using Jellyport on a phone
+
+The interface adapts to the available viewport and touch input automatically,
+including landscape orientation. Compact layouts use a navigation drawer, account
+cards, and five records per page by default. An explicit rows-per-page choice is
+kept when the layout changes. Larger touch controls, readable form inputs,
+safe-area spacing, and dialogs that follow the visible viewport support quick
+administration from a phone. Layout detection stays in the browser.
+
+Automated browser coverage includes the iPhone 16 Pro Max Safari/WebKit device
+profile in portrait and landscape, alongside desktop and generic mobile Chromium
+checks. See [interface regression testing](docs/development.md#automated-interface-regressions)
+for the test environment and its scope.
+
 ## Run with Docker Compose
 
 ### Portainer or a prebuilt image

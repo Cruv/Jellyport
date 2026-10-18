@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useClientLayout } from './client-layout';
 
 export function Tabs({
   id,
@@ -93,20 +94,30 @@ export function TabPanel({
 }
 
 export function usePagination<T>(values: T[], initialSize = 25, resetKey = '') {
-  const [pageSize, setSize] = useState(() =>
-    typeof window !== 'undefined' && window.innerWidth <= 590 ? 5 : initialSize,
-  );
-  const [cursor, setCursor] = useState({ page: 1, key: resetKey });
+  const { compactRecords } = useClientLayout();
+  const [chosenSize, setSize] = useState<number | null>(null);
+  const pageSize = chosenSize ?? (compactRecords ? 5 : initialSize);
+  const [cursor, setCursor] = useState({ page: 1, key: resetKey, size: pageSize });
   const total = values.length;
   const pages = Math.max(1, Math.ceil(total / pageSize));
-  const page = Math.max(1, Math.min(cursor.key === resetKey ? cursor.page : 1, pages));
+  const page = Math.max(
+    1,
+    Math.min(cursor.key === resetKey && cursor.size === pageSize ? cursor.page : 1, pages),
+  );
   useEffect(() => {
     setCursor((previous) =>
-      previous.key !== resetKey || previous.page > pages
-        ? { key: resetKey, page: Math.min(previous.key === resetKey ? previous.page : 1, pages) }
+      previous.key !== resetKey || previous.size !== pageSize || previous.page > pages
+        ? {
+            key: resetKey,
+            size: pageSize,
+            page: Math.min(
+              previous.key === resetKey && previous.size === pageSize ? previous.page : 1,
+              pages,
+            ),
+          }
         : previous,
     );
-  }, [resetKey, pages]);
+  }, [resetKey, pageSize, pages]);
   return {
     page,
     pageSize,
@@ -116,11 +127,11 @@ export function usePagination<T>(values: T[], initialSize = 25, resetKey = '') {
     end: Math.min(page * pageSize, total),
     items: values.slice((page - 1) * pageSize, page * pageSize),
     setPage: (next: number) =>
-      setCursor({ key: resetKey, page: Math.max(1, Math.min(next, pages)) }),
+      setCursor({ key: resetKey, size: pageSize, page: Math.max(1, Math.min(next, pages)) }),
     setPageSize: (next: number) => {
       if (![5, 10, 25, 50].includes(next)) return;
       setSize(next);
-      setCursor({ key: resetKey, page: 1 });
+      setCursor({ key: resetKey, size: next, page: 1 });
     },
   };
 }

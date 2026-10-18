@@ -59,6 +59,24 @@ afterEach(() => {
 });
 
 describe('Account page request lifecycle', () => {
+  it('keeps manually entered creation and recovery usernames literal on phone keyboards', () => {
+    page(vi.fn() as Api);
+    const username = screen.getByLabelText('Username');
+    fireEvent.change(username, { target: { value: 'Case_Sensitive_User' } });
+    fireEvent.click(screen.getByRole('tab', { name: 'Recover interrupted creation' }));
+    const recovery = screen.getByLabelText('Account to inspect');
+    for (const input of [username, recovery]) {
+      expect(input.getAttribute('autocapitalize')).toBe('none');
+      expect(input.getAttribute('autocorrect')).toBe('off');
+      expect(input.getAttribute('spellcheck')).toBe('false');
+      expect(input.getAttribute('autocomplete')).toBe('off');
+    }
+    fireEvent.change(recovery, { target: { value: 'Other_User' } });
+    fireEvent.click(screen.getByRole('tab', { name: 'New account' }));
+    expect((username as HTMLInputElement).value).toBe('Case_Sensitive_User');
+    fireEvent.click(screen.getByRole('tab', { name: 'Recover interrupted creation' }));
+    expect((recovery as HTMLInputElement).value).toBe('Other_User');
+  });
   it('creates an independent account without requiring a Discord identity', async () => {
     const api = vi.fn(async () => job) as Api;
     const { created } = page(api);

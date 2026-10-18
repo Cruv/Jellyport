@@ -68,13 +68,25 @@ export function dailyImportSchedule(
     Object.fromEntries(formatter.formatToParts(time).map((part) => [part.type, part.value]));
   const local = parts(now);
   const today = Date.UTC(Number(local.year), Number(local.month) - 1, Number(local.day));
+  const claimedTime =
+    claimedDate && /^\d{4}-\d{2}-\d{2}$/.test(claimedDate)
+      ? Date.parse(`${claimedDate}T00:00:00Z`)
+      : NaN;
+  const highWater =
+    Number.isFinite(claimedTime) && new Date(claimedTime).toISOString().slice(0, 10) === claimedDate
+      ? claimedDate
+      : undefined;
+  const dayMs = 24 * 60 * 60_000;
+  const firstDay = Math.max(today - dayMs, highWater ? claimedTime + dayMs : -Infinity);
   const occurrences: DailyImportOccurrence[] = [];
   // A one-hour catch-up can cross local midnight. Four future dates also cover
   // DST gaps and the occasional skipped civil date without scanning minute by minute.
-  for (let day = -1; day <= 4; day++) {
-    const midnight = today + day * 24 * 60 * 60_000;
+  // The durable civil-date claim is a high-water mark, including after backward
+  // clock/time-zone edits. Search from its successor rather than reopening old dates.
+  for (let day = 0; day <= 5; day++) {
+    const midnight = firstDay + day * dayMs;
     const date = new Date(midnight).toISOString().slice(0, 10);
-    if (date === claimedDate) continue;
+    if (highWater && date <= highWater) continue;
     const wall = midnight + (config.hour * 60 + config.minute) * 60_000;
     const offsets = new Set<number>();
     for (const hours of [-36, -24, -12, 0, 12, 24, 36]) {

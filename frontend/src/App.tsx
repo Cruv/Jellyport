@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { version as appVersion } from '../../package.json';
 import { useClientLayout, useVisualViewport } from './client-layout';
 import { navigateWorkspace, useWorkspaceRoute, workspaceRouteHash } from './routing';
+import { WorkspaceDraftProvider } from './workspace-drafts';
 import {
   DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
   renderCredentialMessage,
@@ -145,7 +146,6 @@ export default function App() {
   const [users, setUsers] = useState<Users>(emptyUsers);
   const [mappings, setMappings] = useState<UserMapping[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
-  const [settingsVersion, setSettingsVersion] = useState(0);
   const [jobs, setJobs] = useState<Job[]>([]);
   const jobsRef = useRef(jobs);
   const historyRevision = useRef(0);
@@ -488,7 +488,6 @@ export default function App() {
           }
           if (version === loadVersion.current) {
             setSettings(value);
-            setSettingsVersion((current) => current + 1);
             setUsers(listed);
           }
         }
@@ -1068,7 +1067,6 @@ export default function App() {
   else if (page === 'settings' && settings)
     content = (
       <SettingsPage
-        key={settingsVersion}
         settings={settings}
         users={users}
         demo={!!session?.demo}
@@ -1115,152 +1113,154 @@ export default function App() {
           onSession={acceptSession}
         />
       ) : (
-        <div className="shell">
-          <a
-            className="skip-link"
-            href="#workspace-content"
-            onClick={(event) => {
-              event.preventDefault();
-              const content = document.getElementById('workspace-content');
-              content?.focus();
-              content?.scrollIntoView?.({ block: 'start' });
-            }}
-          >
-            Skip to content
-          </a>
-          {mobileOpen && (
-            <button
-              className="nav-scrim"
-              aria-label="Close navigation"
-              onClick={() => setMobileOpen(false)}
-            />
-          )}
-          <aside
-            ref={navigation}
-            id="workspace-navigation"
-            className={`sidebar${mobileOpen ? ' mobile-open' : ''}`}
-            aria-label="Main navigation"
-          >
-            <div className="brand">
-              <span className="brand-icon">
-                <Icon name="logo" />
-              </span>
-              <div>
-                Jellyport<small>EMBY → JELLYFIN</small>
-              </div>
-            </div>
-            <nav className="nav">
-              {navigationGroups.map((group) => (
-                <div className="nav-group" key={group.title}>
-                  <div className="nav-label">{group.title}</div>
-                  {group.pages.map((key) => {
-                    const value = pages[key];
-                    return (
-                      <button
-                        className={`nav-button${page === key ? ' active' : ''}`}
-                        aria-current={page === key ? 'page' : undefined}
-                        onClick={() => navigate(key)}
-                        key={key}
-                      >
-                        <Icon name={value.icon} />
-                        {value.title}
-                        {page === key && <span className="nav-dot" />}
-                      </button>
-                    );
-                  })}
-                </div>
-              ))}
-            </nav>
-            <div className="sidebar-bottom">
-              <div className="operator-card">
-                <div className="avatar">
-                  {(session.user?.name || 'Admin').slice(0, 2).toUpperCase()}
-                </div>
-                <div>
-                  <strong>{session.user?.name || 'Administrator'}</strong>
-                  <span>Jellyfin administrator</span>
-                </div>
-                <button
-                  className="icon-button"
-                  onClick={logout}
-                  disabled={busy.has('logout')}
-                  aria-label="Sign out"
-                  title="Sign out"
-                >
-                  <Icon name="logout" />
-                </button>
-              </div>
-              <div className="sidebar-note" aria-label="Jellyport version">
-                v{appVersion}
-              </div>
-            </div>
-          </aside>
-          <main className="main" inert={mobileOpen && navigationDrawer}>
-            <header className="topbar">
+        <WorkspaceDraftProvider key={authGeneration.current}>
+          <div className="shell">
+            <a
+              className="skip-link"
+              href="#workspace-content"
+              onClick={(event) => {
+                event.preventDefault();
+                const content = document.getElementById('workspace-content');
+                content?.focus();
+                content?.scrollIntoView?.({ block: 'start' });
+              }}
+            >
+              Skip to content
+            </a>
+            {mobileOpen && (
               <button
-                ref={mobileToggle}
-                className="icon-button mobile-menu"
-                onClick={() => setMobileOpen((value) => !value)}
-                aria-label="Toggle navigation"
-                aria-expanded={mobileOpen}
-                aria-controls="workspace-navigation"
-              >
-                <Icon name="menu" />
-              </button>
-              <div className="breadcrumb">
-                <span>Workspace</span>
-                <span>/</span>
-                <span>{pages[page].title}</span>
-              </div>
-              <div className="topbar-right">
-                <span className="version-label">Emby → Jellyfin</span>
-                <span className="operator-label">Admin workspace</span>
-              </div>
-            </header>
-            <div className="content" id="workspace-content" tabIndex={-1}>
-              {session.demo && (
-                <div className="demo-banner">
-                  <Icon name="info" />
-                  Demo mode is active. Accounts, watch history, and Discord messages use sample
-                  data. Settings are read-only.
+                className="nav-scrim"
+                aria-label="Close navigation"
+                onClick={() => setMobileOpen(false)}
+              />
+            )}
+            <aside
+              ref={navigation}
+              id="workspace-navigation"
+              className={`sidebar${mobileOpen ? ' mobile-open' : ''}`}
+              aria-label="Main navigation"
+            >
+              <div className="brand">
+                <span className="brand-icon">
+                  <Icon name="logo" />
+                </span>
+                <div>
+                  Jellyport<small>EMBY → JELLYFIN</small>
                 </div>
-              )}
-              {page === 'migrate' && previewProgress && (
-                <div className="setup-server preview-progress mb-17" role="status">
-                  <span>
-                    Preparing migration review… {previewProgress.processed} of{' '}
-                    {previewProgress.total} {previewProgress.total === 1 ? 'user' : 'users'}{' '}
-                    complete.
-                  </span>
+              </div>
+              <nav className="nav">
+                {navigationGroups.map((group) => (
+                  <div className="nav-group" key={group.title}>
+                    <div className="nav-label">{group.title}</div>
+                    {group.pages.map((key) => {
+                      const value = pages[key];
+                      return (
+                        <button
+                          className={`nav-button${page === key ? ' active' : ''}`}
+                          aria-current={page === key ? 'page' : undefined}
+                          onClick={() => navigate(key)}
+                          key={key}
+                        >
+                          <Icon name={value.icon} />
+                          {value.title}
+                          {page === key && <span className="nav-dot" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </nav>
+              <div className="sidebar-bottom">
+                <div className="operator-card">
+                  <div className="avatar">
+                    {(session.user?.name || 'Admin').slice(0, 2).toUpperCase()}
+                  </div>
+                  <div>
+                    <strong>{session.user?.name || 'Administrator'}</strong>
+                    <span>Jellyfin administrator</span>
+                  </div>
                   <button
-                    className="text-button preview-cancel"
-                    type="button"
-                    onClick={cancelPreview}
+                    className="icon-button"
+                    onClick={logout}
+                    disabled={busy.has('logout')}
+                    aria-label="Sign out"
+                    title="Sign out"
                   >
-                    Cancel preview
+                    <Icon name="logout" />
                   </button>
                 </div>
-              )}
-              {pollPaused && hasActive && (
-                <Callout warning title="Activity updates paused.">
-                  The last known operation status is shown. Refresh Activity to check whether work
-                  is still running before retrying an action.{' '}
-                  <button
-                    type="button"
-                    className="text-button"
-                    onClick={() => {
-                      if (page === 'activity') void load('activity');
-                      else navigate('activity');
-                    }}
-                  >
-                    Refresh Activity
-                  </button>
-                </Callout>
-              )}
-              {content}
-            </div>
-          </main>
-        </div>
+                <div className="sidebar-note" aria-label="Jellyport version">
+                  v{appVersion}
+                </div>
+              </div>
+            </aside>
+            <main className="main" inert={mobileOpen && navigationDrawer}>
+              <header className="topbar">
+                <button
+                  ref={mobileToggle}
+                  className="icon-button mobile-menu"
+                  onClick={() => setMobileOpen((value) => !value)}
+                  aria-label="Toggle navigation"
+                  aria-expanded={mobileOpen}
+                  aria-controls="workspace-navigation"
+                >
+                  <Icon name="menu" />
+                </button>
+                <div className="breadcrumb">
+                  <span>Workspace</span>
+                  <span>/</span>
+                  <span>{pages[page].title}</span>
+                </div>
+                <div className="topbar-right">
+                  <span className="version-label">Emby → Jellyfin</span>
+                  <span className="operator-label">Admin workspace</span>
+                </div>
+              </header>
+              <div className="content" id="workspace-content" tabIndex={-1}>
+                {session.demo && (
+                  <div className="demo-banner">
+                    <Icon name="info" />
+                    Demo mode is active. Accounts, watch history, and Discord messages use sample
+                    data. Settings are read-only.
+                  </div>
+                )}
+                {page === 'migrate' && previewProgress && (
+                  <div className="setup-server preview-progress mb-17" role="status">
+                    <span>
+                      Preparing migration review… {previewProgress.processed} of{' '}
+                      {previewProgress.total} {previewProgress.total === 1 ? 'user' : 'users'}{' '}
+                      complete.
+                    </span>
+                    <button
+                      className="text-button preview-cancel"
+                      type="button"
+                      onClick={cancelPreview}
+                    >
+                      Cancel preview
+                    </button>
+                  </div>
+                )}
+                {pollPaused && hasActive && (
+                  <Callout warning title="Activity updates paused.">
+                    The last known operation status is shown. Refresh Activity to check whether work
+                    is still running before retrying an action.{' '}
+                    <button
+                      type="button"
+                      className="text-button"
+                      onClick={() => {
+                        if (page === 'activity') void load('activity');
+                        else navigate('activity');
+                      }}
+                    >
+                      Refresh Activity
+                    </button>
+                  </Callout>
+                )}
+                {content}
+              </div>
+            </main>
+          </div>
+        </WorkspaceDraftProvider>
       )}
       {session?.authenticated && dialog && (
         <DialogContent
@@ -1775,6 +1775,48 @@ function DialogContent({
           </Callout>
         )}
         <JobProgressDetails job={job} />
+        {['failed', 'partial', 'interrupted'].includes(job.status) && (
+          <Callout warning title="Review this operation before retrying.">
+            Inspect the recorded errors and verification below. A new request may repeat changes
+            that already reached the server.
+            <div className="button-row mt-12">
+              {job.kind === 'create' && (
+                <button
+                  type="button"
+                  className="btn btn-quiet"
+                  onClick={() => {
+                    close();
+                    navigateWorkspace({ page: 'accounts', tab: 'recover' });
+                  }}
+                >
+                  Inspect interrupted creation
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn btn-quiet"
+                onClick={() => {
+                  close();
+                  navigateWorkspace({ page: 'settings', tab: 'media', subtab: 'jellyfin' });
+                }}
+              >
+                Check Jellyfin connection
+              </button>
+              {migrationJob && (
+                <button
+                  type="button"
+                  className="btn btn-quiet"
+                  onClick={() => {
+                    close();
+                    navigateWorkspace({ page: 'mappings' });
+                  }}
+                >
+                  Review user mappings
+                </button>
+              )}
+            </div>
+          </Callout>
+        )}
         {migrationJob &&
           job.workflow_elapsed_ms !== undefined &&
           job.preview_timing &&

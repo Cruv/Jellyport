@@ -183,6 +183,37 @@ describe('Jellyfin daily backup import schedule', () => {
     expect(f.factory).not.toHaveBeenCalled();
     expect((await f.manager.status()).last_outcome).toBe('failed');
   });
+  it('keeps the daily claim monotonic when an edit targets yesterday across midnight', async () => {
+    vi.setSystemTime(new Date('2026-10-08T23:00:00Z'));
+    const f = await fixture('backup');
+    await enable(f, { hour: 0, minute: 5 });
+    vi.setSystemTime(new Date('2026-10-09T00:06:00Z'));
+    await f.heartbeat();
+    await f.tick();
+    const name = (await readdir(f.shared)).find((name) => name.endsWith('.request'))!;
+    await f.finish(await readEnvelope<DestinationCatalogRequest>(join(f.shared, name), f.key));
+    expect(f.factory).toHaveBeenCalledOnce();
+
+    // At 00:10, 23:30 refers to yesterday within catch-up, not another allowed run.
+    vi.setSystemTime(new Date('2026-10-09T00:10:00Z'));
+    await enable(f, { hour: 23, minute: 30 });
+    await f.heartbeat();
+    await f.tick();
+    expect(f.factory).toHaveBeenCalledOnce();
+    expect((await f.manager.status()).next_run_at).toBe('2026-10-10T23:30:00.000Z');
+
+    await enable(f, { hour: 0, minute: 15 });
+    vi.setSystemTime(new Date('2026-10-09T00:15:00Z'));
+    await f.heartbeat();
+    await f.tick();
+    expect(f.factory).toHaveBeenCalledOnce();
+    await f.restart();
+    expect(f.factory).toHaveBeenCalledOnce();
+    vi.setSystemTime(new Date('2026-10-10T00:15:00Z'));
+    await f.heartbeat();
+    await f.tick();
+    expect(f.factory).toHaveBeenCalledTimes(2);
+  });
   it('defers while another import owns the helper without claiming or queueing the occurrence', async () => {
     vi.setSystemTime(new Date('2026-10-09T02:00:00Z'));
     const imports = new ImportCoordinator();

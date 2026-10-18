@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
-import { useRouteTab } from './routing';
+import { navigateWorkspace, useRouteTab } from './routing';
 import { useWorkspaceDraftState } from './workspace-drafts';
 import { Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
@@ -257,7 +257,11 @@ export default function MembershipsPage({
         title="Memberships"
         description="Manage paid and complimentary access, account allowances, and each Discord owner’s linked accounts."
         actions={
-          <button className="btn" onClick={() => void reload()} disabled={busy || loading}>
+          <button
+            className="btn btn-quiet"
+            onClick={() => void reload()}
+            disabled={busy || loading}
+          >
             <Icon name="refresh" /> Refresh
           </button>
         }
@@ -436,7 +440,15 @@ export default function MembershipsPage({
                     </select>
                     <small>
                       Use complimentary access for family and other non-paying Discord members.
-                      Users without Discord can have independent accounts from Create account.
+                      Users without Discord can have independent accounts from{' '}
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={() => navigateWorkspace({ page: 'accounts' })}
+                      >
+                        Create account
+                      </button>
+                      .
                     </small>
                   </div>
                   {accessMode === 'subscription' ? (

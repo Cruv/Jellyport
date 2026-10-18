@@ -173,7 +173,7 @@ export default function UserMappingsPage({
         title="User mappings"
         description="Connect Emby, Jellyfin, and Discord identities when usernames differ."
         actions={
-          <button className="btn" onClick={() => void refresh()} disabled={busy}>
+          <button className="btn btn-quiet" onClick={() => void refresh()} disabled={busy}>
             <Icon name="refresh" />
             Refresh
           </button>

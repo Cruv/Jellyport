@@ -3066,6 +3066,12 @@ progress.progress-track::-moz-progress-bar {
 .settings-focus .section-heading {
   margin: 0;
 }
+.settings-fields {
+  border: 0;
+  padding: 0;
+  margin: 0;
+  min-inline-size: 0;
+}
 .settings-focus .section-heading + .page-tabs {
   margin-top: 0;
 }

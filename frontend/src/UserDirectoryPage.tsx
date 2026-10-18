@@ -396,7 +396,11 @@ export default function UserDirectoryPage({
         description="Review accounts across Emby and Jellyfin, confirm ownership, and manage access."
         actions={
           <>
-            <button className="btn" disabled={busy || loading} onClick={() => void reload()}>
+            <button
+              className="btn btn-quiet"
+              disabled={busy || loading}
+              onClick={() => void reload()}
+            >
               <Icon name="refresh" /> Refresh
             </button>
             <button className="btn btn-primary" onClick={() => navigate('accounts')}>

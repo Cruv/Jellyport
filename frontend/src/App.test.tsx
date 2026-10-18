@@ -570,6 +570,87 @@ async function selectAndPreviewReady() {
   await screen.findByRole('dialog');
 }
 describe('React account safeguards', () => {
+  it('retains unsaved Settings input through main navigation and refresh without serializing or saving it', async () => {
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    await screen.findByRole('heading', { name: 'Settings', level: 1 });
+    fireEvent.change(document.getElementById('setting-emby_url')!, {
+      target: { value: 'http://private-draft.example.test' },
+    });
+    await selectSettingsTab('Account defaults', 'Passwords & messages');
+    fireEvent.change(screen.getByLabelText('Generated password length'), {
+      target: { value: '22' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    responses['/api/settings'] = {
+      ...settings,
+      emby_url: 'http://newer-source.example.test',
+      password_length: 30,
+    };
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    await screen.findByRole('heading', { name: 'Settings', level: 1 });
+    expect((document.getElementById('setting-emby_url') as HTMLInputElement).value).toBe(
+      'http://private-draft.example.test',
+    );
+    await selectSettingsTab('Account defaults', 'Passwords & messages');
+    expect((screen.getByLabelText('Generated password length') as HTMLInputElement).value).toBe(
+      '22',
+    );
+    expect(window.location.href).not.toContain('private-draft');
+    expect(JSON.stringify(window.history.state)).not.toContain('private-draft');
+    expect(
+      requests.filter((r) => r.path === '/api/settings' && r.options?.method === 'PUT'),
+    ).toHaveLength(0);
+  });
+  it('retains account input across main navigation but requires a new recovery inspection', async () => {
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Create account' }));
+    await screen.findByRole('heading', { name: 'Create account', level: 1 });
+    fireEvent.change(screen.getByLabelText('Username'), { target: { value: 'UnsubmittedCrew' } });
+    fireEvent.click(screen.getByRole('tab', { name: 'Recover interrupted creation' }));
+    fireEvent.change(screen.getByLabelText('Account to inspect'), {
+      target: { value: 'InspectLater' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Create account' }));
+    await screen.findByRole('heading', { name: 'Create account', level: 1 });
+    expect((screen.getByLabelText('Username') as HTMLInputElement).value).toBe('UnsubmittedCrew');
+    fireEvent.click(screen.getByRole('tab', { name: 'Recover interrupted creation' }));
+    expect((screen.getByLabelText('Account to inspect') as HTMLInputElement).value).toBe(
+      'InspectLater',
+    );
+    expect(screen.queryByRole('button', { name: 'Recover account' })).toBeNull();
+    expect(
+      requests.some((r) => r.path === '/api/accounts' || r.path === '/api/accounts/recover'),
+    ).toBe(false);
+  });
+  it('clears retained drafts on sign-out before a new administrator session', async () => {
+    responses['/api/logout'] = { ...session, authenticated: false, user: undefined };
+    responses['/api/login'] = session;
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Create account' }));
+    await screen.findByRole('heading', { name: 'Create account', level: 1 });
+    fireEvent.change(screen.getByLabelText('Username'), {
+      target: { value: 'PrivateUnsubmitted' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+    await screen.findByLabelText('Jellyfin username');
+    fireEvent.change(screen.getByLabelText('Jellyfin username'), {
+      target: { value: 'jellyfin-admin' },
+    });
+    fireEvent.change(screen.getByLabelText('Jellyfin password'), {
+      target: { value: 'synthetic-password' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
+    await screen.findByRole('heading', { name: 'Create account', level: 1 });
+    expect((screen.getByLabelText('Username') as HTMLInputElement).value).toBe('');
+  });
+
   it('keeps a persistent last-known-status warning when job polling fails, then reconciles on refresh', async () => {
     let poll: (() => Promise<void>) | undefined;
     const realInterval = globalThis.setInterval;

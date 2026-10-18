@@ -39,6 +39,26 @@ describe('daily import wall-clock scheduling', () => {
       next_run_at: '2026-10-10T03:00:00.000Z',
     });
   });
+  it('never reopens an older civil date after a backward clock or time-zone edit', () => {
+    expect(schedule('2026-10-08T03:05:00Z', {}, '2026-10-09')).toEqual({
+      due: null,
+      next_run_at: '2026-10-10T03:00:00.000Z',
+    });
+    expect(
+      schedule(
+        '2026-10-09T00:10:00Z',
+        { hour: 17, time_zone: 'America/Los_Angeles' },
+        '2026-10-09',
+      ),
+    ).toEqual({ due: null, next_run_at: '2026-10-11T00:00:00.000Z' });
+    expect(schedule('2026-10-01T03:05:00Z', {}, '2026-10-09').next_run_at).toBe(
+      '2026-10-10T03:00:00.000Z',
+    );
+  });
+  it('does not let an invalid legacy date suppress an otherwise valid scheduled occurrence', () => {
+    expect(schedule('2026-10-09T03:05:00Z', {}, '2027-02-30').due?.date).toBe('2026-10-09');
+    expect(schedule('2026-10-09T03:05:00Z', {}, 'not-a-date').due?.date).toBe('2026-10-09');
+  });
   it('catches up across midnight without confusing the next night', () => {
     expect(schedule('2026-10-10T00:10:00Z', { hour: 23, minute: 30 })).toEqual({
       due: { date: '2026-10-09', at: '2026-10-09T23:30:00.000Z' },

@@ -4,6 +4,7 @@ import { ConnectionRows, UserWarnings } from './SettingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import { Pagination, Tabs, TabPanel, usePagination } from './ui-layout';
 import { navigateWorkspace, useRouteTab } from './routing';
+import { useWorkspaceDraftState } from './workspace-drafts';
 import {
   activeJob,
   date,
@@ -479,13 +480,23 @@ export function AccountsPage({
 }) {
   const [busy, setBusy] = useState('');
   const [task, setTask] = useRouteTab('accounts');
-  const [accountUsername, setAccountUsername] = useState('');
-  const [accountMember, setAccountMember] = useState<DiscordMember | null>(null);
-  const [recoveryUsername, setRecoveryUsername] = useState('');
-  const [recoveryMember, setRecoveryMember] = useState<DiscordMember | null>(null);
+  const [accountUsername, setAccountUsername] = useWorkspaceDraftState('accounts.username', '');
+  const [accountMember, setAccountMember] = useWorkspaceDraftState<DiscordMember | null>(
+    'accounts.discord-member',
+    null,
+  );
+  const [recoveryUsername, setRecoveryUsername] = useWorkspaceDraftState(
+    'accounts.recovery-username',
+    '',
+  );
+  const [recoveryMember, setRecoveryMember] = useWorkspaceDraftState<DiscordMember | null>(
+    'accounts.recovery-discord-member',
+    null,
+  );
   const [recovery, setRecovery] = useState<Recovery | null>(null);
   const [approved, setApproved] = useState(false);
   const [recoveryRecipient, setRecoveryRecipient] = useState('');
+  const [creationError, setCreationError] = useState('');
   const recoveryVersion = useRef(0);
   const mounted = useRef(true);
   const busyRef = useRef(false);
@@ -515,6 +526,7 @@ export function AccountsPage({
     const controller = new AbortController();
     controllers.current.add(controller);
     setBusy('create');
+    setCreationError('');
     try {
       const job = await api<Job>('/api/accounts', {
         method: 'POST',
@@ -533,8 +545,11 @@ export function AccountsPage({
       created(job);
       notify('Account creation started.');
     } catch (error) {
-      if (mounted.current && !controller.signal.aborted)
-        notify(error instanceof Error ? error.message : 'Account could not be created.', true);
+      if (mounted.current && !controller.signal.aborted) {
+        const detail = error instanceof Error ? error.message : 'Account could not be created.';
+        setCreationError(detail);
+        notify(detail, true);
+      }
     } finally {
       controllers.current.delete(controller);
       busyRef.current = false;
@@ -637,6 +652,22 @@ export function AccountsPage({
         onChange={setTask}
       />
       <TabPanel id="account-task" tabId="create" active={task === 'create'}>
+        {creationError && (
+          <Callout warning title="Account creation needs attention.">
+            {creationError} Check Activity and inspect the account before retrying if the outcome is
+            uncertain.{' '}
+            <button
+              type="button"
+              className="text-button"
+              onClick={() => {
+                setRecoveryUsername(accountUsername);
+                setTask('recover');
+              }}
+            >
+              Inspect interrupted creation
+            </button>
+          </Callout>
+        )}
         <div className="task-panel">
           <section className="panel">
             <div className="panel-header">
@@ -848,12 +879,21 @@ export function AccountsPage({
   );
 }
 function ManualDiscordId({ id, disabled }: { id: string; disabled: boolean }) {
+  const [value, setValue] = useWorkspaceDraftState(`${id}.draft`, '');
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const form = input.current?.form;
+    const reset = () => setValue('');
+    form?.addEventListener('reset', reset);
+    return () => form?.removeEventListener('reset', reset);
+  }, [setValue]);
   return (
     <details>
       <summary>Advanced Discord details</summary>
       <div className="field">
         <label htmlFor={id}>Discord user ID (advanced)</label>
         <input
+          ref={input}
           id={id}
           name="discord_manual_id"
           disabled={disabled}
@@ -861,6 +901,8 @@ function ManualDiscordId({ id, disabled }: { id: string; disabled: boolean }) {
           pattern="[0-9]{15,22}"
           maxLength={22}
           autoComplete="off"
+          value={value}
+          onChange={(event) => setValue(event.target.value)}
         />
         <small>Use this fallback only when you already know the member’s ID.</small>
       </div>

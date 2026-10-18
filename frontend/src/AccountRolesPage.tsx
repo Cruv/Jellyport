@@ -360,7 +360,7 @@ export default function AccountRolesPage({
         description="Save reusable permissions and preferences, then review changes before applying them."
         actions={
           <button
-            className="btn"
+            className="btn btn-quiet"
             disabled={busy || loading}
             onClick={() => {
               setError('');

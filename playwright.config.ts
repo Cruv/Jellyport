@@ -1,4 +1,4 @@
-import { defineConfig } from '@playwright/test';
+import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
   testDir: './e2e',
@@ -18,6 +18,15 @@ export default defineConfig({
   projects: [
     { name: 'desktop', use: { browserName: 'chromium', viewport: { width: 1440, height: 1000 } } },
     { name: 'mobile', use: { browserName: 'chromium', viewport: { width: 400, height: 844 } } },
+    {
+      name: 'iphone-portrait',
+      use: { ...devices['iPhone 16 Pro Max'], browserName: 'webkit' },
+    },
+    {
+      name: 'iphone-landscape',
+      testMatch: '**/iphone-admin.spec.ts',
+      use: { ...devices['iPhone 16 Pro Max landscape'], browserName: 'webkit' },
+    },
   ],
   webServer: {
     command: 'node scripts/browser-demo.mjs',

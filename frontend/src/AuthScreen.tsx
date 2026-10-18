@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { Icon, Loading } from './components';
 import { type Api, type Session, type SetupConnection } from './types';
+import { useClientLayout } from './client-layout';
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : 'The operation could not be completed.';
@@ -18,6 +19,7 @@ export default function AuthScreen({
   api: Api;
   onSession: (session: Session) => void;
 }) {
+  const { compactRecords } = useClientLayout();
   const [connection, setConnection] = useState<SetupConnection | null>(null);
   const [error, setError] = useState(initialError);
   const [busy, setBusy] = useState('');
@@ -384,7 +386,7 @@ export default function AuthScreen({
                   readOnly={!!session.setup_server_url}
                   placeholder="http://jellyfin:8096"
                   required
-                  autoFocus={!session.setup_server_url}
+                  autoFocus={!compactRecords && !session.setup_server_url}
                   disabled={!!busy}
                 />
                 <small>
@@ -405,7 +407,7 @@ export default function AuthScreen({
                   autoComplete="new-password"
                   spellCheck={false}
                   required
-                  autoFocus={!!session.setup_server_url}
+                  autoFocus={!compactRecords && !!session.setup_server_url}
                   disabled={!!busy}
                 />
                 <small>
@@ -422,9 +424,12 @@ export default function AuthScreen({
                     name="username"
                     type="text"
                     autoComplete="username"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
                     defaultValue={session?.demo ? 'admin' : ''}
                     required
-                    autoFocus={!setup || !!session.setup_server_url}
+                    autoFocus={!compactRecords && (!setup || !!session.setup_server_url)}
                     disabled={!!busy}
                   />
                   <small>Use a Jellyfin administrator account with a password.</small>

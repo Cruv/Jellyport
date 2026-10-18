@@ -1,4 +1,4 @@
-import { test, expect, navigate, expectContainedLayout } from './fixtures';
+import { test, expect, navigate, expectContainedLayout, isCompactLayout } from './fixtures';
 import type { DirectoryUser, Users } from '../frontend/src/types';
 
 const pages = [
@@ -154,7 +154,7 @@ test('each focused Settings view has bounded content and a contained responsive 
       .locator('#workspace-content')
       .evaluate((element) => element.scrollHeight);
     expect(contentHeight, `${main} / ${sub} renders only its current task`).toBeLessThanOrEqual(
-      info.project.name === 'mobile' ? 2400 : 1700,
+      (await isCompactLayout(page)) ? 2400 : 1700,
     );
     await page.screenshot({
       path: info.outputPath(`settings-${sub.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.png`),
@@ -207,7 +207,8 @@ test('120-user directory keeps rendering bounded and filters reset paging withou
   await page.goto('/');
   await navigate(page, 'Users');
   const table = page.getByRole('table', { name: 'Media accounts and confirmed ownership' });
-  const size = info.project.name === 'mobile' ? 5 : 25;
+  const compact = await isCompactLayout(page);
+  const size = compact ? 5 : 25;
   await expect(table.getByRole('row')).toHaveCount(size + 1);
   const pagination = page.getByRole('navigation', { name: 'Users', exact: true });
   await expect(pagination).toContainText(`1–${size} of 120`);
@@ -220,7 +221,7 @@ test('120-user directory keeps rendering bounded and filters reset paging withou
   expect(
     initialHeight,
     'The default directory page stays bounded with 120 users',
-  ).toBeLessThanOrEqual(info.project.name === 'mobile' ? 2400 : 1800);
+  ).toBeLessThanOrEqual(compact ? 2400 : 1800);
   await pagination.getByRole('button', { name: 'Next page' }).click();
   await expect(table).toContainText(`Member ${String(size + 1).padStart(3, '0')}`);
   await expect(table).not.toContainText('Member 001');
@@ -289,7 +290,7 @@ test('120 migration candidates paginate with cross-page selections retained unti
   });
   await page.goto('/');
   await navigate(page, 'Migrate users');
-  const size = info.project.name === 'mobile' ? 5 : 25;
+  const size = (await isCompactLayout(page)) ? 5 : 25;
   const table = page.getByRole('table');
   await expect(table.getByRole('row')).toHaveCount(size + 1);
   await page.screenshot({ path: info.outputPath('migration-120.png'), fullPage: true });
@@ -417,11 +418,12 @@ test('migration review defers history and closing it never accepts the migration
   await expectContainedLayout(page);
 });
 
-test('mobile navigation contains keyboard focus and restores it on dismissal', async ({
-  page,
-}, info) => {
-  test.skip(info.project.name !== 'mobile', 'Desktop navigation is persistent.');
+test('mobile navigation contains keyboard focus and restores it on dismissal', async ({ page }) => {
   await page.goto('/');
+  test.skip(
+    !(await page.getByRole('button', { name: 'Toggle navigation' }).isVisible()),
+    'Wide pointer-based navigation is persistent.',
+  );
   await navigate(page, 'Users');
   const toggle = page.getByRole('button', { name: 'Toggle navigation' });
   const nav = page.getByRole('complementary', { name: 'Main navigation' });

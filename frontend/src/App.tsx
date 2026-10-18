@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { version as appVersion } from '../../package.json';
+import { useClientLayout, useVisualViewport } from './client-layout';
 import {
   DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
   renderCredentialMessage,
@@ -125,6 +126,8 @@ const nextPreviewPoll = (signal: AbortSignal) =>
   });
 
 export default function App() {
+  const { navigationDrawer } = useClientLayout();
+  useVisualViewport();
   const [session, setSession] = useState<Session | null>(null);
   const sessionRef = useRef<Session | null>(null);
   const authGeneration = useRef(0);
@@ -169,7 +172,11 @@ export default function App() {
   const mobileToggle = useRef<HTMLButtonElement>(null);
   const navigation = useRef<HTMLElement>(null);
   useEffect(() => {
-    if (!mobileOpen) return;
+    if (!navigationDrawer) setMobileOpen(false);
+  }, [navigationDrawer]);
+  useEffect(() => {
+    if (!mobileOpen || !navigationDrawer || !session?.authenticated) return;
+    document.body.classList.add('navigation-open');
     const buttons = () =>
       Array.from(
         navigation.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? [],
@@ -196,17 +203,13 @@ export default function App() {
         }
       }
     };
-    const resize = () => {
-      if (window.innerWidth > 850) setMobileOpen(false);
-    };
     window.addEventListener('keydown', closeNavigation);
-    window.addEventListener('resize', resize);
     return () => {
+      document.body.classList.remove('navigation-open');
       window.removeEventListener('keydown', closeNavigation);
-      window.removeEventListener('resize', resize);
       mobileToggle.current?.focus();
     };
-  }, [mobileOpen]);
+  }, [mobileOpen, navigationDrawer, session?.authenticated]);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const toastId = useRef(0);
   const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
@@ -244,6 +247,9 @@ export default function App() {
     (next: Dialog) => {
       releaseReadyPreview();
       dialogVersion.current++;
+      // An async result can arrive after navigation opens. Only one overlay may
+      // own focus and scrolling; release the drawer before mounting its dialog.
+      setMobileOpen(false);
       setDialog(next);
     },
     [releaseReadyPreview],
@@ -1146,7 +1152,7 @@ export default function App() {
               </div>
             </div>
           </aside>
-          <main className="main">
+          <main className="main" inert={mobileOpen && navigationDrawer}>
             <header className="topbar">
               <button
                 ref={mobileToggle}

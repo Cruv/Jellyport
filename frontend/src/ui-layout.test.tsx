@@ -1,12 +1,14 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { useState } from 'react';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
+import { COMPACT_RECORD_QUERY } from './client-layout';
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 function DraftTabs() {
@@ -64,6 +66,21 @@ function Paged({ values, filter = '' }: { values: number[]; filter?: string }) {
       />
     </>
   );
+}
+function reactiveCompact(initial: boolean) {
+  let compact = initial;
+  const list = new EventTarget();
+  vi.stubGlobal('matchMedia', (query: string) => ({
+    get matches() {
+      return query === COMPACT_RECORD_QUERY && compact;
+    },
+    addEventListener: list.addEventListener.bind(list),
+    removeEventListener: list.removeEventListener.bind(list),
+  }));
+  return (next: boolean) => {
+    compact = next;
+    act(() => list.dispatchEvent(new Event('change')));
+  };
 }
 
 describe('Focused task layout behavior', () => {
@@ -139,5 +156,44 @@ describe('Focused task layout behavior', () => {
     expect(screen.getByText('0 results')).toBeTruthy();
     for (const control of screen.getAllByRole('button'))
       expect((control as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('reactively changes automatic page sizes, resets the page, and preserves unsaved form drafts', () => {
+    const compact = reactiveCompact(false);
+    render(
+      <>
+        <DraftTabs />
+        <Paged values={Array.from({ length: 120 }, (_, i) => i + 1)} />
+      </>,
+    );
+    const draft = screen.getByRole('textbox', { name: 'Draft name' });
+    fireEvent.change(draft, { target: { value: 'Unsaved phone draft' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(screen.getAllByRole('listitem')[0]!.textContent).toBe('26');
+    compact(true);
+    expect(screen.getAllByRole('listitem')).toHaveLength(5);
+    expect(screen.getByText('1–5 of 120')).toBeTruthy();
+    expect((draft as HTMLInputElement).value).toBe('Unsaved phone draft');
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    compact(true); // Portrait and coarse-pointer landscape both retain the compact layout.
+    expect(screen.getByText('6–10 of 120')).toBeTruthy();
+    compact(false);
+    expect(screen.getAllByRole('listitem')).toHaveLength(25);
+    expect(screen.getByText('1–25 of 120')).toBeTruthy();
+    expect((draft as HTMLInputElement).value).toBe('Unsaved phone draft');
+  });
+
+  it('preserves an explicit record count and current page across automatic layout changes', () => {
+    const compact = reactiveCompact(true);
+    render(<Paged values={Array.from({ length: 120 }, (_, i) => i + 1)} />);
+    expect(screen.getAllByRole('listitem')).toHaveLength(5);
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: '10' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+    expect(screen.getByText('11–20 of 120')).toBeTruthy();
+    compact(false);
+    expect(screen.getAllByRole('listitem')).toHaveLength(10);
+    expect(screen.getByText('11–20 of 120')).toBeTruthy();
+    compact(true);
+    expect(screen.getByText('11–20 of 120')).toBeTruthy();
   });
 });

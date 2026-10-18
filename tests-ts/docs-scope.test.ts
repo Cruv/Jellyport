@@ -122,12 +122,12 @@ describe('browser regression checks gate the required runtime job', () => {
     return matching[0];
   }
 
-  it('runs Chromium interface checks on Node 24 after the build and before the success marker', () => {
+  it('runs Chromium and WebKit interface checks on Node 24 after the build and before the success marker', () => {
     expect(testJob).toContain('node: [22, 24]');
     const install = namedStep('Install browser for interface regression tests');
     const browser = namedStep('Run desktop and mobile interface regression tests');
     const marker = namedStep('Runtime checks passed');
-    expect(install).toContain('        run: npx playwright install --with-deps chromium\n');
+    expect(install).toContain('        run: npx playwright install --with-deps chromium webkit\n');
     expect(browser).toContain('        run: npm run test:e2e\n');
     for (const step of [install, browser]) {
       expect(step).toContain(

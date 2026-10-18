@@ -263,6 +263,26 @@ describe('User directory and Discord organization', () => {
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Manage Family' }));
     expect(requests.filter((entry) => entry.options?.method)).toHaveLength(0);
   });
+  it('moves focus from a prior input to the touched Manage button so Escape dismisses every reopening', async () => {
+    const { requests } = page();
+    const manage = await screen.findByRole('button', { name: 'Manage Child' });
+    const search = screen.getByLabelText('Search users');
+    for (let opening = 0; opening < 2; opening++) {
+      search.focus();
+      expect(document.activeElement).toBe(search);
+      // fireEvent.click intentionally does not add browser focus behavior: this
+      // models touch Safari leaving focus on an earlier form field after a tap.
+      fireEvent.click(manage);
+      expect(document.activeElement).toBe(manage);
+      expect(manage.getAttribute('aria-expanded')).toBe('true');
+      expect(screen.getByRole('button', { name: 'Manage account access for Child' })).toBeTruthy();
+      fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
+      expect(manage.getAttribute('aria-expanded')).toBe('false');
+      expect(screen.queryByRole('button', { name: 'Manage account access for Child' })).toBeNull();
+      expect(document.activeElement).toBe(manage);
+    }
+    expect(requests.filter((entry) => entry.options?.method)).toEqual([]);
+  });
 
   it('reviews and updates the exact account selected on a later page', async () => {
     const requests: { path: string; options?: ApiOptions }[] = [];

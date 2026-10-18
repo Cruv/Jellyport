@@ -2250,6 +2250,7 @@ describe('React account safeguards', () => {
     expect(within(dialog).queryByText(/Played-status write requests/)).toBeNull();
   });
   it('closes mobile navigation when moving to a page and dismisses private dialogs with Escape', async () => {
+    vi.stubGlobal('innerWidth', 400);
     const dialog = await openJob();
     // The DOM can be visible before the modal's focus and keyboard effects have run.
     const close = within(dialog).getByRole('button', { name: 'Close dialog' });
@@ -2264,6 +2265,7 @@ describe('React account safeguards', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
   });
   it('keeps keyboard focus in open mobile navigation and restores it on dismissal', async () => {
+    vi.stubGlobal('innerWidth', 400);
     render(<App />);
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
     expect(screen.getByRole('link', { name: 'Skip to content' }).getAttribute('href')).toBe(
@@ -2288,6 +2290,7 @@ describe('React account safeguards', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
   });
   it('focuses the current mobile page and contains keyboard focus that starts outside navigation', async () => {
+    vi.stubGlobal('innerWidth', 400);
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
@@ -2324,6 +2327,119 @@ describe('React account safeguards', () => {
     expect(tab.defaultPrevented).toBe(false);
     expect(document.activeElement).toBe(toggle);
   });
+  it('retains an open drawer in wide touch-phone landscape and closes it when the same viewport uses a fine pointer', async () => {
+    let width = 430;
+    let coarse = true;
+    vi.stubGlobal('matchMedia', (query: string) => ({
+      get matches() {
+        return width <= (query.includes('850px') ? 850 : 700) || (width <= 1100 && coarse);
+      },
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    }));
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    const toggle = screen.getByRole('button', { name: 'Toggle navigation' });
+    fireEvent.click(toggle);
+    expect(document.body.classList.contains('navigation-open')).toBe(true);
+    expect(screen.getByRole('main').hasAttribute('inert')).toBe(true);
+    width = 956;
+    fireEvent(window, new Event('resize'));
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(document.body.classList.contains('navigation-open')).toBe(true);
+    coarse = false;
+    fireEvent(window, new Event('resize'));
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.body.classList.contains('navigation-open')).toBe(false);
+    expect(screen.getByRole('main').hasAttribute('inert')).toBe(false);
+    expect(document.activeElement).toBe(toggle);
+  });
+  it('keeps navigation and modal scroll locks independent and releases navigation locks on dismissal', async () => {
+    vi.stubGlobal('innerWidth', 430);
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Toggle navigation' }));
+    expect(document.body.classList.contains('navigation-open')).toBe(true);
+    document.body.classList.add('modal-open');
+    fireEvent.click(screen.getByRole('button', { name: 'Close navigation' }));
+    expect(document.body.classList.contains('navigation-open')).toBe(false);
+    expect(document.body.classList.contains('modal-open')).toBe(true);
+    document.body.classList.remove('modal-open');
+  });
+  it('hands focus and scroll ownership from the drawer to a deferred operation dialog', async () => {
+    vi.stubGlobal('innerWidth', 430);
+    const original = fetch;
+    let reply!: (response: Response) => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((path: string, options?: RequestInit) => {
+        if (path === '/api/jobs/job-1')
+          return new Promise<Response>((resolve) => {
+            reply = resolve;
+          });
+        return original(path, options);
+      }),
+    );
+    // jsdom has no layout, so expose the visible dialog controls to its focus trap.
+    vi.spyOn(HTMLElement.prototype, 'getClientRects').mockImplementation(() => {
+      const rect = new DOMRect(0, 0, 100, 44);
+      return Object.assign([rect], {
+        item: (index: number) => (index === 0 ? rect : null),
+      }) as DOMRectList;
+    });
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'View operation details' }));
+    const toggle = screen.getByRole('button', { name: 'Toggle navigation' });
+    fireEvent.click(toggle);
+    expect(document.body.classList.contains('navigation-open')).toBe(true);
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Overview' }));
+    await act(async () => {
+      reply({ ok: true, status: 200, json: async () => job } as Response);
+    });
+    const dialog = await screen.findByRole('dialog', { name: 'Operation details' });
+    const first = within(dialog).getByRole('button', { name: 'Close dialog' });
+    const last = within(dialog).getByRole('button', { name: 'Reveal new credentials' });
+    await waitFor(() => expect(document.activeElement).toBe(first));
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(document.body.classList.contains('navigation-open')).toBe(false);
+    expect(document.body.classList.contains('modal-open')).toBe(true);
+    expect(screen.getByRole('main').hasAttribute('inert')).toBe(false);
+    last.focus();
+    fireEvent.keyDown(last, { key: 'Tab' });
+    expect(document.activeElement).toBe(first);
+    fireEvent.keyDown(first, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(last);
+    fireEvent.click(first);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.body.classList.contains('modal-open')).toBe(false);
+    expect(document.body.classList.contains('navigation-open')).toBe(false);
+    expect(document.activeElement).toBe(toggle);
+  });
+  it.each(['sign out', 'unmount'] as const)(
+    'releases the navigation focus trap and scroll lock after %s',
+    async (action) => {
+      vi.stubGlobal('innerWidth', 430);
+      responses['/api/logout'] = { ...session, authenticated: false, user: undefined };
+      const { unmount } = render(<App />);
+      await screen.findByRole('heading', { name: 'Overview', level: 1 });
+      fireEvent.click(screen.getByRole('button', { name: 'Toggle navigation' }));
+      expect(document.body.classList.contains('navigation-open')).toBe(true);
+      if (action === 'unmount') unmount();
+      else {
+        fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
+        await screen.findByLabelText('Jellyfin username');
+      }
+      expect(document.body.classList.contains('navigation-open')).toBe(false);
+      const event = new KeyboardEvent('keydown', { key: 'Tab', cancelable: true });
+      fireEvent(window, event);
+      expect(event.defaultPrevented).toBe(false);
+      if (action === 'unmount') {
+        expect(document.documentElement.style.getPropertyValue('--viewport-height')).toBe('');
+        expect(document.documentElement.style.getPropertyValue('--viewport-top')).toBe('');
+      }
+    },
+  );
   it('saves independent activity retention through the authenticated CSRF-protected API', async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));

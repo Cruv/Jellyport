@@ -77,3 +77,10 @@ export async function expectContainedLayout(page: Page) {
   expect(content!.x).toBeGreaterThanOrEqual(0);
   expect(content!.x + content!.width).toBeLessThanOrEqual(page.viewportSize()!.width + 1);
 }
+
+export async function isCompactLayout(page: Page) {
+  return page.evaluate(
+    () =>
+      window.matchMedia('(max-width: 700px), (max-width: 1100px) and (pointer: coarse)').matches,
+  );
+}

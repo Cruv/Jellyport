@@ -487,9 +487,15 @@ describe('targeted Jellyfin destination state reads', () => {
 
   it('enforces one 60-second deadline across the exception phase and drains active reads', async () => {
     const realTimer = setTimeout;
+    const clearRealTimer = clearTimeout;
     vi.useFakeTimers();
     const candidates = catalog(1).map(({ JellyportLibraryIds: _, ...item }) => item);
     let started = false;
+    let adapterStarted!: () => void;
+    const active = new Promise<void>((resolve) => {
+      adapterStarted = resolve;
+    });
+    let startDeadline: ReturnType<typeof setTimeout> | undefined;
     let candidateReads = 0;
     let signal: AbortSignal | undefined;
     const client = clientWithLibraries('http://jellyfin.test', 'key', 'jellyfin', {
@@ -500,6 +506,7 @@ describe('targeted Jellyfin destination state reads', () => {
         if (path === '/Users/alice/Items') candidateReads++;
         started = true;
         signal = init.signal!;
+        adapterStarted();
         return new Promise<Response>(() => {});
       },
     });
@@ -508,9 +515,18 @@ describe('targeted Jellyfin destination state reads', () => {
       (error: unknown) => error,
     );
     try {
-      // The client intentionally yields with node:timers/promises. Let those real
-      // event-loop yields settle before advancing the phase's mocked deadline.
-      await new Promise<void>((resolve) => realTimer(resolve, 10));
+      // Real node:timers/promises yields must reach the adapter before the mocked
+      // phase clock advances. Synchronize with that event, not a scheduling delay.
+      await Promise.race([
+        active,
+        new Promise<never>((_resolve, reject) => {
+          startDeadline = realTimer(
+            () => reject(new Error('The synthetic access adapter did not start.')),
+            2000,
+          );
+        }),
+      ]);
+      clearRealTimer(startDeadline);
       expect(started).toBe(true);
       await vi.advanceTimersByTimeAsync(60_000);
       expect(await outcome).toMatchObject({
@@ -519,6 +535,7 @@ describe('targeted Jellyfin destination state reads', () => {
       expect(signal?.aborted).toBe(true);
       expect(candidateReads).toBe(0);
     } finally {
+      clearRealTimer(startDeadline);
       await client.close();
       await outcome;
       vi.useRealTimers();

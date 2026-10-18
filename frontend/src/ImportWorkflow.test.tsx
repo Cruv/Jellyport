@@ -274,6 +274,32 @@ describe('shared import lifecycle', () => {
 });
 
 describe('truthful import status', () => {
+  it.each(['failed', 'interrupted'] as const)(
+    'uses conservative recovery guidance without retained-data knowledge after %s',
+    (outcome) => {
+      render(
+        <ImportStatus
+          status={{ ...idle, last_error: 'Import attempt did not finish.', last_outcome: outcome }}
+          loading={false}
+          starting={false}
+          initialLabel="Loading"
+          runningLabel="Running"
+          progressLabel="Progress"
+          summary="Import status loaded"
+          error=""
+          stale={false}
+          uncertain={false}
+        />,
+      );
+      expect(screen.getByRole('alert').textContent).toBe('Import attempt did not finish.');
+      expect(screen.getByText(outcome === 'failed' ? 'Failed' : 'Interrupted')).toBeTruthy();
+      expect(screen.queryByText(/Previous.*saved data.*retained/)).toBeNull();
+      expect(screen.queryByText('No previous saved data is available.')).toBeNull();
+      expect(
+        screen.getByText('Refresh status to check available saved data before retrying.'),
+      ).toBeTruthy();
+    },
+  );
   it.each([
     { total: 100, processed: 34 },
     { total: 0, processed: 0 },

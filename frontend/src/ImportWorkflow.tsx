@@ -218,6 +218,7 @@ export function ImportStatus({
   progressLabel,
   capture = false,
   measured,
+  hasRetainedData,
   summary,
   error,
   stale,
@@ -231,6 +232,8 @@ export function ImportStatus({
   progressLabel: string;
   capture?: boolean;
   measured?: { total: number; processed: number };
+  /** Existence only. Freshness and usability are reported separately by the caller. */
+  hasRetainedData?: boolean;
   summary: string;
   error: string;
   stale: boolean;
@@ -303,7 +306,13 @@ export function ImportStatus({
           <p className="error-block" role="alert">
             {status.last_error}
           </p>
-          <p>Previous valid saved data is retained.</p>
+          <p>
+            {hasRetainedData === true
+              ? 'Previous saved data is retained.'
+              : hasRetainedData === false
+                ? 'No previous saved data is available.'
+                : 'Refresh status to check available saved data before retrying.'}
+          </p>
         </>
       )}
       {error && (

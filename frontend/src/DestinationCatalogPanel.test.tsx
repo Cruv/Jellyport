@@ -45,6 +45,48 @@ afterEach(() => {
 });
 
 describe('saved destination catalog settings', () => {
+  it.each(
+    (['failed', 'interrupted'] as const).flatMap((outcome) =>
+      (['none', 'current', 'expired'] as const).map((retained) => ({ outcome, retained })),
+    ),
+  )(
+    'reports retained-data knowledge truthfully after $outcome with $retained matching catalog',
+    async ({ outcome, retained }) => {
+      vi.spyOn(Date, 'now').mockReturnValue(
+        retained === 'expired' ? Date.parse('2026-01-04T04:00:00Z') : now,
+      );
+      const api: Api = async <T,>() =>
+        ({
+          ...status,
+          last_outcome: outcome,
+          last_error: 'Import attempt did not finish.',
+          record: retained === 'none' ? null : status.record,
+        }) as T;
+      render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+      expect((await screen.findByRole('alert')).textContent).toBe('Import attempt did not finish.');
+      expect(screen.getByText(outcome === 'failed' ? 'Failed' : 'Interrupted')).toBeTruthy();
+      expect(screen.getByRole('button', { name: 'Import latest Jellyfin backup' })).toHaveProperty(
+        'disabled',
+        false,
+      );
+      expect(screen.getByRole('button', { name: 'Refresh status' })).toHaveProperty(
+        'disabled',
+        false,
+      );
+      expect(screen.queryByText('Previous valid saved data is retained.')).toBeNull();
+      if (retained === 'none') {
+        expect(screen.getByText('No previous saved data is available.')).toBeTruthy();
+        expect(screen.queryByText('Previous saved data is retained.')).toBeNull();
+        expect(screen.queryByRole('table', { name: 'Imported Jellyfin catalog' })).toBeNull();
+      } else {
+        expect(screen.getByText('Previous saved data is retained.')).toBeTruthy();
+        expect(screen.queryByText('No previous saved data is available.')).toBeNull();
+        expect(screen.getByText(retained === 'expired' ? 'Expired' : 'Available')).toBeTruthy();
+        if (retained === 'expired')
+          expect(screen.queryByText('Saved matching catalog available')).toBeNull();
+      }
+    },
+  );
   it.each([false, true])(
     'does not imply retained matching data exists in the empty state (retained=%s)',
     async (retained) => {

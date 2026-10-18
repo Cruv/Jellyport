@@ -11,6 +11,7 @@ import {
   readJellyfinCatalogCandidates,
 } from '../server/jellyfin-catalog-index.js';
 import { jellyfinLibraryConfigHash } from '../server/jellyfin-library-membership.js';
+import type { JellyfinBackupProgress } from '../server/jellyfin-backup-reader.js';
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -463,9 +464,49 @@ describe('Jellyfin backup catalog reader', () => {
     { ...manifest, Options: { Database: false } },
   ])('rejects unverified manifest formats', async (value) => {
     const source = await fixture([item(1)], [], [], value);
-    await expect(importJellyfinBackupCatalog(source.archive, source.output)).rejects.toThrow(
-      'invalid catalog',
-    );
+    await expect(importJellyfinBackupCatalog(source.archive, source.output)).rejects.toMatchObject({
+      error_code:
+        value.ServerVersion !== manifest.ServerVersion ? 'version_mismatch' : 'backup_invalid',
+    });
+  });
+
+  it.each([
+    ['expired', -49 * 60 * 60_000, '12.2.0', 'backup_expired'],
+    ['future', 61_000, '12.2.0', 'backup_future'],
+    ['different linked version', -60_000, '12.3.0', 'version_mismatch'],
+  ] as const)(
+    'rejects %s manifest policy before creating output or parsing corrupt table JSON',
+    async (_label, offset, version, code) => {
+      const now = Date.parse('2026-10-18T12:00:00.000Z');
+      const source = await fixture([item(1)], [], [], {
+        ...manifest,
+        DateCreated: new Date(now + offset).toISOString(),
+      });
+      source.entries[1]!.text = 'this table is deliberately invalid JSON';
+      await writeFile(source.archive, zip(source.entries));
+      const progress: JellyfinBackupProgress[] = [];
+      await expect(
+        importJellyfinBackupCatalog(source.archive, source.output, {
+          expectedServerVersion: version,
+          now,
+          onProgress: (value) => progress.push(value),
+        }),
+      ).rejects.toMatchObject({ error_code: code });
+      expect(progress).toEqual([]);
+      await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
+
+  it('accepts the exact 48-hour policy boundary without renewing the original backup date', async () => {
+    const now = Date.parse('2026-10-18T12:00:00.000Z');
+    const created = new Date(now - 48 * 60 * 60_000).toISOString();
+    const source = await fixture([item(1)], [], [], { ...manifest, DateCreated: created });
+    const result = await importJellyfinBackupCatalog(source.archive, source.output, {
+      expectedServerVersion: '12.2.0',
+      now,
+    });
+    expect(result.manifest.createdAt).toBe(created);
+    expect(projected(source.output).items).toHaveLength(1);
   });
 
   it.each([
@@ -578,7 +619,7 @@ describe('Jellyfin backup catalog reader', () => {
           }
         },
       }),
-    ).rejects.toThrow('invalid catalog');
+    ).rejects.toMatchObject({ error_code: 'backup_changed' });
     expect(await readFile(source.archive)).toEqual(before);
     await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
   });

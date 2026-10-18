@@ -27,6 +27,10 @@ import {
 import {
   DESTINATION_CATALOG_MAX_AGE,
   normalizedServerVersion,
+  DestinationCatalogError,
+  destinationCatalogErrorCode,
+  type DestinationCatalogDiagnostic,
+  type DestinationCatalogStage,
 } from './destination-catalog-files.js';
 import type { MediaItem } from './media.js';
 import type { PathMapping } from './matching.js';
@@ -62,17 +66,25 @@ type Request =
 process.once('message', (request: Request) => {
   void run(request).then(
     (value) => process.send?.({ ok: true, value }, () => process.exit(0)),
-    () =>
+    (error: unknown) =>
       process.send?.(
         {
           ok: false,
+          ...(request.operation === 'destination_capture'
+            ? {
+                error_code: destinationCatalogErrorCode(error),
+                ...(error instanceof DestinationCatalogError && error.diagnostic
+                  ? { diagnostic: error.diagnostic }
+                  : {}),
+              }
+            : {}),
           error:
             request.operation === 'destination_capture'
-              ? 'Jellyfin backup import failed. Check the completed backup, version and permissions. The last good catalog is preserved.'
+              ? 'Jellyfin backup import failed. Any previously saved catalog is preserved.'
               : request.operation === 'destination_read'
                 ? 'The saved Jellyfin matching catalog is unsupported or cannot be read. Import its backup again.'
                 : request.operation === 'capture'
-                  ? 'Database capture failed. Check the helper mount, version, permissions and WAL files; the last good capture is preserved.'
+                  ? 'Database capture failed. Check the helper mount, version, permissions and WAL files; any previously saved capture is preserved.'
                   : 'The saved database is unsupported or cannot be read. Capture it again and review the selected user.',
         },
         () => process.exit(1),
@@ -182,76 +194,151 @@ function archiveName(name: string): boolean {
 }
 
 async function captureDestination(request: Extract<Request, { operation: 'destination_capture' }>) {
-  const source = await lstat(request.directory, { bigint: true });
-  if (!source.isDirectory() || source.isSymbolicLink()) throw new Error('Invalid backup folder.');
-  const names = (await readdir(request.directory)).filter(archiveName).sort().reverse();
-  if (!names.length) throw new Error('No completed Jellyfin backup.');
-  const path = join(request.directory, names[0]!);
-  const initial = await lstat(path, { bigint: true });
-  if (
-    !initial.isFile() ||
-    initial.isSymbolicLink() ||
-    initial.size <= 0 ||
-    initial.size > BigInt(MAX_SNAPSHOT_BYTES)
-  )
-    throw new Error('Invalid Jellyfin archive.');
-  const imported = await importJellyfinBackupCatalog(path, request.output);
-  const created = Date.parse(imported.manifest.createdAt);
-  if (
-    normalizedServerVersion(imported.manifest.serverVersion) !==
-      normalizedServerVersion(request.version) ||
-    !normalizedServerVersion(request.version) ||
-    !Number.isFinite(created) ||
-    created > Date.now() + 60_000 ||
-    Date.now() - created > DESTINATION_CATALOG_MAX_AGE
-  )
-    throw new Error('Incompatible or expired Jellyfin backup.');
-  const indexed = await buildJellyfinCatalogIndex(request.output);
-  const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-  let fingerprint: string;
-  try {
-    if (!unchanged(initial, await handle.stat({ bigint: true })))
-      throw new Error('The backup changed.');
-    const hash = createHash('sha256');
-    let bytes = 0;
-    for await (const chunk of handle.createReadStream({ autoClose: false })) {
-      bytes += (chunk as Buffer).length;
-      if (bytes > MAX_SNAPSHOT_BYTES) throw new Error('The backup exceeds its size limit.');
-      hash.update(chunk as Buffer);
-    }
-    if (BigInt(bytes) !== initial.size || !unchanged(initial, await handle.stat({ bigint: true })))
-      throw new Error('The backup changed.');
-    fingerprint = hash.digest('hex');
-  } finally {
-    await handle.close();
-  }
-  if (!unchanged(initial, await lstat(path, { bigint: true })))
-    throw new Error('The backup changed.');
-  const folder = await lstat(request.directory, { bigint: true });
-  if (
-    !folder.isDirectory() ||
-    folder.isSymbolicLink() ||
-    folder.dev !== source.dev ||
-    folder.ino !== source.ino
-  )
-    throw new Error('The backup folder changed.');
-  if (created > Date.now() + 60_000 || Date.now() - created > DESTINATION_CATALOG_MAX_AGE)
-    throw new Error('The backup expired during import.');
-  const output = await lstat(request.output);
-  if (
-    !output.isFile() ||
-    output.isSymbolicLink() ||
-    output.size <= 0 ||
-    output.size > MAX_SNAPSHOT_BYTES
-  )
-    throw new Error('The matching catalog exceeds its size limit.');
-  return {
-    bytes: output.size,
-    items: indexed.rows,
-    keys: indexed.keys,
-    backup_created_at: imported.manifest.createdAt,
-    backup_fingerprint: fingerprint,
-    server_version: imported.manifest.serverVersion,
-    backup_engine_version: imported.manifest.backupEngineVersion,
+  const started_at = new Date().toISOString();
+  let diagnostic: DestinationCatalogDiagnostic = {
+    stage: 'validating_backup',
+    started_at,
+    updated_at: started_at,
+    source_rows: 0,
+    provider_rows: 0,
+    items: 0,
+    keys: 0,
+    bytes: 0,
   };
+  let lastSent = 0;
+  const observe = (
+    stage: DestinationCatalogStage,
+    update: Partial<DestinationCatalogDiagnostic> = {},
+    force = false,
+  ) => {
+    const previousStage = diagnostic.stage;
+    const now = Date.now();
+    diagnostic = { ...diagnostic, ...update, stage, updated_at: new Date().toISOString() };
+    if (!force && stage === previousStage && now - lastSent < 1000) return;
+    lastSent = now;
+    try {
+      process.send?.({ type: 'progress', value: diagnostic });
+    } catch {
+      /* No observer can alter the backup. */
+    }
+  };
+  try {
+    observe('validating_backup');
+    const source = await lstat(request.directory, { bigint: true });
+    if (!source.isDirectory() || source.isSymbolicLink())
+      throw new DestinationCatalogError('backup_invalid');
+    const names = (await readdir(request.directory)).filter(archiveName).sort().reverse();
+    if (!names.length) throw new DestinationCatalogError('backup_missing');
+    const path = join(request.directory, names[0]!);
+    const initial = await lstat(path, { bigint: true });
+    if (
+      !initial.isFile() ||
+      initial.isSymbolicLink() ||
+      initial.size <= 0 ||
+      initial.size > BigInt(MAX_SNAPSHOT_BYTES)
+    )
+      throw new DestinationCatalogError('backup_invalid');
+    const imported = await importJellyfinBackupCatalog(path, request.output, {
+      expectedServerVersion: request.version,
+      onProgress: (value) =>
+        observe(
+          value.phase === 'items'
+            ? 'reading_items'
+            : value.phase === 'providers'
+              ? 'reading_providers'
+              : 'enriching',
+          {
+            source_rows: value.sourceRows,
+            provider_rows: value.providerRows,
+            items: value.projectedItems,
+            bytes: value.projectedBytes,
+          },
+        ),
+    });
+    const created = Date.parse(imported.manifest.createdAt);
+    if (
+      normalizedServerVersion(imported.manifest.serverVersion) !==
+        normalizedServerVersion(request.version) ||
+      !normalizedServerVersion(request.version) ||
+      !Number.isFinite(created) ||
+      created > Date.now() + 60_000 ||
+      Date.now() - created > DESTINATION_CATALOG_MAX_AGE
+    )
+      throw new DestinationCatalogError(
+        created > Date.now() + 60_000
+          ? 'backup_future'
+          : Date.now() - created > DESTINATION_CATALOG_MAX_AGE
+            ? 'backup_expired'
+            : 'version_mismatch',
+      );
+    observe('indexing');
+    const indexed = await buildJellyfinCatalogIndex(request.output, {
+      onProgress: (value) => observe('indexing', { keys: value.keys }),
+    });
+    observe('fingerprinting', { items: indexed.rows, keys: indexed.keys });
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let fingerprint: string;
+    try {
+      if (!unchanged(initial, await handle.stat({ bigint: true })))
+        throw new DestinationCatalogError('backup_changed');
+      const hash = createHash('sha256');
+      let bytes = 0;
+      let lastProgress = 0;
+      for await (const chunk of handle.createReadStream({ autoClose: false })) {
+        bytes += (chunk as Buffer).length;
+        if (bytes > MAX_SNAPSHOT_BYTES) throw new Error('The backup exceeds its size limit.');
+        hash.update(chunk as Buffer);
+        if (Date.now() - lastProgress >= 1000) {
+          observe('fingerprinting');
+          lastProgress = Date.now();
+        }
+      }
+      if (
+        BigInt(bytes) !== initial.size ||
+        !unchanged(initial, await handle.stat({ bigint: true }))
+      )
+        throw new DestinationCatalogError('backup_changed');
+      fingerprint = hash.digest('hex');
+    } finally {
+      await handle.close();
+    }
+    if (!unchanged(initial, await lstat(path, { bigint: true })))
+      throw new DestinationCatalogError('backup_changed');
+    const folder = await lstat(request.directory, { bigint: true });
+    if (
+      !folder.isDirectory() ||
+      folder.isSymbolicLink() ||
+      folder.dev !== source.dev ||
+      folder.ino !== source.ino
+    )
+      throw new DestinationCatalogError('backup_changed');
+    if (created > Date.now() + 60_000 || Date.now() - created > DESTINATION_CATALOG_MAX_AGE)
+      throw new DestinationCatalogError(
+        created > Date.now() + 60_000 ? 'backup_future' : 'backup_expired',
+      );
+    const output = await lstat(request.output);
+    if (
+      !output.isFile() ||
+      output.isSymbolicLink() ||
+      output.size <= 0 ||
+      output.size > MAX_SNAPSHOT_BYTES
+    )
+      throw new DestinationCatalogError('backup_invalid');
+    observe('fingerprinting', { bytes: output.size }, true);
+    return {
+      bytes: output.size,
+      items: indexed.rows,
+      keys: indexed.keys,
+      backup_created_at: imported.manifest.createdAt,
+      backup_fingerprint: fingerprint,
+      server_version: imported.manifest.serverVersion,
+      backup_engine_version: imported.manifest.backupEngineVersion,
+      diagnostic,
+    };
+  } catch (error) {
+    let code = destinationCatalogErrorCode(error);
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT')
+      code = diagnostic.stage === 'validating_backup' ? 'backup_missing' : 'backup_changed';
+    throw new DestinationCatalogError(code, diagnostic);
+  }
 }

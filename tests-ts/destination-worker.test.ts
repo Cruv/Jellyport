@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { crc32 } from 'node:zlib';
 import { setTimeout as delay } from 'node:timers/promises';
-import { snapshotProcess } from '../server/snapshot-process.js';
+import { snapshotProcess, type SnapshotProcessOptions } from '../server/snapshot-process.js';
 import {
   decryptDatabase,
   readEnvelope,
@@ -18,6 +18,8 @@ import {
   destinationCatalogPrefix,
   type DestinationCatalogRequest,
   type DestinationCatalogResult,
+  type DestinationCatalogDiagnostic,
+  validDestinationDiagnostic,
 } from '../server/destination-catalog-files.js';
 import type { MediaItem } from '../server/media.js';
 
@@ -119,13 +121,22 @@ interface Capture {
   server_version: string;
   backup_engine_version: string;
 }
-const capture = (value: Awaited<ReturnType<typeof fixture>>, version = '12.2.0') =>
-  snapshotProcess<Capture>({
-    operation: 'destination_capture',
-    directory: value.backups,
-    output: value.output,
-    version,
-  });
+const capture = (
+  value: Awaited<ReturnType<typeof fixture>>,
+  version = '12.2.0',
+  options: SnapshotProcessOptions = {},
+) =>
+  snapshotProcess<Capture>(
+    {
+      operation: 'destination_capture',
+      directory: value.backups,
+      output: value.output,
+      version,
+    },
+    undefined,
+    undefined,
+    options,
+  );
 async function waitFor<T>(read: () => Promise<T>): Promise<T> {
   const deadline = Date.now() + 8000;
   while (Date.now() < deadline) {
@@ -143,7 +154,13 @@ describe('isolated destination catalog worker and helper', () => {
     const value = await fixture(Buffer.from('older incomplete archive'));
     const bytes = archive();
     await writeFile(join(value.backups, 'jellyfin-backup-20260102040000.zip'), bytes);
-    const result = await capture(value);
+    const progress: DestinationCatalogDiagnostic[] = [];
+    const result = await capture(value, '12.2.0', {
+      onProgress: (entry) => {
+        expect(validDestinationDiagnostic(entry)).toBe(true);
+        progress.push(entry as DestinationCatalogDiagnostic);
+      },
+    });
     expect(result).toMatchObject({
       items: 1,
       keys: 2,
@@ -154,6 +171,18 @@ describe('isolated destination catalog worker and helper', () => {
     expect(result.bytes).toBe((await stat(value.output)).size);
     expect((await stat(value.output)).mode & 0o777).toBe(0o600);
     expect((await readFile(value.output)).includes(Buffer.from(secret))).toBe(false);
+    expect(progress.map((entry) => entry.stage)).toEqual(
+      expect.arrayContaining([
+        'validating_backup',
+        'reading_items',
+        'reading_providers',
+        'enriching',
+        'indexing',
+        'fingerprinting',
+      ]),
+    );
+    expect(progress.at(-1)).toMatchObject({ items: 1, keys: 2, bytes: result.bytes });
+    expect(JSON.stringify(progress)).not.toMatch(/Synthetic|synthetic\/|00000001|password/);
     const items = await snapshotProcess<MediaItem[]>({
       operation: 'destination_read',
       path: value.output,
@@ -173,18 +202,51 @@ describe('isolated destination catalog worker and helper', () => {
   });
 
   it.each([
-    ['an expired original backup', new Date(Date.now() - 49 * 60 * 60_000).toISOString(), '12.2.0'],
-    ['a future original backup', new Date(Date.now() + 120_000).toISOString(), '12.2.0'],
-    ['an incompatible linked version', new Date(Date.now() - 60_000).toISOString(), '12.3.0'],
-  ])('rejects %s with a sanitized worker failure', async (_name, created, version) => {
-    const value = await fixture(archive(created));
-    await expect(capture(value, version)).rejects.toThrow('Jellyfin backup import failed.');
-  });
+    [
+      'an expired original backup',
+      new Date(Date.now() - 49 * 60 * 60_000).toISOString(),
+      '12.2.0',
+      'backup_expired',
+    ],
+    [
+      'a future original backup',
+      new Date(Date.now() + 120_000).toISOString(),
+      '12.2.0',
+      'backup_future',
+    ],
+    [
+      'an incompatible linked version',
+      new Date(Date.now() - 60_000).toISOString(),
+      '12.3.0',
+      'version_mismatch',
+    ],
+  ])(
+    'rejects %s with an early safe diagnostic before table processing',
+    async (_name, created, version, code) => {
+      const value = await fixture(archive(created));
+      const progress: unknown[] = [];
+      await expect(
+        capture(value, version, { onProgress: (entry) => progress.push(entry) }),
+      ).rejects.toMatchObject({
+        error_code: code,
+        diagnostic: {
+          stage: 'validating_backup',
+          source_rows: 0,
+          provider_rows: 0,
+          items: 0,
+          keys: 0,
+          bytes: 0,
+        },
+      });
+      expect(progress).toHaveLength(1);
+      await expect(stat(value.output)).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
 
   it('rejects a newer symlink instead of falling back to an older archive', async () => {
     const value = await fixture();
     await symlink(value.path, join(value.backups, 'jellyfin-backup-20260102040000.zip'));
-    await expect(capture(value)).rejects.toThrow('Jellyfin backup import failed.');
+    await expect(capture(value)).rejects.toMatchObject({ error_code: 'backup_invalid' });
   });
 
   it('does not treat an arbitrary or invalid-date ZIP filename as a completed backup', async () => {
@@ -192,7 +254,7 @@ describe('isolated destination catalog worker and helper', () => {
     await rm(value.path);
     await writeFile(join(value.backups, 'backup.zip'), value.bytes);
     await writeFile(join(value.backups, 'jellyfin-backup-20260230030000.zip'), value.bytes);
-    await expect(capture(value)).rejects.toThrow('Jellyfin backup import failed.');
+    await expect(capture(value)).rejects.toMatchObject({ error_code: 'backup_missing' });
   });
 
   it('rejects a source which changes while importing rather than publishing its partial projection', async () => {
@@ -202,7 +264,7 @@ describe('isolated destination catalog worker and helper', () => {
       void utimes(value.path, new Date(), new Date(Date.now() + ++changes)).catch(() => {});
     }, 2);
     try {
-      await expect(capture(value)).rejects.toThrow('Jellyfin backup import failed.');
+      await expect(capture(value)).rejects.toMatchObject({ error_code: 'backup_changed' });
     } finally {
       clearInterval(timer);
     }

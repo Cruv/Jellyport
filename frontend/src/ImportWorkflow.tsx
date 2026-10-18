@@ -1,5 +1,70 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { Api, ApiOptions, ImportWorkflowStatus, Notify } from './types';
+import type {
+  Api,
+  ApiOptions,
+  ImportWorkflowStatus,
+  Notify,
+  DestinationCatalogDiagnostic,
+  DestinationCatalogStage,
+  DestinationCatalogErrorCode,
+} from './types';
+
+const importStages: Record<DestinationCatalogStage, string> = {
+  validating_backup: 'Validating backup',
+  reading_items: 'Reading media items',
+  reading_providers: 'Reading provider identifiers',
+  enriching: 'Enriching matching data',
+  indexing: 'Building matching index',
+  fingerprinting: 'Checking backup integrity',
+  encrypting: 'Encrypting matching catalog',
+  validating_catalog: 'Validating matching catalog',
+};
+const importFailures: Record<DestinationCatalogErrorCode, string> = {
+  backup_missing: 'Completed backup not found',
+  backup_expired: 'Backup expired',
+  backup_future: 'Backup timestamp is in the future',
+  version_mismatch: 'Backup server version does not match',
+  backup_invalid: 'Backup is invalid or unsupported',
+  backup_changed: 'Backup changed during import',
+  storage_error: 'Working storage is unavailable',
+  timeout: 'Import time limit reached',
+  interrupted: 'Import interrupted',
+  canceled: 'Import canceled',
+  worker_failed: 'Import worker failed',
+};
+const importCounterLimits = {
+  source_rows: 5_000_000,
+  provider_rows: 10_000_000,
+  items: 2_000_000,
+  keys: 20_000_000,
+  bytes: 8 * 1024 ** 3,
+} as const;
+function checkedImportDiagnostic(value?: DestinationCatalogDiagnostic | null) {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    typeof value.stage !== 'string' ||
+    typeof value.started_at !== 'string' ||
+    typeof value.updated_at !== 'string' ||
+    !Object.hasOwn(importStages, value.stage)
+  )
+    return;
+  const started = Date.parse(value.started_at),
+    updated = Date.parse(value.updated_at);
+  if (!Number.isFinite(started) || !Number.isFinite(updated) || updated < started) return;
+  for (const [key, limit] of Object.entries(importCounterLimits)) {
+    const count = value[key as keyof typeof importCounterLimits];
+    if (!Number.isSafeInteger(count) || count < 0 || count > limit) return;
+  }
+  return value;
+}
+export function importDuration(milliseconds: number) {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return 'Time unavailable';
+  if (milliseconds < 1000) return `${Math.round(milliseconds)} ms`;
+  if (milliseconds < 60_000) return `${(milliseconds / 1000).toFixed(1)} s`;
+  const seconds = Math.floor(milliseconds / 1000);
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
 
 export const importTimestamp = (value?: string | null) => {
   const parsed = value ? new Date(value) : null;
@@ -219,6 +284,9 @@ export function ImportStatus({
   capture = false,
   measured,
   hasRetainedData,
+  importDiagnostic,
+  importErrorCode,
+  showAttemptDuration = false,
   summary,
   error,
   stale,
@@ -234,12 +302,57 @@ export function ImportStatus({
   measured?: { total: number; processed: number };
   /** Existence only. Freshness and usability are reported separately by the caller. */
   hasRetainedData?: boolean;
+  importDiagnostic?: DestinationCatalogDiagnostic | null;
+  importErrorCode?: DestinationCatalogErrorCode | null;
+  showAttemptDuration?: boolean;
   summary: string;
   error: string;
   stale: boolean;
   uncertain: boolean;
 }) {
   const outcome = starting ? null : status?.running ? 'running' : status?.last_outcome;
+  const now = Date.now();
+  const attemptStart = Date.parse(status?.last_attempt_at || '');
+  const attemptFinish = status?.running ? now : Date.parse(status?.last_finished_at || '');
+  const attemptDuration =
+    !starting &&
+    showAttemptDuration &&
+    Number.isFinite(attemptStart) &&
+    Number.isFinite(attemptFinish) &&
+    attemptFinish >= attemptStart
+      ? attemptFinish - attemptStart
+      : undefined;
+  let diagnostic = !starting && status ? checkedImportDiagnostic(importDiagnostic) : undefined;
+  if (
+    diagnostic &&
+    Number.isFinite(attemptStart) &&
+    Date.parse(diagnostic.updated_at) < attemptStart
+  )
+    diagnostic = undefined;
+  const oldProgress = !!(
+    status?.running &&
+    diagnostic &&
+    now - Date.parse(diagnostic.updated_at) > 15_000
+  );
+  const failure =
+    importErrorCode && Object.hasOwn(importFailures, importErrorCode)
+      ? importFailures[importErrorCode]
+      : undefined;
+  const counters = diagnostic
+    ? [
+        diagnostic.source_rows > 0
+          ? `${diagnostic.source_rows.toLocaleString()} media rows read`
+          : '',
+        diagnostic.provider_rows > 0
+          ? `${diagnostic.provider_rows.toLocaleString()} provider rows read`
+          : '',
+        diagnostic.items > 0 ? `${diagnostic.items.toLocaleString()} matching items` : '',
+        diagnostic.keys > 0 ? `${diagnostic.keys.toLocaleString()} matching keys` : '',
+        diagnostic.bytes > 0
+          ? `Processed bytes: ${(diagnostic.bytes / 1024 ** 2).toFixed(1)} MiB`
+          : '',
+      ].filter(Boolean)
+    : [];
   const actual =
     measured &&
     Number.isSafeInteger(measured.total) &&
@@ -300,6 +413,43 @@ export function ImportStatus({
             }
           </strong>
         </p>
+      )}
+      {attemptDuration !== undefined && (
+        <p aria-live="off">
+          {status?.running ? 'Current attempt elapsed' : 'Latest attempt duration'}:{' '}
+          {importDuration(attemptDuration)}
+        </p>
+      )}
+      {diagnostic && (
+        <>
+          <p>
+            {status?.running ? 'Current stage' : 'Last observed stage'}:{' '}
+            <strong>{importStages[diagnostic.stage]}</strong>
+          </p>
+          {counters.length > 0 && (
+            <p className="text-small" aria-live="off">
+              {counters.join(' · ')}
+            </p>
+          )}
+          <p className="text-small" aria-live="off">
+            Progress last updated {importTimestamp(diagnostic.updated_at)}
+          </p>
+          {oldProgress && (
+            <p>
+              No recent progress update. The import may still be running; refresh status to check.
+            </p>
+          )}
+        </>
+      )}
+      {failure && (status?.last_error || outcome === 'failed' || outcome === 'interrupted') && (
+        <>
+          <p>
+            Failure reason: <strong>{failure}</strong>
+          </p>
+          {importErrorCode === 'backup_expired' && (
+            <p>Create a fresh database backup in Jellyfin, then import it.</p>
+          )}
+        </>
       )}
       {status?.last_error && (
         <>

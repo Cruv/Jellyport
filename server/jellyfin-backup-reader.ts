@@ -7,9 +7,14 @@ import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { crc32 } from 'node:zlib';
 import { parser, type Token } from 'stream-json/parser.js';
 import { fromFdPromise, type Entry, type ZipFile } from 'yauzl';
-import { ServiceError } from './errors.js';
 import { projectCatalogItem, type MediaItem } from './media.js';
 import { jellyfinAsciiPathKey } from './jellyfin-library-membership.js';
+import {
+  DestinationCatalogError,
+  DESTINATION_CATALOG_MAX_AGE,
+  destinationCatalogErrorCode,
+  normalizedServerVersion,
+} from './destination-catalog-files.js';
 
 export const JELLYFIN_BACKUP_PROJECTION_FORMAT = 'jellyfin-backup-catalog-v2';
 const VERSION = '12.2.0.0';
@@ -78,14 +83,17 @@ export interface JellyfinBackupProgress extends JellyfinBackupStats {
 export interface JellyfinBackupReadOptions {
   signal?: AbortSignal;
   onProgress?: (progress: JellyfinBackupProgress) => void;
+  /** The worker supplies its verified live version; reject stale input before table reads. */
+  expectedServerVersion?: string;
+  /** Deterministic private clock for synthetic tests, never accepted over IPC. */
+  now?: number;
 }
 export interface JellyfinBackupCatalogResult {
   manifest: JellyfinBackupManifest;
   stats: JellyfinBackupStats;
 }
-const invalid = () =>
-  new ServiceError('The Jellyfin backup has an unsupported or invalid catalog.');
-const canceled = () => new ServiceError('Jellyfin backup import canceled.');
+const invalid = () => new DestinationCatalogError('backup_invalid');
+const canceled = () => new DestinationCatalogError('canceled');
 const isObject = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 function check(signal?: AbortSignal): void {
@@ -135,6 +143,8 @@ function unchanged(first: BigIntStats, second: BigIntStats): boolean {
 }
 function readManifest(bytes: Buffer): JellyfinBackupManifest {
   const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  if (isObject(value) && typeof value.ServerVersion === 'string' && value.ServerVersion !== VERSION)
+    throw new DestinationCatalogError('version_mismatch');
   if (
     !isObject(value) ||
     value.ServerVersion !== VERSION ||
@@ -473,6 +483,18 @@ export async function importJellyfinBackupCatalog(
       options,
     );
     const manifest = readManifest(Buffer.concat(buffers));
+    if (options.expectedServerVersion !== undefined) {
+      const now = options.now ?? Date.now();
+      const created = Date.parse(manifest.createdAt);
+      if (
+        normalizedServerVersion(options.expectedServerVersion) !==
+        normalizedServerVersion(manifest.serverVersion)
+      )
+        throw new DestinationCatalogError('version_mismatch');
+      if (created > now + 60_000) throw new DestinationCatalogError('backup_future');
+      if (now - created > DESTINATION_CATALOG_MAX_AGE)
+        throw new DestinationCatalogError('backup_expired');
+    }
     const outputFd = openSync(
       outputPath,
       constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -513,13 +535,20 @@ export async function importJellyfinBackupCatalog(
     let transactionRows = 0;
     const checkpoint = async (phase: JellyfinBackupProgress['phase']) => {
       check(options.signal);
-      report(phase);
+      // Keep the first parsed row observable even after the new phase-start event.
+      report(
+        phase,
+        phase === 'items'
+          ? stats.sourceRows === 1
+          : phase === 'providers' && stats.providerRows === 1,
+      );
       if (++transactionRows % 10_000 === 0) database!.exec('COMMIT; BEGIN IMMEDIATE;');
       if (transactionRows % 1000 === 0) {
         await yieldTurn();
         check(options.signal);
       }
     };
+    report('items', true);
     await entryPipeline(
       zip,
       entries.get(ITEMS)!,
@@ -639,6 +668,7 @@ export async function importJellyfinBackupCatalog(
     const insertProvider = database.prepare(
       'INSERT INTO providers(id,provider_key,provider_value) VALUES(?,?,?)',
     );
+    report('providers', true);
     await entryPipeline(
       zip,
       entries.get(PROVIDERS)!,
@@ -674,6 +704,7 @@ export async function importJellyfinBackupCatalog(
     );
     const updateItem = database.prepare('UPDATE catalog_items SET item=? WHERE id=?');
     const series = database.prepare('SELECT item FROM catalog_items WHERE id=?');
+    report('enriching', true);
     let cursor = '';
     while (true) {
       check(options.signal);
@@ -730,14 +761,14 @@ export async function importJellyfinBackupCatalog(
       !unchanged(initial, fstatSync(fd, { bigint: true })) ||
       !unchanged(initial, lstatSync(archivePath, { bigint: true }))
     )
-      throw invalid();
+      throw new DestinationCatalogError('backup_changed');
     report('enriching', true);
     completed = true;
     return { manifest, stats };
   } catch (error) {
     if (options.signal?.aborted) throw canceled();
-    if (error instanceof ServiceError) throw error;
-    throw invalid();
+    if (error instanceof DestinationCatalogError) throw error;
+    throw new DestinationCatalogError(destinationCatalogErrorCode(error));
   } finally {
     database?.close();
     if (zip)

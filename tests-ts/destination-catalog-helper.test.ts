@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { snapshotProcess } from '../server/snapshot-process.js';
+import * as snapshotFiles from '../server/snapshot-files.js';
 import {
   processDestinationCatalogRequest,
   recoverDestinationCatalogHelper,
@@ -19,14 +20,33 @@ import {
   destinationCatalogPrefix,
   validDestinationRequest,
   validDestinationResult,
+  validDestinationProgress,
+  DestinationCatalogError,
+  type DestinationCatalogDiagnostic,
   type DestinationCatalogResult,
 } from '../server/destination-catalog-files.js';
 
 vi.mock('../server/snapshot-process.js', () => ({ snapshotProcess: vi.fn() }));
 const roots: string[] = [];
+const diagnostic = (
+  stage: DestinationCatalogDiagnostic['stage'] = 'reading_items',
+): DestinationCatalogDiagnostic => {
+  const timestamp = new Date().toISOString();
+  return {
+    stage,
+    started_at: timestamp,
+    updated_at: timestamp,
+    source_rows: 5,
+    provider_rows: 0,
+    items: 2,
+    keys: 0,
+    bytes: 0,
+  };
+};
 afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
   vi.resetAllMocks();
+  vi.restoreAllMocks();
 });
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), 'jellyport-destination-protocol-'));
@@ -99,10 +119,84 @@ it('contains worker errors without exposing source paths or replacing unrelated 
   await f.process();
   const result = await f.result();
   expect(result.ok).toBe(false);
+  expect(result.error_code).toBe('worker_failed');
   expect(JSON.stringify(result)).not.toContain('/private');
   expect(JSON.stringify(result)).not.toContain('credential');
   expect(await readFile(join(f.root, 'unrelated-good.db.enc'), 'utf8')).toBe('good');
   expect(await readdir(f.root)).not.toContain(`${f.prefix}.db.enc`);
+});
+it('publishes authenticated aggregate progress and retains a specific safe early failure without a completed catalog', async () => {
+  const f = await fixture();
+  f.worker.mockImplementation(async (_request, _signal, _timeout, options) => {
+    options?.onProgress?.(diagnostic());
+    throw new DestinationCatalogError('backup_expired', diagnostic());
+  });
+  await f.process();
+  const progress = await readEnvelope<unknown>(join(f.root, `${f.prefix}.progress`), f.key);
+  expect(validDestinationProgress(progress)).toBe(true);
+  expect(progress).toMatchObject({ ...f.request, diagnostic: { source_rows: 5, items: 2 } });
+  const result = await f.result();
+  expect(result).toMatchObject({
+    ok: false,
+    error_code: 'backup_expired',
+    diagnostic: { source_rows: 5, items: 2 },
+  });
+  expect(result.error).toContain('older than 48 hours');
+  expect((await readdir(f.root)).filter((name) => name.endsWith('.db.enc'))).toEqual([]);
+  expect(
+    (await readFile(join(f.root, `${f.prefix}.progress`))).includes(Buffer.from('reading_items')),
+  ).toBe(false);
+});
+it('flushes coalesced progress before publishing a terminal result so cleanup cannot race a late write', async () => {
+  const f = await fixture();
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const blocked = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const original = snapshotFiles.writeEnvelope;
+  let first = true;
+  vi.spyOn(snapshotFiles, 'writeEnvelope').mockImplementation(async (path, value, key) => {
+    if (path.endsWith('.progress') && first) {
+      first = false;
+      entered();
+      await gate;
+    }
+    return original(path, value, key);
+  });
+  const work = f.process();
+  await blocked;
+  await new Promise((resolve) => setImmediate(resolve));
+  await expect(readFile(join(f.root, `${f.prefix}.result`))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+  release();
+  await work;
+  expect(await f.result()).toMatchObject({
+    ok: true,
+    diagnostic: { stage: 'validating_catalog', items: 1, keys: 2, bytes: 25 },
+  });
+  const path = join(f.root, `${f.prefix}.progress`);
+  await rm(path);
+  await new Promise((resolve) => setImmediate(resolve));
+  await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+it('ignores invalid progress fields and never exposes private worker diagnostics', async () => {
+  const f = await fixture();
+  f.worker.mockImplementation(async (_request, _signal, _timeout, options) => {
+    options?.onProgress?.({ ...diagnostic(), path: '/synthetic-private-history' });
+    throw new Error('/synthetic-private-history');
+  });
+  await f.process();
+  const result = await f.result();
+  expect(result).toMatchObject({
+    error_code: 'worker_failed',
+    diagnostic: { stage: 'validating_backup', source_rows: 0 },
+  });
+  expect(JSON.stringify(result)).not.toContain('synthetic-private-history');
 });
 it('rejects expired requests before reading the backup and leaves Emby requests untouched', async () => {
   const f = await fixture();
@@ -138,8 +232,17 @@ it('marks incomplete publication interrupted and never retries the source automa
   await writeEnvelope(join(f.root, `${f.prefix}.working`), f.request, f.key);
   await writeFile(join(f.root, `${f.prefix}.db.enc`), 'incomplete');
   await writeFile(join(f.root, `${f.prefix}.db.enc.pending`), 'pending');
+  await writeEnvelope(
+    join(f.root, `${f.prefix}.progress`),
+    { ...f.request, diagnostic: diagnostic('indexing') },
+    f.key,
+  );
   await recoverDestinationCatalogHelper(f.root, f.key);
-  expect((await f.result()).ok).toBe(false);
+  expect(await f.result()).toMatchObject({
+    ok: false,
+    error_code: 'interrupted',
+    diagnostic: { stage: 'indexing', source_rows: 5 },
+  });
   expect(f.worker).not.toHaveBeenCalled();
   expect(await readdir(f.root)).not.toContain(`${f.prefix}.db.enc`);
   expect(await readdir(f.root)).not.toContain(`${f.prefix}.db.enc.pending`);

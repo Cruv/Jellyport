@@ -8,6 +8,7 @@ import {
   destinationCatalogPrefix,
   type DestinationCatalogRequest,
   type DestinationCatalogResult,
+  type DestinationCatalogDiagnostic,
 } from '../server/destination-catalog-files.js';
 import {
   encryptDatabase,
@@ -296,8 +297,8 @@ describe('Jellyfin daily backup import schedule', () => {
         last_outcome: 'failed',
         usable: retained,
         record: good ? { id: good.id, backup_created_at: good.backup_created_at } : null,
-        last_error:
-          'Jellyfin backup import failed. Check the completed backup, mounted folder, version and permissions. Any previously saved catalog is preserved.',
+        error_code: 'backup_invalid',
+        last_error: expect.stringContaining('completed database backup'),
       });
       await f.restart();
       expect((await f.manager.status()).record?.id).toBe(good?.id);
@@ -305,6 +306,125 @@ describe('Jellyfin daily backup import schedule', () => {
       else expect(() => f.manager.queuedSelection(f.settings)).toThrow('current Jellyfin');
     },
   );
+});
+describe('safe Jellyfin import diagnostics', () => {
+  const observation = (at: string): DestinationCatalogDiagnostic => ({
+    stage: 'reading_items',
+    started_at: at,
+    updated_at: at,
+    source_rows: 10,
+    provider_rows: 0,
+    items: 9,
+    keys: 0,
+    bytes: 0,
+  });
+  it('accepts only authenticated progress bound to the active attempt and retains it across restart', async () => {
+    const f = await fixture('backup');
+    const request = await f.request();
+    const diagnostic = observation(request.requested_at);
+    const path = join(f.shared, `${destinationCatalogPrefix(request.id)}.progress`);
+    await writeEnvelope(path, { ...request, diagnostic }, f.key);
+    await f.tick();
+    expect((await f.manager.status()).diagnostic).toEqual(diagnostic);
+    for (const progress of [
+      { ...request, id: randomUUID(), diagnostic },
+      {
+        ...request,
+        requested_at: new Date(Date.parse(request.requested_at) - 1).toISOString(),
+        diagnostic,
+      },
+      { ...request, binding: { ...request.binding, server_id: 'f'.repeat(32) }, diagnostic },
+      { ...request, diagnostic: { ...diagnostic, private_path: '/synthetic-private/path' } },
+      { ...request, diagnostic: { ...diagnostic, items: 2_000_001 } },
+      {
+        ...request,
+        diagnostic: { ...diagnostic, updated_at: new Date(Date.now() + 120_000).toISOString() },
+      },
+    ]) {
+      await writeEnvelope(path, progress, f.key);
+      await f.tick();
+      expect(await f.manager.status()).toMatchObject({
+        running: true,
+        last_outcome: 'running',
+        diagnostic,
+      });
+    }
+    await writeFile(path, Buffer.from('unauthenticated synthetic observation'));
+    await f.tick();
+    expect((await f.manager.status()).diagnostic).toEqual(diagnostic);
+    await f.restart();
+    expect((await f.manager.status()).diagnostic).toEqual(diagnostic);
+    expect((await f.manager.status()).last_outcome).toBe('running');
+  });
+  it.each([false, true])(
+    'preserves the safe expired-backup cause and diagnostic without adopting or leaking failed output (retained=%s)',
+    async (retained) => {
+      const f = await fixture('backup');
+      const good = retained ? await f.complete() : undefined;
+      const request = await f.request();
+      const diagnostic = {
+        ...observation(request.requested_at),
+        stage: 'validating_backup' as const,
+        items: 0,
+        source_rows: 0,
+      };
+      const failed = await f.finish(request, {
+        ok: false,
+        error_code: 'backup_expired',
+        diagnostic,
+        error: '/synthetic-private/path synthetic-secret-token',
+      });
+      const status = await f.manager.status();
+      expect(status).toMatchObject({
+        running: false,
+        last_outcome: 'failed',
+        error_code: 'backup_expired',
+        diagnostic,
+      });
+      expect(status.last_error).toContain('48 hours');
+      expect(JSON.stringify(status)).not.toMatch(/synthetic-private|synthetic-secret/);
+      expect(status.record?.id).toBe(good?.id);
+      for (const suffix of ['progress', 'result', 'db.enc'])
+        await expect(
+          stat(join(f.shared, `${destinationCatalogPrefix(failed.id)}.${suffix}`)),
+        ).rejects.toThrow();
+      await f.restart();
+      expect(await f.manager.status()).toMatchObject({
+        error_code: 'backup_expired',
+        diagnostic,
+        last_outcome: 'failed',
+      });
+      expect((await f.manager.status()).record?.id).toBe(good?.id);
+    },
+  );
+  it('does not let fresh progress extend the absolute helper deadline or turn an observation into success', async () => {
+    vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
+    const f = await fixture('backup');
+    const request = await f.request();
+    vi.setSystemTime(new Date(Date.now() + 6 * 60_000 + 1));
+    await f.heartbeat();
+    const diagnostic = {
+      ...observation(request.requested_at),
+      updated_at: new Date().toISOString(),
+    };
+    await writeEnvelope(
+      join(f.shared, `${destinationCatalogPrefix(request.id)}.progress`),
+      { ...request, diagnostic },
+      f.key,
+    );
+    await f.tick();
+    expect(await f.manager.status()).toMatchObject({
+      running: false,
+      last_outcome: 'failed',
+      error_code: 'timeout',
+      record: null,
+      diagnostic,
+    });
+    expect((await f.manager.status()).last_attempt_at).toBe(request.requested_at);
+    await expect(
+      stat(join(f.shared, `${destinationCatalogPrefix(request.id)}.progress`)),
+    ).rejects.toThrow();
+  });
 });
 afterEach(async () => {
   vi.restoreAllMocks();
@@ -620,7 +740,10 @@ describe('saved destination catalog manager', () => {
     for (const age of [-49 * 3600000, 120000]) {
       await f.complete({ backup_created_at: new Date(Date.now() + age).toISOString() });
       expect((await f.manager.status()).record?.id).toBe(first.id);
-      expect((await f.manager.status()).last_error).toContain('could not be validated');
+      expect((await f.manager.status()).error_code).toBe(
+        age < 0 ? 'backup_expired' : 'backup_future',
+      );
+      expect((await f.manager.status()).last_error).toContain('backup');
     }
   });
   it('retains pinned generations and refuses clearing while a job needs one', async () => {

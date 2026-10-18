@@ -431,14 +431,14 @@ test('migration review defers history and closing it never accepts the migration
   await expectContainedLayout(page);
 });
 
-test('mobile navigation contains keyboard focus and restores it on dismissal', async ({ page }) => {
+test('mobile navigation contains keyboard focus and restores it on dismissal', async ({
+  page,
+}, info) => {
+  test.skip(info.project.name === 'desktop', 'Wide pointer-based navigation is persistent.');
   await page.goto('/');
-  test.skip(
-    !(await page.getByRole('button', { name: 'Toggle navigation' }).isVisible()),
-    'Wide pointer-based navigation is persistent.',
-  );
-  await navigate(page, 'Users');
   const toggle = page.getByRole('button', { name: 'Toggle navigation' });
+  await expect(toggle).toBeVisible();
+  await navigate(page, 'Users');
   const nav = page.getByRole('complementary', { name: 'Main navigation' });
   await toggle.click();
   await expect(nav.getByRole('button', { name: 'Users', exact: true })).toBeFocused();

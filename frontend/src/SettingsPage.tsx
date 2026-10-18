@@ -1,5 +1,6 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useRef,
@@ -49,7 +50,7 @@ const toggleNames = [
   'auto_disable',
   'disable_on_cancel',
 ] as const;
-const SettingsDraftDirty = createContext(false);
+const SettingsDraftDirty = createContext({ dirty: false, latest: { current: false } });
 function Field({
   name,
   label,
@@ -75,11 +76,11 @@ function Field({
   numeric?: boolean;
   readOnly?: boolean;
 }) {
-  const dirty = useContext(SettingsDraftDirty);
+  const { dirty, latest } = useContext(SettingsDraftDirty);
   const [draft, setDraft] = useWorkspaceDraftState(`settings.field.${name}`, secret ? '' : value);
   useEffect(() => {
-    if (!dirty) setDraft(secret ? '' : value);
-  }, [dirty, value, secret, setDraft]);
+    if (!latest.current) setDraft(secret ? '' : value);
+  }, [dirty, latest, value, secret, setDraft]);
   return (
     <div className="field">
       <label htmlFor={`setting-${name}`}>
@@ -114,11 +115,11 @@ function Toggle({
   description: string;
   checked: boolean;
 }) {
-  const dirty = useContext(SettingsDraftDirty);
+  const { dirty, latest } = useContext(SettingsDraftDirty);
   const [draft, setDraft] = useWorkspaceDraftState(`settings.toggle.${name}`, checked);
   useEffect(() => {
-    if (!dirty) setDraft(checked);
-  }, [dirty, checked, setDraft]);
+    if (!latest.current) setDraft(checked);
+  }, [dirty, latest, checked, setDraft]);
   return (
     <div className="toggle-row">
       <div>
@@ -280,7 +281,17 @@ export default function SettingsPage({
   const [automationTab, setAutomationTab] = useRouteTab('settings', 'automation');
   const [selectedTier, setSelectedTier] = useState(0);
   const [historyTab, setHistoryTab] = useRouteTab('settings', 'history');
-  const [dirty, setDirty] = useWorkspaceDraftState('settings.dirty', false);
+  const [dirty, setDirtyDraft] = useWorkspaceDraftState('settings.dirty', false);
+  const latestDirty = useRef(dirty);
+  const setDirty = useCallback(
+    (value: boolean) => {
+      // An edit can arrive after commit but before passive synchronization runs.
+      // Effects must inspect this live guard, not the earlier render's snapshot.
+      latestDirty.current = value;
+      setDirtyDraft(value);
+    },
+    [setDirtyDraft],
+  );
   const [validationRevision, setValidationRevision] = useState(0);
   const pendingFocus = useRef<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null>(
     null,
@@ -365,23 +376,23 @@ export default function SettingsPage({
     };
   }, []);
   useEffect(() => {
-    if (!dirty) setDefaultRoleId(s.default_role_id || '');
+    if (!latestDirty.current) setDefaultRoleId(s.default_role_id || '');
   }, [dirty, s.default_role_id, setDefaultRoleId]);
   useEffect(() => {
-    if (!dirty) setTemplateUserId(s.template_user_id || '');
+    if (!latestDirty.current) setTemplateUserId(s.template_user_id || '');
   }, [dirty, s.template_user_id, setTemplateUserId]);
   useEffect(() => {
-    if (!dirty) setPasswordLength(String(s.password_length ?? 12));
+    if (!latestDirty.current) setPasswordLength(String(s.password_length ?? 12));
   }, [dirty, s.password_length, setPasswordLength]);
   useEffect(() => {
-    if (!dirty) setExcludeAmbiguous(s.password_exclude_ambiguous ?? true);
+    if (!latestDirty.current) setExcludeAmbiguous(s.password_exclude_ambiguous ?? true);
   }, [dirty, s.password_exclude_ambiguous, setExcludeAmbiguous]);
   useEffect(() => {
-    if (!dirty)
+    if (!latestDirty.current)
       setCredentialTemplate(s.credential_message_template ?? DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE);
   }, [dirty, s.credential_message_template, setCredentialTemplate]);
   useEffect(() => {
-    if (dirty) return;
+    if (latestDirty.current) return;
     setMappings(s.path_mappings || []);
     setMembershipTiers((s.membership_tiers || defaultMembershipTiers).map((tier) => ({ ...tier })));
   }, [dirty, s.path_mappings, s.membership_tiers, setMappings, setMembershipTiers]);
@@ -583,13 +594,13 @@ export default function SettingsPage({
         value={activeTab}
         onChange={selectTab}
       />
-      <SettingsDraftDirty.Provider value={dirty}>
+      <SettingsDraftDirty.Provider value={{ dirty, latest: latestDirty }}>
         <form
           id="settings-form"
           hidden={activeTab === 'activity' || activeTab === 'history'}
           noValidate
           onSubmit={save}
-          onChange={(event) => {
+          onChangeCapture={(event) => {
             if (
               !['replacement-jellyfin-api-key', 'membership-tier-editor'].includes(event.target.id)
             )
@@ -786,8 +797,8 @@ export default function SettingsPage({
                           className="btn btn-small btn-quiet"
                           type="button"
                           onClick={() => {
-                            setMappings((rows) => [...rows, { source: '', target: '' }]);
                             setDirty(true);
+                            setMappings((rows) => [...rows, { source: '', target: '' }]);
                           }}
                         >
                           <Icon name="plus" />
@@ -826,8 +837,8 @@ export default function SettingsPage({
                               className="icon-button"
                               type="button"
                               onClick={() => {
-                                setMappings((rows) => rows.filter((_, i) => i !== index));
                                 setDirty(true);
+                                setMappings((rows) => rows.filter((_, i) => i !== index));
                               }}
                               aria-label="Remove path mapping"
                             >
@@ -1037,8 +1048,8 @@ export default function SettingsPage({
                               className="btn btn-small btn-quiet"
                               type="button"
                               onClick={() => {
-                                setCredentialTemplate(DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE);
                                 setDirty(true);
+                                setCredentialTemplate(DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE);
                               }}
                             >
                               Reset message to default
@@ -1276,12 +1287,12 @@ export default function SettingsPage({
                             type="button"
                             disabled={membershipTiers.length >= 20}
                             onClick={() => {
+                              setDirty(true);
                               setSelectedTier(membershipTiers.length);
                               setMembershipTiers((rows) => [
                                 ...rows,
                                 { id: '', name: '', plan_name: '', account_limit: 1 },
                               ]);
-                              setDirty(true);
                             }}
                           >
                             <Icon name="plus" /> Add tier
@@ -1385,9 +1396,9 @@ export default function SettingsPage({
                               disabled={membershipTiers.length === 1}
                               aria-label={`Remove tier ${tier.name || index + 1}`}
                               onClick={() => {
+                                setDirty(true);
                                 setMembershipTiers((rows) => rows.filter((_, i) => i !== index));
                                 setSelectedTier(Math.max(0, index - 1));
-                                setDirty(true);
                               }}
                             >
                               Remove tier

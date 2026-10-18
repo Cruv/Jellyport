@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { useLayoutEffect, type ReactNode } from 'react';
 import SettingsPage from './SettingsPage';
 import { DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE } from '../../server/credential-message';
 import type { Api, ApiOptions, Settings } from './types';
@@ -42,7 +43,14 @@ const oldSettings: Settings = {
   bot_invite_url: '',
 };
 
-function page(settings: Settings = oldSettings, respond?: Api) {
+function EditOnCommit({ children, edit }: { children: ReactNode; edit: () => void }) {
+  useLayoutEffect(() => {
+    edit();
+  }, [edit]);
+  return children;
+}
+
+function page(settings: Settings = oldSettings, respond?: Api, editOnCommit?: () => void) {
   const requests: { path: string; options?: ApiOptions }[] = [];
   const api = vi.fn(async (path: string, options?: ApiOptions) => {
     requests.push({ path, options });
@@ -64,7 +72,10 @@ function page(settings: Settings = oldSettings, respond?: Api) {
   const notify = vi.fn();
   const refresh = vi.fn(async () => {});
   const props = { settings, users: { emby: [], jellyfin: [] }, demo: false, api, notify, refresh };
-  const result = render(<SettingsPage {...props} />);
+  const node = <SettingsPage {...props} />;
+  const result = render(
+    editOnCommit ? <EditOnCommit edit={editOnCommit}>{node}</EditOnCommit> : node,
+  );
   return { ...result, requests, notify, refresh, props };
 }
 
@@ -91,6 +102,155 @@ function passwordPage(...args: Parameters<typeof page>) {
 }
 
 describe('Settings layout and navigation', () => {
+  it.each([
+    {
+      name: 'server URL field',
+      route: '#/settings/media/jellyfin',
+      id: 'setting-jellyfin_public_url',
+      value: 'https://synthetic-first-edit.example.test',
+      settings: oldSettings,
+      saved: { jellyfin_public_url: 'https://synthetic-first-edit.example.test' },
+    },
+    {
+      name: 'Discord toggle',
+      route: '#/settings/discord/connection',
+      id: 'setting-discord_enabled',
+      value: true,
+      settings: oldSettings,
+      saved: { discord_enabled: true },
+    },
+    {
+      name: 'cleared saved default role',
+      route: '#/settings/accounts/permissions',
+      id: 'setting-default_role_id',
+      value: '',
+      settings: { ...oldSettings, default_role_id: 'saved-role' },
+      saved: { default_role_id: '' },
+    },
+    {
+      name: 'cleared saved fallback template',
+      route: '#/settings/accounts/permissions',
+      id: 'setting-template_user_id',
+      value: '',
+      settings: { ...oldSettings, template_user_id: 'saved-template' },
+      saved: { template_user_id: '' },
+    },
+    {
+      name: 'password length',
+      route: '#/settings/accounts/passwords',
+      id: 'setting-password_length',
+      value: '18',
+      settings: oldSettings,
+      saved: { password_length: 18 },
+    },
+    {
+      name: 'disabled password ambiguity preference',
+      route: '#/settings/accounts/passwords',
+      id: 'setting-password_exclude_ambiguous',
+      value: false,
+      settings: oldSettings,
+      saved: { password_exclude_ambiguous: false },
+    },
+    {
+      name: 'credential message',
+      route: '#/settings/accounts/passwords',
+      id: 'setting-credential_message_template',
+      value: 'Welcome {username}\nPassword: {password}\nOpen {server_url}',
+      settings: oldSettings,
+      saved: {
+        credential_message_template: 'Welcome {username}\nPassword: {password}\nOpen {server_url}',
+      },
+    },
+    {
+      name: 'replacement source secret',
+      route: '#/settings/media/emby',
+      id: 'setting-emby_api_key',
+      value: 'synthetic-unsaved-first-edit',
+      settings: oldSettings,
+      saved: { emby_api_key: 'synthetic-unsaved-first-edit' },
+    },
+  ])('keeps a $name edited before passive synchronization', async (fixture) => {
+    window.history.replaceState(null, '', fixture.route);
+    const p = page(fixture.settings, undefined, () => {
+      const element = document.getElementById(fixture.id)!;
+      if (typeof fixture.value === 'boolean') fireEvent.click(element);
+      else fireEvent.change(element, { target: { value: fixture.value } });
+    });
+    const field = document.getElementById(fixture.id)!;
+    expect(field.isConnected).toBe(true);
+    expect(field).toHaveProperty(
+      typeof fixture.value === 'boolean' ? 'checked' : 'value',
+      fixture.value,
+    );
+    expect(screen.getByText('Unsaved changes · save all settings together.')).toBeTruthy();
+    expect(p.requests.filter((request) => request.options?.method)).toEqual([]);
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(
+      p.requests.find((request) => request.options?.method === 'PUT')?.options?.body,
+    ).toMatchObject(fixture.saved);
+  });
+
+  it.each(['add mapping', 'remove mapping', 'reset message'] as const)(
+    'retains an explicit %s action before passive synchronization',
+    async (action) => {
+      window.history.replaceState(
+        null,
+        '',
+        action === 'reset message' ? '#/settings/accounts/passwords' : '#/settings/media/paths',
+      );
+      const savedMappings = [{ source: '/source/kept', target: '/media/kept' }];
+      const p = page(
+        {
+          ...oldSettings,
+          path_mappings: savedMappings,
+          credential_message_template: 'Custom {username} {password} {server_url}',
+        },
+        undefined,
+        () =>
+          fireEvent.click(
+            screen.getByRole('button', {
+              name:
+                action === 'add mapping'
+                  ? 'Add mapping'
+                  : action === 'remove mapping'
+                    ? 'Remove path mapping'
+                    : 'Reset message to default',
+            }),
+          ),
+      );
+      let expected: Record<string, unknown>;
+      if (action === 'reset message') {
+        expect(screen.getByLabelText('New account message')).toHaveProperty(
+          'value',
+          DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
+        );
+        expected = { credential_message_template: DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE };
+      } else if (action === 'remove mapping') {
+        expect(screen.queryAllByLabelText('Emby path prefix')).toHaveLength(0);
+        expected = { path_mappings: [] };
+      } else {
+        expect(screen.getAllByLabelText('Emby path prefix')).toHaveLength(2);
+        fireEvent.change(screen.getAllByLabelText('Emby path prefix')[1], {
+          target: { value: '/source/new' },
+        });
+        fireEvent.change(screen.getAllByLabelText('Jellyfin path prefix')[1], {
+          target: { value: '/media/new' },
+        });
+        expected = {
+          path_mappings: [...savedMappings, { source: '/source/new', target: '/media/new' }],
+        };
+      }
+      expect(screen.getByText('Unsaved changes · save all settings together.')).toBeTruthy();
+      expect(p.requests.filter((request) => request.options?.method)).toEqual([]);
+      submit();
+      await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+      expect(
+        p.requests.find((request) => request.options?.method === 'PUT')?.options?.body,
+      ).toMatchObject(expected);
+    },
+  );
+
   it('edits and removes repeated path and tier rows without saving or changing the surviving rows', async () => {
     const p = page({
       ...oldSettings,

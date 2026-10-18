@@ -1370,12 +1370,14 @@ describe('React account safeguards', () => {
     });
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
-    await selectSettingsTab('Account defaults');
+    // Wait for this deferred read to start so Settings and its routing effects
+    // are mounted before interacting with a tab from its first rendered frame.
+    await waitFor(() => expect(resolveRoles).toBeTypeOf('function'));
+    await act(async () => selectSettingsTab('Account defaults'));
     await screen.findByRole('option', { name: 'Saved default role' });
     expect((screen.getByLabelText('Default account role') as HTMLSelectElement).value).toBe(
       'role-1',
     );
-    await waitFor(() => expect(resolveRoles).toBeTypeOf('function'));
     await act(async () =>
       resolveRoles({ roles: [{ id: 'role-1', name: 'Crew defaults' }], assignments: [] }),
     );

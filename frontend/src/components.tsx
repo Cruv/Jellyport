@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { WorkspaceNotice, useWorkspaceNoticeModal } from './workspace-notices';
 import {
   type Job,
   activeJob,
@@ -815,6 +816,7 @@ export function Modal({
   closeDisabled?: boolean;
 }) {
   const dialog = useRef<HTMLElement>(null);
+  const noticeActive = useWorkspaceNoticeModal();
   const closeRef = useRef(close);
   closeRef.current = close;
   useEffect(() => {
@@ -884,7 +886,10 @@ export function Modal({
             <Icon name="close" />
           </button>
         </div>
-        <div className="modal-body">{children}</div>
+        <div className="modal-body">
+          {noticeActive && <WorkspaceNotice dialog />}
+          {children}
+        </div>
         {footer && <div className="modal-footer">{footer}</div>}
       </section>
     </div>

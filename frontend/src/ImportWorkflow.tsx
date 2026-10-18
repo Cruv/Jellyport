@@ -139,14 +139,15 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
   }, [active, load]);
 
   useEffect(() => {
-    if (!active || !status?.running || busy) return;
+    if (!active || !status || busy) return;
+    const delay = status.running ? 2000 : 30_000;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
       await load();
-      if (!stopped) timer = setTimeout(() => void poll(), 2000);
+      if (!stopped) timer = setTimeout(() => void poll(), delay);
     };
-    timer = setTimeout(() => void poll(), 2000);
+    timer = setTimeout(() => void poll(), delay);
     return () => {
       stopped = true;
       clearTimeout(timer);

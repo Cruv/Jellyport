@@ -1856,18 +1856,9 @@ textarea::placeholder {
   margin-top: 15px;
 }
 .toast-region {
-  position: fixed;
-  top: calc(var(--viewport-top) + var(--viewport-height) - 24px - var(--safe-area-bottom));
-  right: calc(24px + var(--safe-area-right));
-  transform: translateY(-100%);
-  z-index: 200;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-width: 390px;
-  max-height: calc(var(--viewport-height) - 48px - var(--safe-area-top) - var(--safe-area-bottom));
-  overflow-y: auto;
-  overscroll-behavior: contain;
+  width: 100%;
+  min-width: 0;
+  margin-bottom: 20px;
 }
 .toast {
   display: flex;
@@ -1885,6 +1876,24 @@ textarea::placeholder {
   color: var(--mint);
   height: 17px;
   width: 17px;
+}
+.toast > svg {
+  flex-shrink: 0;
+  align-self: center;
+}
+.toast-message {
+  min-width: 0;
+  flex: 1;
+  align-self: center;
+  overflow-wrap: anywhere;
+}
+.toast .icon-button {
+  min-width: 44px;
+  min-height: 44px;
+  flex-shrink: 0;
+}
+.toast .icon-button svg {
+  color: var(--muted);
 }
 .toast.error svg {
   color: var(--red);
@@ -2259,12 +2268,6 @@ textarea::placeholder {
   }
   .credential dd {
     margin-bottom: 8px;
-  }
-  .toast-region {
-    top: calc(var(--viewport-top) + var(--viewport-height) - 16px - var(--safe-area-bottom));
-    left: calc(16px + var(--safe-area-left));
-    right: calc(16px + var(--safe-area-right));
-    max-width: none;
   }
   .operator-label {
     font-size: 11px;

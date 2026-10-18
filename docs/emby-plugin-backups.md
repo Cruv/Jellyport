@@ -22,10 +22,12 @@ folders are rejected until their format and source binding are verified.
 3. Keep `/work` helper-only and private. Share only the separate `/snapshots`
    exchange with Jellyport, and preserve the existing Jellyport `/data` mount.
    The helper needs no network and opens only copied private SQLite databases.
-4. In **Settings → Saved Emby database snapshots**, confirm **Emby plugin backup**,
+4. In **Settings → Saved history → Emby backup**, confirm **Emby plugin backup**,
    then choose **Import latest backup**. The existing daily schedule becomes an
    import schedule. Run it after the Emby task finishes, leaving at least five
    minutes after the last backup-file write. It does not create a second backup.
+   Emby and Jellyfin use the same independent schedule controls and
+   [restart, daylight-saving and overlap rules](jellyfin-backup-catalog.md#daily-import-scheduling).
 5. Plugin-backed migrations default to saved history. If the history source is
    unknown, choose it explicitly before previewing; missing or expired saved data
    stops the preview without switching to live history. Check the original backup

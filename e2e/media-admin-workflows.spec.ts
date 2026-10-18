@@ -9,6 +9,12 @@ import {
 } from './media-admin-fixtures';
 import type { AdminFixture } from './media-admin-fixtures';
 
+test.afterEach(async ({ page }, info) => {
+  if (info.status !== 'passed') return;
+  await expectContainedLayout(page);
+  await page.screenshot({ path: info.outputPath('workflow-outcome.png'), fullPage: true });
+});
+
 async function finishJob(admin: AdminFixture, response: Response) {
   expect(response.ok()).toBe(true);
   const { id } = await response.json();
@@ -77,6 +83,7 @@ test('saved connection repair reaches verified readiness without sending an unsa
   await expect(
     page.locator('.connection-test-results .server-row').filter({ hasText: 'Emby' }),
   ).toContainText('Connected');
+  await page.screenshot({ path: test.info().outputPath('saved-connections.png'), fullPage: true });
   await navigate(page, 'Overview');
   await expect(page.getByText('Servers are ready', { exact: true })).toBeVisible();
   expect(mutations.filter((request) => request === 'PUT /api/settings')).toHaveLength(1);
@@ -114,6 +121,7 @@ test('saving an exact destination mapping is reflected in migration review witho
   await expect(review).toContainText('Mapped Emby account: alex → Jellyfin: river');
   await expect(review).toContainText('Merge into existing account');
   await expect(review).toContainText('History details deferred');
+  await page.screenshot({ path: test.info().outputPath('mapped-review.png'), fullPage: true });
   await review.getByRole('button', { name: 'Back to users', exact: true }).click();
   expect(admin.servers.users.jellyfin).toEqual(before);
   expect(admin.writes).toEqual([]);
@@ -178,6 +186,9 @@ test('role copy and assignment precede applying only reviewed permissions to one
   expect(mutations.filter((request) => request === 'POST /api/account-roles/apply')).toHaveLength(
     1,
   );
+  await expect(
+    page.getByRole('dialog').getByText('Completed', { exact: true }).first(),
+  ).toBeVisible();
   await expectContainedLayout(page);
 });
 
@@ -205,9 +216,14 @@ test('an uncertain account creation is inspected and recovered without creating 
   await page.getByRole('searchbox', { name: 'Search operations', exact: true }).fill(failed.id);
   await page.getByRole('button', { name: 'View operation details', exact: true }).click();
   await expect(page.getByRole('dialog')).toContainText('outcome is uncertain');
-  await page.getByRole('dialog').getByRole('button', { name: 'Close dialog', exact: true }).click();
-  await navigate(page, 'Create account');
-  await page.getByRole('tab', { name: 'Recover interrupted creation', exact: true }).click();
+  await page
+    .getByRole('dialog')
+    .getByRole('button', { name: 'Inspect interrupted creation', exact: true })
+    .click();
+  await expect.poll(() => new URL(page.url()).hash).toBe('#/accounts/recover');
+  await expect(
+    page.getByRole('tab', { name: 'Recover interrupted creation', exact: true }),
+  ).toHaveAttribute('aria-selected', 'true');
   await page.getByRole('textbox', { name: 'Account to inspect', exact: true }).fill('river');
   await page.getByRole('button', { name: 'Inspect account', exact: true }).click();
   await expect(page.getByText('river · Recovery unavailable', { exact: true })).toBeVisible();
@@ -231,6 +247,9 @@ test('an uncertain account creation is inspected and recovered without creating 
     admin.writes.filter((write) => write.method === 'create' && write.id === name),
   ).toHaveLength(1);
   expect(mutations.filter((request) => request === 'POST /api/accounts/recover')).toHaveLength(1);
+  await expect(
+    page.getByRole('dialog').getByText('Completed', { exact: true }).first(),
+  ).toBeVisible();
 });
 
 test('complimentary policy saves without media writes and paid slots downgrade and reactivate the same accounts', async ({
@@ -254,7 +273,11 @@ test('complimentary policy saves without media writes and paid slots downgrade a
     )
     .toBe('complimentary');
   expect(admin.writes).toEqual([]);
-  await page.getByRole('tab', { name: 'Managed memberships', exact: true }).click();
+  await expect(page.locator('.toast-region')).toHaveCount(1);
+  await expect(page.locator('.toast-region')).toContainText(
+    'Access policy saved. Media accounts have not been changed.',
+  );
+  await page.getByRole('tab', { name: /^Managed memberships(?: \d+)?$/ }).click();
   await page.getByRole('button', { name: 'Add member', exact: true }).click();
   await chooseMember(page, 'crew_owner');
   expect((await queueMembership(page, admin, 'galleon')).status).toBe('completed');
@@ -286,6 +309,27 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   slots.forEach((slot, index) =>
     expect(admin.servers.played[slot.remote_id]).toEqual(new Set([String(index + 1)])),
   );
+  const notice = page.locator('.toast-region');
+  await expect(notice).toHaveCount(1);
+  await expect(notice).toContainText(
+    'Membership update queued. Follow account creation and access changes in Activity.',
+  );
+  await expect(notice).not.toContainText('Access policy saved.');
+  expect(await notice.evaluate((element) => getComputedStyle(element).position)).toBe('static');
+  const action = page.getByRole('button', { name: 'Review membership update', exact: true });
+  await action.scrollIntoViewIfNeeded();
+  await expect(action).toBeInViewport({ ratio: 1 });
+  expect(
+    await action.evaluate((element) => {
+      const bounds = element.getBoundingClientRect();
+      const hit = document.elementFromPoint(
+        bounds.x + bounds.width / 2,
+        bounds.y + bounds.height / 2,
+      );
+      return hit === element || (hit !== null && element.contains(hit));
+    }),
+    'The primary membership action is reachable without a notification overlay.',
+  ).toBe(true);
 });
 
 test('subscription review provisions the trusted tier and ignoring a later cancellation preserves access', async ({
@@ -404,6 +448,42 @@ test('a manually flagged Family account is preserved when a reviewed cancellatio
   ).toEqual([true, true, false]);
   expect(admin.servers.played[family.remote_id]).toEqual(new Set(['3']));
   expect(admin.writes.every((write) => write.id !== family.remote_id)).toBe(true);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await navigate(page, 'Users');
+  await page.getByRole('searchbox', { name: 'Search users', exact: true }).fill('crew_owner');
+});
+
+test('unsubmitted editor drafts survive main navigation and Back but disappear after administrator sign-out', async ({
+  page,
+  admin,
+  mutations,
+}) => {
+  await page.goto('/#/settings/media/emby');
+  const serverUrl = page.getByLabel('Server URL', { exact: true }).filter({ visible: true });
+  await serverUrl.fill('http://unsubmitted.example.invalid');
+  await navigate(page, 'Account roles');
+  await page.getByRole('button', { name: 'Create role', exact: true }).click();
+  await page
+    .getByRole('textbox', { name: 'Role name', exact: true })
+    .fill('Unsubmitted browser role');
+  await navigate(page, 'Settings');
+  await expect(serverUrl).toHaveValue('http://unsubmitted.example.invalid');
+  expect(admin.app.jellyport.store.settings().emby_url).toBe('http://emby.example.invalid');
+  await page.goBack();
+  await expect(page.getByRole('textbox', { name: 'Role name', exact: true })).toHaveValue(
+    'Unsubmitted browser role',
+  );
+  await page.getByRole('button', { name: 'Sign out', exact: true }).click();
+  await page.getByRole('textbox', { name: 'Jellyfin username', exact: true }).fill('admin');
+  await page.getByLabel('Jellyfin password', { exact: true }).fill('synthetic-admin-password');
+  await page.getByRole('button', { name: 'Sign in', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'Role name', exact: true })).toHaveValue('');
+  await navigate(page, 'Settings');
+  await expect(serverUrl).toHaveValue('http://emby.example.invalid');
+  expect(mutations).toEqual(['POST /api/logout', 'POST /api/login']);
+  expect(
+    await page.evaluate(() => ({ local: { ...localStorage }, session: { ...sessionStorage } })),
+  ).toEqual({ local: {}, session: {} });
 });
 
 test('reduced motion removes spinner and status animation while leaving loading feedback readable', async ({

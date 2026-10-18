@@ -570,6 +570,66 @@ async function selectAndPreviewReady() {
   await screen.findByRole('dialog');
 }
 describe('React account safeguards', () => {
+  it('keeps a newer draft and blocks duplicate saves when an old Settings request finishes after remount', async () => {
+    const original = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    let finish!: (response: Response) => void;
+    vi.mocked(globalThis.fetch).mockImplementation(async (path, options) => {
+      if (String(path) === '/api/settings' && options?.method === 'PUT') {
+        requests.push({ path: String(path), options });
+        return new Promise<Response>((resolve) => {
+          finish = resolve;
+        });
+      }
+      return original(path, options);
+    });
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    await screen.findByRole('heading', { name: 'Settings', level: 1 });
+    fireEvent.change(document.getElementById('setting-emby_url')!, {
+      target: { value: 'http://submitted-a.example.test' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await waitFor(() => expect(finish).toBeTypeOf('function'));
+    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    await screen.findByRole('heading', { name: 'Settings', level: 1 });
+    expect(screen.getByText('A settings save is still in progress.')).toBeTruthy();
+    fireEvent.change(document.getElementById('setting-emby_url')!, {
+      target: { value: 'http://newer-draft-b.example.test' },
+    });
+    const submit = screen.getByRole('button', { name: 'Save settings' });
+    expect(submit).toHaveProperty('disabled', true);
+    fireEvent.submit(submit.closest('form')!);
+    expect(
+      requests.filter((r) => r.path === '/api/settings' && r.options?.method === 'PUT'),
+    ).toHaveLength(1);
+    await act(async () =>
+      finish({ ok: true, status: 200, json: async () => settings } as Response),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Save settings' })).toHaveProperty(
+        'disabled',
+        false,
+      ),
+    );
+    expect((document.getElementById('setting-emby_url') as HTMLInputElement).value).toBe(
+      'http://newer-draft-b.example.test',
+    );
+    expect(screen.queryByText('Settings saved. Your connections are ready to test.')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    await screen.findByRole('heading', { name: 'Settings', level: 1 });
+    expect((document.getElementById('setting-emby_url') as HTMLInputElement).value).toBe(
+      'http://newer-draft-b.example.test',
+    );
+    expect(
+      requests.filter((r) => r.path === '/api/settings' && r.options?.method === 'PUT'),
+    ).toHaveLength(1);
+  });
+
   it('retains unsaved Settings input through main navigation and refresh without serializing or saving it', async () => {
     render(<App />);
     await screen.findByRole('heading', { name: 'Overview', level: 1 });

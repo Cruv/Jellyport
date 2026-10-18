@@ -263,6 +263,7 @@ export default function SettingsPage({
   api,
   notify,
   refresh,
+  pendingSave = false,
 }: {
   settings: Settings;
   users: Users;
@@ -270,6 +271,7 @@ export default function SettingsPage({
   api: Api;
   notify: Notify;
   refresh: () => Promise<void>;
+  pendingSave?: boolean;
 }) {
   const [activeTab] = useRouteTab('settings');
   const [serverTab, setServerTab] = useRouteTab('settings', 'media');
@@ -320,6 +322,16 @@ export default function SettingsPage({
   );
   const [busy, setBusy] = useState('');
   const changing = useRef(false);
+  const mounted = useRef(false);
+  const requestVersion = useRef(0);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      requestVersion.current++;
+    };
+  }, []);
+
   const [tested, setTested] = useState<Partial<Connections> | null>(null);
   const [roles, setRoles] = useState<AccountRole[]>([]);
   const [rolesError, setRolesError] = useState('');
@@ -403,8 +415,9 @@ export default function SettingsPage({
   }
   async function save(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (changing.current || serviceKeyRequest.current) return;
+    if (pendingSave || changing.current || serviceKeyRequest.current) return;
     changing.current = true;
+    const version = ++requestVersion.current;
     const form = event.currentTarget;
     if (replacementKey.current) replacementKey.current.value = '';
     setBusy('save');
@@ -477,36 +490,49 @@ export default function SettingsPage({
         notify(invalid.validationMessage || 'Check the highlighted setting.', true);
         return;
       }
-      await api('/api/settings', { method: 'PUT', body: data });
+      await api('/api/settings', {
+        method: 'PUT',
+        body: data,
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!mounted.current || requestVersion.current !== version) return;
       setDirty(false);
       notify('Settings saved. Your connections are ready to test.');
       await refresh();
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Settings could not be saved.', true);
+      if (mounted.current && requestVersion.current === version)
+        notify(error instanceof Error ? error.message : 'Settings could not be saved.', true);
     } finally {
-      changing.current = false;
-      setBusy('');
+      if (requestVersion.current === version) {
+        changing.current = false;
+        if (mounted.current) setBusy('');
+      }
     }
   }
   async function test() {
-    if (changing.current || serviceKeyRequest.current) return;
+    if (pendingSave || changing.current || serviceKeyRequest.current) return;
     changing.current = true;
+    const version = ++requestVersion.current;
     setBusy('test');
     try {
       const result = await api<Connections | { connections: Connections }>(
         '/api/connections/test',
         { method: 'POST', body: {} },
       );
+      if (!mounted.current || requestVersion.current !== version) return;
       setTested('connections' in result ? result.connections : result);
     } catch (error) {
-      notify(error instanceof Error ? error.message : 'Connection test failed.', true);
+      if (mounted.current && requestVersion.current === version)
+        notify(error instanceof Error ? error.message : 'Connection test failed.', true);
     } finally {
-      changing.current = false;
-      setBusy('');
+      if (requestVersion.current === version) {
+        changing.current = false;
+        if (mounted.current) setBusy('');
+      }
     }
   }
   async function replaceServiceKey() {
-    if (serviceKeyRequest.current || changing.current) return;
+    if (pendingSave || serviceKeyRequest.current || changing.current) return;
     const apiKey = replacementKey.current?.value.trim() || '';
     if (replacementKey.current) replacementKey.current.value = '';
     if (!apiKey) {
@@ -543,6 +569,13 @@ export default function SettingsPage({
         description="Manage connections, account defaults, and automation one section at a time."
       />
       <UserWarnings users={users} />
+      {pendingSave && busy !== 'save' && (
+        <Callout title="A settings save is still in progress.">
+          You can keep editing this draft. Wait for the earlier request to finish before saving
+          another change; this draft has not been submitted.
+        </Callout>
+      )}
+
       <Tabs
         id="settings"
         label="Settings sections"
@@ -574,11 +607,20 @@ export default function SettingsPage({
                   : 'Changes across tabs save together. Secrets stay private.'}
               </p>
               <div className="button-row">
-                <button className="btn btn-quiet" type="button" onClick={test} disabled={!!busy}>
+                <button
+                  className="btn btn-quiet"
+                  type="button"
+                  onClick={test}
+                  disabled={!!busy || pendingSave}
+                >
                   {busy === 'test' ? <span className="spinner" /> : <Icon name="refresh" />}
                   {busy === 'test' ? 'Testing…' : 'Test saved connections'}
                 </button>
-                <button className="btn btn-primary" type="submit" disabled={demo || !!busy}>
+                <button
+                  className="btn btn-primary"
+                  type="submit"
+                  disabled={demo || !!busy || pendingSave}
+                >
                   {busy === 'save' ? <span className="spinner" /> : <Icon name="check" />}
                   {busy === 'save' ? 'Saving…' : 'Save settings'}
                 </button>
@@ -679,13 +721,13 @@ export default function SettingsPage({
                                 autoComplete="new-password"
                                 spellCheck={false}
                                 placeholder="Paste a newly created API key"
-                                disabled={!!busy || demo}
+                                disabled={!!busy || demo || pendingSave}
                               />
                               <button
                                 className="btn btn-small btn-quiet"
                                 type="button"
                                 onClick={() => void replaceServiceKey()}
-                                disabled={!!busy || demo}
+                                disabled={!!busy || demo || pendingSave}
                               >
                                 <Icon name="refresh" />
                                 {busy === 'service-key'

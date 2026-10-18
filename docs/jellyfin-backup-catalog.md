@@ -22,9 +22,55 @@ Fresh destination account access and playback activity remain authoritative.
    services must use the same 0.15.0-or-later image and private exchange directory.
    The [plugin Compose example](../examples/compose.plugin-backups.yaml) includes
    both backup mounts; replace generic paths with local Docker-host directories.
-4. In Jellyport Settings, use **Jellyfin matching backup → Import latest backup**.
+4. In Jellyport, open **Settings → Saved history → Jellyfin catalog** and choose
+   **Import latest Jellyfin backup**.
    Review its original backup date, expiry and item count. An unavailable helper
    prevents new imports; an already valid imported catalog can still serve jobs.
+
+## Daily import scheduling
+
+Both **Emby backup** and **Jellyfin catalog** under **Settings → Saved history**
+have their own daily schedule. Expand **Daily schedule**, enable it, choose a time
+and explicit IANA time zone, then save that schedule. Scheduling is off by default.
+The saved summary shows the actual configuration and next run; the import status
+shows the last attempt and its outcome separately from the last usable backup.
+Manual import and schedule saves do not save unrelated Settings drafts or change
+each other's configuration. Refreshing status preserves unsaved schedule edits;
+if another administrator changes the saved revision, explicitly reload it before
+saving again.
+
+These schedules import existing completed backups; they do not create or schedule
+backups on either media server. Leave time for the server's own backup task and
+validation/settling requirements. Imports share one helper work slot, including
+preparation, so Emby and Jellyfin imports cannot start concurrently. A manual
+request reports that the slot is busy; a scheduled run waits within its catch-up
+window. This also avoids accepting work that would expire in the helper's queue.
+
+Timing rules are the same for both import schedules:
+
+- Settings and automatic-attempt claims survive application restarts. An active
+  saved request resumes result checking; preparation interrupted before a request
+  was saved reports **Interrupted** and is not silently replayed.
+- An unattempted occurrence may catch up for less than one hour after its scheduled
+  time, including across midnight. Older missed runs are skipped, without a backlog.
+  If another import occupies the slot for that entire window, the next automatic
+  opportunity is the next scheduled date.
+- A spring-forward time that does not exist is skipped that day. A fall-back time
+  that occurs twice uses its first occurrence, at most once for that civil date.
+- Automatic claims only move forward by civil date. Moving the clock/time zone or
+  editing the time backwards cannot reopen an already attempted date. The next
+  run waits for a date later than the last claimed date in the selected zone.
+- A manual attempt within, or spanning, the due window satisfies that automatic
+  occurrence. Administrators can still explicitly import manually more than once.
+  Failed automatic attempts remain visible and wait for the next date; inspect
+  status and fix the reported problem before manually retrying.
+
+Starting an import is an acknowledgement, not a successful completion. Follow its
+running status until the outcome is shown. If a request or status refresh fails,
+refresh status to reconcile what actually happened before retrying. A failed new
+import preserves the last validated copy. Original backup time continues to
+control the 48-hour freshness limit; reimporting an old backup does not renew it.
+The progress indicator stays indeterminate when the helper has no measured total.
 
 The initial adapter supports the inspected **Jellyfin 12.2.0.0 / backup engine
 0.2.0** schema only. Other versions fail explicitly until their format is verified.

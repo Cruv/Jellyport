@@ -79,6 +79,51 @@ afterEach(() => {
 });
 
 describe('shared import lifecycle', () => {
+  it('discovers a scheduled start while idle, switches to fast running polls, and pauses when hidden', async () => {
+    vi.useFakeTimers();
+    let reads = 0;
+    const api: Api = async <T,>() => {
+      reads++;
+      return {
+        ...idle,
+        running: reads === 2 || reads === 3,
+        last_outcome: reads >= 4 ? 'succeeded' : null,
+      } as T;
+    };
+    const view = render(<Harness api={api} />);
+    await act(async () => {});
+    expect(reads).toBe(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(29_999);
+    });
+    expect(reads).toBe(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(reads).toBe(2);
+    expect(screen.getByText('Import running…')).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    expect(reads).toBe(3);
+    view.rerender(<Harness api={api} active={false} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(reads).toBe(3);
+    view.rerender(<Harness api={api} />);
+    await act(async () => {});
+    expect(reads).toBe(4);
+    expect(screen.getByText('Completed')).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(29_999);
+    });
+    expect(reads).toBe(4);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(reads).toBe(5);
+  });
   it('uses native indeterminate progress for loading, starting and running; completion is reported separately', async () => {
     const read = deferred<ImportWorkflowStatus>(),
       start = deferred<ImportWorkflowStatus>();

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useLayoutEffect, type ReactNode } from 'react';
 import SettingsPage from './SettingsPage';
+import { WorkspaceDraftProvider } from './workspace-drafts';
 import { DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE } from '../../server/credential-message';
 import type { Api, ApiOptions, Settings } from './types';
 
@@ -50,7 +51,12 @@ function EditOnCommit({ children, edit }: { children: ReactNode; edit: () => voi
   return children;
 }
 
-function page(settings: Settings = oldSettings, respond?: Api, editOnCommit?: () => void) {
+function page(
+  settings: Settings = oldSettings,
+  respond?: Api,
+  editOnCommit?: () => void,
+  workspace = false,
+) {
   const requests: { path: string; options?: ApiOptions }[] = [];
   const api = vi.fn(async (path: string, options?: ApiOptions) => {
     requests.push({ path, options });
@@ -73,8 +79,9 @@ function page(settings: Settings = oldSettings, respond?: Api, editOnCommit?: ()
   const refresh = vi.fn(async () => {});
   const props = { settings, users: { emby: [], jellyfin: [] }, demo: false, api, notify, refresh };
   const node = <SettingsPage {...props} />;
+  const content = editOnCommit ? <EditOnCommit edit={editOnCommit}>{node}</EditOnCommit> : node;
   const result = render(
-    editOnCommit ? <EditOnCommit edit={editOnCommit}>{node}</EditOnCommit> : node,
+    workspace ? <WorkspaceDraftProvider>{content}</WorkspaceDraftProvider> : content,
   );
   return { ...result, requests, notify, refresh, props };
 }
@@ -102,6 +109,92 @@ function passwordPage(...args: Parameters<typeof page>) {
 }
 
 describe('Settings layout and navigation', () => {
+  it.each([false, true])(
+    'reconciles current saved settings on remount before a first edit while retaining dirty drafts=%s',
+    async (wasDirty) => {
+      window.history.replaceState(null, '', '#/settings/media/jellyfin');
+      const initial: Settings = {
+        ...oldSettings,
+        emby_url: 'https://saved-source-a.example.test',
+        default_role_id: 'saved-role-a',
+        template_user_id: 'saved-template-a',
+        password_length: 12,
+        password_exclude_ambiguous: true,
+        credential_message_template: 'Saved A {username} {password} {server_url}',
+        path_mappings: [{ source: '/source/a', target: '/media/a' }],
+        membership_tiers: [{ id: 'a', name: 'A', plan_name: 'Plan A', account_limit: 1 }],
+      };
+      const current: Settings = {
+        ...initial,
+        emby_url: 'https://current-source-c.example.test',
+        discord_enabled: true,
+        default_role_id: 'current-role-c',
+        template_user_id: 'current-template-c',
+        password_length: 16,
+        password_exclude_ambiguous: false,
+        credential_message_template: 'Current C {username} {password} {server_url}',
+        path_mappings: [{ source: '/source/c', target: '/media/c' }],
+        membership_tiers: [{ id: 'c', name: 'C', plan_name: 'Plan C', account_limit: 3 }],
+      };
+      const p = page(initial, undefined, undefined, true);
+      const oldSource = document.getElementById('setting-emby_url')!;
+      if (wasDirty) {
+        fireEvent.change(oldSource, { target: { value: 'https://dirty-source-d.example.test' } });
+        fireEvent.change(screen.getByLabelText('Generated password length'), {
+          target: { value: '20' },
+        });
+      }
+      p.rerender(<WorkspaceDraftProvider>{null}</WorkspaceDraftProvider>);
+      expect(oldSource.isConnected).toBe(false);
+      p.rerender(
+        <WorkspaceDraftProvider>
+          <EditOnCommit
+            edit={() =>
+              fireEvent.change(document.getElementById('setting-jellyfin_public_url')!, {
+                target: { value: 'https://new-public-b.example.test' },
+              })
+            }
+          >
+            <SettingsPage {...p.props} settings={current} />
+          </EditOnCommit>
+        </WorkspaceDraftProvider>,
+      );
+      const expected = wasDirty ? initial : current;
+      const beforeSave = {
+        source: (document.getElementById('setting-emby_url') as HTMLInputElement).value,
+        discord: (document.getElementById('setting-discord_enabled') as HTMLInputElement).checked,
+        role: (screen.getByLabelText('Default account role') as HTMLSelectElement).value,
+      };
+      expect(document.getElementById('setting-jellyfin_public_url')).toHaveProperty(
+        'value',
+        'https://new-public-b.example.test',
+      );
+      expect(screen.getByText('Unsaved changes · save all settings together.')).toBeTruthy();
+      expect(p.requests.filter((request) => request.options?.method)).toEqual([]);
+      submit();
+      await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+      expect(
+        p.requests.find((request) => request.options?.method === 'PUT')?.options?.body,
+      ).toMatchObject({
+        emby_url: wasDirty ? 'https://dirty-source-d.example.test' : current.emby_url,
+        jellyfin_public_url: 'https://new-public-b.example.test',
+        discord_enabled: expected.discord_enabled,
+        default_role_id: expected.default_role_id,
+        template_user_id: expected.template_user_id,
+        password_length: wasDirty ? 20 : current.password_length,
+        password_exclude_ambiguous: expected.password_exclude_ambiguous,
+        credential_message_template: expected.credential_message_template,
+        path_mappings: expected.path_mappings,
+        membership_tiers: expected.membership_tiers,
+      });
+      expect(beforeSave).toEqual({
+        source: wasDirty ? 'https://dirty-source-d.example.test' : current.emby_url,
+        discord: expected.discord_enabled,
+        role: expected.default_role_id,
+      });
+    },
+  );
+
   it.each([
     {
       name: 'server URL field',

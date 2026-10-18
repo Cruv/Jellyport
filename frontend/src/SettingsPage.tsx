@@ -3,6 +3,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type FormEvent,
@@ -78,7 +79,7 @@ function Field({
 }) {
   const { dirty, latest } = useContext(SettingsDraftDirty);
   const [draft, setDraft] = useWorkspaceDraftState(`settings.field.${name}`, secret ? '' : value);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!latest.current) setDraft(secret ? '' : value);
   }, [dirty, latest, value, secret, setDraft]);
   return (
@@ -117,7 +118,7 @@ function Toggle({
 }) {
   const { dirty, latest } = useContext(SettingsDraftDirty);
   const [draft, setDraft] = useWorkspaceDraftState(`settings.toggle.${name}`, checked);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!latest.current) setDraft(checked);
   }, [dirty, latest, checked, setDraft]);
   return (
@@ -285,8 +286,7 @@ export default function SettingsPage({
   const latestDirty = useRef(dirty);
   const setDirty = useCallback(
     (value: boolean) => {
-      // An edit can arrive after commit but before passive synchronization runs.
-      // Effects must inspect this live guard, not the earlier render's snapshot.
+      // Effects must inspect this live guard, not an earlier render's snapshot.
       latestDirty.current = value;
       setDirtyDraft(value);
     },
@@ -375,23 +375,25 @@ export default function SettingsPage({
       serviceKeyRequest.current?.abort();
     };
   }, []);
-  useEffect(() => {
+  // Reconcile a clean workspace cache before the first interaction can freeze it
+  // as a draft. Dirty remounts keep their edits, including intentionally empty values.
+  useLayoutEffect(() => {
     if (!latestDirty.current) setDefaultRoleId(s.default_role_id || '');
   }, [dirty, s.default_role_id, setDefaultRoleId]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!latestDirty.current) setTemplateUserId(s.template_user_id || '');
   }, [dirty, s.template_user_id, setTemplateUserId]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!latestDirty.current) setPasswordLength(String(s.password_length ?? 12));
   }, [dirty, s.password_length, setPasswordLength]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!latestDirty.current) setExcludeAmbiguous(s.password_exclude_ambiguous ?? true);
   }, [dirty, s.password_exclude_ambiguous, setExcludeAmbiguous]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!latestDirty.current)
       setCredentialTemplate(s.credential_message_template ?? DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE);
   }, [dirty, s.credential_message_template, setCredentialTemplate]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (latestDirty.current) return;
     setMappings(s.path_mappings || []);
     setMembershipTiers((s.membership_tiers || defaultMembershipTiers).map((tier) => ({ ...tier })));

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DestinationCatalogs } from '../server/destination-catalogs.js';
@@ -317,6 +317,22 @@ describe('safe Jellyfin import diagnostics', () => {
     items: 9,
     keys: 0,
     bytes: 0,
+  });
+  it('prunes old orphan observations while keeping recent and active attempts', async () => {
+    const f = await fixture('backup');
+    const active = await f.request();
+    const stale = join(f.shared, `${destinationCatalogPrefix(randomUUID())}.progress`);
+    const recent = join(f.shared, `${destinationCatalogPrefix(randomUUID())}.progress`);
+    const owned = join(f.shared, `${destinationCatalogPrefix(active.id)}.progress`);
+    for (const path of [stale, recent, owned]) await writeFile(path, 'synthetic observation');
+    const old = new Date(Date.now() - 61_000);
+    await utimes(stale, old, old);
+    await utimes(owned, old, old);
+    await f.tick();
+    await expect(stat(stale)).rejects.toThrow();
+    expect((await stat(recent)).isFile()).toBe(true);
+    expect((await stat(owned)).isFile()).toBe(true);
+    expect((await f.manager.status()).running).toBe(true);
   });
   it('accepts only authenticated progress bound to the active attempt and retains it across restart', async () => {
     const f = await fixture('backup');

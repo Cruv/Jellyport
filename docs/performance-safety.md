@@ -220,7 +220,12 @@ also refuses live catalog scans. Importing is explicit and shared across users;
 preview never starts an import or catalog crawl. Queueing pins a generation;
 missing, expired, changed or incompatible data fails closed, including helper
 outages. Original backup age is limited to 48 hours, without renewal on reimport.
-The last good catalog survives import failure. See the [setup and repeatable
+Manifest age, future-time and linked-version checks run before projection creation
+and large catalog-table reads; freshness and unchanged-file checks still run before
+publication. An expired backup requires creating a new completed backup in
+Jellyfin. A Jellyport daily schedule only imports an existing backup and cannot
+create one or make old content fresh. Any previously validated catalog survives
+import failure, but an expired retained catalog remains unusable. See the [setup and repeatable
 procedure](jellyfin-backup-catalog.md).
 
 Projection and matching indexes stay on disk: at most two million supported items,
@@ -229,7 +234,26 @@ candidate limits remain 200,000 items / 64 MiB, and source history remains bound
 separately. Limits reject work rather than truncate it. Import and candidate workers
 have five-minute deadlines; cancellation kills and reaps the worker. Decryption is
 shared per generation with bounded idle retention, not repeated per account.
+The supported streaming tokenizer groups at most 256 unpacked tokens before each
+stream handoff, with bounded backpressure and sequential row consumption. It does
+not pack arbitrary strings or keys, change the existing memory/row limits, or relax
+CRC, UTF-8, duplicate-key, relationship, identity or library-access validation.
 No live media-server database is modified or opened by this import.
+
+Two local synthetic comparisons used 500,000 source rows, 200,000 matching items,
+900,000 provider rows and 89 columns per source row. Shared import work fell from
+32.74 to 27.59 seconds with token batching; reversing the execution order measured
+27.85 seconds batched versus 32.17 seconds baseline. The measured total reduction
+was 13.5–15.7%. Peak RSS increased modestly, to about 192–199 MiB from 184–185 MiB,
+with a fixed bounded token queue. All runs produced 1,322,000 keys and the same
+canonical catalog digest,
+`ae84aeb166960014ded4b41be1b59572e04711e45f7b29c2c395668ed666fd99`.
+These measurements cover local synthetic preprocessing, not a production import
+deadline, playback impact or end-to-end migration target. Storage, CPU availability
+and real row contents can change the result. A separate expired-manifest check on
+the same large synthetic archive rejected it in 4.69 ms with no item progress
+events or output creation. That measures the reader's early rejection path, not
+an API round trip or a successful import.
 
 The independent readback retains pre-write played-state expectations, including
 no-op matches and multiple source editions mapping to one target. Missing,
@@ -588,6 +612,16 @@ HTTP attempts (including retries), accumulated read duration and metadata-cache 
 failed reads are reported without upstream response bodies. These counters cover destination
 preparation reads, not a complete playback-impact metric or every write. They
 follow the same exclusions for credentials and personal playback details.
+
+Saved Jellyfin imports additionally report validated stage labels, aggregate
+source/provider/item/key counts, processed bytes and progress timestamps through
+the authenticated helper exchange. Current-attempt elapsed time and the latest
+attempt's duration are distinct from a retained catalog's successful import time.
+Allowlisted failure codes distinguish `backup_missing`, `backup_expired`,
+`backup_future`, `version_mismatch`, `backup_invalid`, `backup_changed`,
+`storage_error`, `timeout`, `interrupted`, `canceled` and `worker_failed`; raw
+exceptions, filesystem paths, item IDs and titles are never exposed. Progress is
+observational and does not renew a deadline, authorize adoption or invent a total.
 
 Jobs distinguish shared index preparation from account history reads. During a
 cold build the interface reports accepted pages, cumulative indexed items and last

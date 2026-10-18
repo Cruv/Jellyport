@@ -77,6 +77,18 @@ async function importBoth(page: Page, imports: ImportFixture) {
     new Date(Date.parse(imports.backupAt) + 48 * 60 * 60_000).toISOString(),
   );
   expect(destination.expires_at).toBe(source.expires_at);
+  const status = await imports.destinationStatus();
+  expect(status.error_code).toBeNull();
+  expect(status.diagnostic).toMatchObject({
+    stage: 'validating_catalog',
+    source_rows: 2,
+    provider_rows: 2,
+    items: 2,
+  });
+  await expect(destinationView.getByText(/Latest attempt duration:/)).toBeVisible();
+  await expect(destinationView.getByText('Last observed stage:')).toContainText(
+    'Validating matching catalog',
+  );
   return { source, destination };
 }
 async function editSchedule(view: Locator) {
@@ -284,8 +296,37 @@ test('missing and invalid backups fail visibly, retain original valid history, a
     fullPage: true,
   });
   await imports.backup('jellyfin', 'expired');
-  await importBackup(page, imports, 'jellyfin', 'failed');
-  expect((await imports.destinationStatus()).record!.backup_created_at).toBe(imports.backupAt);
+  view = await importBackup(page, imports, 'jellyfin', 'failed');
+  const expired = await imports.destinationStatus();
+  expect(expired.record).toMatchObject({
+    id: first.destination.id,
+    backup_created_at: imports.backupAt,
+    expires_at: first.destination.expires_at,
+  });
+  expect(expired.error_code).toBe('backup_expired');
+  // The actual helper rejects the manifest before reading or indexing any media.
+  expect(expired.diagnostic).toMatchObject({
+    stage: 'validating_backup',
+    source_rows: 0,
+    provider_rows: 0,
+    items: 0,
+    keys: 0,
+    bytes: 0,
+  });
+  await expect(view.getByText('Failure reason:')).toContainText('Backup expired');
+  await expect(
+    view.getByText('Create a fresh database backup in Jellyfin, then import it.', { exact: true }),
+  ).toBeVisible();
+  await expect(view.getByText(/Latest attempt duration:/)).toBeVisible();
+  await expect(view.getByText('Last observed stage:')).toContainText('Validating backup');
+  expect((await readdir(imports.exchange)).filter((name) => name.endsWith('.db.enc'))).toHaveLength(
+    2,
+  );
+  await expectContainedLayout(page);
+  await page.screenshot({
+    path: testInfo.outputPath('expired-backup-early-rejection.png'),
+    fullPage: true,
+  });
   await imports.backup('jellyfin', 'valid');
   view = await importBackup(page, imports, 'jellyfin');
   await expect(view.getByText('Saved matching catalog available', { exact: true })).toBeVisible();

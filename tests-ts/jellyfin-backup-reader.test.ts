@@ -563,6 +563,60 @@ describe('Jellyfin backup catalog reader', () => {
     }
   });
 
+  it('preserves neutral identities when dense rows and streamed scalar chunks cross token-batch boundaries', async () => {
+    const unused = Object.fromEntries(
+      Array.from({ length: 89 }, (_, index) => [`Unused${index}`, null]),
+    );
+    const values = Array.from({ length: 40 }, (_, index) =>
+      item(index + 1, undefined, {
+        ...unused,
+        Overview: 'unneeded 😀 metadata '.repeat(100),
+        NestedIgnored: { nested: ['unused', null, false, { value: 12 }] },
+      }),
+    );
+    const source = await fixture(
+      values,
+      values.map((value, index) => ({
+        ItemId: value.Id,
+        ProviderId: 'Tmdb',
+        ProviderValue: String(index + 100),
+      })),
+    );
+    const result = await importJellyfinBackupCatalog(source.archive, source.output);
+    expect(result.stats).toMatchObject({ sourceRows: 40, providerRows: 40, projectedItems: 40 });
+    expect(projected(source.output).items).toEqual(
+      values.map((value, index) => ({
+        Id: value.Id.replaceAll('-', ''),
+        Type: 'Movie',
+        Name: value.Name,
+        Path: value.Path,
+        ProviderIds: { Tmdb: String(index + 100) },
+      })),
+    );
+  });
+
+  it('rejects a duplicate key after several token batches and removes the already-started projection', async () => {
+    const source = await fixture([item(1)]);
+    const unused = Object.fromEntries(
+      Array.from({ length: 89 }, (_, index) => [`Unused${index}`, null]),
+    );
+    const valid = JSON.stringify(item(1, undefined, unused));
+    const invalid =
+      JSON.stringify(item(2, undefined, unused)).slice(0, -1) + ',"Name":"duplicate"}';
+    source.entries[1]!.text = `[${valid},${invalid}]`;
+    await writeFile(source.archive, zip(source.entries));
+    const progress: JellyfinBackupProgress[] = [];
+    await expect(
+      importJellyfinBackupCatalog(source.archive, source.output, {
+        onProgress: (value) => progress.push(value),
+      }),
+    ).rejects.toMatchObject({ error_code: 'backup_invalid' });
+    expect(progress.some((value) => value.sourceRows === 1 && value.projectedItems === 1)).toBe(
+      true,
+    );
+    await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('bounds a single ignored field before assembling it', async () => {
     const source = await fixture([item(1, undefined, { Overview: 'z'.repeat(1024 * 1024 + 1) })]);
     // Stored form bypasses the separate compression-ratio guard so this tests token limits.

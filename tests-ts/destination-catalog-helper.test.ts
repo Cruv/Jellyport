@@ -21,6 +21,7 @@ import {
   validDestinationRequest,
   validDestinationResult,
   validDestinationProgress,
+  validDestinationDiagnostic,
   DestinationCatalogError,
   type DestinationCatalogDiagnostic,
   type DestinationCatalogResult,
@@ -44,6 +45,7 @@ const diagnostic = (
   };
 };
 afterEach(async () => {
+  vi.useRealTimers();
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
   vi.resetAllMocks();
   vi.restoreAllMocks();
@@ -76,14 +78,14 @@ async function fixture() {
       backup_engine_version: '0.2.0',
     };
   });
-  const process = () =>
+  const process = (signal = new AbortController().signal) =>
     processDestinationCatalogRequest(
       `${prefix}.request`,
       root,
       root,
       '/synthetic-backups',
       key,
-      new AbortController().signal,
+      signal,
     );
   const result = () => readEnvelope<DestinationCatalogResult>(join(root, `${prefix}.result`), key);
   return { root, key, id, prefix, request, worker, process, result };
@@ -159,13 +161,13 @@ it('flushes coalesced progress before publishing a terminal result so cleanup ca
   });
   const original = snapshotFiles.writeEnvelope;
   let first = true;
-  vi.spyOn(snapshotFiles, 'writeEnvelope').mockImplementation(async (path, value, key) => {
+  vi.spyOn(snapshotFiles, 'writeEnvelope').mockImplementation(async (path, value, key, signal) => {
     if (path.endsWith('.progress') && first) {
       first = false;
       entered();
       await gate;
     }
-    return original(path, value, key);
+    return original(path, value, key, signal);
   });
   const work = f.process();
   await blocked;
@@ -184,6 +186,92 @@ it('flushes coalesced progress before publishing a terminal result so cleanup ca
   await new Promise((resolve) => setImmediate(resolve));
   await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' });
 });
+it.each(['success', 'failure', 'canceled'] as const)(
+  'bounds a hung optional progress flush and prevents late publication after terminal %s',
+  async (outcome) => {
+    const f = await fixture();
+    const controller = new AbortController();
+    const originalWorker = f.worker.getMockImplementation()!;
+    f.worker.mockImplementation(async (...args) => {
+      args[3]?.onProgress?.(diagnostic('indexing'));
+      if (outcome === 'canceled') controller.abort();
+      if (outcome !== 'success') throw new DestinationCatalogError('backup_expired');
+      return originalWorker(...args);
+    });
+    let release!: () => void;
+    let entered!: () => void;
+    let finished!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const blocked = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const observerFinished = new Promise<void>((resolve) => {
+      finished = resolve;
+    });
+    const original = snapshotFiles.writeEnvelope;
+    let observerSignal: AbortSignal | undefined;
+    let first = true;
+    vi.spyOn(snapshotFiles, 'writeEnvelope').mockImplementation(async (...args) => {
+      if (args[0].endsWith('.progress') && first) {
+        first = false;
+        observerSignal = args[3];
+        entered();
+        await gate;
+        try {
+          return await original(...args);
+        } finally {
+          finished();
+        }
+      }
+      return original(...args);
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const timers = vi.spyOn(globalThis, 'setTimeout');
+    const work = f.process(controller.signal);
+    try {
+      await blocked;
+      const waitUntil = performance.now() + 2000;
+      while (!timers.mock.calls.some(([, delay]) => delay === 1000)) {
+        if (performance.now() > waitUntil)
+          throw new Error('No bounded progress flush was started.');
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      await vi.advanceTimersByTimeAsync(999);
+      await expect(readFile(join(f.root, `${f.prefix}.result`))).rejects.toMatchObject({
+        code: 'ENOENT',
+      });
+      await vi.advanceTimersByTimeAsync(1);
+      await work;
+      const result = await f.result();
+      expect(result).toMatchObject({
+        ok: outcome === 'success',
+        diagnostic:
+          outcome === 'success'
+            ? { stage: 'validating_catalog', items: 1, keys: 2, bytes: 25 }
+            : { stage: 'indexing', source_rows: 5, items: 2 },
+        ...(outcome === 'success'
+          ? {}
+          : { error_code: outcome === 'canceled' ? 'canceled' : 'backup_expired' }),
+      });
+      expect(validDestinationResult(result)).toBe(outcome === 'success');
+      expect(validDestinationDiagnostic(result.diagnostic)).toBe(true);
+      expect(observerSignal?.aborted).toBe(true);
+      const progressPath = join(f.root, `${f.prefix}.progress`);
+      await rm(progressPath, { force: true });
+      release();
+      await observerFinished;
+      await new Promise((resolve) => setImmediate(resolve));
+      await expect(readFile(progressPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect((await readdir(f.root)).some((name) => name.endsWith('.tmp'))).toBe(false);
+    } finally {
+      release();
+      vi.useRealTimers();
+      await work;
+    }
+  },
+);
 it('ignores invalid progress fields and never exposes private worker diagnostics', async () => {
   const f = await fixture();
   f.worker.mockImplementation(async (_request, _signal, _timeout, options) => {

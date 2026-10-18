@@ -786,7 +786,7 @@ export class DestinationCatalogs {
     this.save();
     if (this.state.active) keep.add(this.state.active.id);
     for (const name of await readdir(this.directory)) {
-      const match = /^jellyfin-([a-f0-9-]{36})\.(?:request|result|db\.enc)$/.exec(name);
+      const match = /^jellyfin-([a-f0-9-]{36})\.(?:request|result|progress|db\.enc)$/.exec(name);
       if (!match || keep.has(match[1]!)) continue;
       const path = join(this.directory, name),
         stat = await lstat(path);

@@ -1,6 +1,6 @@
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { lstat, mkdir, readFile, readdir, rename, writeFile, rm } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, writeFile, rm } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import { join } from 'node:path';
 
@@ -60,10 +60,38 @@ export async function readEnvelope<T>(path: string, key: Buffer): Promise<T> {
   if (info.size > 1024 * 1024) throw new Error('Snapshot metadata exceeds its limit.');
   return unseal<T>(await readFile(path), key);
 }
-export async function writeEnvelope(path: string, value: unknown, key: Buffer): Promise<void> {
+/**
+ * An optional signal requires a caller-owned target with one publisher, such as
+ * an attempt-specific progress file. Cancellation may remove that target after
+ * an already-issued atomic rename; do not use it for concurrently shared paths.
+ */
+export async function writeEnvelope(
+  path: string,
+  value: unknown,
+  key: Buffer,
+  signal?: AbortSignal,
+): Promise<void> {
+  signal?.throwIfAborted();
   const temporary = `${path}.${randomBytes(8).toString('hex')}.tmp`;
-  await writeFile(temporary, seal(value, key), { mode: 0o600, flag: 'wx' });
-  await rename(temporary, path);
+  let owned = false;
+  try {
+    const file = await open(temporary, 'wx', 0o600);
+    owned = true;
+    try {
+      await file.writeFile(seal(value, key), { signal });
+    } finally {
+      await file.close();
+    }
+    signal?.throwIfAborted();
+    await rename(temporary, path);
+    owned = false;
+    if (signal?.aborted) {
+      await rm(path, { force: true });
+      signal.throwIfAborted();
+    }
+  } finally {
+    if (owned) await rm(temporary, { force: true });
+  }
 }
 export async function encryptDatabase(
   source: string,

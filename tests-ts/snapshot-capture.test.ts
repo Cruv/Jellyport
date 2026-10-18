@@ -1,4 +1,5 @@
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
+import * as filesystem from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -20,6 +21,11 @@ import {
 import { snapshotProcess } from '../server/snapshot-process.js';
 import { readSnapshotItems } from '../server/emby-snapshot-reader.js';
 
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...actual, open: vi.fn(actual.open), rename: vi.fn(actual.rename) };
+});
+
 const directories: string[] = [];
 async function directory() {
   const path = await mkdtemp(join(tmpdir(), 'jellyport-capture-fixture-'));
@@ -27,6 +33,7 @@ async function directory() {
   return path;
 }
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const path of directories.splice(0)) await rm(path, { recursive: true, force: true });
 });
 
@@ -65,6 +72,100 @@ it('keeps helper message files and their key private without replacing an existi
   expect((await readFile(messagePath)).includes(Buffer.from(metadata.private))).toBe(false);
   expect((await stat(join(path, 'snapshot.key'))).mode & 0o777).toBe(0o600);
   expect((await stat(messagePath)).mode & 0o777).toBe(0o600);
+});
+
+it('does not create an envelope for an already-aborted observer or replace existing metadata', async () => {
+  const path = await directory();
+  const key = randomBytes(32);
+  const target = join(path, 'preserved.progress');
+  await writeEnvelope(target, { generation: 'preserved' }, key);
+  const before = await readFile(target);
+  const controller = new AbortController();
+  controller.abort();
+  await expect(
+    writeEnvelope(target, { generation: 'canceled' }, key, controller.signal),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+  await expect(
+    writeEnvelope(join(path, 'absent.progress'), {}, key, controller.signal),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+  expect(await readFile(target)).toEqual(before);
+  expect(await readdir(path)).toEqual(['preserved.progress']);
+});
+
+it('cleans its partial envelope when cancellation arrives after exclusive creation', async () => {
+  const path = await directory();
+  const controller = new AbortController();
+  await expect(
+    writeEnvelope(
+      join(path, 'canceled.progress'),
+      {
+        toJSON() {
+          controller.abort();
+          return { generation: 'canceled' };
+        },
+      },
+      randomBytes(32),
+      controller.signal,
+    ),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+  expect(await readdir(path)).toEqual([]);
+});
+
+it('checks cancellation after the temporary write before atomically replacing a published envelope', async () => {
+  const path = await directory();
+  const key = randomBytes(32);
+  const target = join(path, 'preserved.progress');
+  await writeEnvelope(target, { generation: 'preserved' }, key);
+  const before = await readFile(target);
+  const controller = new AbortController();
+  const originalOpen = vi.mocked(filesystem.open).getMockImplementation()!;
+  vi.mocked(filesystem.open).mockImplementationOnce(async (...args) => {
+    const file = await originalOpen(...args);
+    const originalWrite = file.writeFile.bind(file);
+    vi.spyOn(file, 'writeFile').mockImplementation(async (...writeArgs) => {
+      await originalWrite(...writeArgs);
+      controller.abort();
+    });
+    return file;
+  });
+  await expect(
+    writeEnvelope(target, { generation: 'canceled' }, key, controller.signal),
+  ).rejects.toMatchObject({ name: 'AbortError' });
+  expect(await readFile(target)).toEqual(before);
+  expect(await readdir(path)).toEqual(['preserved.progress']);
+});
+
+it('removes an attempt-owned progress envelope if its rename finishes after cancellation and caller cleanup', async () => {
+  const path = await directory();
+  const target = join(path, 'unique-attempt.progress');
+  const controller = new AbortController();
+  let release!: () => void;
+  let entered!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const blocked = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const originalRename = vi.mocked(filesystem.rename).getMockImplementation()!;
+  vi.mocked(filesystem.rename).mockImplementationOnce(async (...args) => {
+    entered();
+    await gate;
+    return originalRename(...args);
+  });
+  const writing = writeEnvelope(target, { phase: 'indexing' }, randomBytes(32), controller.signal);
+  try {
+    await blocked;
+    expect((await readdir(path)).some((name) => name.endsWith('.tmp'))).toBe(true);
+    controller.abort();
+    await rm(target, { force: true });
+    release();
+    await expect(writing).rejects.toMatchObject({ name: 'AbortError' });
+    expect(await readdir(path)).toEqual([]);
+  } finally {
+    release();
+    await writing.catch(() => {});
+  }
 });
 
 it('rejects symlinked keys, invalid key lengths, symlinked messages and oversized metadata', async () => {

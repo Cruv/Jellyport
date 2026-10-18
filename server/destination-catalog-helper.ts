@@ -69,17 +69,25 @@ export async function processDestinationCatalogRequest(
   };
   let pending: DestinationCatalogDiagnostic | undefined;
   let publishing: Promise<void> | undefined;
+  // This attempt is the sole publisher of its unique progress path. Cancellation
+  // can safely remove a late atomic publication without touching another attempt.
+  const progressController = new AbortController();
   const progress = (value: DestinationCatalogDiagnostic) => {
-    if (!validDestinationDiagnostic(value)) return;
+    if (progressController.signal.aborted || !validDestinationDiagnostic(value)) return;
     diagnostic = { ...value, started_at, updated_at: new Date().toISOString() };
     pending = diagnostic;
     if (!publishing)
       publishing = (async () => {
-        while (pending) {
+        while (pending && !progressController.signal.aborted) {
           const next = pending;
           pending = undefined;
           const message: DestinationCatalogProgress = { ...request, diagnostic: next };
-          await writeEnvelope(join(exchange, `${prefix}.progress`), message, key);
+          await writeEnvelope(
+            join(exchange, `${prefix}.progress`),
+            message,
+            key,
+            progressController.signal,
+          );
         }
       })()
         .catch(() => {
@@ -171,10 +179,22 @@ export async function processDestinationCatalogRequest(
     };
     await rm(join(exchange, `${prefix}.db.enc`), { force: true });
   } finally {
-    // Flush and stop all progress writes before publishing the terminal result.
-    // The app can then remove both files without a late observer recreating progress.
-    while (publishing) await publishing;
-    pending = undefined;
+    // Optional progress cannot hold the serialized helper indefinitely. Abort any
+    // delayed write before terminal publication so it cannot publish on a later retry.
+    let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (publishing)
+        await Promise.race([
+          publishing,
+          new Promise<void>((resolve) => {
+            flushTimer = setTimeout(resolve, 1000);
+          }),
+        ]);
+    } finally {
+      if (flushTimer) clearTimeout(flushTimer);
+      progressController.abort();
+      pending = undefined;
+    }
     await rm(join(exchange, `${prefix}.db.enc.pending`), { force: true });
     if (temporary) await rm(temporary, { recursive: true, force: true });
   }

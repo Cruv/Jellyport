@@ -193,12 +193,12 @@ describe('User directory and Discord organization', () => {
     fireEvent.click(await accountAction('Family and owner notes for Family'));
     expect(screen.getByRole('dialog')).toBeTruthy();
     act(() => window.history.forward());
-    await waitFor(() =>
+    await waitFor(() => {
       expect(
         screen.getByRole('tab', { name: 'Discord organization' }).getAttribute('aria-selected'),
-      ).toBe('true'),
-    );
-    expect(screen.queryByRole('dialog')).toBeNull();
+      ).toBe('true');
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
     expect(p.requests.filter((entry) => entry.options?.method)).toHaveLength(0);
     expect(window.location.hash).toBe('#/users/organization');
     expect(localStorage.length + sessionStorage.length).toBe(0);

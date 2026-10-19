@@ -1,4 +1,4 @@
-import { test as base, expect, type APIRequestContext } from '@playwright/test';
+import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
 import { fork, type ChildProcess } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -124,7 +124,7 @@ export interface ImportFixture {
   readonly exchange: string;
   readonly writes: Array<{ user: string; item: string }>;
   backup: (kind: Kind, state: BackupState) => Promise<void>;
-  restart: () => Promise<void>;
+  restart: (page: Page) => Promise<void>;
   stopHelper: () => Promise<void>;
   helperImports: () => number;
   nativeBackupCalls: () => number;
@@ -467,13 +467,21 @@ for(const object of [dns,dns.promises]) for(const name of Object.keys(object)) i
         exchange,
         writes,
         backup,
-        restart: async () => {
+        restart: async (page) => {
+          const location = page.url();
+          // These scenarios verify persisted state across a backend restart.
+          // Stop the old document's polling before deliberately closing its
+          // server; keep all HTTP/error observers active across navigation.
+          await page.goto('about:blank');
           const port = Number(new URL(url).port);
           await client?.dispose();
           await app?.close();
           app = undefined;
           url = await create(port);
           await signIn();
+          await page.context().addCookies((await client!.storageState()).cookies);
+          // A fresh document also obtains the new session's CSRF token.
+          await page.goto(location);
         },
         stopHelper,
         helperImports: () => completedImports,

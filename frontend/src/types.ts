@@ -290,6 +290,17 @@ export interface ImportScheduleConfig {
   time_zone: string;
   revision: string;
 }
+export interface DestinationCatalogConfig extends ImportScheduleConfig {
+  /** Missing on older servers; creating server backups is always opt-in. */
+  create_backup?: boolean;
+}
+export interface DestinationBackupCreation {
+  /** Required for recovery writes on current servers; absent on older status responses. */
+  attempt_id?: string;
+  phase: 'creating' | 'waiting' | 'uncertain';
+  started_at: string;
+  deadline_at: string;
+}
 export type ImportOutcome = 'running' | 'succeeded' | 'failed' | 'interrupted' | null;
 export interface ImportWorkflowStatus {
   running: boolean;
@@ -334,13 +345,14 @@ export type DestinationCatalogErrorCode =
   | 'canceled'
   | 'worker_failed';
 export interface DestinationCatalogStatus extends ImportWorkflowStatus {
-  config: ImportScheduleConfig;
+  config: DestinationCatalogConfig;
   usable?: boolean;
   configured: boolean;
   available: boolean;
   record: DestinationCatalogMetadata | null;
   diagnostic?: DestinationCatalogDiagnostic | null;
   error_code?: DestinationCatalogErrorCode | null;
+  backup_creation?: DestinationBackupCreation | null;
 }
 export interface SourceSnapshotStatus extends ImportWorkflowStatus {
   available?: boolean;

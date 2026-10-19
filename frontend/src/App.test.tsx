@@ -1524,10 +1524,30 @@ describe('React account safeguards', () => {
     responses['/api/accounts'] = job;
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Create account' }));
-    fireEvent.change(await screen.findByLabelText('Discord member (optional)'), {
-      target: { value: 'Captain' },
+    const memberSearch = await screen.findByRole('searchbox', {
+      name: 'Discord member (optional)',
     });
-    fireEvent.click(await screen.findByRole('button', { name: 'Select @alex.actual' }));
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        fireEvent.change(memberSearch, { target: { value: 'Captain' } });
+      });
+      expect(requests.filter((request) => request.path.startsWith('/api/discord/members'))).toEqual(
+        [],
+      );
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(
+        requests
+          .filter((request) => request.path.startsWith('/api/discord/members'))
+          .map((request) => request.path),
+      ).toEqual(['/api/discord/members?query=Captain']);
+      expect(screen.getByRole('button', { name: 'Select @alex.actual' })).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Select @alex.actual' }));
     expect((screen.getByLabelText('Username') as HTMLInputElement).value).toBe('alex.actual');
     fireEvent.click(
       within(screen.getByLabelText('Username').closest('form')!).getByRole('button', {
@@ -1568,19 +1588,55 @@ describe('React account safeguards', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Create account' }));
     fireEvent.click(await screen.findByRole('tab', { name: 'Recover interrupted creation' }));
-    fireEvent.change(screen.getByLabelText('Account to inspect'), { target: { value: 'alex' } });
-    fireEvent.focus(screen.getByLabelText('Recovery Discord member (optional)'));
-    await screen.findByRole('button', { name: 'Select @alex' });
-    fireEvent.click(screen.getByRole('button', { name: 'Inspect account' }));
-    await screen.findByText('alex · Eligible for recovery');
-    fireEvent.click(
-      screen.getByLabelText(
+    const account = await screen.findByRole('textbox', { name: 'Account to inspect' });
+    fireEvent.change(account, { target: { value: 'alex' } });
+    const memberSearch = (await screen.findByRole('searchbox', {
+      name: 'Recovery Discord member (optional)',
+    })) as HTMLInputElement;
+    await waitFor(() => expect(memberSearch.value).toBe('alex'));
+    const memberQueries = () =>
+      requests
+        .filter((request) => request.path.startsWith('/api/discord/members'))
+        .map((request) => request.path);
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        fireEvent.focus(memberSearch);
+      });
+      expect(memberQueries()).toEqual([]);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(memberQueries()).toEqual(['/api/discord/members?query=alex']);
+      expect(screen.getByRole('button', { name: 'Select @alex' })).toBeTruthy();
+      fireEvent.click(screen.getByRole('button', { name: 'Inspect account' }));
+      expect(memberSearch.disabled).toBe(true);
+      await act(async () => {});
+      expect(screen.getByText('alex · Eligible for recovery')).toBeTruthy();
+      expect(memberSearch.disabled).toBe(false);
+      expect(screen.queryByRole('button', { name: 'Select @alex' })).toBeNull();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(memberQueries()).toEqual([
+        '/api/discord/members?query=alex',
+        '/api/discord/members?query=alex',
+      ]);
+      const approval = screen.getByLabelText(
         'I inspected this Jellyfin account and approve a new password and account defaults.',
-      ),
-    );
-    fireEvent.click(await screen.findByRole('button', { name: 'Select @alex' }));
-    expect(screen.queryByRole('button', { name: 'Recover account' })).toBeNull();
-    expect(requests.some((request) => request.path === '/api/accounts/recover')).toBe(false);
+      ) as HTMLInputElement;
+      fireEvent.click(approval);
+      expect(approval.checked).toBe(true);
+      expect(
+        (screen.getByRole('button', { name: 'Recover account' }) as HTMLButtonElement).disabled,
+      ).toBe(false);
+      fireEvent.click(screen.getByRole('button', { name: 'Select @alex' }));
+      expect(screen.getByRole('button', { name: 'Clear Discord member @alex' })).toBeTruthy();
+      expect(screen.queryByRole('button', { name: 'Recover account' })).toBeNull();
+      expect(requests.some((request) => request.path === '/api/accounts/recover')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it('states that manual cancellation approval disables access immediately before sending the request', async () => {
     const event = {

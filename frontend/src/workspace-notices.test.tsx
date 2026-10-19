@@ -22,7 +22,89 @@ afterEach(() => {
 });
 const notice = { id: 1, message: 'Membership saved.', error: false };
 
+function dialogWorkspace() {
+  const dismiss = vi.fn();
+  function Workspace({ current }: { current?: typeof notice }) {
+    const [open, setOpen] = useState(false);
+    return (
+      <WorkspaceNoticeProvider notice={current} dismiss={dismiss}>
+        <WorkspaceNotice />
+        <button onClick={() => setOpen(true)}>Open review</button>
+        {open && (
+          <Modal
+            title="Review"
+            close={() => setOpen(false)}
+            footer={<button onClick={() => setOpen(false)}>Cancel</button>}
+          >
+            <p>Review the requested change.</p>
+          </Modal>
+        )}
+      </WorkspaceNoticeProvider>
+    );
+  }
+  const view = render(<Workspace current={notice} />);
+  const open = () => fireEvent.click(screen.getByRole('button', { name: 'Open review' }));
+  open();
+  return {
+    dismiss,
+    open,
+    setNotice: (current?: typeof notice) => view.rerender(<Workspace current={current} />),
+  };
+}
+
 describe('workspace notices', () => {
+  it('keeps the dialog notice mounted through automatic expiry and releases it when the dialog closes', () => {
+    const view = dialogWorkspace();
+    const dialog = screen.getByRole('dialog', { name: 'Review' });
+    const status = within(dialog).getByRole('status');
+    const cancel = within(dialog).getByRole('button', { name: 'Cancel' });
+    cancel.focus();
+    fireEvent.mouseDown(cancel);
+    // App's ordinary timer removes its notice prop. That must not collapse a
+    // live dialog body between pointer down and pointer up on a footer action.
+    view.setNotice(undefined);
+    expect(within(dialog).getByRole('status')).toBe(status);
+    expect(status.isConnected).toBe(true);
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+    expect(status.closest('.modal-body')).toBeTruthy();
+    expect(document.activeElement).toBe(cancel);
+    expect(view.dismiss).not.toHaveBeenCalled();
+    fireEvent.mouseUp(cancel);
+    fireEvent.click(cancel);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByText(notice.message)).toBeNull();
+    view.open();
+    expect(screen.getByRole('dialog')).toBeTruthy();
+    expect(screen.queryByText(notice.message)).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('retains only the latest dialog notice and allows explicit dismissal after parent expiry', () => {
+    const view = dialogWorkspace();
+    const latest = { id: 2, message: 'Latest request failed.', error: true };
+    view.setNotice(latest);
+    const error = screen.getByRole('alert');
+    expect(screen.queryByText(notice.message)).toBeNull();
+    view.setNotice(undefined);
+    expect(screen.getByRole('alert')).toBe(error);
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss notification' }));
+    expect(view.dismiss).toHaveBeenCalledExactlyOnceWith(latest.id);
+    expect(screen.queryByText(latest.message)).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    view.setNotice(undefined);
+    expect(screen.queryByText(latest.message)).toBeNull();
+    const newer = { id: 3, message: 'Newer change saved.', error: false };
+    view.setNotice(newer);
+    view.setNotice(undefined);
+    expect(screen.getByText(newer.message)).toBeTruthy();
+    expect(screen.queryByText(latest.message)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    view.open();
+    expect(screen.queryByText(newer.message)).toBeNull();
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
   it('shows only the latest dismissible notice in normal document flow, before the primary action', () => {
     const dismiss = vi.fn();
     const view = render(

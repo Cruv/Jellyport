@@ -4,6 +4,13 @@ import {
   type JellyfinLibraryConfigEntry,
 } from './jellyfin-library-membership.js';
 import { MediaError } from './errors.js';
+import {
+  parseJellyfinBackupManifest,
+  parseJellyfinBackups,
+  parseJellyfinBackupTasks,
+  type JellyfinBackupManifest,
+  type JellyfinBackupTask,
+} from './jellyfin-backup-api.js';
 import type { MediaReadOperation, MediaWorkload } from './media-workload.js';
 
 export type MediaKind = 'emby' | 'jellyfin';
@@ -58,6 +65,9 @@ export interface MediaUser extends JsonObject {
 export interface MediaAPI {
   close(): Promise<void>;
   systemInfo(): Promise<JsonObject>;
+  jellyfinBackups?(): Promise<JellyfinBackupManifest[]>;
+  createJellyfinBackup?(): Promise<JellyfinBackupManifest>;
+  jellyfinBackupTasks?(): Promise<JellyfinBackupTask[]>;
   users(): Promise<MediaUser[]>;
   user(id: string): Promise<MediaUser>;
   items(userId?: string): Promise<MediaItem[]>;
@@ -710,6 +720,39 @@ export class MediaClient implements MediaAPI {
 
   async systemInfo(): Promise<JsonObject> {
     return this.object(await this.request('GET', 'System/Info'));
+  }
+  async jellyfinBackups(): Promise<JellyfinBackupManifest[]> {
+    if (this.kind !== 'jellyfin')
+      throw new MediaError('Native backup automation requires Jellyfin.');
+    return parseJellyfinBackups(
+      await this.request('GET', 'Backup', undefined, undefined, true, undefined, {
+        retry: false,
+      }),
+    );
+  }
+  async createJellyfinBackup(): Promise<JellyfinBackupManifest> {
+    if (this.kind !== 'jellyfin')
+      throw new MediaError('Native backup automation requires Jellyfin.');
+    const manifest = parseJellyfinBackupManifest(
+      await this.request('POST', 'Backup/Create', undefined, {
+        Database: true,
+        Metadata: false,
+        Trickplay: false,
+        Subtitles: false,
+      }),
+    );
+    if (manifest.metadata || manifest.trickplay || manifest.subtitles)
+      throw new MediaError('Jellyfin did not confirm a database-only backup.');
+    return manifest;
+  }
+  async jellyfinBackupTasks(): Promise<JellyfinBackupTask[]> {
+    if (this.kind !== 'jellyfin')
+      throw new MediaError('Native backup automation requires Jellyfin.');
+    return parseJellyfinBackupTasks(
+      await this.request('GET', 'ScheduledTasks', undefined, undefined, true, undefined, {
+        retry: false,
+      }),
+    );
   }
   async users(): Promise<MediaUser[]> {
     const value = await this.request('GET', 'Users');

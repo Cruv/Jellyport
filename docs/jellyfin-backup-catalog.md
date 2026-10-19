@@ -1,4 +1,4 @@
-# Saved Jellyfin matching catalog — 0.15.0
+# Saved Jellyfin matching catalog
 
 For a large library, use a completed native Jellyfin backup for item matching
 alongside the [Emby plugin backup](emby-plugin-backups.md) for source history.
@@ -11,8 +11,8 @@ Fresh destination account access and playback activity remain authoritative.
 1. In Jellyfin's admin dashboard, create a **database-only backup**. Metadata,
    subtitles and trickplay are unnecessary. Wait until Jellyfin reports completion.
    The completed backup must be no more than 48 hours old when imported and used.
-   Creating this backup can consume server resources; Jellyport does not trigger
-   backups or schedule them on the media server.
+   Creating this backup can consume server resources. After initial setup, the
+   optional create-before-import schedule below can replace this manual step.
 2. Mount only the actual directory containing completed
    `jellyfin-backup-YYYYMMDDHHMMSS.zip` files read-only into the snapshot helper at
    `/jellyfin-backups`. Set its `JELLYPORT_JELLYFIN_BACKUP_DIR=/jellyfin-backups`.
@@ -40,12 +40,70 @@ each other's configuration. Refreshing status preserves unsaved schedule edits;
 if another administrator changes the saved revision, explicitly reload it before
 saving again.
 
-These schedules import existing completed backups; they do not create or schedule
-backups on either media server. Leave time for the server's own backup task and
-validation/settling requirements. Imports share one helper work slot, including
+By default these schedules import existing completed backups. Emby backups still
+come from its Backup & Restore plugin. Jellyfin additionally offers the opt-in
+creation step below. Imports share one work slot, including backup creation and
 preparation, so Emby and Jellyfin imports cannot start concurrently. A manual
 request reports that the slot is busy; a scheduled run waits within its catch-up
 window. This also avoids accepting work that would expire in the helper's queue.
+
+### Create a fresh Jellyfin backup before nightly import
+
+Starting with **0.22.0**, enable **Create a fresh Jellyfin backup before each
+scheduled import** in the Jellyfin daily schedule, then save it. The scheduled
+time becomes the start of **backup creation → completed archive import**. Existing
+installations default to import-only. Both containers must use the updated image;
+there are **no additional mounts, credentials or environment variables**.
+
+The web app uses its saved administrator API key to request Jellyfin's native
+backup API with database enabled and metadata, subtitles and trickplay disabled.
+Jellyfin also includes configuration and supporting files in this native archive.
+The helper keeps its read-only backup mount and receives only the completed
+archive's safe filename and original timestamp, never the API key. Manual
+**Import latest Jellyfin backup** remains import-only.
+
+Jellyfin does the live database work, including database optimization. Its native
+backup is supported while the server is running, but can consume CPU, I/O and
+hold database transactions; this is not a guarantee of uninterrupted playback.
+Jellyport checks for an active library scan before requesting a backup and skips
+that occurrence if one is running. Choose a time outside the library-scan window,
+and avoid starting another backup manually while Jellyport is preparing one.
+Changing or disabling the schedule does not cancel already accepted server work.
+
+Backup preparation has a separate **30-minute observation window**; the completed
+archive then gets the existing five-minute import limit. The UI distinguishes
+creation, waiting for completion, and import. The original archive timestamp
+continues to determine expiry. A failed or missing new archive never causes an
+older backup to be imported as a successful fresh backup.
+
+Jellyfin supplies neither a backup job ID nor a cancellation/idempotency API.
+Jellyport saves its intent before the POST and never automatically repeats that
+POST after a timeout, network error or application restart. It reconciles through
+read-only completed-backup observations. A unique new archive matching the bound
+server/version and request time can continue the import; an ambiguous result or
+unconfirmed completion retains the last good catalog and blocks new imports.
+Late completion can still be recovered without another creation request.
+
+If completion remains uncertain, inspect **Jellyfin → Dashboard → Backups** first.
+Use **Confirm backup stopped…** only after confirming the backup finished or
+stopped. The confirmation is bound to that specific attempt, rechecks Jellyfin,
+and cannot override a changed server identity, unavailable helper or ambiguous
+result. It neither cancels server work nor deletes backups. A rotated API key can
+reconcile the same verified server; a changed server URL/identity requires restoring
+the original connection. Successful confirmation with no new archive releases the
+attempt for the next scheduled date without replaying today's creation request.
+
+The native API currently has no archive deletion or retention endpoint. Jellyport
+retains its existing catalog cleanup rules and does not delete raw Jellyfin ZIPs.
+Apply a suitable retention policy to the server's backup directory separately.
+The native service requires free space before starting, but that is not retention.
+
+API behavior is verified against the official [backup controller](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Api/Controllers/BackupController.cs)
+and [backup service](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Server.Implementations/FullSystemBackup/BackupService.cs).
+The [Jellyfin backup guide](https://jellyfin.org/docs/general/administration/backup-and-restore/)
+describes native backup contents and live-server limitations. Jellyport rejects
+unsupported server versions before requesting a backup. Insufficient API-key
+permissions report a failed attempt without an import.
 
 Timing rules are the same for both import schedules:
 

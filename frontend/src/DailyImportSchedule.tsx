@@ -1,17 +1,20 @@
 import { useRef, useState, type FormEvent } from 'react';
-import type { ImportScheduleConfig, SourceSnapshotConfig } from './types';
+import type { DestinationCatalogConfig, ImportScheduleConfig, SourceSnapshotConfig } from './types';
 import { useWorkspaceDraftState } from './workspace-drafts';
 
 const clock = (config: ImportScheduleConfig) =>
   `${String(config.hour).padStart(2, '0')}:${String(config.minute).padStart(2, '0')}`;
-type Schedule = ImportScheduleConfig | SourceSnapshotConfig;
-const scheduleDraft = (config: Schedule): Schedule => ({
+type Schedule = ImportScheduleConfig | SourceSnapshotConfig | DestinationCatalogConfig;
+const createsBackup = (config: Schedule) =>
+  'create_backup' in config && config.create_backup === true;
+const scheduleDraft = (config: Schedule, createBackup: boolean): Schedule => ({
   enabled: config.enabled,
   hour: config.hour,
   minute: config.minute,
   time_zone: config.time_zone,
   revision: config.revision,
   ...('scope' in config ? { scope: config.scope } : {}),
+  ...(createBackup ? { create_backup: createsBackup(config) } : {}),
 });
 
 export default function DailyImportSchedule({
@@ -21,6 +24,7 @@ export default function DailyImportSchedule({
   busy,
   demo,
   capture = false,
+  createBackup = false,
   onSave,
 }: {
   id: string;
@@ -29,11 +33,14 @@ export default function DailyImportSchedule({
   busy: string;
   demo: boolean;
   capture?: boolean;
+  createBackup?: boolean;
   onSave: (
     input: Omit<Schedule, 'revision'> & { expected_revision: string },
   ) => Promise<Schedule | undefined>;
 }) {
-  const [draft, setDraft] = useWorkspaceDraftState(`${id}:config`, () => scheduleDraft(config));
+  const [draft, setDraft] = useWorkspaceDraftState(`${id}:config`, () =>
+    scheduleDraft(config, createBackup),
+  );
   const [time, setTime] = useWorkspaceDraftState(`${id}:time`, () => clock(config));
   const [validation, setValidation] = useState('');
   const generation = useRef(0);
@@ -42,7 +49,8 @@ export default function DailyImportSchedule({
   const dirty =
     time !== clock(config) ||
     draft.enabled !== config.enabled ||
-    draft.time_zone !== config.time_zone;
+    draft.time_zone !== config.time_zone ||
+    (createBackup && createsBackup(draft) !== createsBackup(config));
   let scheduledTime = 'Time unavailable';
   if (nextRun && Number.isFinite(Date.parse(nextRun))) {
     try {
@@ -57,7 +65,7 @@ export default function DailyImportSchedule({
   }
   function reload() {
     generation.current++;
-    setDraft(scheduleDraft(config));
+    setDraft(scheduleDraft(config, createBackup));
     setTime(clock(config));
     setValidation('');
   }
@@ -85,10 +93,11 @@ export default function DailyImportSchedule({
       minute,
       time_zone: zone,
       ...('scope' in draft ? { scope: draft.scope } : {}),
+      ...(createBackup ? { create_backup: createsBackup(draft) } : {}),
       expected_revision: draft.revision,
     });
     if (value && generation.current === submitted) {
-      setDraft(scheduleDraft(value));
+      setDraft(scheduleDraft(value, createBackup));
       setTime(clock(value));
     }
   }
@@ -101,6 +110,14 @@ export default function DailyImportSchedule({
             {config.enabled ? `Daily at ${clock(config)} (${config.time_zone})` : 'Off'}
           </strong>
         </p>
+        {createBackup && (
+          <p>
+            Scheduled workflow:{' '}
+            {createsBackup(config)
+              ? 'Create a fresh Jellyfin backup, then import it after it finishes.'
+              : 'Import an existing completed Jellyfin backup.'}
+          </p>
+        )}
         <p>
           Next scheduled {verb}:{' '}
           {config.enabled
@@ -124,6 +141,26 @@ export default function DailyImportSchedule({
               This schedule saves independently from connection and account settings.
             </p>
           </div>
+          {createBackup && (
+            <div className="toggle-row">
+              <label htmlFor={`${id}-create-backup`} className="switch-label">
+                Create a fresh Jellyfin backup before each scheduled import
+              </label>
+              <label className="toggle">
+                <input
+                  id={`${id}-create-backup`}
+                  type="checkbox"
+                  checked={createsBackup(draft)}
+                  disabled={demo || !!busy}
+                  onChange={(event) => {
+                    generation.current++;
+                    setDraft({ ...draft, create_backup: event.target.checked });
+                  }}
+                />
+                <span className="toggle-track" aria-hidden="true" />
+              </label>
+            </div>
+          )}
           <div className="toggle-row">
             <label htmlFor={`${id}-enabled`} className="switch-label">
               {capture ? 'Enable daily database capture' : 'Enable daily backup import'}
@@ -183,7 +220,11 @@ export default function DailyImportSchedule({
           <p className="section-note">
             {capture
               ? 'Captured history supplies only played flags; playback positions are not transferred.'
-              : 'Choose a time after your media server finishes its backup. Jellyport imports an existing completed backup; it does not create a server backup.'}
+              : createBackup && createsBackup(draft)
+                ? 'At the scheduled time, Jellyport asks Jellyfin to create a backup without optional metadata, subtitles or trickplay, then imports the completed backup. Creating it uses the live Jellyfin database and can affect server performance. Manual imports still use existing backups.'
+                : createBackup
+                  ? 'Choose a time after Jellyfin finishes its backup. This schedule imports an existing completed backup; fresh-backup creation is off.'
+                  : 'Choose a time after your media server finishes its backup. Jellyport imports an existing completed backup; it does not create a server backup.'}
           </p>
           {dirty && <p className="section-note">Unsaved schedule changes.</p>}
           {stale && (

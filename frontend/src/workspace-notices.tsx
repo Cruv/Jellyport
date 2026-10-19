@@ -55,8 +55,25 @@ export function useWorkspaceNoticeModal() {
 
 export function WorkspaceNotice({ dialog = false }: { dialog?: boolean }) {
   const context = useContext(WorkspaceNotices);
-  if (!context?.notice || (dialog ? !context.activeModal : !!context.activeModal)) return null;
-  const { notice, dismiss } = context;
+  const current = context?.notice;
+  const active = dialog && !!context?.activeModal;
+  const [retained, setRetained] = useState<Notice | undefined>(active ? current : undefined);
+  const [dismissed, setDismissed] = useState<number | null>(null);
+  useLayoutEffect(() => {
+    if (!active) setRetained(undefined);
+    else if (current && current.id !== dismissed) setRetained(current);
+  }, [active, current, dismissed]);
+  // Automatic expiry must not move modal footer actions during a pointer gesture.
+  // Keep only this dialog's latest notice; unmount and explicit dismissal release it.
+  const notice = current || (active ? retained : undefined);
+  if (
+    !context ||
+    !notice ||
+    notice.id === dismissed ||
+    (dialog ? !context.activeModal : !!context.activeModal)
+  )
+    return null;
+  const { dismiss } = context;
   return (
     <div className="toast-region" aria-label="Notifications">
       <div
@@ -88,7 +105,11 @@ export function WorkspaceNotice({ dialog = false }: { dialog?: boolean }) {
           className="icon-button"
           type="button"
           aria-label="Dismiss notification"
-          onClick={() => dismiss(notice.id)}
+          onClick={() => {
+            setDismissed(notice.id);
+            setRetained(undefined);
+            dismiss(notice.id);
+          }}
         >
           <svg
             viewBox="0 0 24 24"

@@ -13,13 +13,14 @@ import { projectCatalogItem, type MediaItem } from './media.js';
 import { jellyfinAsciiPathKey } from './jellyfin-library-membership.js';
 import {
   DestinationCatalogError,
+  DESTINATION_BACKUP_SERVER_VERSION,
   DESTINATION_CATALOG_MAX_AGE,
   destinationCatalogErrorCode,
   normalizedServerVersion,
 } from './destination-catalog-files.js';
 
 export const JELLYFIN_BACKUP_PROJECTION_FORMAT = 'jellyfin-backup-catalog-v2';
-const VERSION = '12.2.0.0';
+const VERSION = DESTINATION_BACKUP_SERVER_VERSION;
 const ENGINE_VERSION = '0.2.0';
 const MAX_ARCHIVE_BYTES = 8 * 1024 ** 3;
 const MAX_ITEMS_BYTES = 16 * 1024 ** 3;
@@ -88,6 +89,7 @@ export interface JellyfinBackupReadOptions {
   onProgress?: (progress: JellyfinBackupProgress) => void;
   /** The worker supplies its verified live version; reject stale input before table reads. */
   expectedServerVersion?: string;
+  expectedCreatedAt?: string;
   /** Deterministic private clock for synthetic tests, never accepted over IPC. */
   now?: number;
 }
@@ -498,6 +500,12 @@ export async function importJellyfinBackupCatalog(
       options,
     );
     const manifest = readManifest(Buffer.concat(buffers));
+    if (
+      options.expectedCreatedAt !== undefined &&
+      (!Number.isFinite(Date.parse(options.expectedCreatedAt)) ||
+        Date.parse(manifest.createdAt) !== Date.parse(options.expectedCreatedAt))
+    )
+      throw new DestinationCatalogError('backup_changed');
     if (options.expectedServerVersion !== undefined) {
       const now = options.now ?? Date.now();
       const created = Date.parse(manifest.createdAt);

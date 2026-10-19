@@ -112,7 +112,7 @@ export function useImportClock(deadlines: string[], active: boolean) {
   return now;
 }
 
-type ChangeKind = 'import' | 'clear' | 'schedule';
+type ChangeKind = 'import' | 'clear' | 'schedule' | 'backup-acknowledge';
 /** Own one read or mutation at a time; hiding a panel pauses reads, not accepted server work. */
 export function useImportWorkflow<T extends ImportWorkflowStatus>({
   api,
@@ -205,7 +205,12 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
 
   useEffect(() => {
     if (!active || !status || busy) return;
-    const delay = status.running ? 2000 : 30_000;
+    const next = Date.parse(status.next_run_at ?? '');
+    const untilNext = next - Date.now();
+    // This polls Jellyport's local status, never the media server. Discover an
+    // imminent/due scheduled start promptly instead of showing idle for 30s.
+    const imminent = Number.isFinite(next) && untilNext < 30_000 && untilNext > -60 * 60_000;
+    const delay = status.running || imminent ? 2000 : 30_000;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
@@ -217,7 +222,7 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
       stopped = true;
       clearTimeout(timer);
     };
-  }, [active, status?.running, busy, load]);
+  }, [active, status?.running, status?.next_run_at, busy, load]);
 
   async function change(
     kind: ChangeKind,
@@ -242,9 +247,12 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
     setBusy(kind);
     setLoading(false);
     setError('');
+    let refreshAfterFailure = false;
     try {
       const value = await api<T>(
-        kind === 'clear' ? path : `${path}/${kind === 'import' ? 'refresh' : 'schedule'}`,
+        kind === 'clear'
+          ? path
+          : `${path}/${kind === 'import' ? 'refresh' : kind === 'backup-acknowledge' ? 'backup/acknowledge' : 'schedule'}`,
         {
           ...options,
           signal: controller.signal,
@@ -261,6 +269,9 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
       if (mounted.current && !controller.signal.aborted && requestVersion === version.current) {
         setError(failure);
         if (kind === 'import') setUncertain(true);
+        // Reconciliation may find a completed backup and start importing it (409).
+        // Never repeat the acknowledgement; read the authoritative state instead.
+        if (kind === 'backup-acknowledge') refreshAfterFailure = true;
       }
     } finally {
       // An old session's reply must never release a newer session's mutation guard.
@@ -269,6 +280,7 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
         if (mounted.current && !controller.signal.aborted) setBusy('');
       }
       if (mutation.current === controller) mutation.current = null;
+      if (refreshAfterFailure && mounted.current && !controller.signal.aborted) void load();
     }
   }
   return { status, busy, loading, error, uncertain, stale, load, change };

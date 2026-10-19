@@ -5,6 +5,7 @@ import DestinationCatalogPanel, { type DestinationCatalogStatus } from './Destin
 import type { Api, ApiOptions, DestinationCatalogDiagnostic } from './types';
 
 const now = Date.parse('2026-01-02T04:00:00Z');
+const backupAttempt = '11111111-1111-4111-8111-111111111111';
 const status: DestinationCatalogStatus = {
   config: { enabled: false, hour: 3, minute: 0, time_zone: 'UTC', revision: 'catalog-revision-1' },
   next_run_at: null,
@@ -45,6 +46,236 @@ afterEach(() => {
 });
 
 describe('saved destination catalog settings', () => {
+  it('saves fresh-backup creation as an explicit nightly opt-in while manual imports remain import-only', async () => {
+    const calls: Array<{ path: string; options?: ApiOptions }> = [];
+    let current = status;
+    const api: Api = async <T,>(path: string, options?: ApiOptions) => {
+      calls.push({ path, options });
+      if (options?.method === 'PUT') {
+        current = {
+          ...current,
+          config: { ...current.config, create_backup: true, revision: 'catalog-revision-2' },
+        };
+      }
+      return current as T;
+    };
+    render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+    const checkbox = await screen.findByLabelText(/Create a fresh Jellyfin backup/);
+    expect(checkbox).toHaveProperty('checked', false);
+    fireEvent.click(checkbox);
+    expect(calls.filter((call) => call.options?.method)).toHaveLength(0);
+    fireEvent.click(screen.getByRole('button', { name: 'Save import schedule' }));
+    await act(async () => {});
+    expect(calls.filter((call) => call.options?.method === 'PUT')).toEqual([
+      expect.objectContaining({
+        path: '/api/destination-catalog/schedule',
+        options: expect.objectContaining({
+          body: expect.objectContaining({
+            create_backup: true,
+            expected_revision: status.config.revision,
+          }),
+        }),
+      }),
+    ]);
+    expect(screen.getByText(/Scheduled workflow:/).textContent).toContain(
+      'Create a fresh Jellyfin backup, then import it after it finishes.',
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Import latest Jellyfin backup' }));
+    await act(async () => {});
+    expect(calls.filter((call) => call.options?.method === 'POST')).toEqual([
+      expect.objectContaining({
+        path: '/api/destination-catalog/refresh',
+        options: expect.objectContaining({ method: 'POST' }),
+      }),
+    ]);
+    expect(calls.find((call) => call.options?.method === 'POST')?.options?.body).toBeUndefined();
+  });
+  it.each([
+    ['creating', 'Creating fresh Jellyfin backup…'],
+    ['waiting', 'Waiting for completed Jellyfin backup…'],
+  ] as const)(
+    'shows %s preparation with elapsed time and blocks overlapping manual work',
+    async (phase, label) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(now);
+      const calls: Array<{ path: string; options?: ApiOptions }> = [];
+      const api: Api = async <T,>(path: string, options?: ApiOptions) => {
+        calls.push({ path, options });
+        return {
+          ...status,
+          running: true,
+          last_outcome: 'running',
+          backup_creation: {
+            phase,
+            started_at: '2026-01-02T03:58:00Z',
+            deadline_at: '2026-01-02T04:20:00Z',
+          },
+        } as T;
+      };
+      render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+      await act(async () => {});
+      expect(screen.getByText(label)).toBeTruthy();
+      expect(screen.getByText(/Backup preparation elapsed: 2m 0s/)).toBeTruthy();
+      expect(
+        screen
+          .getByRole('progressbar', { name: 'Jellyfin catalog import progress' })
+          .hasAttribute('value'),
+      ).toBe(false);
+      expect(screen.getByRole('button', { name: 'Import latest Jellyfin backup' })).toHaveProperty(
+        'disabled',
+        true,
+      );
+      expect(screen.getByRole('button', { name: 'Clear matching catalog' })).toHaveProperty(
+        'disabled',
+        true,
+      );
+      expect(screen.queryByRole('button', { name: 'Confirm backup stopped…' })).toBeNull();
+      await act(async () => vi.advanceTimersByTimeAsync(2000));
+      expect(calls).toHaveLength(2);
+      expect(screen.getByText(/Backup preparation elapsed: 2m 2s/)).toBeTruthy();
+      expect(calls.every((call) => !call.options?.method)).toBe(true);
+    },
+  );
+  it('requires explicit confirmation of uncertain server work and waits for the server response without optimistic clearing', async () => {
+    const pending = deferred<DestinationCatalogStatus>();
+    const uncertainStatus: DestinationCatalogStatus = {
+      ...status,
+      backup_creation: {
+        attempt_id: backupAttempt,
+        phase: 'uncertain',
+        started_at: '2026-01-02T03:58:00Z',
+        deadline_at: '2026-01-02T04:20:00Z',
+      },
+    };
+    const calls: Array<{ path: string; options?: ApiOptions }> = [];
+    const api: Api = async <T,>(path: string, options?: ApiOptions) => {
+      calls.push({ path, options });
+      return (options?.method === 'POST' ? await pending.promise : uncertainStatus) as T;
+    };
+    render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+    const start = await screen.findByRole('button', { name: 'Confirm backup stopped…' });
+    expect(screen.getByRole('button', { name: 'Import latest Jellyfin backup' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    fireEvent.click(start);
+    expect(
+      screen.getByRole('dialog', { name: 'Confirm Jellyfin backup has stopped?' }).textContent,
+    ).toContain('A timeout in Jellyport does not stop Jellyfin’s backup work.');
+    expect(calls.filter((call) => call.options?.method)).toHaveLength(0);
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(calls.filter((call) => call.options?.method)).toHaveLength(0);
+    fireEvent.click(start);
+    const confirm = screen.getByRole('button', { name: 'Confirm backup stopped' });
+    act(() => {
+      fireEvent.click(confirm);
+      fireEvent.click(confirm);
+    });
+    expect(calls.filter((call) => call.options?.method)).toHaveLength(1);
+    expect(calls.at(-1)).toMatchObject({
+      path: '/api/destination-catalog/backup/acknowledge',
+      options: { method: 'POST', body: { expected_attempt_id: backupAttempt } },
+    });
+    expect(screen.getByRole('button', { name: 'Checking backup status…' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(screen.getByRole('button', { name: 'Import latest Jellyfin backup' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    await act(async () => pending.resolve(uncertainStatus));
+    expect(screen.getByText('Jellyfin backup completion is uncertain.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Import latest Jellyfin backup' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+  it('refreshes after an acknowledgement conflict discovers a completed backup being imported, without repeating the POST', async () => {
+    const calls: Array<{ path: string; options?: ApiOptions }> = [];
+    let reads = 0;
+    const api: Api = async <T,>(path: string, options?: ApiOptions) => {
+      calls.push({ path, options });
+      if (options?.method === 'POST') throw new Error('Conflict');
+      return (
+        ++reads === 1
+          ? {
+              ...status,
+              backup_creation: {
+                attempt_id: backupAttempt,
+                phase: 'uncertain',
+                started_at: '2026-01-02T03:58:00Z',
+                deadline_at: '2026-01-02T04:20:00Z',
+              },
+            }
+          : { ...status, running: true, last_outcome: 'running', backup_creation: null }
+      ) as T;
+    };
+    render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm backup stopped…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm backup stopped' }));
+    await screen.findByText('Importing Jellyfin backup…');
+    expect(calls.filter((call) => call.options?.method === 'POST')).toHaveLength(1);
+    expect(calls.at(-1)?.path).toBe('/api/destination-catalog');
+    expect(calls.at(-1)?.options?.method).toBeUndefined();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByText('Jellyfin backup completion is uncertain.')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Import latest Jellyfin backup' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+  });
+  it('does not offer a recovery write without an attempt identifier from the server', async () => {
+    const api: Api = async <T,>() =>
+      ({
+        ...status,
+        backup_creation: {
+          phase: 'uncertain',
+          started_at: '2026-01-02T03:58:00Z',
+          deadline_at: '2026-01-02T04:20:00Z',
+        },
+      }) as T;
+    render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+    await screen.findByText('Jellyfin backup completion is uncertain.');
+    expect(screen.queryByRole('button', { name: 'Confirm backup stopped…' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Import latest Jellyfin backup' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+  });
+  it('closes a stale recovery confirmation when polling discovers a different uncertain attempt', async () => {
+    vi.useFakeTimers();
+    const nextAttempt = '22222222-2222-4222-8222-222222222222';
+    const calls: Array<{ path: string; options?: ApiOptions }> = [];
+    let reads = 0;
+    const api: Api = async <T,>(path: string, options?: ApiOptions) => {
+      calls.push({ path, options });
+      return {
+        ...status,
+        backup_creation: {
+          attempt_id: ++reads === 1 ? backupAttempt : nextAttempt,
+          phase: 'uncertain',
+          started_at: '2026-01-02T03:58:00Z',
+          deadline_at: '2026-01-02T04:20:00Z',
+        },
+      } as T;
+    };
+    render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm backup stopped…' }));
+    expect(screen.getByRole('dialog')).toBeTruthy();
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(calls.filter((call) => call.options?.method)).toHaveLength(0);
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm backup stopped…' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm backup stopped' }));
+    await act(async () => {});
+    expect(calls.find((call) => call.options?.method === 'POST')?.options?.body).toEqual({
+      expected_attempt_id: nextAttempt,
+    });
+  });
   it.each([false, true])(
     'explains an expired-backup failure separately from a retained expired catalog (retained=%s)',
     async (retained) => {

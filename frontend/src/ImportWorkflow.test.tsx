@@ -86,6 +86,24 @@ afterEach(() => {
 });
 
 describe('shared import lifecycle', () => {
+  it('observes an imminent scheduled start promptly without issuing a mutation', async () => {
+    vi.useFakeTimers();
+    const at = Date.now();
+    let reads = 0;
+    const api: Api = async <T,>(_path: string, options?: ApiOptions) => {
+      expect(options?.method).toBeUndefined();
+      reads++;
+      return { ...idle, next_run_at: new Date(at - 1000).toISOString(), running: reads > 1 } as T;
+    };
+    render(<Harness api={api} />);
+    await act(async () => {});
+    expect(reads).toBe(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+    });
+    expect(reads).toBe(2);
+    expect(screen.getByText('Import running…')).toBeTruthy();
+  });
   it('discovers a scheduled start while idle, switches to fast running polls, and pauses when hidden', async () => {
     vi.useFakeTimers();
     let reads = 0;

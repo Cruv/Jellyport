@@ -12,6 +12,7 @@ import { DEFAULT_SETTINGS } from '../server/types';
 import type { JellyfinAuthentication } from '../server/jellyfin-auth';
 import type { SourceSnapshots } from '../server/source-snapshots';
 import type { DestinationCatalogs } from '../server/destination-catalogs';
+import type { JellyfinBackupManifest } from '../server/jellyfin-backup-api';
 
 export const sourceMember = '00112233445566778899aabbccddeeff';
 export const destinationMember = '112233445566778899aabbccddeeff00';
@@ -67,6 +68,53 @@ function archive(entries: Array<{ name: string; text: string }>): Buffer {
   return Buffer.concat([...local, directory, end]);
 }
 
+function jellyfinArchive(createdAt: string): Buffer {
+  return archive([
+    {
+      name: 'manifest.json',
+      text: JSON.stringify({
+        ServerVersion: '12.2.0.0',
+        BackupEngineVersion: '0.2.0',
+        DateCreated: createdAt,
+        DatabaseTables: ['DbSet`1'],
+        Options: { Database: true, Metadata: false, Subtitles: false, Trickplay: false },
+      }),
+    },
+    {
+      name: 'Database/BaseItems.json',
+      text: JSON.stringify([
+        {
+          Id: '00000001-0000-0000-0000-000000000001',
+          Type: 'MediaBrowser.Controller.Entities.Movies.Movie',
+          Name: 'Synthetic first movie',
+          Path: '/synthetic/one.mkv',
+        },
+        {
+          Id: '00000002-0000-0000-0000-000000000001',
+          Type: 'MediaBrowser.Controller.Entities.Movies.Movie',
+          Name: 'Synthetic protected movie',
+          Path: '/synthetic/two.mkv',
+        },
+      ]),
+    },
+    {
+      name: 'Database/BaseItemProviders.json',
+      text: JSON.stringify([
+        {
+          ItemId: '00000001-0000-0000-0000-000000000001',
+          ProviderId: 'Tmdb',
+          ProviderValue: '424242',
+        },
+        {
+          ItemId: '00000002-0000-0000-0000-000000000001',
+          ProviderId: 'Tmdb',
+          ProviderValue: '434343',
+        },
+      ]),
+    },
+  ]);
+}
+
 export interface ImportFixture {
   readonly app: JellyportApp;
   readonly client: APIRequestContext;
@@ -79,6 +127,8 @@ export interface ImportFixture {
   restart: () => Promise<void>;
   stopHelper: () => Promise<void>;
   helperImports: () => number;
+  nativeBackupCalls: () => number;
+  completeNativeBackup: () => Promise<string>;
   sourceStatus: () => ReturnType<SourceSnapshots['status']>;
   destinationStatus: () => ReturnType<DestinationCatalogs['status']>;
 }
@@ -111,6 +161,9 @@ export const test = base.extend<{ imports: ImportFixture }>({
       for (const path of [exchange, work, sourceBackups, destinationBackups])
         await mkdir(path, { recursive: true, mode: 0o700 });
       const backupAt = new Date(Date.now() - 60 * 60_000).toISOString();
+      const nativeManifests = new Map<string, JellyfinBackupManifest>();
+      let nativeBackupCalls = 0;
+      let pendingNativeBackup: { resolve: (manifest: JellyfinBackupManifest) => void } | undefined;
       const schema = await readFile(resolve('tests-ts/fixtures/emby-4.10.1.0-schema.sql'), 'utf8');
       async function backup(kind: Kind, state: BackupState) {
         if (kind === 'emby') {
@@ -175,69 +228,33 @@ export const test = base.extend<{ imports: ImportFixture }>({
         if (state === 'valid' || state === 'missing')
           for (const name of await readdir(destinationBackups))
             await rm(join(destinationBackups, name));
+        if (state === 'valid' || state === 'missing') nativeManifests.clear();
         if (state === 'missing') return;
         const stamp = new Date(Date.now() - (state === 'valid' ? 60 : 30) * 60_000)
           .toISOString()
           .slice(0, 19)
           .replaceAll(/[-:T]/g, '');
-        const path = join(destinationBackups, `jellyfin-backup-${stamp}.zip`);
+        const name = `jellyfin-backup-${stamp}.zip`;
+        const path = join(destinationBackups, name);
+        const createdAt =
+          state === 'expired' ? new Date(Date.now() - 49 * 60 * 60_000).toISOString() : backupAt;
         await writeFile(
           path,
           state === 'incomplete'
             ? Buffer.from('synthetic-truncated-zip')
-            : archive([
-                {
-                  name: 'manifest.json',
-                  text: JSON.stringify({
-                    ServerVersion: '12.2.0.0',
-                    BackupEngineVersion: '0.2.0',
-                    DateCreated:
-                      state === 'expired'
-                        ? new Date(Date.now() - 49 * 60 * 60_000).toISOString()
-                        : backupAt,
-                    DatabaseTables: ['DbSet`1'],
-                    Options: {
-                      Database: true,
-                      Metadata: false,
-                      Subtitles: false,
-                      Trickplay: false,
-                    },
-                  }),
-                },
-                {
-                  name: 'Database/BaseItems.json',
-                  text: JSON.stringify([
-                    {
-                      Id: '00000001-0000-0000-0000-000000000001',
-                      Type: 'MediaBrowser.Controller.Entities.Movies.Movie',
-                      Name: 'Synthetic first movie',
-                      Path: '/synthetic/one.mkv',
-                    },
-                    {
-                      Id: '00000002-0000-0000-0000-000000000001',
-                      Type: 'MediaBrowser.Controller.Entities.Movies.Movie',
-                      Name: 'Synthetic protected movie',
-                      Path: '/synthetic/two.mkv',
-                    },
-                  ]),
-                },
-                {
-                  name: 'Database/BaseItemProviders.json',
-                  text: JSON.stringify([
-                    {
-                      ItemId: '00000001-0000-0000-0000-000000000001',
-                      ProviderId: 'Tmdb',
-                      ProviderValue: '424242',
-                    },
-                    {
-                      ItemId: '00000002-0000-0000-0000-000000000001',
-                      ProviderId: 'Tmdb',
-                      ProviderValue: '434343',
-                    },
-                  ]),
-                },
-              ]),
+            : jellyfinArchive(createdAt),
         );
+        if (state !== 'incomplete')
+          nativeManifests.set(name, {
+            name,
+            created_at: createdAt,
+            server_version: '12.2.0.0',
+            backup_engine_version: '0.2.0',
+            database: true,
+            metadata: false,
+            subtitles: false,
+            trickplay: false,
+          });
       }
       await backup('emby', 'valid');
       await backup('jellyfin', 'valid');
@@ -315,6 +332,18 @@ export const test = base.extend<{ imports: ImportFixture }>({
                   'Live source history scans are prohibited in this saved-backup fixture.',
                 );
               };
+            else {
+              media.jellyfinBackups = async () => [...nativeManifests.values()];
+              media.jellyfinBackupTasks = async () => [{ key: 'RefreshLibrary', state: 'Idle' }];
+              media.createJellyfinBackup = async () => {
+                nativeBackupCalls++;
+                if (pendingNativeBackup)
+                  throw new Error('Synthetic native backup creation was duplicated.');
+                return new Promise<JellyfinBackupManifest>((resolve) => {
+                  pendingNativeBackup = { resolve };
+                });
+              };
+            }
             const mark = media.markPlayed.bind(media);
             media.markPlayed = async (user, item, date) => {
               writes.push({ user, item });
@@ -448,6 +477,29 @@ for(const object of [dns,dns.promises]) for(const name of Object.keys(object)) i
         },
         stopHelper,
         helperImports: () => completedImports,
+        nativeBackupCalls: () => nativeBackupCalls,
+        completeNativeBackup: async () => {
+          if (!pendingNativeBackup)
+            throw new Error('The synthetic native backup has not been requested.');
+          const createdAt = new Date().toISOString();
+          const stamp = createdAt.slice(0, 19).replaceAll(/[-:T]/g, '');
+          const name = `jellyfin-backup-${stamp}.zip`;
+          await writeFile(join(destinationBackups, name), jellyfinArchive(createdAt));
+          const manifest: JellyfinBackupManifest = {
+            name,
+            created_at: createdAt,
+            server_version: '12.2.0.0',
+            backup_engine_version: '0.2.0',
+            database: true,
+            metadata: false,
+            subtitles: false,
+            trickplay: false,
+          };
+          nativeManifests.set(name, manifest);
+          pendingNativeBackup.resolve(manifest);
+          pendingNativeBackup = undefined;
+          return createdAt;
+        },
         sourceStatus: () => app!.jellyport.service.sourceSnapshots.status(),
         destinationStatus: () => app!.jellyport.service.destinationSnapshots.status(),
       });

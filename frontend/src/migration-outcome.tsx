@@ -103,7 +103,7 @@ export function resultOutcome(result: JobResult, scope?: HistoricalMigrationScop
     matchingCoverage(result)?.meetsTarget &&
     verifiedExecution(result)
   )
-    return { value: 'partial', label: 'Succeeded with warnings', needsReview: false };
+    return originalOutcome('completed');
   return originalOutcome(result.status);
 }
 
@@ -116,15 +116,11 @@ export function jobOutcome(job: Job): OutcomeDisplay {
     job.migration_scope !== 'complete' &&
     job.results?.length &&
     job.results.every(
-      (result) =>
-        result.status === 'completed' ||
-        resultOutcome(result, job.migration_scope).label === 'Succeeded with warnings',
+      (result) => resultOutcome(result, job.migration_scope).value === 'completed',
     ) &&
-    job.results.some(
-      (result) => resultOutcome(result, job.migration_scope).label === 'Succeeded with warnings',
-    )
+    job.results.some((result) => result.status === 'partial')
   )
-    return { value: 'partial', label: 'Succeeded with warnings', needsReview: false };
+    return originalOutcome('completed');
   return originalOutcome(job.status);
 }
 

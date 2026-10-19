@@ -933,13 +933,7 @@ export function ActivityPage({
   const filtered = jobs.filter(
     (job) =>
       (status === 'all' ||
-        (status === 'active'
-          ? activeJob(job)
-          : status === 'succeeded_with_warnings'
-            ? job.status === 'partial' && !jobOutcome(job).needsReview
-            : status === 'partial'
-              ? job.status === 'partial' && jobOutcome(job).needsReview
-              : job.status === status)) &&
+        (status === 'active' ? activeJob(job) : jobOutcome(job).value === status)) &&
       `${job.kind} ${job.id} ${job.results?.map((item) => item.username).join(' ') ?? ''}`
         .toLowerCase()
         .includes(query.trim().toLowerCase()),
@@ -1005,7 +999,6 @@ export function ActivityPage({
               <option value="all">All operations</option>
               <option value="active">Running or queued</option>
               <option value="completed">Completed</option>
-              <option value="succeeded_with_warnings">Succeeded with warnings</option>
               <option value="partial">Needs review</option>
               <option value="failed">Failed</option>
               <option value="canceled">Canceled</option>

@@ -54,7 +54,7 @@ const emptyPlayedDetails: MigrationDetails = {
   history_dates_missing: 0,
   warnings: [],
 };
-function verifiedWarningMigration(): Job {
+function verifiedHistoryMigration(): Job {
   return {
     ...job,
     kind: 'migrate',
@@ -2897,14 +2897,15 @@ describe('React account safeguards', () => {
     expect(within(dialog).queryByText(/resume positions/)).toBeNull();
     expect(within(dialog).queryByText(/favorites/)).toBeNull();
   });
-  it('separates verified execution from matching coverage and unresolved source history in the report', async () => {
-    const completed = verifiedWarningMigration();
+  it('shows normal completed status while keeping matching coverage and historical differences visible', async () => {
+    const completed = verifiedHistoryMigration();
     const before = structuredClone(completed);
     responses['/api/jobs/job-1'] = completed;
     const dialog = await openJob();
-    const labels = within(dialog).getAllByText('Succeeded with warnings');
+    const labels = within(dialog).getAllByText('Completed');
     expect(labels).toHaveLength(2);
-    expect(labels.every((label) => label.className === 'status warn')).toBe(true);
+    expect(labels.every((label) => label.className === 'status good')).toBe(true);
+    expect(within(dialog).queryByText('Succeeded with warnings')).toBeNull();
     const coverage = within(dialog).getByRole('region', { name: 'Matching coverage' });
     expect(within(coverage).getByText('99.6% matched')).toBeTruthy();
     expect(coverage.textContent).toContain('2,978 of 2,991 identifiable source items');
@@ -2919,7 +2920,7 @@ describe('React account safeguards', () => {
     expect(within(dialog).queryByText('Needs review')).toBeNull();
     expect(within(dialog).queryByText('Review this operation before retrying.')).toBeNull();
     expect(within(dialog).getByText('Synthetic source-history diagnostic.').className).toBe(
-      'warning-block',
+      'info-block',
     );
     expect(completed).toEqual(before);
     expect(
@@ -2929,8 +2930,8 @@ describe('React account safeguards', () => {
     expect(sessionStorage.length).toBe(0);
   });
 
-  it('filters successful migrations with warnings separately from legacy review and failed activity without changing reports', async () => {
-    const successful = verifiedWarningMigration();
+  it('groups verified migrations with completed activity and keeps uncertain or failed reports separate', async () => {
+    const successful = verifiedHistoryMigration();
     const legacy = structuredClone(successful);
     legacy.id = 'legacy-history-job';
     legacy.results![0]!.username = 'legacy-review-user';
@@ -2941,7 +2942,12 @@ describe('React account safeguards', () => {
     failed.results![0]!.status = 'failed';
     failed.results![0]!.username = 'failed-history-user';
     failed.results![0]!.error = 'Synthetic migration failure.';
-    const jobs = [successful, legacy, failed];
+    const ordinary = {
+      ...job,
+      id: 'ordinary-completed-job',
+      results: [{ ...job.results![0]!, username: 'ordinary-completed-user' }],
+    };
+    const jobs = [successful, ordinary, legacy, failed];
     const before = structuredClone(jobs);
     responses['/api/jobs'] = { jobs };
     responses['/api/overview'] = { ...overview, recent_jobs: jobs };
@@ -2950,10 +2956,13 @@ describe('React account safeguards', () => {
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
     const table = screen.getByRole('table');
     const filter = screen.getByRole('combobox', { name: 'Status' });
-    fireEvent.change(filter, { target: { value: 'succeeded_with_warnings' } });
-    expect(within(table).getAllByRole('row')).toHaveLength(2);
+    expect(within(filter).queryByRole('option', { name: 'Succeeded with warnings' })).toBeNull();
+    fireEvent.change(filter, { target: { value: 'completed' } });
+    expect(within(table).getAllByRole('row')).toHaveLength(3);
     expect(within(table).getByText('verified-history-user')).toBeTruthy();
-    expect(within(table).getByText('Succeeded with warnings')).toBeTruthy();
+    expect(within(table).getByText('ordinary-completed-user')).toBeTruthy();
+    expect(within(table).getAllByText('Completed')).toHaveLength(2);
+    expect(within(table).queryByText('Succeeded with warnings')).toBeNull();
     expect(within(table).queryByText('legacy-review-user')).toBeNull();
     expect(within(table).queryByText('failed-history-user')).toBeNull();
     fireEvent.change(filter, { target: { value: 'partial' } });
@@ -2961,6 +2970,7 @@ describe('React account safeguards', () => {
     expect(within(table).getByText('legacy-review-user')).toBeTruthy();
     expect(within(table).getByText('Needs review')).toBeTruthy();
     expect(within(table).queryByText('verified-history-user')).toBeNull();
+    expect(within(table).queryByText('ordinary-completed-user')).toBeNull();
     fireEvent.change(filter, { target: { value: 'failed' } });
     expect(within(table).getAllByRole('row')).toHaveLength(2);
     expect(within(table).getByText('failed-history-user')).toBeTruthy();

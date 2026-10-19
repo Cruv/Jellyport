@@ -1,4 +1,10 @@
-import { test as base, expect, type APIRequestContext, type Page } from '@playwright/test';
+import {
+  test as base,
+  expect,
+  type APIRequestContext,
+  type Locator,
+  type Page,
+} from '@playwright/test';
 
 const demoUrl = 'http://127.0.0.1:4179';
 type DemoSession = Awaited<ReturnType<APIRequestContext['storageState']>>;
@@ -59,12 +65,25 @@ export { expect };
 
 export async function navigate(page: Page, name: string) {
   await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
-  const toggle = page.getByRole('button', { name: 'Toggle navigation' });
-  if (await toggle.isVisible()) await toggle.click();
-  await page
-    .getByRole('complementary', { name: 'Main navigation' })
-    .getByRole('button', { name, exact: true })
-    .click();
+  // Match the client's input capability. Native taps avoid introducing mouse
+  // hover into touch navigation, while retaining normal actionability checks.
+  const touch = await page.evaluate(() => navigator.maxTouchPoints > 0);
+  const activate = (control: Locator) => (touch ? control.tap() : control.click());
+  const toggle = page.getByRole('button', {
+    name: 'Toggle navigation',
+    includeHidden: true,
+  });
+  const drawer = await toggle.isVisible();
+  const navigation = page.getByRole('complementary', { name: 'Main navigation' });
+  if (drawer) {
+    if ((await toggle.getAttribute('aria-expanded')) !== 'true') await activate(toggle);
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    // Opening the drawer deliberately transfers focus to the current page.
+    // Finish that handoff before activating a different target.
+    await expect(navigation.locator('[aria-current="page"]')).toBeFocused();
+  }
+  await activate(navigation.getByRole('button', { name, exact: true }));
+  if (drawer) await expect(toggle).toHaveAttribute('aria-expanded', 'false');
   await expect(page.getByRole('heading', { level: 1, name, exact: true })).toBeVisible();
 }
 

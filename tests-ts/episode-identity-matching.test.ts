@@ -374,12 +374,15 @@ describe('complete episode identity precedes stray episode-provider hits', () =>
 
   it('preserves the aggregate ambiguity bound for duplicate complete episode identities', () => {
     const collisionSize = 1000;
+    // One series provider proves complete context; this case exercises the full
+    // candidate budget, while the smaller cases above cover provider aliases.
     const targets = Array.from({ length: collisionSize }, (_, index) =>
-      episode(`target-${index}`, { ProviderIds: {} }),
+      episode(`target-${index}`, { ProviderIds: {}, SeriesProviderIds: { Tvdb: 'series-100' } }),
     );
     const history = Array.from(
       { length: MAX_AMBIGUOUS_CANDIDATES / collisionSize + 1 },
-      (_, index) => episode(`source-${index}`, { ProviderIds: {} }),
+      (_, index) =>
+        episode(`source-${index}`, { ProviderIds: {}, SeriesProviderIds: { Tvdb: 'series-100' } }),
     );
     const matcher = createMatcher(targets);
     expect(matcher(history.slice(0, -1)).ambiguous).toHaveLength(history.length - 1);

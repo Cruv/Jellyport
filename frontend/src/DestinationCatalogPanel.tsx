@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useLayoutEffect, useState } from 'react';
 import { Callout, Icon, Modal } from './components';
 import DailyImportSchedule from './DailyImportSchedule';
 import {
@@ -37,7 +37,7 @@ export default function DestinationCatalogPanel({
   const preparation = status?.backup_creation;
   const preparing = preparation?.phase === 'creating' || preparation?.phase === 'waiting';
   const backupUncertain = preparation?.phase === 'uncertain';
-  useEffect(() => {
+  useLayoutEffect(() => {
     setConfirmStopped(false);
   }, [active, api, backupUncertain, preparation?.attempt_id]);
   const now = useImportClock(

@@ -173,11 +173,7 @@ test('real backup imports, daily execution and restart preserve original freshne
   await expectContainedLayout(page);
 
   const attempt = (await imports.destinationStatus()).last_attempt_at;
-  await imports.restart();
-  await page.context().addCookies((await imports.client.storageState()).cookies);
-  // Re-authentication replaces cookies; reload the document to obtain its new
-  // CSRF token rather than retaining the prior session through a hash-only change.
-  await page.reload();
+  await imports.restart(page);
   view = await panel(page, 'jellyfin');
   await expect(view.getByText('Last outcome: Completed', { exact: true })).toBeVisible();
   expect((await imports.destinationStatus()).config).toEqual(config);

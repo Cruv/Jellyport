@@ -87,9 +87,7 @@ test('nightly import creates one fresh native backup, waits for completion and r
     fullPage: true,
   });
 
-  await imports.restart();
-  await page.context().addCookies((await imports.client.storageState()).cookies);
-  await page.reload();
+  await imports.restart(page);
   panel = page.getByRole('region', { name: 'Saved Jellyfin matching catalog', exact: true });
   await expect(panel.getByText('Last outcome: Completed', { exact: true })).toBeVisible();
   expect((await imports.destinationStatus()).config).toEqual(config);

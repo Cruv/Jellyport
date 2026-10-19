@@ -77,7 +77,16 @@ import {
 
 export { ServiceError } from './errors.js';
 export { generatePassword } from './credentials.js';
+export interface ReviewedHistoryTarget {
+  target_user_id: string;
+  target_username: string;
+  server_id: string;
+  administrator: boolean;
+  template: boolean;
+  template_user_id: string;
+}
 export interface JobRequest {
+  history_only_target?: ReviewedHistoryTarget;
   source_snapshot_id?: string;
   migration_scope?: MigrationScope;
   username?: string;
@@ -133,6 +142,12 @@ export interface MigrationAmbiguitySummary extends MigrationItemSummary {
 /** Per account, including both result lists; full matching counts remain unbounded by display. */
 export const MAX_RESULT_DIAGNOSTIC_BYTES = 1024 * 1024;
 export interface JobResult extends Partial<JobStats> {
+  history_only?: true;
+  migration_outcome?: {
+    version: 1;
+    execution: 'verified' | 'needs_review';
+    unresolved_source_history: number;
+  };
   destination_catalog?: DestinationCatalogMetadata;
   timing?: {
     elapsed_ms: number;
@@ -305,6 +320,7 @@ interface MigrationPreviewOptions {
   use_snapshots?: boolean;
 }
 interface PreviewUser {
+  history_only?: true;
   source_snapshot?: SnapshotMetadata;
   source_user_id: string;
   source_username: string;
@@ -720,6 +736,7 @@ export class Service {
     username: string,
     settings: Settings,
     recoverTargetId?: string,
+    allowProtectedHistory = false,
   ): MediaUser | null {
     if (!mapping?.target_user_id) {
       const target = this.target(users, username);
@@ -753,7 +770,7 @@ export class Service {
         'The mapped Jellyfin account was removed or renamed. Review its mapping.',
       );
     if (
-      target.Policy?.IsAdministrator !== false ||
+      (!allowProtectedHistory && target.Policy?.IsAdministrator !== false) ||
       (target.Policy?.IsDisabled !== false && recoverTargetId !== target.Id)
     )
       throw new ServiceError(
@@ -818,6 +835,7 @@ export class Service {
     mode: 'merge';
     migration_scope: MigrationScope;
     source_snapshot_ids?: Record<string, string>;
+    history_only_targets?: Record<string, ReviewedHistoryTarget>;
   }> {
     const scope = migrationScope(options.migration_scope);
     const checkCanceled = () => {
@@ -842,6 +860,8 @@ export class Service {
           checkCanceled();
           const users: PreviewUser[] = [];
           const snapshotIds: Record<string, string> = {};
+          const historyOnlyTargets: Record<string, ReviewedHistoryTarget> = {};
+          let destinationServerId: string | undefined;
           const snapshotInfo = options.use_snapshots ? await emby.systemInfo() : null;
           if (
             snapshotInfo &&
@@ -865,20 +885,36 @@ export class Service {
             const username = mapping?.target_user_id
                 ? validateExistingMappingUsername(mapping.target_username)
                 : validateUsername(mapping?.target_username ?? sourceUser.Name),
-              target = this.mappedTarget(targets, mapping, username, settings);
-            if (
+              target = this.mappedTarget(targets, mapping, username, settings, undefined, true);
+            if (target?.Policy?.IsDisabled !== false && target)
+              throw new ServiceError(
+                'A disabled or unverifiable Jellyfin account cannot be a migration destination.',
+              );
+            const historyOnly = Boolean(
               target &&
               (target.Id === template.Id ||
                 target.Id === settings.template_user_id ||
-                target.Policy?.IsAdministrator)
-            )
-              throw new ServiceError(
-                'A migration cannot target your template user or a Jellyfin administrator.',
-              );
-            if (target?.Policy?.IsDisabled)
-              throw new ServiceError(
-                'A disabled Jellyfin account cannot be a migration destination.',
-              );
+                target.Policy?.IsAdministrator === true),
+            );
+            if (target && historyOnly) {
+              if (typeof target.Policy?.IsAdministrator !== 'boolean')
+                throw new ServiceError('The destination account protection could not be verified.');
+              if (!destinationServerId) {
+                const info = await jellyfin.systemInfo();
+                checkCanceled();
+                if (typeof info.Id !== 'string' || !info.Id)
+                  throw new ServiceError('The Jellyfin server identity could not be verified.');
+                destinationServerId = info.Id;
+              }
+              historyOnlyTargets[sourceId] = {
+                target_user_id: target.Id,
+                target_username: target.Name,
+                server_id: destinationServerId,
+                administrator: target.Policy.IsAdministrator,
+                template: target.Id === settings.template_user_id || target.Id === template.Id,
+                template_user_id: settings.template_user_id,
+              };
+            }
             // Approval validates identity and pins a suitable generation. It never starts a
             // catalog crawl, decrypts history, or reads playlists on either server.
             let snapshot: SnapshotMetadata | undefined;
@@ -906,6 +942,7 @@ export class Service {
               username,
               target_user_id: target?.Id ?? null,
               target_exists: Boolean(target),
+              ...(historyOnly ? { history_only: true } : {}),
               history_deferred: true,
               stats: null,
               unmatched: [],
@@ -919,6 +956,11 @@ export class Service {
                   ? 'Saved history is available. Preview checks account identity and backup freshness only. Exact watched-status counts and matching details are deferred until approval; results report unmatched and ambiguous items. Approval uses this backup generation and a shared Jellyfin matching catalog.'
                   : 'Live preview checks account identity only. Played flags and matching details are read after approval; results report unmatched and ambiguous items. Shared matching catalogs are reused during the job, so library changes after collection require another migration.',
                 ...(snapshot ? snapshotHistoryWarnings(snapshot.diagnostics) : []),
+                ...(historyOnly
+                  ? [
+                      'History only: this existing protected account receives additive played flags. Password, permissions, roles, ownership and Discord delivery are preserved.',
+                    ]
+                  : []),
                 ...(!target && template.accountRole
                   ? [
                       'The new account’s role may limit library access; final matches are checked using that account.',
@@ -933,6 +975,9 @@ export class Service {
             users,
             mode: 'merge',
             migration_scope: scope,
+            ...(Object.keys(historyOnlyTargets).length
+              ? { history_only_targets: historyOnlyTargets }
+              : {}),
             ...(options.use_snapshots ? { source_snapshot_ids: snapshotIds } : {}),
           };
         } catch (error) {
@@ -1619,6 +1664,7 @@ export class Service {
     requestedScope?: MigrationScope,
     sourceSnapshotIds?: Record<string, string>,
     previewTiming?: Job['preview_timing'],
+    historyOnlyTargets?: Record<string, ReviewedHistoryTarget>,
   ): Promise<Job> {
     const requestedAt = now();
     const scope = migrationScope(requestedScope);
@@ -1654,6 +1700,11 @@ export class Service {
           await this.sourceSnapshots.select(id, settings, info.Id, sourceSnapshotIds[id]);
       });
     }
+    if (
+      historyOnlyTargets &&
+      Object.keys(historyOnlyTargets).some((id) => !sourceUserIds.includes(id))
+    )
+      throw new ServiceError('History-only targets must belong to selected source users.');
     const recipientSlots = new Set<string>();
     const requests = sourceUserIds.map((id): JobRequest => {
       const mapping = this.mappings.getForSource(id, settings);
@@ -1662,6 +1713,11 @@ export class Service {
           'The user mapping changed after preview. Review a new preview before migrating.',
         );
       const recipient = Object.hasOwn(discordRecipients, id) ? discordRecipients[id] : undefined;
+      const historyOnly = historyOnlyTargets?.[id];
+      if (historyOnly && recipient)
+        throw new ServiceError(
+          'History-only migration cannot send credentials or change Discord ownership.',
+        );
       const slot = mapping?.membership_slot ?? 1;
       const member = recipient ? this.memberships.get(recipient, settings) : null;
       if (recipient) {
@@ -1685,6 +1741,7 @@ export class Service {
         );
       return {
         migration_scope: scope,
+        ...(historyOnly ? { history_only_target: structuredClone(historyOnly) } : {}),
         ...(sourceSnapshotIds ? { source_snapshot_id: sourceSnapshotIds[id] } : {}),
         source_user_id: id,
         discord_user_id: recipient,
@@ -1965,7 +2022,11 @@ export class Service {
       const role = this.roles.get(settings.default_role_id, settings);
       if (!role)
         throw new ServiceError('The default account role is unavailable. Review Settings.');
-      requests = requests.map((request) => ({ ...request, default_role_revision: role.revision }));
+      requests = requests.map((request) =>
+        request.history_only_target
+          ? request
+          : { ...request, default_role_revision: role.revision },
+      );
     }
     this.store.saveQueuedJob(job, requests, settings);
     this.schedule(job, requests, settings);
@@ -2406,6 +2467,9 @@ export class Service {
     const scope = migrationScope(request.migration_scope);
     let source: SourceSnapshot | null = null;
     let savedMetadata: SnapshotMetadata | undefined;
+    // Register only warnings produced at explicitly informational callsites. Any
+    // other warning remains operationally uncertain, including future additions.
+    const informationalWarnings = new Set<string>();
     let mapping = this.requestMapping(request, settings);
     let destinationId: string | null = null;
     let username: string;
@@ -2420,7 +2484,7 @@ export class Service {
       this.checkJobStopped(job);
       this.assertConnections(settings);
       this.assertMembershipRequest(request, settings);
-      this.assertDefaultRole(template, request, settings);
+      if (!request.history_only_target) this.assertDefaultRole(template, request, settings);
       this.assertMapping(mapping, request.source_user_id, settings);
       this.assertDestinationMapping(mapping, destinationId, username, settings);
     };
@@ -2499,7 +2563,9 @@ export class Service {
               ),
               this.jobControllers.get(job.id)?.signal,
             );
-            source.warnings.push(...snapshotHistoryWarnings(selected.metadata.diagnostics));
+            const historyWarnings = snapshotHistoryWarnings(selected.metadata.diagnostics);
+            historyWarnings.forEach((warning) => informationalWarnings.add(warning));
+            source.warnings.push(...historyWarnings);
             return source;
           },
           this.jobControllers.get(job.id)?.signal,
@@ -2542,10 +2608,43 @@ export class Service {
       username,
       settings,
       request.recover_target_id,
+      Boolean(request.history_only_target),
     );
     destinationId = currentTarget?.Id ?? null;
     guard();
     const recipient = request.discord_user_id;
+    const historyOnly = request.history_only_target;
+    if (historyOnly && (!source || recipient || request.recover_target_id || request.role_id))
+      throw new ServiceError('History-only migration cannot create, recover or manage accounts.');
+    const validateHistoryTarget = async () => {
+      if (!historyOnly) return;
+      if (!historyOnly.administrator && !historyOnly.template)
+        throw new ServiceError(
+          'The reviewed history-only account is not protected. Prepare a new review.',
+        );
+      guard();
+      const info = await jellyfin.systemInfo();
+      guard();
+      const live = await jellyfin.user(historyOnly.target_user_id);
+      guard();
+      if (
+        info.Id !== historyOnly.server_id ||
+        live.Id !== historyOnly.target_user_id ||
+        live.Id !== currentTarget?.Id ||
+        live.Name !== historyOnly.target_username ||
+        live.Name !== username ||
+        typeof live.Policy?.IsAdministrator !== 'boolean' ||
+        live.Policy.IsAdministrator !== historyOnly.administrator ||
+        live.Policy.IsDisabled !== false ||
+        this.store.settings().template_user_id !== historyOnly.template_user_id ||
+        (live.Id === this.store.settings().template_user_id || live.Id === template.Id) !==
+          historyOnly.template
+      )
+        throw new ServiceError(
+          'The reviewed history-only destination changed. Applied played flags are preserved; prepare a new review.',
+        );
+    };
+    if (historyOnly) await validateHistoryTarget();
     if (recipient) {
       const slot = request.membership_slot ?? mapping?.membership_slot ?? 1;
       const identity = await this.recipientIdentity(recipient),
@@ -2593,6 +2692,7 @@ export class Service {
     const result: JobResult = {
       timing,
       username,
+      ...(historyOnly ? { history_only: true } : {}),
       ...(source ? { source_username: source.user.Name } : {}),
       ...(source?.catalog ? { source_catalog: source.catalog } : {}),
       ...(savedMetadata ? { source_snapshot: savedMetadata } : {}),
@@ -2614,16 +2714,18 @@ export class Service {
     job.results.push(result);
     this.save(job);
     try {
-      const [target, created, password] = await this.provision(
-        jellyfin,
-        settings,
-        template,
-        username,
-        Boolean(request.source_user_id),
-        request.recover_target_id,
-        mapping,
-        guard,
-      );
+      const [target, created, password] = historyOnly
+        ? ([currentTarget!, false, null] as const)
+        : await this.provision(
+            jellyfin,
+            settings,
+            template,
+            username,
+            Boolean(request.source_user_id),
+            request.recover_target_id,
+            mapping,
+            guard,
+          );
       Object.assign(result, { created, target_user_id: target.Id });
       destinationId = target.Id;
       const publicUrl = settings.jellyfin_public_url || settings.jellyfin_url;
@@ -2633,16 +2735,17 @@ export class Service {
         this.store.saveAccount(username, target.Id, 'ready');
       }
       guard();
-      if (mapping && !mapping.target_user_id)
+      if (!historyOnly && mapping && !mapping.target_user_id)
         mapping = this.mappings.bindTarget(mapping.id, mapping.revision, target.Id, settings);
       // Recheck the stable identity and protection flags after provisioning, before personal data.
-      const liveTarget = await jellyfin.user(target.Id);
+      const liveTarget = historyOnly ? currentTarget! : await jellyfin.user(target.Id);
       if (
         liveTarget.Id !== target.Id ||
         liveTarget.Name !== username ||
-        liveTarget.Id === template.Id ||
-        liveTarget.Id === settings.template_user_id ||
-        liveTarget.Policy?.IsAdministrator ||
+        (!historyOnly &&
+          (liveTarget.Id === template.Id ||
+            liveTarget.Id === settings.template_user_id ||
+            liveTarget.Policy?.IsAdministrator)) ||
         liveTarget.Policy?.IsDisabled
       )
         throw new ServiceError(
@@ -2787,8 +2890,12 @@ export class Service {
           if (!retainDiagnostic(detail)) break;
           result.unmatched_items.push(detail);
         }
+        const informationalWarning = (details: MigrationDetails, message: string) => {
+          informationalWarnings.add(message);
+          migrationWarning(details, message);
+        };
         if (diagnosticBudgetLimited)
-          migrationWarning(
+          informationalWarning(
             result.data,
             'Result diagnostic details are limited to 1 MiB per account. Full counts are shown; migration checks every item.',
           );
@@ -2797,7 +2904,7 @@ export class Service {
           plan.ambiguous.length > 200 ||
           plan.ambiguous.some((entry) => entry.candidates.length > 20)
         )
-          migrationWarning(
+          informationalWarning(
             result.data,
             'Result details are limited to 200 unmatched items, 200 ambiguous items, and 20 candidates per item. Full counts are shown; migration checks every item.',
           );
@@ -2827,6 +2934,23 @@ export class Service {
             lastCheckpoint = performance.now();
           }
         };
+        let remainingGuardedWrites = 0;
+        let checkingHistoryTarget: Promise<void> | undefined;
+        const beforeHistoryWrite = async () => {
+          if (!historyOnly) return;
+          if (remainingGuardedWrites <= 0) {
+            checkingHistoryTarget ??= validateHistoryTarget()
+              .then(() => {
+                remainingGuardedWrites = 100;
+              })
+              .finally(() => {
+                checkingHistoryTarget = undefined;
+              });
+            await checkingHistoryTarget;
+          }
+          guard();
+          remainingGuardedWrites--;
+        };
         try {
           result.applied = await migrateItemState(
             jellyfin,
@@ -2837,6 +2961,7 @@ export class Service {
             () => {},
             {
               migration_scope: scope,
+              ...(historyOnly ? { before_write: beforeHistoryWrite } : {}),
               expectation: (target, patch, unsupported) => {
                 const expected = captureExpectation(target, patch, scope);
                 expected.unsupported_fields = [
@@ -2896,6 +3021,7 @@ export class Service {
               candidates.push(parent);
             }
           }
+          if (historyOnly) await validateHistoryTarget();
           const observed = new Map(
             (await jellyfin.destinationItems!(target.Id, candidates)).map((item) => [
               item.Id,
@@ -2903,6 +3029,7 @@ export class Service {
             ]),
           );
           guard();
+          if (historyOnly) await validateHistoryTarget();
           for (const item of candidates) {
             if (
               item.SeriesProviderIds &&
@@ -2972,6 +3099,30 @@ export class Service {
             'Discord delivery failed. Credentials remain available for one-time reveal for 24 hours.';
         }
       else if (recipient) result.discord_delivery = 'skipped_existing_account';
+      if (source && result.data) {
+        const verification = result.data.verification;
+        const writes = result.data.write_metrics;
+        result.migration_outcome = {
+          version: 1,
+          execution:
+            !result.error &&
+            !result.delivery_error &&
+            !result.warnings?.length &&
+            !result.data.failed_items &&
+            !result.data.warnings.some((warning) => !informationalWarnings.has(warning)) &&
+            writes &&
+            writes.failed === 0 &&
+            writes.attempts === writes.succeeded &&
+            verification &&
+            verification.checked === verification.verified + verification.preserved_newer &&
+            !verification.missing &&
+            !verification.mismatched &&
+            !verification.unsupported_fields
+              ? 'verified'
+              : 'needs_review',
+          unresolved_source_history: savedMetadata?.diagnostics?.orphan_state_items ?? 0,
+        };
+      }
       result.status =
         result.unmatched ||
         result.ambiguous ||
@@ -2984,6 +3135,12 @@ export class Service {
     } catch (error) {
       if (error instanceof StoppedError) throw error;
       result.status = 'failed';
+      if (source && result.data)
+        result.migration_outcome = {
+          version: 1,
+          execution: 'needs_review',
+          unresolved_source_history: savedMetadata?.diagnostics?.orphan_state_items ?? 0,
+        };
       result.error =
         error instanceof MediaError || error instanceof ServiceError
           ? error.message

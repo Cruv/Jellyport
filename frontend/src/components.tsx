@@ -1,3 +1,4 @@
+import { jobOutcome } from './migration-outcome';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { WorkspaceNotice, useWorkspaceNoticeModal } from './workspace-notices';
 import {
@@ -330,7 +331,7 @@ export function JobsTable({
                 </small>
               </td>
               <td data-label="Status">
-                <Status value={job.status} />
+                <Status {...jobOutcome(job)} />
               </td>
               {!compact && (
                 <td data-label="Users">

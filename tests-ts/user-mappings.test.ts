@@ -510,9 +510,9 @@ describe('administrator mapping routes', () => {
     });
     expect(rename.statusCode).toBe(400);
   });
-  it('protects administrators, disabled targets, unknown policy and the template account', async () => {
+  it('rejects disabled targets and unknown account policy', async () => {
     const { app, headers } = await apiFixture();
-    for (const target_user_id of ['template', 'administrator', 'disabled', 'unknown-policy']) {
+    for (const target_user_id of ['disabled', 'unknown-policy']) {
       const response = await app.inject({
         method: 'POST',
         url: '/api/user-mappings',
@@ -524,6 +524,53 @@ describe('administrator mapping routes', () => {
     }
     expect((await app.inject({ url: '/api/user-mappings', headers })).json().mappings).toEqual([]);
   });
+  it.each(['administrator', 'template'])(
+    'maps an enabled %s only for history without assigning Discord ownership',
+    async (targetId) => {
+      const { app, headers, servers, bot } = await apiFixture();
+      const before = structuredClone(servers.users.jellyfin);
+      const saved = await app.inject({
+        method: 'POST',
+        url: '/api/user-mappings',
+        headers,
+        payload: { source_user_id: 'e-alex', target_user_id: targetId },
+      });
+      expect(saved.statusCode).toBe(200);
+      expect(saved.json()).toMatchObject({
+        target_user_id: targetId,
+        discord_user_id: null,
+        discord_username: null,
+        membership_slot: 1,
+      });
+      for (const fields of [
+        { discord_user_id: '123456789' },
+        { discord_username: 'owner-label' },
+        { membership_slot: 2 },
+      ]) {
+        const blocked = await app.inject({
+          method: 'POST',
+          url: '/api/user-mappings',
+          headers,
+          payload: {
+            id: saved.json().id,
+            source_user_id: 'e-alex',
+            target_user_id: targetId,
+            ...fields,
+          },
+        });
+        expect(blocked.statusCode).toBe(400);
+        expect(blocked.json().detail).toContain('watch history only');
+      }
+      expect(servers.users.jellyfin).toEqual(before);
+      expect(bot.recipientIdentity).not.toHaveBeenCalled();
+      expect(bot.sendCredentials).not.toHaveBeenCalled();
+      expect(app.jellyport.store.links()).toEqual([]);
+      expect(app.jellyport.store.jobs()).toEqual([]);
+      expect((await app.inject({ url: '/api/user-mappings', headers })).json().mappings).toEqual([
+        saved.json(),
+      ]);
+    },
+  );
   it('verifies stable Discord IDs without requiring an active subscription and sends no messages', async () => {
     const { app, headers, bot } = await apiFixture();
     const response = await app.inject({

@@ -62,6 +62,27 @@ remain sensitive and must not be mounted in the web container. Validation used
 private copies and fake destination clients; no production API writes or
 deployments were performed, and no real backup data enters fixtures or commits.
 
+## Protected-account played-history migration — 0.24.0
+
+A session-owned, authenticated and CSRF-protected migration review can authorize
+additive played flags on an existing enabled administrator or template account.
+Only the server-retained review supplies its exact user ID/name, server identity
+and protection flags; client-provided pins are rejected. Workers bypass all
+provisioning, credentials, permissions, roles, ownership links and Discord delivery
+for this path. Disabled or unverified targets remain ineligible. Renames, replaced
+accounts, server/protection changes and settings changes stop work when observed.
+Checks are coalesced every 100 mutation permits and around history reads/writes;
+no-op matches do not trigger per-item policy requests. Upstream account changes
+cannot be locked atomically, so accepted or in-flight played flags can remain after
+a concurrent change. Existing account-management protections remain in force.
+
+Reports retain machine-readable partial states for compatibility. A separate
+versioned execution proof classifies only warnings from explicitly informational
+callsites; message-text heuristics are not used. A 95% identifiable-source coverage
+threshold cannot override write or readback failures, unknown warnings, interrupted
+work or old records without authoritative evidence. Unidentified history rows
+remain visible outside that percentage.
+
 ## Native Jellyfin backup retention — 0.23.0
 
 Native archive cleanup is a separate, opt-in helper capability. Enabling it requires

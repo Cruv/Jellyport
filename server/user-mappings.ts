@@ -350,12 +350,8 @@ export class UserMappings {
   }
 }
 
-function eligibleTarget(target: MediaUser, templateId: string): boolean {
-  return (
-    target.Id !== templateId &&
-    target.Policy?.IsAdministrator === false &&
-    target.Policy?.IsDisabled === false
-  );
+function eligibleTarget(target: MediaUser): boolean {
+  return typeof target.Policy?.IsAdministrator === 'boolean' && target.Policy.IsDisabled === false;
 }
 function assertCurrentSettings(store: Store, settings: Settings): void {
   const current = store.settings();
@@ -387,16 +383,19 @@ export function registerUserMappingRoutes(app: JellyportApp): void {
           throw new ServiceError('Emby returned a different user. Reload the user list.');
         let targetId: string | null = input.target_user_id ?? null;
         let targetName: string;
+        let historyOnly = false;
         if (targetId) {
           const target = await jellyfin.user(targetId);
-          if (target.Id !== targetId || !eligibleTarget(target, settings.template_user_id))
+          if (target.Id !== targetId || !eligibleTarget(target))
             throw new ServiceError(
-              'Choose an enabled Jellyfin user other than an administrator or your template.',
+              'Choose an enabled Jellyfin user with verified account permissions.',
             );
           if (input.target_username !== undefined && input.target_username !== target.Name)
             throw new ServiceError(
               'Selecting an existing Jellyfin account preserves its current username.',
             );
+          historyOnly =
+            target.Id === settings.template_user_id || target.Policy?.IsAdministrator === true;
           targetName = target.Name;
           validateExistingMappingUsername(targetName);
         } else {
@@ -407,6 +406,13 @@ export function registerUserMappingRoutes(app: JellyportApp): void {
               'That Jellyfin username already exists. Select its existing account explicitly.',
             );
         }
+        if (
+          historyOnly &&
+          (input.discord_user_id || input.discord_username || (input.membership_slot ?? 1) !== 1)
+        )
+          throw new ServiceError(
+            'Administrator and template mappings are for watch history only. Discord ownership and membership slots cannot be assigned.',
+          );
         const discordId = input.discord_user_id ?? null;
         let discordName = input.discord_username ?? null;
         if (discordId) {

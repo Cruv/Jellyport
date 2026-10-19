@@ -4,6 +4,7 @@ import { useClientLayout, useVisualViewport } from './client-layout';
 import { navigateWorkspace, useWorkspaceRoute, workspaceRouteHash } from './routing';
 import { WorkspaceDraftProvider } from './workspace-drafts';
 import { WorkspaceNotice, WorkspaceNoticeProvider } from './workspace-notices';
+import { jobOutcome, resultOutcome, MigrationCoverage } from './migration-outcome';
 import {
   DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
   renderCredentialMessage,
@@ -807,9 +808,11 @@ export default function App() {
     const recipients: Record<string, string> = {};
     const mappingRevisions: Record<string, string | null> = {};
     dialog.preview.users.forEach((user) => {
-      const value = String(
-        values.get(user.source_user_id) || values.get(`manual-${user.source_user_id}`) || '',
-      ).trim();
+      const value = user.history_only
+        ? ''
+        : String(
+            values.get(user.source_user_id) || values.get(`manual-${user.source_user_id}`) || '',
+          ).trim();
       if (value) recipients[user.source_user_id] = value;
       if (user.mapping_revision !== undefined)
         mappingRevisions[user.source_user_id] = user.mapping_revision;
@@ -1642,9 +1645,20 @@ function DialogContent({
               <div className="preview-user-header">
                 <UserCell name={user.username} />
                 <span className={`status ${user.target_exists ? '' : 'good'}`}>
-                  {user.target_exists ? 'Merge into existing account' : 'Create new account'}
+                  {user.history_only
+                    ? 'Watch history only'
+                    : user.target_exists
+                      ? 'Merge into existing account'
+                      : 'Create new account'}
                 </span>
               </div>
+              {user.history_only && (
+                <Callout icon="shield" title="Protected account · watch history only">
+                  Add played flags to this existing administrator or template account. Its password,
+                  permissions, Home settings, and Discord ownership stay unchanged.
+                  <p className="text-small">Jellyfin account ID: {user.target_user_id}</p>
+                </Callout>
+              )}
               {user.mapping_id && (
                 <p className="subtle text-small">
                   Mapped Emby account: {user.source_username} → Jellyfin: {user.username}
@@ -1711,11 +1725,13 @@ function DialogContent({
                     The existing Jellyfin password and account permissions will be preserved.
                   </p>
                 )}
-                <MigrationRecipient
-                  key={`${user.source_user_id}:${user.mapping_revision || ''}`}
-                  user={user}
-                  api={api}
-                />
+                {!user.history_only && (
+                  <MigrationRecipient
+                    key={`${user.source_user_id}:${user.mapping_revision || ''}`}
+                    user={user}
+                    api={api}
+                  />
+                )}
               </div>
             </section>
           ))}
@@ -1753,7 +1769,7 @@ function DialogContent({
         }
         description={
           job.migration_scope === 'watched_only'
-            ? 'Played-status migration. Follow account changes and review delivery results.'
+            ? 'Played-status migration. Review matching coverage and verified transfers.'
             : 'Follow account changes and review delivery results.'
         }
         close={close}
@@ -1794,7 +1810,7 @@ function DialogContent({
               Started {date(job.started_at || job.created_at)}
             </p>
           </div>
-          <Status value={job.status} />
+          <Status {...jobOutcome(job)} />
         </div>
         {historicalMigration && (
           <Callout icon="info" title="Historical migration">
@@ -1803,7 +1819,7 @@ function DialogContent({
           </Callout>
         )}
         <JobProgressDetails job={job} />
-        {['failed', 'partial', 'interrupted'].includes(job.status) && (
+        {jobOutcome(job).needsReview && (
           <Callout warning title="Review this operation before retrying.">
             Inspect the recorded errors and verification below. A new request may repeat changes
             that already reached the server.
@@ -1883,8 +1899,18 @@ function DialogContent({
           <section className="job-result" key={index}>
             <div className="job-result-header">
               <h3>{result.username || 'User'}</h3>
-              <Status value={result.status} />
+              <Status
+                {...(migrationJob
+                  ? resultOutcome(result, job.migration_scope)
+                  : { value: result.status })}
+              />
             </div>
+            {result.history_only && (
+              <p className="subtle text-small">
+                Watch history only · existing protected account. No password, permissions, account
+                preferences, or Discord ownership changes were requested.
+              </p>
+            )}
             {result.source_username && result.source_username !== result.username && (
               <p className="subtle text-small">
                 Emby: {result.source_username} → Jellyfin: {result.username}
@@ -1936,6 +1962,7 @@ function DialogContent({
                   .join(', ') || 'none'}
               </p>
             )}
+            {migrationJob && !activeJob(job) && <MigrationCoverage result={result} />}
             <div className="job-meta">
               {result.created && (
                 <span>
@@ -2036,7 +2063,14 @@ function DialogContent({
               </p>
             )}
             {result.data?.warnings.map((warning, index) => (
-              <div className="error-block" key={index}>
+              <div
+                className={
+                  resultOutcome(result, job.migration_scope).label === 'Succeeded with warnings'
+                    ? 'warning-block'
+                    : 'error-block'
+                }
+                key={index}
+              >
                 {warning}
               </div>
             ))}
@@ -2071,12 +2105,14 @@ function DialogContent({
         {!job.results?.length && !activeJob(job) && !job.error && (
           <p className="muted text-small mt-18">This operation has no per-user results.</p>
         )}
-        {!activeJob(job) && job.kind !== 'role_update' && (
-          <div className="support-note">
-            New account passwords can be revealed once. Existing account passwords are preserved. If
-            Discord delivery failed, reveal and copy the new credentials for manual delivery.
-          </div>
-        )}
+        {!activeJob(job) &&
+          job.kind !== 'role_update' &&
+          !job.results?.every((result) => result.history_only) && (
+            <div className="support-note">
+              New account passwords can be revealed once. Existing account passwords are preserved.
+              If Discord delivery failed, reveal and copy the new credentials for manual delivery.
+            </div>
+          )}
       </Modal>
     );
   }

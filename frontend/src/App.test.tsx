@@ -54,6 +54,52 @@ const emptyPlayedDetails: MigrationDetails = {
   history_dates_missing: 0,
   warnings: [],
 };
+function verifiedWarningMigration(): Job {
+  return {
+    ...job,
+    kind: 'migrate',
+    status: 'partial',
+    migration_scope: 'watched_only',
+    results: [
+      {
+        username: 'verified-history-user',
+        status: 'partial',
+        matched: 2978,
+        unmatched: 1,
+        ambiguous: 12,
+        applied: 37,
+        already_played: 2939,
+        discord_delivery: 'not_requested',
+        migration_outcome: {
+          version: 1,
+          execution: 'verified',
+          unresolved_source_history: 545,
+        },
+        data: {
+          ...emptyPlayedDetails,
+          items_updated: 37,
+          warnings: ['Synthetic source-history diagnostic.'],
+          write_metrics: {
+            attempts: 37,
+            succeeded: 37,
+            failed: 0,
+            cumulative_ms: 100,
+            max_ms: 10,
+            peak_in_flight: 3,
+          },
+          verification: {
+            checked: 2976,
+            verified: 2976,
+            preserved_newer: 0,
+            missing: 0,
+            mismatched: 0,
+            unsupported_fields: 0,
+          },
+        },
+      },
+    ],
+  };
+}
 const overview = {
   counts: { emby_users: 1, jellyfin_users: 1, jobs: 1 },
   connections: {
@@ -2582,6 +2628,120 @@ describe('React account safeguards', () => {
       mapping_revisions: { complex: 'approved-revision' },
     });
   });
+  it.each([
+    ['administrator', 'protected-administrator', true],
+    ['template', 'template', false],
+  ] as const)(
+    'reviews %s history-only migration and sends only server-review approval, ignoring injected recipient and target pins',
+    async (_kind, targetId, administrator) => {
+      const sourceId = 'source-protected';
+      const username = 'protected-history-user';
+      const sourceUser = {
+        Id: sourceId,
+        Name: username,
+        Policy: { IsAdministrator: administrator, IsDisabled: false },
+      };
+      const targetUser = {
+        Id: targetId,
+        Name: username,
+        Policy: { IsAdministrator: administrator, IsDisabled: false },
+      };
+      const originalUsers = { emby: [sourceUser], jellyfin: [targetUser] };
+      const before = structuredClone(originalUsers);
+      responses['/api/users'] = originalUsers;
+      responses['/api/migrations/preview'] = {
+        id: 'protected-history-review',
+        status: 'ready',
+        progress: { processed: 1, total: 1 },
+        preview: {
+          migration_scope: 'watched_only',
+          history_only_targets: {
+            [sourceId]: {
+              target_user_id: targetId,
+              target_username: username,
+              server_id: 'synthetic-jellyfin',
+            },
+          },
+          users: [
+            {
+              source_user_id: sourceId,
+              username,
+              target_exists: true,
+              target_user_id: targetId,
+              history_only: true,
+              stats: null,
+              history_deferred: true,
+            },
+          ],
+        },
+      };
+      responses['/api/migrations'] = {
+        ...job,
+        kind: 'migrate',
+        migration_scope: 'watched_only',
+        results: [
+          {
+            username,
+            status: 'completed',
+            history_only: true,
+            created: false,
+            discord_delivery: 'not_requested',
+          },
+        ],
+      };
+      render(<App />);
+      fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+      fireEvent.click(await screen.findByRole('checkbox', { name: `Select ${username}` }));
+      fireEvent.click(screen.getByRole('button', { name: 'Preview migration (1)' }));
+      const dialog = await screen.findByRole('dialog');
+      expect(within(dialog).getByText('Watch history only')).toBeTruthy();
+      expect(within(dialog).getByText('Protected account · watch history only')).toBeTruthy();
+      expect(within(dialog).getByText(`Jellyfin account ID: ${targetId}`)).toBeTruthy();
+      expect(within(dialog).queryByLabelText('Discord recipient (optional)')).toBeNull();
+      expect(within(dialog).queryByText('Create new account')).toBeNull();
+      const form = dialog.querySelector<HTMLFormElement>('#migration-preview-form')!;
+      for (const [name, value] of [
+        [sourceId, '123456789012345678'],
+        [
+          'history_only_targets',
+          JSON.stringify({ [sourceId]: { target_user_id: 'injected-other-account' } }),
+        ],
+      ]) {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = name;
+        input.value = value;
+        form.append(input);
+      }
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
+      await waitFor(() =>
+        expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
+      );
+      const accepted = requests.find((request) => request.path === '/api/migrations')!;
+      expect(JSON.parse(String(accepted.options?.body))).toEqual({
+        source_user_ids: [sourceId],
+        preview_id: 'protected-history-review',
+        migration_scope: 'watched_only',
+        discord_recipients: {},
+      });
+      expect(
+        requests
+          .filter((request) => request.options?.method && request.options.method !== 'GET')
+          .map((request) => request.path),
+      ).toEqual(['/api/migrations/preview', '/api/migrations']);
+      await screen.findByRole('heading', { name: 'Migration details' });
+      const report = screen.getByRole('dialog');
+      expect(
+        within(report).getByText(/Watch history only · existing protected account/),
+      ).toBeTruthy();
+      expect(within(report).queryByRole('button', { name: 'Reveal new credentials' })).toBeNull();
+      expect(within(report).queryByText(/New account passwords can be revealed once/)).toBeNull();
+      expect(originalUsers).toEqual(before);
+      expect(localStorage.length).toBe(0);
+      expect(sessionStorage.length).toBe(0);
+    },
+  );
+
   it('cancels queued jobs, updates their displayed status and keeps completed-change guidance explicit', async () => {
     responses['/api/jobs/job-1'] = { ...job, status: 'queued', results: [] };
     responses['/api/jobs/job-1/cancel'] = { ...job, status: 'canceled', results: [] };
@@ -2675,6 +2835,7 @@ describe('React account safeguards', () => {
       };
       const dialog = await openJob();
       expect(within(dialog).getByText('Historical migration')).toBeTruthy();
+      expect(within(dialog).getByText('Review this operation before retrying.')).toBeTruthy();
       expect(within(dialog).getByText('4 items updated')).toBeTruthy();
       expect(within(dialog).getByText('2 favorites')).toBeTruthy();
       expect(within(dialog).getByText('1 resume positions')).toBeTruthy();
@@ -2736,6 +2897,82 @@ describe('React account safeguards', () => {
     expect(within(dialog).queryByText(/resume positions/)).toBeNull();
     expect(within(dialog).queryByText(/favorites/)).toBeNull();
   });
+  it('separates verified execution from matching coverage and unresolved source history in the report', async () => {
+    const completed = verifiedWarningMigration();
+    const before = structuredClone(completed);
+    responses['/api/jobs/job-1'] = completed;
+    const dialog = await openJob();
+    const labels = within(dialog).getAllByText('Succeeded with warnings');
+    expect(labels).toHaveLength(2);
+    expect(labels.every((label) => label.className === 'status warn')).toBe(true);
+    const coverage = within(dialog).getByRole('region', { name: 'Matching coverage' });
+    expect(within(coverage).getByText('99.6% matched')).toBeTruthy();
+    expect(coverage.textContent).toContain('2,978 of 2,991 identifiable source items');
+    expect(coverage.textContent).toContain(
+      '545 saved-history rows have no verified media identity',
+    );
+    expect(coverage.textContent).toContain('not migrated or assumed obsolete');
+    expect(within(dialog).getByText(/37 attempted · 37 succeeded · 0 failed/)).toBeTruthy();
+    expect(
+      within(dialog).getByText(/Independent played-status verification: 2,976 verified/),
+    ).toBeTruthy();
+    expect(within(dialog).queryByText('Needs review')).toBeNull();
+    expect(within(dialog).queryByText('Review this operation before retrying.')).toBeNull();
+    expect(within(dialog).getByText('Synthetic source-history diagnostic.').className).toBe(
+      'warning-block',
+    );
+    expect(completed).toEqual(before);
+    expect(
+      requests.filter((request) => request.options?.method && request.options.method !== 'GET'),
+    ).toEqual([]);
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
+
+  it('filters successful migrations with warnings separately from legacy review and failed activity without changing reports', async () => {
+    const successful = verifiedWarningMigration();
+    const legacy = structuredClone(successful);
+    legacy.id = 'legacy-history-job';
+    legacy.results![0]!.username = 'legacy-review-user';
+    delete legacy.results![0]!.migration_outcome;
+    const failed = structuredClone(successful);
+    failed.id = 'failed-history-job';
+    failed.status = 'failed';
+    failed.results![0]!.status = 'failed';
+    failed.results![0]!.username = 'failed-history-user';
+    failed.results![0]!.error = 'Synthetic migration failure.';
+    const jobs = [successful, legacy, failed];
+    const before = structuredClone(jobs);
+    responses['/api/jobs'] = { jobs };
+    responses['/api/overview'] = { ...overview, recent_jobs: jobs };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    const table = screen.getByRole('table');
+    const filter = screen.getByRole('combobox', { name: 'Status' });
+    fireEvent.change(filter, { target: { value: 'succeeded_with_warnings' } });
+    expect(within(table).getAllByRole('row')).toHaveLength(2);
+    expect(within(table).getByText('verified-history-user')).toBeTruthy();
+    expect(within(table).getByText('Succeeded with warnings')).toBeTruthy();
+    expect(within(table).queryByText('legacy-review-user')).toBeNull();
+    expect(within(table).queryByText('failed-history-user')).toBeNull();
+    fireEvent.change(filter, { target: { value: 'partial' } });
+    expect(within(table).getAllByRole('row')).toHaveLength(2);
+    expect(within(table).getByText('legacy-review-user')).toBeTruthy();
+    expect(within(table).getByText('Needs review')).toBeTruthy();
+    expect(within(table).queryByText('verified-history-user')).toBeNull();
+    fireEvent.change(filter, { target: { value: 'failed' } });
+    expect(within(table).getAllByRole('row')).toHaveLength(2);
+    expect(within(table).getByText('failed-history-user')).toBeTruthy();
+    expect(within(table).getByText('Failed')).toBeTruthy();
+    expect(jobs).toEqual(before);
+    expect(
+      requests.filter((request) => request.options?.method && request.options.method !== 'GET'),
+    ).toEqual([]);
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
+
   it('reports request workload and escaped failed played updates without implying complete success', async () => {
     responses['/api/jobs/job-1'] = {
       ...job,
@@ -2776,6 +3013,7 @@ describe('React account safeguards', () => {
     };
     const dialog = await openJob();
     expect(within(dialog).getAllByText('Needs review')).toHaveLength(2);
+    expect(within(dialog).getByText('Review this operation before retrying.')).toBeTruthy();
     expect(within(dialog).getByText('12 failed updates')).toBeTruthy();
     expect(
       within(dialog).getByText(

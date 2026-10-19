@@ -83,6 +83,18 @@ per user. Direct API calls and older jobs without a linked review explicitly lac
 that combined timing. Use **Refresh review** after expiration; changing the selected
 users, mappings or saved generations requires a matching current review.
 
+From 0.24.0, reports separate matching coverage from execution outcome. Coverage is
+`matched / (matched + unmatched + ambiguous)` over identifiable source items;
+multiple source editions may map to one Jellyfin item. Unidentified backup-history
+rows are reported separately and are not counted as migrated or assumed deleted.
+At least 95% coverage plus confirmed successful writes and independent readback
+can display **Succeeded with warnings** for known source/matching diagnostics.
+Low coverage, failed writes/readback, uncertain operations and unclassified warnings
+retain **Needs review** or **Failed**. Activity includes a separate successful-warning
+filter. Raw persisted statuses stay compatible; old partial reports without the
+new structured execution evidence remain **Needs review**, with their coverage
+shown where matching counts are available.
+
 Each user's saved migration result includes at most 200 unmatched items and 200 ambiguous items, with at most 20 candidate matches per ambiguous item. Summary statistics count all eligible matching work. Previews return deferred statistics rather than zero counts and empty matching-detail lists until execution. These bounds limit browser-response size and persisted diagnostics; migration matching and its result counts still cover all eligible items. A completed preview larger than 8 MiB is rejected with a request to select fewer users.
 
 From 0.16.5, ambiguity details identify the media type, movie title or show name,
@@ -171,6 +183,8 @@ If a generic **502 Bad Gateway** appears before history matching can be reviewed
 
 Both live and saved-snapshot reviews defer catalog matching, so a long review suggests connection, account-validation or snapshot-metadata trouble rather than an expected library crawl. Wait for progress or cancel an unwanted review. A review timeout, restart, sign-out or configuration change requires a new preview; the review causes no media-account writes. The approved job's cold destination catalog can still take time; inspect aggregate preparation logs for page counts and latency. A source-read cooldown stops approved work and requires review rather than automatic resumption. Do not repeatedly start reviews or migrations during the cooldown.
 
-If the destination is your selected legacy template user, Jellyport rejects it before scanning history. The template is a source of permissions and preferences, and cannot also be a migration destination. Select a different destination account. If you need that account's settings without retaining it as a protected template, copy its supported settings into an **Account role**, choose that role as the default, and remove the legacy template selection before reviewing an otherwise eligible destination. Existing-account migrations retain their permissions and preferences; apply a role separately when you intend to change them.
+From 0.24.0, an existing enabled Jellyfin administrator or selected template can receive a **Watch history only** migration. Select its Emby account, prepare the review and confirm the displayed Jellyfin username and account ID before starting. Differently named accounts can use a manual mapping without Discord ownership or membership slots. The server pins the reviewed destination identity, server and protection state; a direct unreviewed migration cannot opt into this exception. This path only adds played flags and verifies them. It bypasses account provisioning, password changes, role settings, Discord linking and credential delivery. Administrator/template restrictions on recovery, access changes and role application still apply.
+
+A changed or disabled destination requires a new review. Protected-account checks run before history work, before writes, after every 100 write permits and around readback; concurrent workers share each check. Already-played items do not cause one account-policy request per item. The upstream API has no atomic account lock: a concurrent external change can happen after a check, and already accepted or in-flight played updates remain applied. No account permissions or credentials are changed by these updates.
 
 Earlier primary API research on **2026-10-08** included Jellyfin 10.8.13, 10.9.0, 10.10.7, 10.11.10 and 12.2. The current migration scope is played flags only; older broad-state capabilities are historical. Fixture and local performance evidence, with their dates and limitations, are recorded in [workload safety](performance-safety.md).

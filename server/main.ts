@@ -1118,6 +1118,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           'watched_only',
           request.body.source_snapshot_ids,
           previewTiming,
+          reviewed?.preview?.history_only_targets,
         );
         // The duration is now copied into the durable job; release session-owned review data.
         if (reviewed) previews.cancel(request.cookies[COOKIE]!, reviewed.id);

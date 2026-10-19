@@ -127,7 +127,7 @@ describe('account migration and subscription safety', () => {
   }
 
   it.each(['template', 'administrator', 'disabled'])(
-    'rejects a %s destination before scanning catalogs or playlists',
+    'checks a %s destination before scanning catalogs or playlists',
     async (protection) => {
       if (protection === 'template') servers.users.emby[0]!.Name = 'Member template';
       else {
@@ -146,7 +146,9 @@ describe('account migration and subscription safety', () => {
         client.playlists = reads;
         return client;
       };
-      await expect(service.preview(['e-alex'])).rejects.toThrow(protection);
+      if (protection === 'disabled')
+        await expect(service.preview(['e-alex'])).rejects.toThrow('disabled');
+      else expect((await service.preview(['e-alex'])).users[0]?.history_only).toBe(true);
       expect(reads).not.toHaveBeenCalled();
     },
   );
@@ -1450,13 +1452,79 @@ describe('account migration and subscription safety', () => {
     expect(servers.users.jellyfin).toEqual(before);
     expect(store.link('123456789')).toBeNull();
   });
-  it('protects template and administrator destinations in preview and migration', async () => {
+  it('classifies verified transfer separately from informational saved-history warnings', async () => {
+    savedPreview();
+    const select = vi.mocked(service.sourceSnapshots.select).getMockImplementation()!;
+    vi.mocked(service.sourceSnapshots.select).mockImplementation(async (...args) => {
+      const selected = await select(...args);
+      selected.metadata.diagnostics = {
+        unsupported_state_items: 0,
+        invalid_resume_positions: 0,
+        invalid_display_names: 0,
+        orphan_state_items: 545,
+      };
+      return selected;
+    });
+    const preview = await service.preview(['e-river'], { use_snapshots: true });
+    const job = await finish(
+      await service.migrateUsers(
+        ['e-river'],
+        {},
+        undefined,
+        'watched_only',
+        preview.source_snapshot_ids,
+      ),
+    );
+    expect(job.status).toBe('partial');
+    expect(job.results[0]).toMatchObject({
+      migration_outcome: { version: 1, execution: 'verified', unresolved_source_history: 545 },
+      data: { verification: { missing: 0, mismatched: 0 } },
+    });
+    expect(job.results[0]?.data?.warnings).toHaveLength(1);
+  });
+  it.each(['failed write', 'failed readback', 'unverified capabilities'])(
+    'never labels a migration operationally verified after %s',
+    async (failure) => {
+      const factory = service.clientFactory;
+      let reads = 0;
+      service.clientFactory = (...args) => {
+        const client = factory(...args);
+        if (args[2] === 'jellyfin') {
+          if (failure === 'failed write')
+            client.updateUserData = async () => {
+              throw new MediaError('Fixture rejected update.');
+            };
+          if (failure === 'unverified capabilities')
+            client.migrationCapabilities = async () => {
+              throw new MediaError('Fixture capability failure.');
+            };
+          if (failure === 'failed readback') {
+            const destinationItems = client.destinationItems!.bind(client);
+            client.destinationItems = async (...values) => {
+              const items = await destinationItems(...values);
+              if (++reads === 2) throw new MediaError('Fixture failed independent readback.');
+              return items;
+            };
+          }
+        }
+        return client;
+      };
+      const job = await finish(await service.migrateUsers(['e-river']));
+      expect(job.status).toBe('partial');
+      expect(job.results[0]?.migration_outcome).toEqual({
+        version: 1,
+        execution: 'needs_review',
+        unresolved_source_history: 0,
+      });
+    },
+  );
+  it('requires reviewed history-only targets for template and administrator migrations', async () => {
     servers.users.emby[0]!.Name = 'Member template';
-    await expect(service.preview(['e-alex'])).rejects.toThrow('template');
+    expect((await service.preview(['e-alex'])).users[0]?.history_only).toBe(true);
     expect((await finish(await service.migrateUsers(['e-alex']))).status).toBe('failed');
     servers.users.emby[0]!.Name = 'river';
     servers.users.jellyfin[1]!.Policy!.IsAdministrator = true;
-    await expect(service.preview(['e-alex'])).rejects.toThrow('administrator');
+    expect((await service.preview(['e-alex'])).users[0]?.history_only).toBe(true);
     expect((await finish(await service.migrateUsers(['e-alex']))).status).toBe('failed');
   });
   it('never uses template watch history as a new account baseline', async () => {

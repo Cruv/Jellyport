@@ -62,6 +62,27 @@ remain sensitive and must not be mounted in the web container. Validation used
 private copies and fake destination clients; no production API writes or
 deployments were performed, and no real backup data enters fixtures or commits.
 
+## Native Jellyfin backup retention — 0.23.0
+
+Native archive cleanup is a separate, opt-in helper capability. Enabling it requires
+`JELLYPORT_JELLYFIN_BACKUP_CLEANUP=true` and write permission only on the helper's
+Jellyfin backup-directory mount. Emby backup mounts remain read-only; raw archives
+and helper work directories remain inaccessible to the web container. A compromised
+helper with this capability can damage files in its writable backup directory, so
+do not grant access to the whole Jellyfin configuration directory.
+
+The administrator configures retention through an authenticated, CSRF-protected,
+revision-checked endpoint. The default is disabled with seven backups to retain.
+Only directly confirmed Jellyport creation responses establish durable ownership;
+an imported archive must then pass validation before becoming eligible for deletion.
+Existing, manually created and uncertain archives are not retroactively claimed.
+Cleanup follows a successful import and uses authenticated exact-file requests,
+archive fingerprints, bounded manifest validation and isolated file checks before
+deletion. Changed or uncertain files are preserved. Cleanup status is separate from
+import status; failure does not discard a validated matching catalog. These checks
+do not protect against a compromised host, helper or administrator session, and
+deletion does not guarantee forensic erasure or remove external backup copies.
+
 ## Findings addressed
 
 | Area | Finding | Change |

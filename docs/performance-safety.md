@@ -232,8 +232,11 @@ procedure](jellyfin-backup-catalog.md).
 Projection and matching indexes stay on disk: at most two million supported items,
 8 GiB projected database, 8 MiB SQLite page cache per connection. Per-account
 candidate limits remain 200,000 items / 64 MiB, and source history remains bounded
-separately. Limits reject work rather than truncate it. Import and candidate workers
-have five-minute deadlines; cancellation kills and reaps the worker. Decryption is
+separately. Limits reject work rather than truncate it. Since 0.23.0, the offline
+Jellyfin catalog import worker has a thirty-minute deadline; per-account candidate
+workers keep their five-minute limit. Import-request admission expires after five
+minutes and recovery allows thirty-six minutes from the request, including
+finalization. Cancellation kills and reaps the worker. Decryption is
 shared per generation with bounded idle retention, not repeated per account.
 The supported streaming tokenizer groups at most 256 unpacked tokens before each
 stream handoff, with bounded backpressure and sequential row consumption. It does
@@ -271,6 +274,9 @@ administrator reading the ready review is excluded. Under two minutes is the tar
 two to five minutes is a partial performance success, not the highest-success result.
 Timing success does not turn unmatched items or failed verification into a complete
 migration. Backup-only matching benchmarks cannot establish this acceptance measure.
+Nightly shared backup creation and offline catalog preprocessing are reported
+separately; they are not subject to the per-user five-minute performance target.
+The offline worker watchdog is a safety bound, not that acceptance threshold.
 
 Job elapsed time covers the server migration request, including preflight validation,
 queue admission, final verification and completion. That timer alone excludes review
@@ -659,8 +665,10 @@ Jellyfin's optional create-before-import schedule uses the native server backup
 API before the offline catalog import. This step performs live database work,
 including optimization, and cannot be described as an offline-only workload.
 It is opt-in, skips active library scans, serializes with other imports and never
-repeats an uncertain creation POST automatically. The helper mount remains
-read-only. See [creation, recovery and retention](jellyfin-backup-catalog.md#create-a-fresh-jellyfin-backup-before-nightly-import)
+repeats an uncertain creation POST automatically. Its helper mount is read-only
+unless the separate scoped backup-cleanup permission is enabled; optional cleanup
+keeps seven positively identified Jellyport-created backups by default and
+preserves manual/untracked archives. See [creation, recovery and retention](jellyfin-backup-catalog.md#create-a-fresh-jellyfin-backup-before-nightly-import)
 for the separate observation deadline and operational limitations.
 
 Saved Jellyfin imports additionally report validated stage labels, aggregate

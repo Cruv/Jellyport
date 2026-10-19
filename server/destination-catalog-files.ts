@@ -5,7 +5,16 @@ import { validJellyfinBackupName } from './jellyfin-backup-api.js';
 
 export const DESTINATION_BACKUP_SERVER_VERSION = '12.2.0.0';
 export const DESTINATION_CATALOG_MAX_AGE = 48 * 60 * 60_000;
-export const DESTINATION_CATALOG_DEADLINE = 5 * 60_000;
+// Offline ZIP/index preparation is separate from the user migration performance target.
+export const DESTINATION_CATALOG_DEADLINE = 30 * 60_000;
+export const DESTINATION_CATALOG_REQUEST_MAX_AGE = 5 * 60_000;
+export const DESTINATION_CATALOG_RECOVERY_GRACE = 60_000;
+// A helper may claim a request at the end of its admission window. Do not release
+// its lease while that worker can still be running or finalizing its result.
+export const DESTINATION_CATALOG_RECOVERY_DEADLINE =
+  DESTINATION_CATALOG_REQUEST_MAX_AGE +
+  DESTINATION_CATALOG_DEADLINE +
+  DESTINATION_CATALOG_RECOVERY_GRACE;
 export const DESTINATION_CATALOG_FORMAT = 2;
 export const DESTINATION_CATALOG_STAGES = [
   'validating_backup',
@@ -58,7 +67,7 @@ const failureMessages: Record<DestinationCatalogErrorCode, string> = {
   storage_error:
     'The Jellyfin import could not use its private storage. Check free space and helper folder permissions.',
   timeout:
-    'Jellyfin backup import timed out after its five-minute limit. Check helper resources before trying again.',
+    'Jellyfin backup import exceeded its 30-minute preparation watchdog. Check helper resources before trying again.',
   interrupted:
     'Jellyfin backup import was interrupted. Check the helper, then import the completed backup again.',
   canceled: 'Jellyfin backup import canceled.',

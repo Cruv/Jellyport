@@ -815,6 +815,24 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     },
     async (request) => service.destinationSnapshots.configure(request.body),
   );
+  app.put<{ Body: { enabled: boolean; keep: number; expected_revision: string } }>(
+    '/api/destination-catalog/backup-retention',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['enabled', 'keep', 'expected_revision'],
+          properties: {
+            enabled: { type: 'boolean' },
+            keep: { type: 'integer', minimum: 1, maximum: 100 },
+            expected_revision: { type: 'string', format: 'uuid' },
+          },
+        },
+      },
+    },
+    async (request) => service.destinationSnapshots.configureRetention(request.body),
+  );
   app.post('/api/destination-catalog/refresh', noSnapshotBody, async (_request, reply) =>
     reply.code(202).send(await service.destinationSnapshots.refresh()),
   );

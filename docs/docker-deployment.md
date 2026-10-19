@@ -24,6 +24,22 @@ Use the actual host path in the Compose volume entry. On a NAS shell already run
 
 Jellyport pairs with a pre-created Jellyfin API key; ordinary sign-in uses your Jellyfin administrator account. Enter the key in the web wizard, without adding it or an administrator password to Compose or Portainer's environment variables. Use `TZ=Etc/UTC` or another valid timezone in the container environment; no localtime mount is required.
 
+## Optional Jellyfin backup cleanup — 0.23.0
+
+The [plugin backup example](../examples/compose.plugin-backups.yaml) imports native
+Jellyfin archives through a read-only helper mount by default. To let Jellyport
+remove only backups it created and successfully imported, set
+`JELLYPORT_JELLYFIN_BACKUP_CLEANUP=true` on the helper and change **only** that
+service's `/jellyfin-backups` bind mount to `read_only: false`. The configured
+UID/GID must be able to remove files there. Keep Emby backups read-only, the helper
+root filesystem read-only, and all raw backup mounts out of the web container.
+
+Then enable **Automatic backup cleanup** in **Settings → Saved history → Jellyfin
+catalog** and save the retention count; **7** is recommended (1–100 supported).
+Cleanup follows successful imports, never a settings read/save. Manual and old
+untracked backups remain protected. It requires both the explicit helper flag and
+web setting. See [eligibility, recovery and status](jellyfin-backup-catalog.md#clean-up-jellyport-created-jellyfin-backups).
+
 ## Optional local Emby snapshots — 0.12.0
 
 File-copy capture requires Jellyport **0.13.0 or later on both services**. Older helpers do not recognize `JELLYPORT_SNAPSHOT_METHOD` and continue using Online Backup; setting the variable on an older image does not enable file copying.

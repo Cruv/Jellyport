@@ -112,7 +112,7 @@ export function useImportClock(deadlines: string[], active: boolean) {
   return now;
 }
 
-type ChangeKind = 'import' | 'clear' | 'schedule' | 'backup-acknowledge';
+type ChangeKind = 'import' | 'clear' | 'schedule' | 'backup-acknowledge' | 'backup-retention';
 /** Own one read or mutation at a time; hiding a panel pauses reads, not accepted server work. */
 export function useImportWorkflow<T extends ImportWorkflowStatus>({
   api,
@@ -252,7 +252,7 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
       const value = await api<T>(
         kind === 'clear'
           ? path
-          : `${path}/${kind === 'import' ? 'refresh' : kind === 'backup-acknowledge' ? 'backup/acknowledge' : 'schedule'}`,
+          : `${path}/${kind === 'import' ? 'refresh' : kind === 'backup-acknowledge' ? 'backup/acknowledge' : kind === 'backup-retention' ? 'backup-retention' : 'schedule'}`,
         {
           ...options,
           signal: controller.signal,

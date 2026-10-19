@@ -13,6 +13,18 @@ import {
 } from './media.js';
 import type { Settings } from './types.js';
 import type { PathMapping } from './matching.js';
+import {
+  BACKUP_CLEANUP_DEADLINE,
+  BACKUP_CLEANUP_MAX_FILES,
+  BACKUP_CLEANUP_ERROR,
+  backupCleanupPrefix,
+  sameBackupBinding,
+  validBackupCleanupResult,
+  type OwnedJellyfinBackup,
+  type BackupRetentionConfig,
+  type BackupCleanupRequest,
+  type BackupCleanupResult,
+} from './jellyfin-backup-retention.js';
 import { MediaError, ServiceError } from './errors.js';
 import { validJellyfinBackupName, type JellyfinBackupManifest } from './jellyfin-backup-api.js';
 import {
@@ -27,7 +39,7 @@ import { decryptDatabase, readEnvelope, snapshotKey, writeEnvelope } from './sna
 import {
   DESTINATION_CATALOG_MAX_AGE,
   DESTINATION_BACKUP_SERVER_VERSION,
-  DESTINATION_CATALOG_DEADLINE,
+  DESTINATION_CATALOG_RECOVERY_DEADLINE,
   destinationCatalogMetadata,
   destinationCatalogPrefix,
   normalizedServerVersion,
@@ -79,6 +91,15 @@ interface State {
   last_scheduled_date?: string;
   last_diagnostic?: DestinationCatalogDiagnostic;
   last_error_code?: DestinationCatalogErrorCode | null;
+  backup_retention?: BackupRetentionConfig;
+  owned_backups?: OwnedJellyfinBackup[];
+  backup_cleanup?: {
+    pending?: BackupCleanupRequest;
+    last_run_at: string | null;
+    last_outcome: 'succeeded' | 'failed' | 'interrupted' | null;
+    last_deleted: number;
+    error: string | null;
+  };
 }
 interface DatabaseEntry {
   promise: Promise<string>;
@@ -184,6 +205,8 @@ export class DestinationCatalogs {
   private clearing = false;
   private starting = false;
   private backupSelectionSupported = false;
+  private backupCleanupSupported = false;
+  private cleanupStarting = false;
   private backupClient?: MediaAPI;
   private readonly backupReadClients = new Set<MediaAPI>();
   private backupPollAt = 0;
@@ -222,6 +245,16 @@ export class DestinationCatalogs {
           last_error: null,
         };
     this.imports = options.imports ?? new ImportCoordinator();
+    this.state.backup_retention ??= { enabled: false, keep: 7, revision: randomUUID() };
+    this.state.owned_backups ??= [];
+    this.state.backup_cleanup ??= {
+      last_run_at: null,
+      last_outcome: null,
+      last_deleted: 0,
+      error: null,
+    };
+    if (this.state.backup_cleanup.pending)
+      this.imports.restore(`jellyfin-cleanup:${this.state.backup_cleanup.pending.id}`);
     if (!validDestinationDiagnostic(this.state.last_diagnostic)) delete this.state.last_diagnostic;
     if (!validDestinationErrorCode(this.state.last_error_code)) delete this.state.last_error_code;
     if (this.state.active) this.imports.restore(`jellyfin:${this.state.active.id}`);
@@ -281,6 +314,7 @@ export class DestinationCatalogs {
         version: number;
         jellyfin_catalog_enabled?: boolean;
         jellyfin_backup_selection_enabled?: boolean;
+        jellyfin_backup_cleanup_enabled?: boolean;
         updated_at: string;
       }>(join(this.directory, 'helper.status'), this.key);
       if (
@@ -292,6 +326,7 @@ export class DestinationCatalogs {
       )
         return false;
       this.backupSelectionSupported = value.jellyfin_backup_selection_enabled === true;
+      this.backupCleanupSupported = value.jellyfin_backup_cleanup_enabled === true;
       if (!this.state.configured) {
         this.state.configured = true;
         this.save();
@@ -299,6 +334,7 @@ export class DestinationCatalogs {
       return true;
     } catch {
       this.backupSelectionSupported = false;
+      this.backupCleanupSupported = false;
       return false;
     }
   }
@@ -338,6 +374,16 @@ export class DestinationCatalogs {
     }
     return {
       config: { ...this.state.config, create_backup: this.state.config.create_backup === true },
+      backup_cleanup: {
+        config: { ...this.state.backup_retention! },
+        supported: available && this.backupCleanupSupported,
+        running: this.cleanupStarting || !!this.state.backup_cleanup!.pending,
+        owned_backups: this.state.owned_backups!.length,
+        last_run_at: this.state.backup_cleanup!.last_run_at,
+        last_outcome: this.state.backup_cleanup!.last_outcome,
+        last_deleted: this.state.backup_cleanup!.last_deleted,
+        error: this.state.backup_cleanup!.error,
+      },
       backup_creation: this.state.backup_creation
         ? {
             attempt_id: this.state.backup_creation.id,
@@ -354,6 +400,8 @@ export class DestinationCatalogs {
       running:
         this.starting ||
         !!this.state.active ||
+        this.cleanupStarting ||
+        !!this.state.backup_cleanup!.pending ||
         !!(this.state.backup_creation && this.state.backup_creation.phase !== 'uncertain'),
       record,
       last_attempt_at: this.state.last_attempt_at,
@@ -400,6 +448,200 @@ export class DestinationCatalogs {
     this.save();
     return this.status();
   }
+  async configureRetention(input: { enabled: boolean; keep: number; expected_revision: string }) {
+    if (this.options.demo)
+      throw new ServiceError('Jellyfin backup cleanup changes are unavailable in demo mode.');
+    if (input.expected_revision !== this.state.backup_retention!.revision)
+      throw new ServiceError('The backup cleanup settings changed. Reload them before saving.');
+    if (
+      typeof input.enabled !== 'boolean' ||
+      !Number.isInteger(input.keep) ||
+      input.keep < 1 ||
+      input.keep > 100
+    )
+      throw new ServiceError(
+        'Choose whether cleanup is enabled and retain between 1 and 100 backups.',
+      );
+    if (
+      this.stopping ||
+      this.clearing ||
+      this.starting ||
+      this.cleanupStarting ||
+      this.state.active ||
+      this.state.backup_creation ||
+      this.state.backup_cleanup!.pending
+    )
+      throw new ServiceError(
+        'Wait for the Jellyfin backup operation to finish before changing cleanup.',
+      );
+    this.state.backup_retention = {
+      enabled: input.enabled,
+      keep: input.keep,
+      revision: randomUUID(),
+    };
+    this.save();
+    return this.status();
+  }
+  private async queueBackupCleanup(binding: DestinationCatalogRequest['binding']) {
+    const retention = this.state.backup_retention!;
+    if (
+      !retention.enabled ||
+      this.stopping ||
+      this.starting ||
+      this.cleanupStarting ||
+      this.state.backup_creation ||
+      this.state.active ||
+      this.state.backup_cleanup!.pending
+    )
+      return;
+    const owned = this.state
+      .owned_backups!.filter((entry) => sameBackupBinding(entry.binding, binding))
+      .sort((a, b) => Date.parse(b.manifest.created_at) - Date.parse(a.manifest.created_at));
+    const protectedDates = new Set(
+      this.state.generations
+        .filter((entry) => sameBinding(entry.binding, binding))
+        .map((entry) => entry.backup_created_at),
+    );
+    if (owned.length <= retention.keep) return;
+    const id = randomUUID(),
+      owner = `jellyfin-cleanup:${id}`;
+    if (!this.imports.acquire(owner)) return;
+    this.cleanupStarting = true;
+    const cleanup = this.state.backup_cleanup!;
+    cleanup.last_run_at = new Date().toISOString();
+    cleanup.last_deleted = 0;
+    try {
+      if (!(await this.helper()) || !this.backupCleanupSupported)
+        throw new Error('Cleanup helper unavailable.');
+      const settings = this.store.settings();
+      const client = this.options.clientFactory()(
+        settings.jellyfin_url,
+        settings.jellyfin_api_key,
+        'jellyfin',
+      );
+      this.backupReadClients.add(client);
+      let present: JellyfinBackupManifest[];
+      try {
+        const info = await client.systemInfo();
+        if (
+          this.stopping ||
+          this.state.active ||
+          this.state.backup_creation ||
+          connectionHash(settings) !== connectionHash(this.store.settings()) ||
+          !sameBackupBinding(binding, {
+            url: settings.jellyfin_url,
+            server_id: String(info.Id),
+            version: String(info.Version),
+          })
+        )
+          throw new Error('Cleanup server changed.');
+        if (!client.jellyfinBackups) throw new Error('Backup listing unavailable.');
+        // This bounded native manifest listing is positive presence evidence, not
+        // a catalog scan. An unavailable listing never prunes ownership records.
+        present = await client.jellyfinBackups();
+      } finally {
+        this.backupReadClients.delete(client);
+        await client.close();
+      }
+      if (
+        this.stopping ||
+        connectionHash(settings) !== connectionHash(this.store.settings()) ||
+        this.state.backup_retention!.revision !== retention.revision ||
+        this.state.active ||
+        this.state.backup_creation
+      )
+        throw new Error('Cleanup settings changed.');
+      const byName = new Map(present.map((entry) => [entry.name, entry]));
+      this.state.owned_backups = this.state.owned_backups!.filter(
+        (entry) => !sameBackupBinding(entry.binding, binding) || byName.has(entry.manifest.name),
+      );
+      const unchanged = owned.filter((entry) => {
+        const current = byName.get(entry.manifest.name);
+        return (
+          !!current &&
+          current.created_at === entry.manifest.created_at &&
+          normalizedServerVersion(current.server_version) ===
+            normalizedServerVersion(entry.manifest.server_version) &&
+          current.backup_engine_version === entry.manifest.backup_engine_version &&
+          current.database === entry.manifest.database &&
+          current.metadata === entry.manifest.metadata &&
+          current.trickplay === entry.manifest.trickplay &&
+          current.subtitles === entry.manifest.subtitles
+        );
+      });
+      const candidates = unchanged
+        .slice(retention.keep)
+        .filter((entry) => entry.fingerprint && !protectedDates.has(entry.manifest.created_at))
+        .slice(0, BACKUP_CLEANUP_MAX_FILES);
+      if (!candidates.length) {
+        cleanup.last_outcome = 'succeeded';
+        cleanup.error = null;
+        this.save();
+        return;
+      }
+      const request: BackupCleanupRequest = {
+        purpose: 'jellyfin_backup_cleanup',
+        id,
+        requested_at: new Date().toISOString(),
+        binding: { ...binding },
+        backups: candidates.map((entry) => ({
+          manifest: { ...entry.manifest },
+          fingerprint: entry.fingerprint!,
+        })),
+      };
+      cleanup.pending = request;
+      cleanup.last_outcome = null;
+      cleanup.error = null;
+      // Durable exact deletion intent precedes publication. A restart only checks this result.
+      this.save();
+      await writeEnvelope(
+        join(this.directory, `${backupCleanupPrefix(request.id)}.request`),
+        request,
+        this.key!,
+      );
+    } catch {
+      if (!cleanup.pending) cleanup.last_outcome = 'failed';
+      cleanup.error = BACKUP_CLEANUP_ERROR;
+      this.save();
+    } finally {
+      this.cleanupStarting = false;
+      if (!cleanup.pending) this.imports.release(owner);
+    }
+  }
+  private async reconcileBackupCleanup() {
+    const cleanup = this.state.backup_cleanup!,
+      request = cleanup.pending!;
+    let result: BackupCleanupResult | undefined;
+    try {
+      result = await readEnvelope(
+        join(this.directory, `${backupCleanupPrefix(request.id)}.result`),
+        this.key!,
+      );
+    } catch {}
+    if (result && validBackupCleanupResult(result, request)) {
+      this.state.owned_backups = this.state.owned_backups!.filter(
+        (entry) =>
+          !sameBackupBinding(entry.binding, request.binding) ||
+          !result!.removed.includes(entry.manifest.name),
+      );
+      cleanup.last_run_at = result.finished_at;
+      cleanup.last_outcome = result.ok ? 'succeeded' : 'failed';
+      cleanup.last_deleted = result.removed.length;
+      cleanup.error = result.ok ? null : BACKUP_CLEANUP_ERROR;
+    } else if (
+      Date.now() - Date.parse(request.requested_at) >
+      BACKUP_CLEANUP_DEADLINE + 6 * 60_000
+    ) {
+      cleanup.last_run_at = new Date().toISOString();
+      cleanup.last_outcome = 'interrupted';
+      cleanup.error = BACKUP_CLEANUP_ERROR;
+    } else return;
+    delete cleanup.pending;
+    this.imports.release(`jellyfin-cleanup:${request.id}`);
+    this.save();
+    // Retain the authenticated terminal receipt beyond request freshness to reject replays.
+    await rm(join(this.directory, `${backupCleanupPrefix(request.id)}.request`), { force: true });
+  }
   /** Queue pinning is synchronous; execution authenticates the file and live identity again. */
   queuedSelection(settings: Settings): string | undefined {
     if (this.stopping || this.clearing)
@@ -425,7 +667,13 @@ export class DestinationCatalogs {
       throw new ServiceError('The Jellyfin import is changing or stopping. Retry shortly.');
     const id = randomUUID();
     const owner = `jellyfin:${id}`;
-    if (this.state.active || this.state.backup_creation || !this.imports.acquire(owner))
+    if (
+      this.cleanupStarting ||
+      this.state.active ||
+      this.state.backup_creation ||
+      this.state.backup_cleanup!.pending ||
+      !this.imports.acquire(owner)
+    )
       throw new ServiceError(
         'A backup import or capture is already running. Wait for it to finish.',
       );
@@ -616,6 +864,19 @@ export class DestinationCatalogs {
         return;
       }
       backup.completed = completed;
+      if (
+        !this.state.owned_backups!.some(
+          (entry) =>
+            entry.manifest.name === completed.name &&
+            sameBackupBinding(entry.binding, backup.binding),
+        )
+      ) {
+        this.state.owned_backups!.push({
+          attempt_id: backup.id,
+          binding: { ...backup.binding },
+          manifest: { ...completed },
+        });
+      }
       backup.phase = 'waiting';
       this.backupPollAt = 0;
       this.save();
@@ -720,7 +981,7 @@ export class DestinationCatalogs {
         expected_backup: { name: value.name, created_at: value.created_at },
       };
       // Persist the transition before publishing. Restarts resume checking this
-      // request, not the native mutation. Import gets its own five-minute window.
+      // request, not the native mutation. Offline import has its own worker watchdog.
       this.state.active = request;
       delete this.state.backup_creation;
       this.state.last_error = null;
@@ -939,6 +1200,10 @@ export class DestinationCatalogs {
     this.ticking = true;
     try {
       await this.helper();
+      if (this.state.backup_cleanup!.pending) {
+        await this.reconcileBackupCleanup();
+        return;
+      }
       if (this.state.backup_creation) {
         if (Date.now() >= this.backupPollAt) {
           const backup = this.state.backup_creation;
@@ -1034,6 +1299,15 @@ export class DestinationCatalogs {
               ? 'interrupted'
               : 'failed'
             : 'succeeded';
+          if (this.state.last_outcome === 'succeeded' && active.expected_backup) {
+            const owned = this.state.owned_backups!.find(
+              (entry) =>
+                entry.attempt_id === active.id &&
+                entry.manifest.name === active.expected_backup!.name &&
+                sameBackupBinding(entry.binding, active.binding),
+            );
+            if (owned) owned.fingerprint = value.backup_fingerprint;
+          }
           delete this.state.active;
           this.imports.release(`jellyfin:${active.id}`);
           this.save();
@@ -1041,9 +1315,10 @@ export class DestinationCatalogs {
             force: true,
           });
           if (!adopted) await this.generationFiles(active.id);
+          if (this.state.last_outcome === 'succeeded') await this.queueBackupCleanup(value.binding);
         } else if (
           Date.now() - Date.parse(active.requested_at) >
-          DESTINATION_CATALOG_DEADLINE + 60_000
+          DESTINATION_CATALOG_RECOVERY_DEADLINE
         ) {
           delete this.state.active;
           this.imports.release(`jellyfin:${active.id}`);
@@ -1123,6 +1398,17 @@ export class DestinationCatalogs {
     this.save();
     if (this.state.active) keep.add(this.state.active.id);
     for (const name of await readdir(this.directory)) {
+      if (/^jellyfin-cleanup-[a-f0-9-]{36}\.result$/.test(name)) {
+        const path = join(this.directory, name),
+          info = await lstat(path);
+        if (
+          info.isFile() &&
+          !info.isSymbolicLink() &&
+          Date.now() - info.mtimeMs >= 24 * 60 * 60_000
+        )
+          await rm(path);
+        continue;
+      }
       const match = /^jellyfin-([a-f0-9-]{36})\.(?:request|result|progress|db\.enc)$/.exec(name);
       if (!match || keep.has(match[1]!)) continue;
       const path = join(this.directory, name),
@@ -1138,6 +1424,8 @@ export class DestinationCatalogs {
       this.options.demo ||
       this.state.active ||
       this.state.backup_creation ||
+      this.cleanupStarting ||
+      this.state.backup_cleanup!.pending ||
       this.pins().size ||
       [...this.databases.values()].some((value) => value.users)
     )

@@ -1,6 +1,7 @@
 import { useLayoutEffect, useState } from 'react';
 import { Callout, Icon, Modal } from './components';
 import DailyImportSchedule from './DailyImportSchedule';
+import JellyfinBackupRetention from './JellyfinBackupRetention';
 import {
   ImportStatus,
   importDuration,
@@ -34,6 +35,8 @@ export default function DestinationCatalogPanel({
       statusError: 'Jellyfin catalog status could not be loaded. Refresh status to try again.',
     });
   const record = status?.record;
+  // Cleanup holds the shared work slot, but it is not another catalog import.
+  const importStatus = status?.backup_cleanup?.running ? { ...status, running: false } : status;
   const preparation = status?.backup_creation;
   const preparing = preparation?.phase === 'creating' || preparation?.phase === 'waiting';
   const backupUncertain = preparation?.phase === 'uncertain';
@@ -105,6 +108,11 @@ export default function DestinationCatalogPanel({
             history updates and verification also use the live server. No saved Jellyfin user
             history is imported.
           </p>
+          <p className="muted text-small">
+            This shared offline import has a 30-minute worker safety limit. The per-user migration
+            performance target remains under two minutes, or under five minutes for partial
+            performance success; backup creation and catalog preprocessing are measured separately.
+          </p>
         </details>
         <Callout icon="info" title="Original backup time controls expiry.">
           Import a completed database backup from the linked Jellyfin server. Importing it again
@@ -126,7 +134,7 @@ export default function DestinationCatalogPanel({
         )}
         {status?.configured && !status.available && (
           <Callout warning title="Jellyfin backup import helper is unavailable.">
-            Check that the helper is running with its read-only Jellyfin backup bind mount, then
+            Check that the helper is running with its Jellyfin backup-folder bind mount, then
             refresh status. An existing, unexpired matching catalog can still be used.
           </Callout>
         )}
@@ -164,7 +172,7 @@ export default function DestinationCatalogPanel({
           </Callout>
         )}
         <ImportStatus
-          status={status}
+          status={importStatus}
           importDiagnostic={preparation ? null : status?.diagnostic}
           importErrorCode={preparation ? null : status?.error_code}
           showAttemptDuration
@@ -263,6 +271,31 @@ export default function DestinationCatalogPanel({
                 'The schedule could not be saved. Your changes are kept; refresh status to verify the saved schedule before retrying.',
               );
               return value?.config;
+            }}
+          />
+        )}
+        {status?.backup_cleanup && (
+          <JellyfinBackupRetention
+            status={status.backup_cleanup}
+            busy={busy === 'backup-retention'}
+            disabled={
+              demo ||
+              !active ||
+              !!busy ||
+              loading ||
+              stale ||
+              uncertain ||
+              status.running ||
+              !!preparation
+            }
+            onSave={async (input) => {
+              const value = await change(
+                'backup-retention',
+                { method: 'PUT', body: input },
+                'Jellyfin backup cleanup settings saved.',
+                '',
+              );
+              return value?.backup_cleanup?.config;
             }}
           />
         )}

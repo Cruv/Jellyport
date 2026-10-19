@@ -5,6 +5,7 @@ import { snapshotProcess } from './snapshot-process.js';
 import { encryptDatabase, readEnvelope, writeEnvelope, snapshotId } from './snapshot-files.js';
 import {
   DESTINATION_CATALOG_DEADLINE,
+  DESTINATION_CATALOG_REQUEST_MAX_AGE,
   DESTINATION_CATALOG_FORMAT,
   destinationCatalogPrefix,
   validDestinationRequest,
@@ -48,7 +49,7 @@ export async function processDestinationCatalogRequest(
     if (
       !validDestinationRequest(request) ||
       request.id !== id ||
-      Math.abs(Date.now() - Date.parse(request.requested_at)) > DESTINATION_CATALOG_DEADLINE
+      Math.abs(Date.now() - Date.parse(request.requested_at)) > DESTINATION_CATALOG_REQUEST_MAX_AGE
     )
       throw new Error('Invalid catalog request.');
     await rename(path, join(exchange, `${prefix}.working`));

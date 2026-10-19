@@ -31,13 +31,14 @@ async function setup(demo = false) {
     signOut: async () => {},
     validateApiKey: async () => ({ serverId: identity.serverId, apiKeyName: 'fixture-key' }),
   };
-  const app = await createApp({
+  let app = await createApp({
     dataDir: directory,
     demo,
     demoPassword: 'fixture-password',
     authClient,
   });
-  resources.push({ app, directory });
+  const resource = { app, directory };
+  resources.push(resource);
   if (!demo) {
     const state = app.jellyport.store.authState();
     if (state?.kind !== 'pending') throw new Error('Expected pending fixture setup.');
@@ -56,25 +57,40 @@ async function setup(demo = false) {
       }),
     );
   }
-  const anonymous = await app.inject('/api/session');
-  const response = await app.inject({
-    method: 'POST',
-    url: '/api/login',
-    headers: {
-      cookie: `${anonymous.cookies[0].name}=${anonymous.cookies[0].value}`,
-      'x-csrf-token': anonymous.json().csrf_token,
-    },
-    payload: { username: 'admin', password: 'fixture-password' },
-  });
-  expect(response.statusCode).toBe(200);
-  return {
-    app,
-    headers: {
+  async function signIn() {
+    const anonymous = await app.inject('/api/session');
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/login',
+      headers: {
+        cookie: `${anonymous.cookies[0].name}=${anonymous.cookies[0].value}`,
+        'x-csrf-token': anonymous.json().csrf_token,
+      },
+      payload: { username: 'admin', password: 'fixture-password' },
+    });
+    expect(response.statusCode).toBe(200);
+    return {
       cookie: `${response.cookies[0].name}=${response.cookies[0].value}`,
       'x-csrf-token': response.json().csrf_token as string,
-    },
+    };
+  }
+  const headers = await signIn();
+  return {
+    app,
+    headers,
     revoke: () => {
       authorized = false;
+    },
+    restart: async () => {
+      await app.close();
+      app = await createApp({
+        dataDir: directory,
+        demo,
+        demoPassword: 'fixture-password',
+        authClient,
+      });
+      resource.app = app;
+      return { app, headers: await signIn() };
     },
   };
 }
@@ -494,6 +510,153 @@ it('saves only the strictly typed Jellyfin schedule with current administrator a
   revoke();
   expect((await app.inject({ ...request, headers })).statusCode).toBe(401);
   expect(configure).not.toHaveBeenCalled();
+});
+
+it('requires current administrator access and CSRF before changing Jellyfin backup retention', async () => {
+  const { app, headers, revoke } = await setup();
+  const manager = app.jellyport.service.destinationSnapshots;
+  const before = await manager.status();
+  const configure = vi.spyOn(manager, 'configureRetention');
+  const request = {
+    method: 'PUT' as const,
+    url: '/api/destination-catalog/backup-retention',
+    payload: {
+      enabled: true,
+      keep: 7,
+      expected_revision: before.backup_cleanup.config.revision,
+    },
+  };
+  expect((await app.inject(request)).statusCode).toBe(401);
+  expect((await app.inject({ ...request, headers: { cookie: headers.cookie } })).statusCode).toBe(
+    403,
+  );
+  expect(
+    (await app.inject({ ...request, headers: { ...headers, origin: 'https://attacker.example' } }))
+      .statusCode,
+  ).toBe(403);
+  expect(configure).not.toHaveBeenCalled();
+  expect((await manager.status()).backup_cleanup.config).toEqual(before.backup_cleanup.config);
+  revoke();
+  expect((await app.inject({ ...request, headers })).statusCode).toBe(401);
+  expect(configure).not.toHaveBeenCalled();
+  expect((await manager.status()).backup_cleanup.config).toEqual(before.backup_cleanup.config);
+});
+
+it('rejects malformed retention policies before mutation without reflecting submitted secrets', async () => {
+  const { app, headers } = await setup();
+  const manager = app.jellyport.service.destinationSnapshots;
+  const before = await manager.status();
+  const configure = vi.spyOn(manager, 'configureRetention');
+  const input = {
+    enabled: true,
+    keep: 7,
+    expected_revision: before.backup_cleanup.config.revision,
+  };
+  const request = {
+    method: 'PUT' as const,
+    url: '/api/destination-catalog/backup-retention',
+    headers,
+  };
+  for (const override of [
+    { enabled: 'true' },
+    { enabled: 1 },
+    { enabled: null },
+    { keep: 0 },
+    { keep: -1 },
+    { keep: 101 },
+    { keep: 1.5 },
+    { keep: '7' },
+    { keep: null },
+    { expected_revision: '' },
+    { expected_revision: 'not-a-uuid' },
+    { expected_revision: null },
+    { expected_revision: 1 },
+    { directory: '/synthetic-private-backup-path' },
+    { api_key: 'synthetic-private-submitted-secret' },
+  ]) {
+    const rejected = await app.inject({ ...request, payload: { ...input, ...override } });
+    expect(rejected.statusCode).toBe(422);
+    expect(rejected.body).not.toMatch(
+      /synthetic-private-backup-path|synthetic-private-submitted-secret/,
+    );
+  }
+  for (const omitted of Object.keys(input)) {
+    const missing: Record<string, unknown> = { ...input };
+    delete missing[omitted];
+    expect((await app.inject({ ...request, payload: missing })).statusCode).toBe(422);
+  }
+  expect((await app.inject({ ...request, payload: [] })).statusCode).toBe(422);
+  expect(configure).not.toHaveBeenCalled();
+  expect((await manager.status()).backup_cleanup.config).toEqual(before.backup_cleanup.config);
+});
+
+it('persists revision-guarded retention changes across restart and never exposes backup paths or credentials', async () => {
+  const { app, headers, restart } = await setup();
+  const initial = await app.inject({ url: '/api/destination-catalog', headers });
+  expect(initial.statusCode).toBe(200);
+  expect(initial.json().backup_cleanup.config).toMatchObject({ enabled: false, keep: 7 });
+  const revision = initial.json().backup_cleanup.config.revision as string;
+  const input = { enabled: true, keep: 1, expected_revision: revision };
+  const request = {
+    method: 'PUT' as const,
+    url: '/api/destination-catalog/backup-retention',
+    headers,
+  };
+  const saved = await app.inject({ ...request, payload: input });
+  expect(saved.statusCode).toBe(200);
+  expect(saved.headers['cache-control']).toBe('no-store');
+  expect(saved.json().backup_cleanup.config).toMatchObject({ enabled: true, keep: 1 });
+  expect(saved.json().backup_cleanup.config.revision).not.toBe(revision);
+  const configuration = saved.json().backup_cleanup.config;
+  const restarted = await restart();
+  const restored = await restarted.app.inject({
+    url: '/api/destination-catalog',
+    headers: restarted.headers,
+  });
+  expect(restored.statusCode).toBe(200);
+  expect(restored.json().backup_cleanup.config).toEqual(configuration);
+  const stale = await restarted.app.inject({
+    ...request,
+    headers: restarted.headers,
+    payload: { enabled: false, keep: 100, expected_revision: revision },
+  });
+  expect(stale.statusCode).toBe(400);
+  expect(
+    (
+      await restarted.app.inject({ url: '/api/destination-catalog', headers: restarted.headers })
+    ).json().backup_cleanup.config,
+  ).toEqual(configuration);
+  const changed = await restarted.app.inject({
+    ...request,
+    headers: restarted.headers,
+    payload: { enabled: false, keep: 100, expected_revision: configuration.revision },
+  });
+  expect(changed.statusCode).toBe(200);
+  expect(changed.json().backup_cleanup.config).toMatchObject({ enabled: false, keep: 100 });
+  expect(changed.json().backup_cleanup.config.revision).not.toBe(configuration.revision);
+  for (const response of [initial, saved, restored, stale, changed])
+    expect(response.body).not.toMatch(
+      /private-service-key|private-interactive-token|fixture-password|jellyport-snapshot-api-|\.zip|\/synthetic-private/,
+    );
+});
+
+it('keeps backup retention readable in demo mode while refusing policy changes', async () => {
+  const { app, headers } = await setup(true);
+  const state = (await app.inject({ url: '/api/destination-catalog', headers })).json();
+  const response = await app.inject({
+    method: 'PUT',
+    url: '/api/destination-catalog/backup-retention',
+    headers,
+    payload: {
+      enabled: true,
+      keep: 7,
+      expected_revision: state.backup_cleanup.config.revision,
+    },
+  });
+  expect(response.statusCode).toBe(400);
+  expect((await app.jellyport.service.destinationSnapshots.status()).backup_cleanup.config).toEqual(
+    state.backup_cleanup.config,
+  );
 });
 
 it('protects backup confirmation with administrator revalidation, CSRF and a strict attempt-bound body', async () => {

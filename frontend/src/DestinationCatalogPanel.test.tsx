@@ -2,7 +2,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import DestinationCatalogPanel, { type DestinationCatalogStatus } from './DestinationCatalogPanel';
-import type { Api, ApiOptions, DestinationCatalogDiagnostic } from './types';
+import type {
+  Api,
+  ApiOptions,
+  DestinationCatalogDiagnostic,
+  JellyfinBackupCleanupStatus,
+} from './types';
 
 const now = Date.parse('2026-01-02T04:00:00Z');
 const backupAttempt = '11111111-1111-4111-8111-111111111111';
@@ -29,6 +34,16 @@ const status: DestinationCatalogStatus = {
   last_error: null,
   last_attempt_at: '2026-01-02T03:59:57Z',
 };
+const backupCleanup: JellyfinBackupCleanupStatus = {
+  config: { enabled: false, keep: 7, revision: 'cleanup-revision-1' },
+  supported: true,
+  running: false,
+  owned_backups: 0,
+  last_run_at: null,
+  last_outcome: null,
+  last_deleted: 0,
+  error: null,
+};
 const deferred = <T,>() => {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
@@ -38,6 +53,126 @@ const deferred = <T,>() => {
   });
   return { promise, resolve, reject };
 };
+
+describe('Independent native Jellyfin backup cleanup controls', () => {
+  it('keeps the finished import outcome and duration stable while separate cleanup holds the work slot', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    const api = vi.fn(
+      async <T,>() =>
+        ({
+          ...status,
+          running: true,
+          diagnostic: {
+            stage: 'indexing',
+            started_at: status.last_attempt_at,
+            updated_at: status.last_finished_at,
+            source_rows: 2,
+            provider_rows: 2,
+            items: 2,
+            keys: 4,
+            bytes: 1024,
+          },
+          backup_cleanup: { ...backupCleanup, running: true },
+        }) as T,
+    ) as Api;
+    render(<DestinationCatalogPanel api={api} notify={vi.fn()} demo={false} />);
+    await act(async () => {});
+    const outcome = () => screen.getByText(/Last outcome:/).textContent;
+    expect(outcome()).toBe('Last outcome: Completed');
+    expect(screen.getByText('Latest attempt duration: 2.0 s')).toBeTruthy();
+    expect(screen.getByText('Cleaning up eligible Jellyfin backups…')).toBeTruthy();
+    expect(screen.queryByText('Importing Jellyfin backup…')).toBeNull();
+    expect(
+      screen.queryByRole('progressbar', { name: 'Jellyfin catalog import progress' }),
+    ).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(20_000));
+    expect(vi.mocked(api).mock.calls.length).toBeGreaterThan(1);
+    expect(outcome()).toBe('Last outcome: Completed');
+    expect(screen.getByText('Latest attempt duration: 2.0 s')).toBeTruthy();
+    expect(screen.queryByText(/Current attempt elapsed/)).toBeNull();
+    expect(screen.queryByText(/No recent progress update/)).toBeNull();
+    for (const name of [
+      'Import latest Jellyfin backup',
+      'Clear matching catalog',
+      'Save backup cleanup',
+    ])
+      expect(screen.getByRole('button', { name })).toHaveProperty('disabled', true);
+  });
+
+  it('saves only cleanup configuration while preserving an unsaved daily schedule and server-confirmed import status', async () => {
+    const calls: Array<{ path: string; options?: ApiOptions }> = [];
+    let latest = { ...status, backup_cleanup: backupCleanup };
+    const api: Api = async <T,>(path: string, options?: ApiOptions) => {
+      calls.push({ path, options });
+      if (path === '/api/destination-catalog/backup-retention' && options?.method === 'PUT')
+        latest = {
+          ...latest,
+          backup_cleanup: {
+            ...backupCleanup,
+            config: { enabled: true, keep: 14, revision: 'cleanup-revision-2' },
+          },
+        };
+      return latest as T;
+    };
+    const notify = vi.fn();
+    render(<DestinationCatalogPanel api={api} notify={notify} demo={false} />);
+    await screen.findByRole('table');
+    fireEvent.change(screen.getByLabelText('Import time'), { target: { value: '04:30' } });
+    fireEvent.click(screen.getByLabelText('Enable automatic Jellyfin backup cleanup'));
+    fireEvent.change(screen.getByLabelText('Jellyport-created backups to keep'), {
+      target: { value: '14' },
+    });
+    fireEvent.submit(screen.getByRole('form', { name: 'Jellyfin backup retention' }));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith('Jellyfin backup cleanup settings saved.'),
+    );
+    expect(calls.filter((call) => call.options?.method)).toEqual([
+      expect.objectContaining({
+        path: '/api/destination-catalog/backup-retention',
+        options: expect.objectContaining({
+          method: 'PUT',
+          body: { enabled: true, keep: 14, expected_revision: 'cleanup-revision-1' },
+        }),
+      }),
+    ]);
+    expect(screen.getByLabelText('Import time')).toHaveProperty('value', '04:30');
+    expect(screen.getByText('Keep the latest 14 Jellyport-created backups')).toBeTruthy();
+    expect(screen.getByText('Unsaved schedule changes.')).toBeTruthy();
+    expect(screen.getByText('Saved matching catalog expired')).toBeTruthy();
+  });
+
+  it('keeps a cleanup save failure separate from the successful import outcome and reconciles before retry', async () => {
+    const notify = vi.fn();
+    const api: Api = async <T,>(_path: string, options?: ApiOptions) => {
+      if (options?.method === 'PUT') throw new Error('PRIVATE_BACKUP_PATH');
+      return { ...status, backup_cleanup: backupCleanup } as T;
+    };
+    render(<DestinationCatalogPanel api={api} notify={notify} demo={false} />);
+    await screen.findByRole('table');
+    fireEvent.click(screen.getByLabelText('Enable automatic Jellyfin backup cleanup'));
+    fireEvent.submit(screen.getByRole('form', { name: 'Jellyfin backup retention' }));
+    await screen.findByText(/Backup cleanup settings could not be saved/);
+    expect(screen.queryByText('PRIVATE_BACKUP_PATH')).toBeNull();
+    expect(screen.queryByText(/Jellyfin backup import could not start/)).toBeNull();
+    expect(screen.getByLabelText('Enable automatic Jellyfin backup cleanup')).toHaveProperty(
+      'checked',
+      true,
+    );
+    expect(notify).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Refresh status' })).toHaveProperty(
+        'disabled',
+        false,
+      ),
+    );
+    expect(screen.getByLabelText('Enable automatic Jellyfin backup cleanup')).toHaveProperty(
+      'checked',
+      true,
+    );
+  });
+});
 
 afterEach(() => {
   cleanup();

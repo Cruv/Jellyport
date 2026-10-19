@@ -577,6 +577,7 @@ export function AccountsPage({
         setRecoveryRecipient(
           String(values.get('discord_user_id') || values.get('discord_manual_id') || '').trim(),
         );
+        notify('Account inspected. Review the recovery details before continuing.');
       }
     } catch (error) {
       if (mounted.current && !controller.signal.aborted)
@@ -821,7 +822,12 @@ export function AccountsPage({
               </div>
               <ManualDiscordId id="recovery-manual-discord" disabled={!!busy || !!recoveryMember} />
               <div className="form-actions">
-                <button className="btn btn-quiet" type="submit" disabled={!!busy}>
+                <button
+                  className="btn btn-quiet"
+                  type="submit"
+                  disabled={!!busy}
+                  aria-busy={busy === 'inspect'}
+                >
                   {busy === 'inspect' ? <span className="spinner" /> : <Icon name="search" />}
                   {busy === 'inspect' ? 'Inspecting…' : 'Inspect account'}
                 </button>

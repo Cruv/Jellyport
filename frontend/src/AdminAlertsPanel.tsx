@@ -24,26 +24,43 @@ export default function AdminAlertsPanel({
   const [status, setStatus] = useState<AdminAlertStatus | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const active = useRef<AbortController | null>(null);
+  const manualRead = useRef<AbortController | null>(null);
   const mounted = useRef(false);
   const stopping = useRef(false);
-  const load = useCallback(async () => {
-    if (stopping.current) return;
-    active.current?.abort();
-    const controller = new AbortController();
-    active.current = controller;
-    try {
-      const value = await api<AdminAlertStatus>('/api/discord/admin-alerts', {
-        signal: controller.signal,
-      });
-      if (!mounted.current || controller.signal.aborted) return;
-      setStatus(value);
-      setError('');
-    } catch {
-      if (mounted.current && !controller.signal.aborted)
-        setError('Admin alert status could not be loaded. Refresh before changing delivery.');
-    }
-  }, [api]);
+  const load = useCallback(
+    async (manual = false) => {
+      if (stopping.current || (!manual && manualRead.current)) return;
+      active.current?.abort();
+      const controller = new AbortController();
+      active.current = controller;
+      if (manual) {
+        manualRead.current = controller;
+        setRefreshing(true);
+      }
+      try {
+        const value = await api<AdminAlertStatus>('/api/discord/admin-alerts', {
+          signal: controller.signal,
+        });
+        if (!mounted.current || controller.signal.aborted) return;
+        setStatus(value);
+        setError('');
+        if (manual) notify('Private admin alert status refreshed.');
+      } catch {
+        if (mounted.current && !controller.signal.aborted) {
+          const detail =
+            'Admin alert status could not be loaded. Refresh before changing delivery.';
+          setError(detail);
+          if (manual) notify(detail, true);
+        }
+      } finally {
+        if (manualRead.current === controller) manualRead.current = null;
+        if (mounted.current && active.current === controller) setRefreshing(false);
+      }
+    },
+    [api, notify],
+  );
   useEffect(() => {
     mounted.current = true;
     void load();
@@ -51,6 +68,7 @@ export default function AdminAlertsPanel({
     return () => {
       mounted.current = false;
       active.current?.abort();
+      manualRead.current = null;
       window.clearInterval(interval);
     };
   }, [load]);
@@ -59,6 +77,8 @@ export default function AdminAlertsPanel({
     if (demo || stopping.current || !status?.revision) return;
     stopping.current = true;
     active.current?.abort();
+    manualRead.current = null;
+    setRefreshing(false);
     const controller = new AbortController();
     active.current = controller;
     setBusy(true);
@@ -73,8 +93,11 @@ export default function AdminAlertsPanel({
       setStatus(value);
       notify('Private admin DMs stopped. Slash-command replies remain private.');
     } catch {
-      if (mounted.current && !controller.signal.aborted)
-        setError('Admin DMs could not be stopped. Refresh the status and try again.');
+      if (mounted.current && !controller.signal.aborted) {
+        const detail = 'Admin DMs could not be stopped. Refresh the status and try again.';
+        setError(detail);
+        notify(detail, true);
+      }
     } finally {
       stopping.current = false;
       if (mounted.current && !controller.signal.aborted) setBusy(false);
@@ -126,7 +149,13 @@ export default function AdminAlertsPanel({
         </p>
       )}
       <div className="form-actions">
-        <button className="btn btn-quiet" type="button" disabled={busy} onClick={() => void load()}>
+        <button
+          className="btn btn-quiet"
+          type="button"
+          disabled={busy || refreshing}
+          aria-busy={refreshing}
+          onClick={() => void load(true)}
+        >
           Refresh status
         </button>
         {status?.revision && (

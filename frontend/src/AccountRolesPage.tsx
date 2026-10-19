@@ -134,31 +134,41 @@ export default function AccountRolesPage({
   const loadController = useRef<AbortController | null>(null);
   const controllers = useRef(new Set<AbortController>());
 
-  const reload = useCallback(async () => {
-    const generation = ++loadGeneration.current;
-    loadController.current?.abort();
-    const controller = new AbortController();
-    loadController.current = controller;
-    if (mounted.current) setLoading(true);
-    try {
-      const data = await api<{ roles: AccountRole[]; assignments: RoleAssignment[] }>(
-        '/api/account-roles',
-        { signal: controller.signal },
-      );
-      if (!mounted.current || controller.signal.aborted || generation !== loadGeneration.current)
+  const reload = useCallback(
+    async (manual = false) => {
+      const generation = ++loadGeneration.current;
+      loadController.current?.abort();
+      const controller = new AbortController();
+      loadController.current = controller;
+      if (mounted.current) setLoading(true);
+      try {
+        const data = await api<{ roles: AccountRole[]; assignments: RoleAssignment[] }>(
+          '/api/account-roles',
+          { signal: controller.signal },
+        );
+        if (!mounted.current || controller.signal.aborted || generation !== loadGeneration.current)
+          return false;
+        setRoles(data.roles);
+        setAssignments(data.assignments);
+        setLoaded(true);
+        if (manual) notify('Account roles refreshed.');
+        return true;
+      } catch (reason) {
+        if (
+          mounted.current &&
+          !controller.signal.aborted &&
+          generation === loadGeneration.current
+        ) {
+          setError(message(reason));
+          if (manual) notify(message(reason), true);
+        }
         return false;
-      setRoles(data.roles);
-      setAssignments(data.assignments);
-      setLoaded(true);
-      return true;
-    } catch (reason) {
-      if (mounted.current && !controller.signal.aborted && generation === loadGeneration.current)
-        setError(message(reason));
-      return false;
-    } finally {
-      if (mounted.current && generation === loadGeneration.current) setLoading(false);
-    }
-  }, [api]);
+      } finally {
+        if (mounted.current && generation === loadGeneration.current) setLoading(false);
+      }
+    },
+    [api, notify],
+  );
 
   useEffect(() => {
     mounted.current = true;
@@ -230,7 +240,10 @@ export default function AccountRolesPage({
     try {
       await action(controller.signal);
     } catch (reason) {
-      if (mounted.current && !controller.signal.aborted) setError(message(reason));
+      if (mounted.current && !controller.signal.aborted) {
+        setError(message(reason));
+        notify(message(reason), true);
+      }
     } finally {
       controllers.current.delete(controller);
       busyRef.current = false;
@@ -251,6 +264,7 @@ export default function AccountRolesPage({
       setWarnings(result.warnings);
       setDirty(true);
       setReview(null);
+      notify('Account settings imported into the role draft. Save the role to keep them.');
     });
   }
 
@@ -362,9 +376,10 @@ export default function AccountRolesPage({
           <button
             className="btn btn-quiet"
             disabled={busy || loading}
+            aria-busy={loading}
             onClick={() => {
               setError('');
-              void reload();
+              void reload(true);
             }}
           >
             <Icon name="refresh" /> Refresh roles
@@ -583,6 +598,7 @@ export default function AccountRolesPage({
                       className="btn"
                       type="button"
                       disabled={busy || !sourceId}
+                      aria-busy={busy}
                       onClick={importSettings}
                     >
                       <Icon name="copy" /> Copy settings

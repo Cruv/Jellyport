@@ -371,8 +371,16 @@ describe('Account roles', () => {
     await screen.findByText('Client-local theme settings are not copied.');
     expect(screen.getByText('Enable Content Downloading')).toBeTruthy();
     expect(screen.getByText('homesection0: resume; homesection1: nextup')).toBeTruthy();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      'Account settings imported into the role draft. Save the role to keep them.',
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Save new role' }));
-    await waitFor(() => expect(notify).toHaveBeenCalledOnce());
+    await waitFor(() =>
+      expect(notify).toHaveBeenLastCalledWith(
+        'Account role saved. Existing accounts were not changed.',
+      ),
+    );
+    expect(notify).toHaveBeenCalledTimes(2);
     expect(
       mutations(requests).map(({ path, options }) => ({
         path,

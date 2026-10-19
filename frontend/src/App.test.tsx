@@ -178,6 +178,43 @@ beforeEach(() => {
   );
 });
 
+describe('explicit workspace feedback', () => {
+  it('shows pending and actual outcomes for manual refresh without retaining an obsolete error toast', async () => {
+    render(<App />);
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    expect(document.querySelector('.toast-region')).toBeNull();
+    const original = fetch;
+    let reply!: (response: Response) => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((path: string, options?: RequestInit) => {
+        if (path === '/api/overview')
+          return new Promise<Response>((resolve) => {
+            reply = resolve;
+          });
+        return original(path, options);
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(screen.getByText('Refreshing workspace…')).toBeTruthy();
+    await act(async () =>
+      reply(new Response(JSON.stringify({ detail: 'Synthetic refresh failed.' }), { status: 400 })),
+    );
+    expect(
+      within(document.querySelector('.toast-region') as HTMLElement).getByRole('alert').textContent,
+    ).toContain('Synthetic refresh failed.');
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(screen.queryAllByText('Synthetic refresh failed.')).toHaveLength(0);
+    await act(async () => reply(new Response(JSON.stringify(overview), { status: 200 })));
+    expect(screen.getByText('Workspace refreshed.')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss notification' }));
+    expect(document.querySelector('.toast-region')).toBeNull();
+    expect(
+      requests.filter((request) => request.options?.method && request.options.method !== 'GET'),
+    ).toEqual([]);
+  });
+});
+
 describe('Activity report cleanup', () => {
   const past = (id: string, status = 'completed'): Job => ({
     ...job,
@@ -806,13 +843,17 @@ describe('React account safeguards', () => {
         }),
       );
       fireEvent.click(screen.getByRole('button', { name: 'Refresh roles' }));
-      await screen.findByText(failure);
+      const notifications = await screen.findByLabelText('Notifications');
+      expect(within(notifications).getByRole('alert')).toHaveProperty('textContent', failure);
+      expect(
+        screen.getAllByRole('alert').find((alert) => !notifications.contains(alert)),
+      ).toHaveProperty('textContent', failure);
       expect(screen.getByRole('heading', { name: 'Account roles', level: 1 })).toBeTruthy();
       expect(screen.getByRole('searchbox', { name: 'Find saved roles' })).toBeTruthy();
       expect(document.body.textContent).not.toContain('synthetic-private-body-fragment');
       fireEvent.click(screen.getByRole('button', { name: 'Refresh roles' }));
       await screen.findByRole('searchbox', { name: 'Find saved roles' });
-      expect(screen.queryByText(failure)).toBeNull();
+      await waitFor(() => expect(screen.queryAllByText(failure)).toHaveLength(0));
       expect(screen.getByRole('heading', { name: 'Account roles', level: 1 })).toBeTruthy();
       expect(
         requests.filter((request) => request.options?.method && request.options.method !== 'GET'),

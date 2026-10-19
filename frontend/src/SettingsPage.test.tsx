@@ -407,6 +407,34 @@ describe('Settings layout and navigation', () => {
     });
   });
 
+  it('acknowledges failed saved connections without exposing details in the notification', async () => {
+    const p = page(
+      oldSettings,
+      vi.fn(async (path: string) => {
+        if (path === '/api/connections/test')
+          return {
+            connections: {
+              emby: { configured: true, connected: false, error: 'Synthetic connection failure.' },
+              jellyfin: { configured: true, connected: true },
+              discord: { configured: false, connected: false },
+            },
+          };
+        throw new Error(`Unexpected request: ${path}`);
+      }) as Api,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Test saved connections' }));
+    await waitFor(() =>
+      expect(p.notify).toHaveBeenCalledExactlyOnceWith(
+        'Connection test finished. Some saved connections need attention.',
+        true,
+      ),
+    );
+    expect(p.refresh).not.toHaveBeenCalled();
+    expect(p.requests.filter((request) => request.options?.method)).toEqual([
+      { path: '/api/connections/test', options: { method: 'POST', body: {} } },
+    ]);
+  });
+
   it('tests saved connections without submitting unsaved server details or credentials', async () => {
     const p = page(
       oldSettings,
@@ -432,7 +460,10 @@ describe('Settings layout and navigation', () => {
     expect(sourceUrl).toHaveProperty('value', 'https://draft.example.test');
     expect(key).toHaveProperty('value', 'synthetic-unsaved-secret');
     expect(p.refresh).not.toHaveBeenCalled();
-    expect(p.notify).not.toHaveBeenCalled();
+    expect(p.notify).toHaveBeenCalledExactlyOnceWith(
+      'Connection test finished. Saved connections are ready.',
+      false,
+    );
     submit();
     await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
     expect(

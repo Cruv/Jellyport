@@ -198,6 +198,10 @@ describe('Account page request lifecycle', () => {
         'I inspected this Jellyfin account and approve a new password and account defaults.',
       ),
     );
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      'Account inspected. Review the recovery details before continuing.',
+    );
+    notify.mockClear();
     fireEvent.click(screen.getByRole('button', { name: 'Recover account' }));
     await waitFor(() => expect(finish).toBeTypeOf('function'));
     unmount();

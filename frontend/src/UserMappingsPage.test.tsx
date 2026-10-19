@@ -197,7 +197,10 @@ describe('Manual user mappings', () => {
       'The destination account is already linked.',
     );
     expect(refresh).not.toHaveBeenCalled();
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      'The destination account is already linked.',
+      true,
+    );
     expect(api).toHaveBeenCalledOnce();
     expect(screen.getByLabelText('Emby account')).toHaveProperty('value', 'emby-alex');
     expect(screen.getByLabelText('New Jellyfin username')).toHaveProperty('value', 'NewAlex');
@@ -466,7 +469,10 @@ describe('Manual user mappings', () => {
     ).toBeTruthy();
     expect(api).toHaveBeenCalledWith('/api/user-mappings/mapping-1', { method: 'DELETE' });
     expect(refresh).not.toHaveBeenCalled();
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      'A queued migration still uses this mapping.',
+      true,
+    );
   });
 
   it('ignores a pending save response after the page is unmounted', async () => {

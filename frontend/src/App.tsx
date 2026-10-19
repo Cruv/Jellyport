@@ -219,7 +219,7 @@ export default function App() {
   const [settingsSavePending, setSettingsSavePending] = useState(false);
   const notify = useCallback((text: string, error = false) => {
     const id = ++toastId.current;
-    setToasts((current) => [...current, { id, message: text, error }]);
+    setToasts([{ id, message: text, error }]);
     const timer = setTimeout(
       () => {
         setToasts((current) => current.filter((item) => item.id !== id));
@@ -434,13 +434,15 @@ export default function App() {
     setSourceDefaults('ready');
   }
   const load = useCallback(
-    async (target: Page) => {
+    async (target: Page, manual = false) => {
       if (target !== pageRef.current) return;
       const version = ++loadVersion.current;
       const historyVersion = historyRevision.current;
       setLoading(true);
       setPageError('');
       setPollPaused(false);
+      if (manual) notify('Refreshing workspace…');
+      let complete = true;
       try {
         if (target === 'overview') {
           const value = await api<Overview>('/api/overview');
@@ -505,6 +507,7 @@ export default function App() {
             listed = await api<Users>('/api/users');
           } catch (error) {
             listed = emptyUsers;
+            complete = false;
             if (sessionRef.current?.authenticated && version === loadVersion.current)
               notify(`Template users could not be loaded: ${message(error)}`, true);
           }
@@ -513,9 +516,18 @@ export default function App() {
             setUsers(listed);
           }
         }
+        if (
+          manual &&
+          complete &&
+          version === loadVersion.current &&
+          sessionRef.current?.authenticated
+        )
+          notify('Workspace refreshed.');
       } catch (error) {
-        if (version === loadVersion.current && sessionRef.current?.authenticated)
+        if (version === loadVersion.current && sessionRef.current?.authenticated) {
           setPageError(message(error));
+          if (manual) notify(message(error), true);
+        }
       } finally {
         if (version === loadVersion.current) {
           setLoadedPage(target);
@@ -990,7 +1002,7 @@ export default function App() {
           {pageError}
         </div>
         <div className="mt-18">
-          <button className="btn" onClick={() => void load(page)}>
+          <button className="btn" onClick={() => void load(page, true)}>
             <Icon name="refresh" />
             Try again
           </button>
@@ -1003,7 +1015,7 @@ export default function App() {
         overview={overview}
         navigate={navigate}
         openJob={openJob}
-        refresh={() => void load(page)}
+        refresh={() => void load(page, true)}
       />
     );
   else if (page === 'migrate' && overview)
@@ -1055,7 +1067,7 @@ export default function App() {
         templateUserId={settings?.template_user_id}
         api={api}
         notify={notify}
-        refresh={() => load('mappings')}
+        refresh={(manual) => load('mappings', manual)}
       />
     );
   else if (page === 'roles')
@@ -1104,7 +1116,7 @@ export default function App() {
         jobs={jobs}
         navigate={navigate}
         openJob={openJob}
-        refresh={() => void load(page)}
+        refresh={() => void load(page, true)}
         clearHistory={reviewHistory}
       />
     );
@@ -1114,7 +1126,7 @@ export default function App() {
         events={events}
         navigate={navigate}
         openJob={openJob}
-        refresh={() => void load(page)}
+        refresh={() => void load(page, true)}
         review={(event) => showDialog({ kind: 'event', event })}
         ignore={ignore}
         busy={busy.has('event')}
@@ -1272,7 +1284,7 @@ export default function App() {
                       type="button"
                       className="text-button"
                       onClick={() => {
-                        if (page === 'activity') void load('activity');
+                        if (page === 'activity') void load('activity', true);
                         else navigate('activity');
                       }}
                     >

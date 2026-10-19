@@ -105,7 +105,7 @@ describe('workspace notices', () => {
     expect(screen.queryByRole('status')).toBeNull();
   });
 
-  it('shows only the latest dismissible notice in normal document flow, before the primary action', () => {
+  it('shows only the latest workspace toast outside document flow without blocking the primary action', () => {
     const dismiss = vi.fn();
     const view = render(
       <WorkspaceNoticeProvider notice={notice} dismiss={dismiss}>
@@ -115,8 +115,10 @@ describe('workspace notices', () => {
     );
     const region = screen.getByText('Membership saved.').closest('.toast-region')!;
     expect(region.nextElementSibling).toBe(screen.getByRole('button', { name: 'Create accounts' }));
-    expect(['fixed', 'absolute']).not.toContain(getComputedStyle(region).position);
+    expect(getComputedStyle(region).position).toBe('fixed');
+    expect(getComputedStyle(region).pointerEvents).toBe('none');
     const button = screen.getByRole('button', { name: 'Dismiss notification' });
+    expect(getComputedStyle(button).pointerEvents).toBe('auto');
     expect(getComputedStyle(button).minWidth).toBe('44px');
     expect(getComputedStyle(button).minHeight).toBe('44px');
     expect(screen.getAllByRole('status')).toHaveLength(1);

@@ -24,40 +24,48 @@ export default function ActivityRetentionPanel({
   const request = useRef<AbortController | null>(null);
   const requestVersion = useRef(0);
   const saving = useRef(false);
-  const readStatus = useCallback(async () => {
-    if (saving.current) return;
-    request.current?.abort();
-    const controller = new AbortController();
-    request.current = controller;
-    const version = ++requestVersion.current;
-    setBusy('load');
-    setError('');
-    try {
-      const value = await api<ActivityRetentionStatus>('/api/jobs/retention', {
-        signal: controller.signal,
-      });
-      if (!mounted.current || controller.signal.aborted || version !== requestVersion.current)
-        return;
-      if (
-        !Number.isInteger(value.retention_days) ||
-        value.retention_days < 0 ||
-        value.retention_days > 3650
-      )
-        throw new Error('Unsupported retention setting.');
-      setStatus(value);
-      if (!initialized.current) {
-        initialized.current = true;
-        setEnabled(value.retention_days > 0);
-        setDays(String(value.retention_days || 30));
+  const readStatus = useCallback(
+    async (manual = false) => {
+      if (saving.current) return;
+      request.current?.abort();
+      const controller = new AbortController();
+      request.current = controller;
+      const version = ++requestVersion.current;
+      setBusy('load');
+      setError('');
+      try {
+        const value = await api<ActivityRetentionStatus>('/api/jobs/retention', {
+          signal: controller.signal,
+        });
+        if (!mounted.current || controller.signal.aborted || version !== requestVersion.current)
+          return;
+        if (
+          !Number.isInteger(value.retention_days) ||
+          value.retention_days < 0 ||
+          value.retention_days > 3650
+        )
+          throw new Error('Unsupported retention setting.');
+        setStatus(value);
+        if (manual) notify('Activity retention status refreshed.');
+        if (!initialized.current) {
+          initialized.current = true;
+          setEnabled(value.retention_days > 0);
+          setDays(String(value.retention_days || 30));
+        }
+      } catch {
+        if (mounted.current && !controller.signal.aborted && version === requestVersion.current) {
+          const detail =
+            'Activity retention status could not be loaded. Refresh status to try again.';
+          setError(detail);
+          if (manual) notify(detail, true);
+        }
+      } finally {
+        if (mounted.current && !controller.signal.aborted && version === requestVersion.current)
+          setBusy('');
       }
-    } catch {
-      if (mounted.current && !controller.signal.aborted && version === requestVersion.current)
-        setError('Activity retention status could not be loaded. Refresh status to try again.');
-    } finally {
-      if (mounted.current && !controller.signal.aborted && version === requestVersion.current)
-        setBusy('');
-    }
-  }, [api]);
+    },
+    [api, notify],
+  );
   useEffect(() => {
     if (!active) return;
     mounted.current = true;
@@ -106,10 +114,12 @@ export default function ActivityRetentionPanel({
           : 'Automatic activity cleanup turned off.',
       );
     } catch {
-      if (mounted.current && !controller.signal.aborted && version === requestVersion.current)
-        setError(
-          'Activity retention could not be saved. Your changes are kept; retry saving or refresh status to verify the current setting.',
-        );
+      if (mounted.current && !controller.signal.aborted && version === requestVersion.current) {
+        const detail =
+          'Activity retention could not be saved. Your changes are kept; retry saving or refresh status to verify the current setting.';
+        setError(detail);
+        notify(detail, true);
+      }
     } finally {
       if (version === requestVersion.current) {
         saving.current = false;
@@ -128,7 +138,8 @@ export default function ActivityRetentionPanel({
         <button
           className="btn btn-small btn-quiet"
           type="button"
-          onClick={() => void readStatus()}
+          onClick={() => void readStatus(true)}
+          aria-busy={busy === 'load'}
           disabled={!!busy}
         >
           <Icon name="refresh" />

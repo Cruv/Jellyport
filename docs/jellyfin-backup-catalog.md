@@ -220,6 +220,18 @@ Limits: 8 GiB archive and projection, two million supported projected items,
 CPU/memory limits also apply. Reserve private work/exchange space for projection,
 index construction, encryption and temporary reads. Validation errors remain
 sanitized; no credentials, item identities or personal playback data enter logs.
+Starting with **0.22.1**, provider validation uses a single indexed insert per row,
+then one enrichment pass with a bounded parent-show cache. New private projections
+cluster items by ID for indexed lookups; older saved projections remain readable.
+The helper logs aggregate durations for each stage (including an interrupted stage
+and encryption), without filenames, item IDs, titles or personal state. These are
+helper-observed wall times, including IPC/scheduling, not CPU timings. A timeout at
+**Building matching index** includes time already spent reading and enriching;
+the displayed matching-item count is the total projection, not indexed progress.
+**Processed bytes** measures projected item JSON, not archive transfer throughput.
+See the [dated offline measurements](performance-safety.md#jellyfin-backup-import-performance--0221)
+for scope and limits. The five-minute deadline and validation rules are unchanged.
+
 Unknown or apparently denied access checks are limited to 2,048 IDs, four read-only
 workers and 60 seconds per phase. The normal known-access path remains batched;
 there is no automatic per-item scan of a large legacy catalog.

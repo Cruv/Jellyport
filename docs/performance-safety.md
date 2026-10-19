@@ -223,9 +223,10 @@ outages. Original backup age is limited to 48 hours, without renewal on reimport
 Manifest age, future-time and linked-version checks run before projection creation
 and large catalog-table reads; freshness and unchanged-file checks still run before
 publication. An expired backup requires creating a new completed backup in
-Jellyfin. A Jellyport daily schedule only imports an existing backup and cannot
-create one or make old content fresh. Any previously validated catalog survives
-import failure, but an expired retained catalog remains unusable. See the [setup and repeatable
+Jellyfin. By default a Jellyport daily schedule imports an existing backup; since 0.22.0,
+[opt-in native backup creation](jellyfin-backup-catalog.md#create-a-fresh-jellyfin-backup-before-nightly-import)
+can request a new archive before import. Reimporting old content cannot make it fresh.
+Any previously validated catalog survives import failure, but an expired retained catalog remains unusable. See the [setup and repeatable
 procedure](jellyfin-backup-catalog.md).
 
 Projection and matching indexes stay on disk: at most two million supported items,
@@ -280,6 +281,47 @@ shared import time and original backup dates appear separately. A bulk job's wal
 time is authoritative: individual account work does not include its wait behind
 other accounts or once-per-job provisioning checks. Neither CPU-only simulation nor
 shared preparation establishes the five-minute target-environment acceptance limit.
+
+## Jellyfin backup import performance — 0.22.1
+
+On October 18, 2026, a reported import reached its five-minute worker limit during
+index building after 487,859 media rows and 969,462 provider rows. This establishes
+the timeout stage, not which preceding stage consumed most time or an out-of-memory
+failure. Reading, enrichment/compaction, indexing and archive fingerprinting share
+that limit. Helper-observed aggregate stage durations now include failures and
+cancellation; encryption is measured separately. Logs exclude identities and paths.
+
+The 0.22.1 importer reduces provider validation from up to four SQLite statements
+per row to one indexed insert, preserving source-ID and case-insensitive duplicate
+checks even for ignored items. Ignored provider values are not stored. One bounded
+enrichment pass replaces two; a parent cache retains at most 4,096 entries and
+4 MiB of serialized data (not a 4 MiB RSS guarantee). Each provider lookup returns
+at most 65 rows to reject items exceeding the 64-provider limit without loading
+all their rows. Fresh item/ID tables use clustered primary keys, and existing
+projections remain compatible. Archive validation, private output compaction,
+matching keys, library access checks and the five-minute deadline remain intact.
+
+A read-only completed-backup comparison used a private local copy on Node 24.19.0
+(macOS ARM64), with no media-server API calls. At 194,755 projected items and
+1,096,279 matching keys, import/index/fingerprint/encryption took **43.66 seconds**
+before and **34.65 seconds** after (20.7% less time). Full ordered item and key-row
+SHA256 digests were identical; the new database used 288,124,928 bytes versus
+293,928,960. Peak process RSS reported 386.9 MiB after versus 391.1 MiB before.
+These are individual local runs, subject to CPU/storage/cache variation, not
+production acceptance or an exact memory ceiling. The measurements include a whole-archive SHA256 and encryption. They exclude native
+backup creation, IPC/adoption and per-user live migration writes. No production mutation,
+backup creation or migration trial was performed for this patch.
+
+Run `npm run benchmark:jellyfin-import` for a repeatable synthetic native ZIP at
+the reported source/provider/projected-item scale. It generates all inputs inside
+a private temporary directory, accepts no external paths or URLs, checks full
+projection/key digests, series enrichment, privacy and final candidate matching,
+and removes its files. It reports phase timings, sampled RSS and explicit scope
+limitations. A comparison against the 0.22.0 reader at the same 487,859 / 969,462 row scale
+produced 194,755 items and 970,265 keys: **34.70 → 30.76 seconds** (11.3% less time),
+with identical full item, key and archive digests. It excludes encryption/adoption;
+its synthetic content differs from the private archive. These runs do not establish
+production playback impact or the end-to-end migration target.
 
 ## Legacy live destination matching without a full per-user crawl
 

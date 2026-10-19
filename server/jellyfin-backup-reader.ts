@@ -529,9 +529,12 @@ export async function importJellyfinBackupCatalog(
     const pageSize = Number(database.prepare('PRAGMA page_size').get()?.page_size);
     if (!Number.isSafeInteger(pageSize) || pageSize < 512 || pageSize > 65_536) throw invalid();
     database.exec(`PRAGMA max_page_count=${Math.floor(MAX_PROJECTED_BYTES / pageSize)};`);
+    // Cluster fresh private item/ID tables by the same IDs used for lookups and
+    // keyset enrichment. The published logical schema remains compatible with
+    // existing catalogs; neither live server database is opened or modified.
     database.exec(`PRAGMA trusted_schema=OFF; PRAGMA busy_timeout=1000; PRAGMA cache_size=-8192; PRAGMA temp_store=FILE; PRAGMA mmap_size=0; PRAGMA journal_mode=DELETE;
-      CREATE TABLE catalog_items(id TEXT PRIMARY KEY,item TEXT NOT NULL) STRICT;
-      CREATE TABLE source_ids(id TEXT PRIMARY KEY) STRICT;
+      CREATE TABLE catalog_items(id TEXT PRIMARY KEY,item TEXT NOT NULL) STRICT, WITHOUT ROWID;
+      CREATE TABLE source_ids(id TEXT PRIMARY KEY,projected INTEGER NOT NULL) STRICT, WITHOUT ROWID;
       CREATE TABLE catalog_membership(version INTEGER NOT NULL PRIMARY KEY) STRICT;
       INSERT INTO catalog_membership VALUES(1);
       CREATE TABLE catalog_item_roots(id TEXT PRIMARY KEY,root_id TEXT NOT NULL) STRICT;
@@ -541,10 +544,9 @@ export async function importJellyfinBackupCatalog(
       CREATE INDEX catalog_library_root_lookup ON catalog_library_roots(root_id,library_id);
       CREATE TABLE catalog_library_config(library_id TEXT PRIMARY KEY,locations TEXT NOT NULL) STRICT;
       CREATE TABLE source_libraries(id TEXT PRIMARY KEY,path TEXT NOT NULL,roots TEXT NOT NULL,locations TEXT NOT NULL) STRICT;
-      CREATE TABLE provider_keys(id TEXT NOT NULL,provider_key TEXT NOT NULL,PRIMARY KEY(id,provider_key)) STRICT;
-      CREATE TABLE providers(id TEXT NOT NULL,provider_key TEXT NOT NULL,provider_value TEXT NOT NULL,PRIMARY KEY(id,provider_key)) STRICT;
+      CREATE TABLE providers(id TEXT NOT NULL,normalized_key TEXT NOT NULL,provider_key TEXT NOT NULL,provider_value TEXT,PRIMARY KEY(id,normalized_key)) STRICT, WITHOUT ROWID;
       BEGIN IMMEDIATE;`);
-    const insertId = database.prepare('INSERT INTO source_ids(id) VALUES(?)');
+    const insertId = database.prepare('INSERT INTO source_ids(id,projected) VALUES(?,?)');
     const insertItem = database.prepare('INSERT INTO catalog_items(id,item) VALUES(?,?)');
     const insertRoot = database.prepare('INSERT INTO catalog_roots(id,path,known) VALUES(?,?,1)');
     const insertItemRoot = database.prepare(
@@ -578,8 +580,9 @@ export async function importJellyfinBackupCatalog(
       rowProjection(itemFields, async (row) => {
         if (++stats.sourceRows > MAX_SOURCE_ROWS) throw invalid();
         const id = identifier(row.Id);
-        insertId.run(id);
         if (typeof row.Type !== 'string') throw invalid();
+        const type = Object.hasOwn(clrTypes, row.Type) ? clrTypes[row.Type] : undefined;
+        insertId.run(id, type ? 1 : 0);
         if (
           row.Type === 'MediaBrowser.Controller.Entities.Folder' &&
           row.Path !== null &&
@@ -599,7 +602,6 @@ export async function importJellyfinBackupCatalog(
             JSON.stringify(physicalLocations(data.PhysicalLocationsList)),
           );
         }
-        const type = Object.hasOwn(clrTypes, row.Type) ? clrTypes[row.Type] : undefined;
         if (!type) stats.ignoredRows++;
         else {
           const projected: Record<string, unknown> = { Id: id, Type: type };
@@ -683,14 +685,13 @@ export async function importJellyfinBackupCatalog(
       } else for (const id of ids) libraryRoot.run(row.id!, id);
       await yieldTurn();
     }
-    const sourceId = database.prepare('SELECT 1 AS present FROM source_ids WHERE id=?');
-    const targetId = database.prepare('SELECT 1 AS present FROM catalog_items WHERE id=?');
-    const insertProviderKey = database.prepare(
-      'INSERT INTO provider_keys(id,provider_key) VALUES(?,?)',
-    );
-    const insertProvider = database.prepare(
-      'INSERT INTO providers(id,provider_key,provider_value) VALUES(?,?,?)',
-    );
+    // One bounded statement validates source membership and case-insensitive key
+    // uniqueness. Ignored item values are never stored, but their keys still
+    // participate in duplicate validation just as projected item keys do.
+    const insertProvider = database.prepare(`
+      INSERT INTO providers(id,normalized_key,provider_key,provider_value)
+      SELECT id,?,?,CASE WHEN projected=1 THEN ? ELSE NULL END FROM source_ids WHERE id=?
+    `);
     report('providers', true);
     await entryPipeline(
       zip,
@@ -707,12 +708,10 @@ export async function importJellyfinBackupCatalog(
           /[\u0000-\u001f\u007f]/.test(key) ||
           typeof value !== 'string' ||
           value.length > 1024 ||
-          /[\u0000-\u001f\u007f]/.test(value) ||
-          !sourceId.get(id)
+          /[\u0000-\u001f\u007f]/.test(value)
         )
           throw invalid();
-        insertProviderKey.run(id, key.toLowerCase());
-        if (targetId.get(id)) insertProvider.run(id, key, value);
+        if (insertProvider.run(key.toLowerCase(), key, value, id).changes !== 1) throw invalid();
         await checkpoint('providers');
       }),
       options,
@@ -723,10 +722,49 @@ export async function importJellyfinBackupCatalog(
       'SELECT id,item FROM catalog_items WHERE id>? ORDER BY id LIMIT 1000',
     );
     const readProviders = database.prepare(
-      'SELECT provider_key,provider_value FROM providers WHERE id=?',
+      'SELECT provider_key,provider_value FROM providers WHERE id=? ORDER BY provider_key LIMIT 65',
     );
     const updateItem = database.prepare('UPDATE catalog_items SET item=? WHERE id=?');
     const series = database.prepare('SELECT item FROM catalog_items WHERE id=?');
+    const withProviders = (item: MediaItem): MediaItem => {
+      const providers = readProviders.all(item.Id);
+      if (providers.length > 64) throw invalid();
+      if (providers.length) {
+        item.ProviderIds = Object.create(null) as Record<string, unknown>;
+        for (const provider of providers)
+          Object.defineProperty(item.ProviderIds, String(provider.provider_key), {
+            value: provider.provider_value,
+            enumerable: true,
+          });
+      }
+      return item;
+    };
+    // Parent enrichment must not depend on item-ID order. Resolve from the
+    // original parent plus its provider rows, with a serialized-byte-bounded LRU for
+    // episodes sharing a show. No full catalog or unbounded parent map in memory.
+    const parents = new Map<string, { item: MediaItem; bytes: number }>();
+    let parentBytes = 0;
+    const parentItem = (id: string): MediaItem => {
+      const cached = parents.get(id);
+      if (cached) {
+        parents.delete(id);
+        parents.set(id, cached);
+        return cached.item;
+      }
+      const row = series.get(id);
+      if (!row) throw invalid();
+      const item = withProviders(JSON.parse(String(row.item)) as MediaItem);
+      if (item.Type !== 'Series') throw invalid();
+      const bytes = Buffer.byteLength(JSON.stringify(item));
+      parents.set(id, { item, bytes });
+      parentBytes += bytes;
+      while (parents.size > 4096 || parentBytes > 4 * 1024 * 1024) {
+        const oldest = parents.keys().next().value!;
+        parentBytes -= parents.get(oldest)!.bytes;
+        parents.delete(oldest);
+      }
+      return item;
+    };
     report('enriching', true);
     let cursor = '';
     while (true) {
@@ -734,37 +772,11 @@ export async function importJellyfinBackupCatalog(
       const batch = readBatch.all(cursor);
       if (batch.length === 0) break;
       for (const row of batch) {
-        const item = JSON.parse(String(row.item)) as MediaItem;
-        const providers = readProviders.all(String(row.id));
-        if (providers.length > 64) throw invalid();
-        if (providers.length) {
-          item.ProviderIds = Object.create(null) as Record<string, unknown>;
-          for (const provider of providers)
-            Object.defineProperty(item.ProviderIds, String(provider.provider_key), {
-              value: provider.provider_value,
-              enumerable: true,
-            });
-        }
-        updateItem.run(JSON.stringify(projectCatalogItem(item)), row.id!);
-        cursor = String(row.id);
-      }
-      report('enriching');
-      await yieldTurn();
-    }
-    cursor = '';
-    while (true) {
-      check(options.signal);
-      const batch = readBatch.all(cursor);
-      if (batch.length === 0) break;
-      for (const row of batch) {
-        const item = JSON.parse(String(row.item)) as MediaItem;
+        const item = withProviders(JSON.parse(String(row.item)) as MediaItem);
         if (item.SeriesId) {
-          const parent = series.get(item.SeriesId);
-          if (!parent) throw invalid();
-          const parentItem = JSON.parse(String(parent.item)) as MediaItem;
-          if (parentItem.Type !== 'Series') throw invalid();
-          if (parentItem.ProviderIds) item.SeriesProviderIds = parentItem.ProviderIds;
-          if (parentItem.Name && parentItem.Name.length <= 2048) item.SeriesName = parentItem.Name;
+          const parent = parentItem(item.SeriesId);
+          if (parent.ProviderIds) item.SeriesProviderIds = parent.ProviderIds;
+          if (parent.Name && parent.Name.length <= 2048) item.SeriesName = parent.Name;
         }
         const serialized = JSON.stringify(projectCatalogItem(item));
         const bytes = Buffer.byteLength(serialized);
@@ -777,7 +789,7 @@ export async function importJellyfinBackupCatalog(
       await yieldTurn();
     }
     database.exec(
-      'COMMIT; DROP TABLE provider_keys; DROP TABLE providers; DROP TABLE source_ids; DROP TABLE source_libraries; VACUUM;',
+      'COMMIT; DROP TABLE providers; DROP TABLE source_ids; DROP TABLE source_libraries; VACUUM;',
     );
     check(options.signal);
     if (

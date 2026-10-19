@@ -276,6 +276,92 @@ describe('Jellyfin backup catalog reader', () => {
     database.close();
   });
 
+  it('resolves series providers for children sorted before their parent across enrichment batches', async () => {
+    const children = Array.from({ length: 1001 }, (_value, index) =>
+      item(index + 1, 'MediaBrowser.Controller.Entities.TV.Episode', {
+        SeriesId: id(9000),
+        ParentIndexNumber: 1,
+        IndexNumber: index + 1,
+      }),
+    );
+    const source = await fixture(
+      [
+        ...children.toReversed(),
+        item(1002, 'MediaBrowser.Controller.Entities.TV.Season', {
+          SeriesId: id(9000),
+          IndexNumber: 1,
+        }),
+        item(9000, 'MediaBrowser.Controller.Entities.TV.Series', { Name: 'Synthetic show' }),
+      ],
+      [
+        ...children.map((child, index) => ({
+          ItemId: child.Id,
+          ProviderId: 'IMDb',
+          ProviderValue: `tt${index + 1}`,
+        })),
+        { ItemId: id(9000), ProviderId: 'TvDB', ProviderValue: '9000' },
+      ],
+    );
+    await importJellyfinBackupCatalog(source.archive, source.output);
+    const result = projected(source.output).items;
+    for (const [index, child] of result.slice(0, 1001).entries()) {
+      expect(child).toMatchObject({
+        Id: apiId(index + 1),
+        ProviderIds: { IMDb: `tt${index + 1}` },
+        SeriesId: apiId(9000),
+        SeriesName: 'Synthetic show',
+        SeriesProviderIds: { TvDB: '9000' },
+      });
+    }
+    expect(result[1001]).toMatchObject({
+      Type: 'Season',
+      SeriesProviderIds: { TvDB: '9000' },
+      SeriesName: 'Synthetic show',
+    });
+    expect(result[1001]).not.toHaveProperty('ProviderIds');
+    expect(result[1002]).toMatchObject({ Type: 'Series', ProviderIds: { TvDB: '9000' } });
+  });
+
+  it('preserves original provider-key casing at the supported per-item boundary', async () => {
+    const providers = Array.from({ length: 64 }, (_value, index) => ({
+      ItemId: id(1),
+      ProviderId: `SyntheticProvider${index}`,
+      ProviderValue: `synthetic-value-${index}`,
+    }));
+    const source = await fixture([item(1)], providers);
+    await importJellyfinBackupCatalog(source.archive, source.output);
+    expect(projected(source.output).items[0]!.ProviderIds).toEqual(
+      Object.fromEntries(
+        providers.map((provider) => [provider.ProviderId, provider.ProviderValue]),
+      ),
+    );
+    const excessive = await fixture(
+      [item(1)],
+      [...providers, { ItemId: id(1), ProviderId: 'SyntheticProvider64', ProviderValue: 'extra' }],
+    );
+    await expect(
+      importJellyfinBackupCatalog(excessive.archive, excessive.output),
+    ).rejects.toMatchObject({ error_code: 'backup_invalid' });
+    await expect(stat(excessive.output)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('validates ignored provider rows without projecting their values or limiting their count as matching identities', async () => {
+    const source = await fixture(
+      [item(1), item(2, 'MediaBrowser.Controller.Entities.Person')],
+      Array.from({ length: 65 }, (_value, index) => ({
+        ItemId: id(2),
+        ProviderId: `IgnoredProvider${index}`,
+        ProviderValue: `never-project-ignored-provider-${index}`,
+      })),
+    );
+    const result = await importJellyfinBackupCatalog(source.archive, source.output);
+    expect(result.stats).toMatchObject({ providerRows: 65, projectedItems: 1, ignoredRows: 1 });
+    expect(projected(source.output).items[0]).not.toHaveProperty('ProviderIds');
+    expect(
+      (await readFile(source.output)).includes(Buffer.from('never-project-ignored-provider')),
+    ).toBe(false);
+  });
+
   it('keeps inconsistent cached physical IDs and locations unknown instead of guessing a library', async () => {
     const source = await fixture([
       item(100, 'MediaBrowser.Controller.Entities.Folder', { Path: '/synthetic/root-a' }),
@@ -444,6 +530,19 @@ describe('Jellyfin backup catalog reader', () => {
         { ItemId: id(1), ProviderId: 'Tmdb', ProviderValue: '1' },
         { ItemId: id(1), ProviderId: 'tmdb', ProviderValue: '2' },
       ],
+    ],
+    [
+      'duplicate provider keys on an ignored item',
+      [item(1), item(2, 'MediaBrowser.Controller.Entities.Person')],
+      [
+        { ItemId: id(2), ProviderId: 'Imdb', ProviderValue: 'nm0000001' },
+        { ItemId: id(2), ProviderId: 'imdb', ProviderValue: 'nm0000002' },
+      ],
+    ],
+    [
+      'unknown provider item when ignored source items are present',
+      [item(1), item(2, 'MediaBrowser.Controller.Entities.Person')],
+      [{ ItemId: id(3), ProviderId: 'Imdb', ProviderValue: 'nm0000001' }],
     ],
     [
       'missing series reference',
@@ -772,6 +871,48 @@ describe('Jellyfin backup catalog reader', () => {
     expect(performance.now() - canceledAt).toBeLessThan(1000);
     await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
   });
+
+  it.each(['providers', 'enriching'] as const)(
+    'yields to cancellation during %s and removes the private partial projection',
+    async (phase) => {
+      const source =
+        phase === 'providers'
+          ? await fixture(
+              [item(1), item(2, 'MediaBrowser.Controller.Entities.Person')],
+              Array.from({ length: 3000 }, (_value, index) => ({
+                ItemId: id(2),
+                ProviderId: `IgnoredProvider${index}`,
+                ProviderValue: String(index),
+              })),
+            )
+          : await fixture(Array.from({ length: 2001 }, (_value, index) => item(index + 1)));
+      const controller = new AbortController();
+      let canceledAt = 0;
+      let scheduled = false;
+      await expect(
+        importJellyfinBackupCatalog(source.archive, source.output, {
+          signal: controller.signal,
+          onProgress(event) {
+            if (
+              !scheduled &&
+              event.phase === phase &&
+              (phase !== 'providers' || event.providerRows === 1)
+            ) {
+              scheduled = true;
+              setTimeout(() => {
+                canceledAt = performance.now();
+                controller.abort();
+              }, 0);
+            }
+          },
+        }),
+      ).rejects.toThrow('import canceled');
+      expect(scheduled).toBe(true);
+      expect(canceledAt).toBeGreaterThan(0);
+      expect(performance.now() - canceledAt).toBeLessThan(1000);
+      await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
 
   it('keeps observer exceptions from changing the validated result', async () => {
     const source = await fixture([item(1)]);

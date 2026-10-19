@@ -3,6 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { snapshotProcess } from '../server/snapshot-process.js';
 import * as snapshotFiles from '../server/snapshot-files.js';
 import {
@@ -113,6 +114,140 @@ it('publishes only encrypted neutral projection and authenticated original-age m
         name.endsWith('.request'),
     ),
   ).toBe(false);
+});
+it('logs aggregate phase wall times without resetting repeated progress or changing persisted diagnostics', async () => {
+  const f = await fixture();
+  const logs = vi.spyOn(console, 'info').mockImplementation(() => {});
+  let now = 100;
+  vi.spyOn(performance, 'now').mockImplementation(() => now);
+  const originalWorker = f.worker.getMockImplementation()!;
+  const originalEncrypt = snapshotFiles.encryptDatabase;
+  vi.spyOn(snapshotFiles, 'encryptDatabase').mockImplementation(async (...args) => {
+    await originalEncrypt(...args);
+    now += 50;
+  });
+  f.worker.mockImplementation(async (...args) => {
+    const emit = (stage: DestinationCatalogDiagnostic['stage'], at: number) => {
+      now = at;
+      args[3]?.onProgress?.(diagnostic(stage));
+    };
+    emit('reading_items', 110);
+    emit('reading_items', 120);
+    args[3]?.onProgress?.({ ...diagnostic(), stage: '/private-history' });
+    emit('reading_providers', 150);
+    emit('enriching', 180);
+    emit('indexing', 220);
+    emit('fingerprinting', 260);
+    const value = await originalWorker(...args);
+    now = 280;
+    return value;
+  });
+  await f.process();
+  const events = logs.mock.calls.map(([value]) => JSON.parse(String(value)));
+  const phases = events.filter((value) => value.outcome === 'stage_completed');
+  expect(phases.map(({ stage, duration_ms }) => ({ stage, duration_ms }))).toEqual([
+    { stage: 'validating_backup', duration_ms: 10 },
+    { stage: 'reading_items', duration_ms: 40 },
+    { stage: 'reading_providers', duration_ms: 30 },
+    { stage: 'enriching', duration_ms: 40 },
+    { stage: 'indexing', duration_ms: 40 },
+    { stage: 'fingerprinting', duration_ms: 20 },
+    { stage: 'encrypting', duration_ms: 50 },
+    { stage: 'validating_catalog', duration_ms: 0 },
+  ]);
+  for (const phase of phases)
+    expect(Object.keys(phase).sort()).toEqual([
+      'bytes',
+      'duration_ms',
+      'event',
+      'items',
+      'keys',
+      'outcome',
+      'provider_rows',
+      'source_rows',
+      'stage',
+    ]);
+  expect(phases[4]).toMatchObject({ source_rows: 5, provider_rows: 0, items: 2, keys: 0 });
+  expect(phases[6]).toMatchObject({ items: 1, keys: 2, bytes: 25 });
+  expect(JSON.stringify(events)).not.toContain(f.root);
+  expect(JSON.stringify(events)).not.toContain(f.request.id);
+  expect(JSON.stringify(events)).not.toContain(f.request.binding.url);
+  expect(JSON.stringify(events)).not.toContain('private-history');
+  const result = await f.result();
+  expect(validDestinationResult(result)).toBe(true);
+  expect(Object.keys(result.diagnostic!).sort()).toEqual([
+    'bytes',
+    'items',
+    'keys',
+    'provider_rows',
+    'source_rows',
+    'stage',
+    'started_at',
+    'updated_at',
+  ]);
+});
+it.each(['timeout', 'canceled'] as const)(
+  'logs the partial active phase for %s with only its safe error code',
+  async (error_code) => {
+    const f = await fixture();
+    const controller = new AbortController();
+    const logs = vi.spyOn(console, 'info').mockImplementation(() => {});
+    let now = 100;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    f.worker.mockImplementation(async (_request, _signal, _timeout, options) => {
+      now = 110;
+      options?.onProgress?.(diagnostic('reading_items'));
+      now = 200;
+      options?.onProgress?.(diagnostic('indexing'));
+      now = 280;
+      options?.onProgress?.(diagnostic('indexing'));
+      now = 310;
+      if (error_code === 'canceled') controller.abort();
+      throw new DestinationCatalogError(error_code, diagnostic('indexing'));
+    });
+    await f.process(controller.signal);
+    const events = logs.mock.calls.map(([value]) => JSON.parse(String(value)));
+    const phases = events.filter((value) => value.outcome.startsWith('stage_'));
+    expect(
+      phases.map(({ stage, outcome, duration_ms }) => ({ stage, outcome, duration_ms })),
+    ).toEqual([
+      { stage: 'validating_backup', outcome: 'stage_completed', duration_ms: 10 },
+      { stage: 'reading_items', outcome: 'stage_completed', duration_ms: 90 },
+      {
+        stage: 'indexing',
+        outcome: error_code === 'canceled' ? 'stage_canceled' : 'stage_failed',
+        duration_ms: 110,
+      },
+    ]);
+    expect(phases[2]).toMatchObject({ error_code, source_rows: 5, items: 2 });
+    expect(Object.keys(phases[2]).sort()).toEqual([
+      'bytes',
+      'duration_ms',
+      'error_code',
+      'event',
+      'items',
+      'keys',
+      'outcome',
+      'provider_rows',
+      'source_rows',
+      'stage',
+    ]);
+    expect(JSON.stringify(events)).not.toContain(f.root);
+    expect(JSON.stringify(events)).not.toContain(f.request.id);
+    expect(await f.result()).toMatchObject({
+      ok: false,
+      error_code,
+      diagnostic: { stage: 'indexing', source_rows: 5 },
+    });
+  },
+);
+it('keeps imports successful when aggregate phase logging fails', async () => {
+  const f = await fixture();
+  vi.spyOn(console, 'info').mockImplementation(() => {
+    throw new Error('/private-log-sink');
+  });
+  await f.process();
+  expect(validDestinationResult(await f.result())).toBe(true);
 });
 it('contains worker errors without exposing source paths or replacing unrelated good generations', async () => {
   const f = await fixture();

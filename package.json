@@ -1,6 +1,6 @@
 {
   "name": "jellyport",
-  "version": "0.22.0",
+  "version": "0.22.1",
   "private": true,
   "type": "module",
   "description": "Self-hosted Emby to Jellyfin migration and Discord account management",
@@ -18,7 +18,8 @@
     "format": "prettier --write server frontend e2e tests-ts scripts *.ts *.json .github/**/*.yml",
     "build": "npm run typecheck && tsc -p tsconfig.build.json && vite build",
     "start": "node dist/server/index.js",
-    "benchmark:destination": "node --import tsx scripts/benchmark-destination.ts"
+    "benchmark:destination": "node --import tsx scripts/benchmark-destination.ts",
+    "benchmark:jellyfin-import": "node --import tsx scripts/benchmark-jellyfin-import.ts"
   },
   "dependencies": {
     "@fastify/cookie": "11.1.2",

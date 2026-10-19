@@ -1,5 +1,6 @@
 import { lstat, mkdtemp, readdir, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { snapshotProcess } from './snapshot-process.js';
 import { encryptDatabase, readEnvelope, writeEnvelope, snapshotId } from './snapshot-files.js';
 import {
@@ -57,6 +58,7 @@ export async function processDestinationCatalogRequest(
   }
   const started_at = new Date().toISOString();
   observe({ outcome: 'started' });
+  let stageStarted = performance.now();
   let diagnostic: DestinationCatalogDiagnostic = {
     stage: 'validating_backup',
     started_at,
@@ -67,6 +69,22 @@ export async function processDestinationCatalogRequest(
     keys: 0,
     bytes: 0,
   };
+  const observeStage = (
+    outcome: 'stage_completed' | 'stage_failed' | 'stage_canceled',
+    now = performance.now(),
+    error_code?: DestinationCatalogResult['error_code'],
+  ) =>
+    observe({
+      outcome,
+      stage: diagnostic.stage,
+      duration_ms: Math.max(0, Math.round(now - stageStarted)),
+      ...(error_code ? { error_code } : {}),
+      source_rows: diagnostic.source_rows,
+      provider_rows: diagnostic.provider_rows,
+      items: diagnostic.items,
+      keys: diagnostic.keys,
+      bytes: diagnostic.bytes,
+    });
   let pending: DestinationCatalogDiagnostic | undefined;
   let publishing: Promise<void> | undefined;
   // This attempt is the sole publisher of its unique progress path. Cancellation
@@ -74,6 +92,13 @@ export async function processDestinationCatalogRequest(
   const progressController = new AbortController();
   const progress = (value: DestinationCatalogDiagnostic) => {
     if (progressController.signal.aborted || !validDestinationDiagnostic(value)) return;
+    if (value.stage !== diagnostic.stage) {
+      const now = performance.now();
+      // Measure helper-observed wall time, including IPC/scheduling overhead.
+      // Repeated counters within a phase must not reset its elapsed duration.
+      observeStage('stage_completed', now);
+      stageStarted = now;
+    }
     diagnostic = { ...value, started_at, updated_at: new Date().toISOString() };
     pending = diagnostic;
     if (!publishing)
@@ -155,6 +180,7 @@ export async function processDestinationCatalogRequest(
       diagnostic,
     };
     if (!validDestinationResult(result)) throw new DestinationCatalogError('backup_invalid');
+    observeStage('stage_completed');
   } catch (error) {
     if (
       error instanceof DestinationCatalogError &&
@@ -178,6 +204,7 @@ export async function processDestinationCatalogRequest(
       error_code,
       diagnostic,
     };
+    observeStage(signal.aborted ? 'stage_canceled' : 'stage_failed', undefined, error_code);
     await rm(join(exchange, `${prefix}.db.enc`), { force: true });
   } finally {
     // Optional progress cannot hold the serialized helper indefinitely. Abort any

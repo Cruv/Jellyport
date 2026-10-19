@@ -228,7 +228,9 @@ and encryption), without filenames, item IDs, titles or personal state. These ar
 helper-observed wall times, including IPC/scheduling, not CPU timings. A timeout at
 **Building matching index** includes time already spent reading and enriching;
 the displayed matching-item count is the total projection, not indexed progress.
-**Processed bytes** measures projected item JSON, not archive transfer throughput.
+**Processed bytes** counts projected item JSON while reading and indexing, then
+the private catalog database file size once the helper receives the completed
+projection, before encryption. Neither value measures archive transfer throughput.
 See the [dated offline measurements](performance-safety.md#jellyfin-backup-import-performance--0221)
 for scope and limits. The five-minute deadline and validation rules are unchanged.
 

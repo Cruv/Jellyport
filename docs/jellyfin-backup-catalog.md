@@ -101,8 +101,9 @@ The native service requires free space before starting, but that is not retentio
 API behavior is verified against the official [backup controller](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Api/Controllers/BackupController.cs)
 and [backup service](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Server.Implementations/FullSystemBackup/BackupService.cs).
 The [Jellyfin backup guide](https://jellyfin.org/docs/general/administration/backup-and-restore/)
-describes native backup contents and live-server limitations. Unsupported servers
-or insufficient API-key permissions report a failed attempt without an import.
+describes native backup contents and live-server limitations. Jellyport rejects
+unsupported server versions before requesting a backup. Insufficient API-key
+permissions report a failed attempt without an import.
 
 Timing rules are the same for both import schedules:
 

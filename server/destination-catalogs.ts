@@ -26,6 +26,7 @@ import { snapshotProcess } from './snapshot-process.js';
 import { decryptDatabase, readEnvelope, snapshotKey, writeEnvelope } from './snapshot-files.js';
 import {
   DESTINATION_CATALOG_MAX_AGE,
+  DESTINATION_BACKUP_SERVER_VERSION,
   DESTINATION_CATALOG_DEADLINE,
   destinationCatalogMetadata,
   destinationCatalogPrefix,
@@ -486,6 +487,10 @@ export class DestinationCatalogs {
           },
         };
         if (createBackup) {
+          if (normalizedServerVersion(info.Version) !== DESTINATION_BACKUP_SERVER_VERSION)
+            throw new ServiceError(
+              'The linked Jellyfin version is unsupported by the backup importer. No backup was requested; update Jellyport when support for that server version is available.',
+            );
           if (!this.backupSelectionSupported)
             throw new ServiceError(
               'Update both Jellyport and its snapshot helper before enabling automatic Jellyfin backup creation.',

@@ -13,13 +13,14 @@ import { projectCatalogItem, type MediaItem } from './media.js';
 import { jellyfinAsciiPathKey } from './jellyfin-library-membership.js';
 import {
   DestinationCatalogError,
+  DESTINATION_BACKUP_SERVER_VERSION,
   DESTINATION_CATALOG_MAX_AGE,
   destinationCatalogErrorCode,
   normalizedServerVersion,
 } from './destination-catalog-files.js';
 
 export const JELLYFIN_BACKUP_PROJECTION_FORMAT = 'jellyfin-backup-catalog-v2';
-const VERSION = '12.2.0.0';
+const VERSION = DESTINATION_BACKUP_SERVER_VERSION;
 const ENGINE_VERSION = '0.2.0';
 const MAX_ARCHIVE_BYTES = 8 * 1024 ** 3;
 const MAX_ITEMS_BYTES = 16 * 1024 ** 3;

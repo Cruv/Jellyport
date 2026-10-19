@@ -341,6 +341,24 @@ describe('scheduled native Jellyfin backup creation', () => {
     expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
   });
 
+  it('rejects an unsupported future server version before native backup work and retains the last valid catalog', async () => {
+    const f = await fixture();
+    const good = await f.seedGood();
+    f.client.systemInfo.mockResolvedValue({ Id: serverId, Version: '13.0.0' });
+    await f.enable();
+    await f.due();
+    expect(await f.manager.status()).toMatchObject({
+      last_outcome: 'failed',
+      last_error: expect.stringContaining('unsupported'),
+      record: { id: good.id },
+    });
+    expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
+    expect(f.client.jellyfinBackupTasks).not.toHaveBeenCalled();
+    expect(f.client.jellyfinBackups).not.toHaveBeenCalled();
+    expect(await f.requests()).toEqual([]);
+    expect(f.imports.busy).toBe(false);
+  });
+
   it.each(['old', 'unavailable'] as const)(
     'fails before POST when the helper is %s',
     async (helper) => {

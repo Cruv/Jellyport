@@ -3,6 +3,7 @@ import { snapshotId } from './snapshot-files.js';
 import { ServiceError } from './errors.js';
 import { validJellyfinBackupName } from './jellyfin-backup-api.js';
 
+export const DESTINATION_BACKUP_SERVER_VERSION = '12.2.0.0';
 export const DESTINATION_CATALOG_MAX_AGE = 48 * 60 * 60_000;
 export const DESTINATION_CATALOG_DEADLINE = 5 * 60_000;
 export const DESTINATION_CATALOG_FORMAT = 2;

@@ -135,6 +135,8 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
   const [error, setError] = useState('');
   const [uncertain, setUncertain] = useState(false);
   const [stale, setStale] = useState(false);
+  const notifyRef = useRef(notify);
+  notifyRef.current = notify;
   const mounted = useRef(false);
   const visible = useRef(active);
   visible.current = active;
@@ -160,30 +162,36 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
     };
   }, [api, path]);
 
-  const load = useCallback(async () => {
-    if (!mounted.current || !visible.current || changing.current || read.current) return;
-    const controller = new AbortController();
-    read.current = controller;
-    const requestVersion = ++version.current;
-    setLoading(true);
-    try {
-      const value = await api<T>(path, { signal: controller.signal });
-      if (!mounted.current || controller.signal.aborted || requestVersion !== version.current)
-        return;
-      setStatus(value);
-      setError('');
-      setStale(false);
-      setUncertain(false);
-    } catch {
-      if (mounted.current && !controller.signal.aborted && requestVersion === version.current) {
-        setError(statusError);
-        setStale(true);
+  const load = useCallback(
+    async (manual = false) => {
+      if (!mounted.current || !visible.current || changing.current || read.current) return;
+      const controller = new AbortController();
+      read.current = controller;
+      const requestVersion = ++version.current;
+      setLoading(true);
+      if (manual) notifyRef.current('Refreshing status…');
+      try {
+        const value = await api<T>(path, { signal: controller.signal });
+        if (!mounted.current || controller.signal.aborted || requestVersion !== version.current)
+          return;
+        setStatus(value);
+        setError('');
+        setStale(false);
+        setUncertain(false);
+        if (manual) notifyRef.current('Status refreshed.');
+      } catch {
+        if (mounted.current && !controller.signal.aborted && requestVersion === version.current) {
+          setError(statusError);
+          setStale(true);
+          if (manual) notifyRef.current(statusError, true);
+        }
+      } finally {
+        if (mounted.current && requestVersion === version.current) setLoading(false);
+        if (read.current === controller) read.current = null;
       }
-    } finally {
-      if (mounted.current && requestVersion === version.current) setLoading(false);
-      if (read.current === controller) read.current = null;
-    }
-  }, [api, path, statusError]);
+    },
+    [api, path, statusError],
+  );
 
   useEffect(() => {
     if (active) void load();
@@ -268,6 +276,7 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
     } catch {
       if (mounted.current && !controller.signal.aborted && requestVersion === version.current) {
         setError(failure);
+        if (failure) notify(failure, true);
         if (kind === 'import') setUncertain(true);
         // Reconciliation may find a completed backup and start importing it (409).
         // Never repeat the acknowledgement; read the authoritative state instead.
@@ -400,7 +409,6 @@ export function ImportStatus({
           {actual.processed.toLocaleString()} of {actual.total.toLocaleString()} accounts checked
         </p>
       )}
-      {loading && status && <p>Refreshing status…</p>}
       {status?.last_attempt_at && (
         <p>
           Last {capture ? 'capture' : 'import'} attempt {importTimestamp(status.last_attempt_at)}

@@ -235,6 +235,8 @@ describe('User directory and Discord organization', () => {
       await screen.findByText('Child');
       organization();
       await screen.findByLabelText('Emby-only role');
+      expect(p.notify).toHaveBeenCalledExactlyOnceWith('Discord roles loaded.');
+      p.notify.mockClear();
       fireEvent.click(screen.getByRole('button', { name: 'Preview role changes' }));
       await waitFor(() => expect(finish).toBeTypeOf('function'));
       act(() => window.history.back());
@@ -779,7 +781,10 @@ describe('User directory and Discord organization', () => {
       'value',
       'My unsaved private note',
     );
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      'Account profile changed. Refresh and review the latest details.',
+      true,
+    );
   });
 
   it('aborts profile saves on unmount and ignores late success callbacks', async () => {

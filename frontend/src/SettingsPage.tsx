@@ -533,7 +533,19 @@ export default function SettingsPage({
         { method: 'POST', body: {} },
       );
       if (!mounted.current || requestVersion.current !== version) return;
-      setTested('connections' in result ? result.connections : result);
+      const connections = 'connections' in result ? result.connections : result;
+      setTested(connections);
+      const failed = Object.values(connections).some(
+        (connection) =>
+          !!connection.error ||
+          (!!(connection.configured || connection.enabled) && !connection.connected),
+      );
+      notify(
+        failed
+          ? 'Connection test finished. Some saved connections need attention.'
+          : 'Connection test finished. Saved connections are ready.',
+        failed,
+      );
     } catch (error) {
       if (mounted.current && requestVersion.current === version)
         notify(error instanceof Error ? error.message : 'Connection test failed.', true);
@@ -624,6 +636,7 @@ export default function SettingsPage({
                   className="btn btn-quiet"
                   type="button"
                   onClick={test}
+                  aria-busy={busy === 'test'}
                   disabled={!!busy || pendingSave}
                 >
                   {busy === 'test' ? <span className="spinner" /> : <Icon name="refresh" />}

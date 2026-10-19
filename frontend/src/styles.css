@@ -554,6 +554,7 @@ hr {
   overflow-y: auto;
 }
 .status-summary.form-stack {
+  font-variant-numeric: tabular-nums;
   align-items: stretch;
   gap: 8px;
   padding: 16px;
@@ -1859,6 +1860,20 @@ textarea::placeholder {
   width: 100%;
   min-width: 0;
   margin-bottom: 20px;
+}
+.toast-region-workspace {
+  position: fixed;
+  top: calc(var(--viewport-top) + var(--safe-area-top) + 77px);
+  right: calc(var(--safe-area-right) + 16px);
+  width: min(420px, calc(100% - var(--safe-area-left) - var(--safe-area-right) - 32px));
+  max-height: calc(var(--viewport-height) - var(--safe-area-top) - var(--safe-area-bottom) - 93px);
+  overflow-y: auto;
+  z-index: 20;
+  margin: 0;
+  pointer-events: none;
+}
+.toast-region-workspace .icon-button {
+  pointer-events: auto;
 }
 .toast {
   display: flex;

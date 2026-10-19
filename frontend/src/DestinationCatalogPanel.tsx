@@ -211,11 +211,12 @@ export default function DestinationCatalogPanel({
           <button
             className="btn btn-quiet"
             type="button"
-            onClick={() => void load()}
+            onClick={() => void load(true)}
             disabled={!!busy || loading}
+            aria-busy={loading}
           >
             <Icon name="refresh" />
-            {loading ? 'Refreshing status…' : 'Refresh status'}
+            Refresh status
           </button>
           <button
             className="btn btn-quiet"

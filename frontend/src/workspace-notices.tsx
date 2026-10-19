@@ -21,7 +21,7 @@ interface NoticeContext {
 }
 const WorkspaceNotices = createContext<NoticeContext | null>(null);
 
-/** Keep feedback in the active workspace or topmost dialog, never over its controls. */
+/** Keep feedback visible in the active workspace or topmost dialog without moving actions. */
 export function WorkspaceNoticeProvider({
   notice,
   dismiss,
@@ -75,7 +75,10 @@ export function WorkspaceNotice({ dialog = false }: { dialog?: boolean }) {
     return null;
   const { dismiss } = context;
   return (
-    <div className="toast-region" aria-label="Notifications">
+    <div
+      className={`toast-region${dialog ? '' : ' toast-region-workspace'}`}
+      aria-label="Notifications"
+    >
       <div
         className={`toast${notice.error ? ' error' : ''}`}
         role={notice.error ? 'alert' : 'status'}

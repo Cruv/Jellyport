@@ -71,32 +71,37 @@ export default function MembershipsPage({
   const loadController = useRef<AbortController | null>(null);
   const controllers = useRef(new Set<AbortController>());
 
-  const reload = useCallback(async () => {
-    const version = ++generation.current;
-    loadController.current?.abort();
-    const controller = new AbortController();
-    loadController.current = controller;
-    setLoading(true);
-    setError('');
-    try {
-      const [value, associations] = await Promise.all([
-        api<{ memberships: Membership[] }>('/api/memberships', { signal: controller.signal }),
-        api<{ mappings: UserMapping[] }>('/api/user-mappings', { signal: controller.signal }),
-      ]);
-      if (!mounted.current || controller.signal.aborted || version !== generation.current) return;
-      setMemberships(value.memberships);
-      setMappings(associations.mappings);
-      setLoaded(true);
-    } catch (reason) {
-      if (mounted.current && !controller.signal.aborted && version === generation.current) {
-        setLoaded(false);
-        setError(message(reason));
+  const reload = useCallback(
+    async (manual = false) => {
+      const version = ++generation.current;
+      loadController.current?.abort();
+      const controller = new AbortController();
+      loadController.current = controller;
+      setLoading(true);
+      setError('');
+      try {
+        const [value, associations] = await Promise.all([
+          api<{ memberships: Membership[] }>('/api/memberships', { signal: controller.signal }),
+          api<{ mappings: UserMapping[] }>('/api/user-mappings', { signal: controller.signal }),
+        ]);
+        if (!mounted.current || controller.signal.aborted || version !== generation.current) return;
+        setMemberships(value.memberships);
+        setMappings(associations.mappings);
+        setLoaded(true);
+        if (manual) notify('Memberships refreshed.');
+      } catch (reason) {
+        if (mounted.current && !controller.signal.aborted && version === generation.current) {
+          setLoaded(false);
+          setError(message(reason));
+          if (manual) notify(message(reason), true);
+        }
+      } finally {
+        if (mounted.current && !controller.signal.aborted && version === generation.current)
+          setLoading(false);
       }
-    } finally {
-      if (mounted.current && !controller.signal.aborted && version === generation.current)
-        setLoading(false);
-    }
-  }, [api]);
+    },
+    [api, notify],
+  );
   useEffect(() => {
     mounted.current = true;
     void reload();
@@ -211,7 +216,10 @@ export default function MembershipsPage({
       notify('Membership update queued. Follow account creation and access changes in Activity.');
       await reload();
     } catch (reason) {
-      if (mounted.current && !controller.signal.aborted) setError(message(reason));
+      if (mounted.current && !controller.signal.aborted) {
+        setError(message(reason));
+        notify(message(reason), true);
+      }
     } finally {
       controllers.current.delete(controller);
       busyRef.current = false;
@@ -243,7 +251,10 @@ export default function MembershipsPage({
       notify('Access policy saved. Media accounts have not been changed.');
       await reload();
     } catch (reason) {
-      if (mounted.current && !controller.signal.aborted) setError(message(reason));
+      if (mounted.current && !controller.signal.aborted) {
+        setError(message(reason));
+        notify(message(reason), true);
+      }
     } finally {
       controllers.current.delete(controller);
       busyRef.current = false;
@@ -259,7 +270,8 @@ export default function MembershipsPage({
         actions={
           <button
             className="btn btn-quiet"
-            onClick={() => void reload()}
+            aria-busy={loading}
+            onClick={() => void reload(true)}
             disabled={busy || loading}
           >
             <Icon name="refresh" /> Refresh

@@ -58,7 +58,10 @@ function Harness({
         stale={workflow.stale}
         uncertain={workflow.uncertain}
       />
-      <button onClick={() => void workflow.load()} disabled={workflow.loading || !!workflow.busy}>
+      <button
+        onClick={() => void workflow.load(true)}
+        disabled={workflow.loading || !!workflow.busy}
+      >
         Refresh status
       </button>
       <button
@@ -86,6 +89,63 @@ afterEach(() => {
 });
 
 describe('shared import lifecycle', () => {
+  it('keeps existing status markup steady during background reads and only toasts explicit refreshes', async () => {
+    vi.useFakeTimers();
+    const background = deferred<ImportWorkflowStatus>();
+    const manual = deferred<ImportWorkflowStatus>();
+    const notify = vi.fn();
+    let reads = 0;
+    const running = { ...idle, running: true };
+    const api: Api = async <T,>() => {
+      reads++;
+      return (
+        reads === 1 ? running : await (reads === 2 ? background.promise : manual.promise)
+      ) as T;
+    };
+    render(<Harness api={api} notify={notify} />);
+    await act(async () => {});
+    const summary = screen.getByRole('progressbar').parentElement!;
+    const markup = summary.innerHTML;
+    expect(notify).not.toHaveBeenCalled();
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(reads).toBe(2);
+    expect(summary.innerHTML).toBe(markup);
+    expect(notify).not.toHaveBeenCalled();
+    await act(async () => background.resolve(running));
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+    expect(notify).toHaveBeenCalledExactlyOnceWith('Refreshing status…');
+    expect(summary.innerHTML).toBe(markup);
+    // A second click or timer must not overlap the active read.
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+    await act(async () => vi.advanceTimersByTimeAsync(6000));
+    expect(reads).toBe(3);
+    await act(async () => manual.resolve(running));
+    expect(notify.mock.calls).toEqual([['Refreshing status…'], ['Status refreshed.']]);
+    expect(summary.innerHTML).toBe(markup);
+  });
+
+  it('reports an explicit refresh failure safely and suppresses aborted or superseded outcomes', async () => {
+    const pending = deferred<ImportWorkflowStatus>();
+    const notify = vi.fn();
+    let reads = 0;
+    const api: Api = async <T,>() => {
+      if (++reads === 1) return idle as T;
+      if (reads === 2) throw new Error('PRIVATE_UPSTREAM_DETAIL');
+      return (await pending.promise) as T;
+    };
+    const view = render(<Harness api={api} notify={notify} />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+    await act(async () => {});
+    expect(notify.mock.calls).toEqual([['Refreshing status…'], ['Status refresh failed.', true]]);
+    notify.mockClear();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+    view.rerender(<Harness api={api} notify={notify} active={false} />);
+    await act(async () => pending.resolve(idle));
+    expect(notify).toHaveBeenCalledExactlyOnceWith('Refreshing status…');
+    expect(screen.queryByText(/PRIVATE_/)).toBeNull();
+  });
+
   it('observes an imminent scheduled start promptly without issuing a mutation', async () => {
     vi.useFakeTimers();
     const at = Date.now();

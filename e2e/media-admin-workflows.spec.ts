@@ -315,7 +315,7 @@ test('complimentary policy saves without media writes and paid slots downgrade a
     'Membership update queued. Follow account creation and access changes in Activity.',
   );
   await expect(notice).not.toContainText('Access policy saved.');
-  expect(await notice.evaluate((element) => getComputedStyle(element).position)).toBe('static');
+  expect(await notice.evaluate((element) => getComputedStyle(element).position)).toBe('fixed');
   const action = page.getByRole('button', { name: 'Review membership update', exact: true });
   await action.scrollIntoViewIfNeeded();
   await expect(action).toBeInViewport({ ratio: 1 });
@@ -330,6 +330,24 @@ test('complimentary policy saves without media writes and paid slots downgrade a
     }),
     'The primary membership action is reachable without a notification overlay.',
   ).toBe(true);
+  const writesBeforeReview = admin.writes.length;
+  const touch = await page.evaluate(() => navigator.maxTouchPoints > 0);
+  if (touch) await action.tap();
+  else await action.click();
+  const review = page.getByRole('dialog', { name: 'Review membership update', exact: true });
+  await expect(review).toBeVisible();
+  const dialogNotice = review.locator('.toast-region');
+  await expect(dialogNotice).toHaveCount(1);
+  await expect(page.locator('.toast-region')).toHaveCount(1);
+  expect(await dialogNotice.evaluate((element) => getComputedStyle(element).position)).toBe(
+    'static',
+  );
+  await review.getByRole('button', { name: 'Dismiss notification', exact: true }).click();
+  await expect(page.locator('.toast-region')).toHaveCount(0);
+  await review.getByRole('button', { name: 'Cancel', exact: true }).click();
+  await expect(review).toHaveCount(0);
+  await expect(page.locator('.toast-region')).toHaveCount(0);
+  expect(admin.writes).toHaveLength(writesBeforeReview);
 });
 
 test('subscription review provisions the trusted tier and ignoring a later cancellation preserves access', async ({

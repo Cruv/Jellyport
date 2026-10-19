@@ -139,27 +139,33 @@ export default function UserDirectoryPage({
     autoSync !== savedRoles.autoSync ||
     embyOnly !== savedRoles.embyOnly;
 
-  const reload = useCallback(async () => {
-    const version = ++generation.current;
-    loadController.current?.abort();
-    const controller = new AbortController();
-    loadController.current = controller;
-    setLoading(true);
-    setError('');
-    try {
-      const value = await api<{ users: DirectoryUser[] }>('/api/user-directory', {
-        signal: controller.signal,
-      });
-      if (!mounted.current || controller.signal.aborted || version !== generation.current) return;
-      setUsers(value.users);
-    } catch (reason) {
-      if (mounted.current && !controller.signal.aborted && version === generation.current)
-        setError(message(reason));
-    } finally {
-      if (mounted.current && !controller.signal.aborted && version === generation.current)
-        setLoading(false);
-    }
-  }, [api]);
+  const reload = useCallback(
+    async (manual = false) => {
+      const version = ++generation.current;
+      loadController.current?.abort();
+      const controller = new AbortController();
+      loadController.current = controller;
+      setLoading(true);
+      setError('');
+      try {
+        const value = await api<{ users: DirectoryUser[] }>('/api/user-directory', {
+          signal: controller.signal,
+        });
+        if (!mounted.current || controller.signal.aborted || version !== generation.current) return;
+        setUsers(value.users);
+        if (manual) notify('Users refreshed.');
+      } catch (reason) {
+        if (mounted.current && !controller.signal.aborted && version === generation.current) {
+          setError(message(reason));
+          if (manual) notify(message(reason), true);
+        }
+      } finally {
+        if (mounted.current && !controller.signal.aborted && version === generation.current)
+          setLoading(false);
+      }
+    },
+    [api, notify],
+  );
   useEffect(() => {
     mounted.current = true;
     void reload();
@@ -181,8 +187,10 @@ export default function UserDirectoryPage({
     try {
       await operation(controller.signal);
     } catch (reason) {
-      if (mounted.current && !controller.signal.aborted)
+      if (mounted.current && !controller.signal.aborted) {
         (forRoles ? setRoleError : setError)(message(reason));
+        notify(message(reason), true);
+      }
     } finally {
       controllers.current.delete(controller);
       busyRef.current = false;
@@ -294,6 +302,7 @@ export default function UserDirectoryPage({
     });
   }
   function loadRoles() {
+    const version = sectionGeneration.current.version;
     setOrganizer(true);
     void run(async (signal) => {
       const result = await api<{ roles: DiscordTagRole[]; can_manage_roles: boolean }>(
@@ -304,6 +313,7 @@ export default function UserDirectoryPage({
       setRoles(result.roles);
       setCanManage(result.can_manage_roles);
       setRolesLoaded(true);
+      if (sectionGeneration.current.version === version) notify('Discord roles loaded.');
     }, true);
   }
   function saveRoles(event: FormEvent) {
@@ -399,7 +409,8 @@ export default function UserDirectoryPage({
             <button
               className="btn btn-quiet"
               disabled={busy || loading}
-              onClick={() => void reload()}
+              aria-busy={loading}
+              onClick={() => void reload(true)}
             >
               <Icon name="refresh" /> Refresh
             </button>
@@ -779,6 +790,7 @@ export default function UserDirectoryPage({
               <button
                 className="btn"
                 disabled={busy || !settings.discord_enabled}
+                aria-busy={busy}
                 onClick={loadRoles}
               >
                 {organizer ? 'Refresh roles' : 'Configure roles'}

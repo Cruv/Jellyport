@@ -126,9 +126,18 @@ describe('Independent activity retention', () => {
     await screen.findByRole('alert');
     expect(screen.queryByText('PRIVATE_INTERNAL_PATH')).toBeNull();
     expect(days().value).toBe('45');
+    expect(p.notify.mock.calls).toEqual([
+      ['Activity retention status refreshed.'],
+      [
+        'Activity retention could not be saved. Your changes are kept; retry saving or refresh status to verify the current setting.',
+        true,
+      ],
+    ]);
     failing = false;
     save();
-    await waitFor(() => expect(p.notify).toHaveBeenCalledOnce());
+    await waitFor(() =>
+      expect(p.notify).toHaveBeenLastCalledWith('Automatic activity cleanup saved.'),
+    );
     expect(screen.getByText('Clear reports older than 45 days')).toBeTruthy();
   });
 
@@ -145,7 +154,7 @@ describe('Independent activity retention', () => {
     failing = false;
     fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
     await screen.findByText('Clear reports older than 90 days');
-    expect(p.notify).not.toHaveBeenCalled();
+    expect(p.notify).toHaveBeenCalledExactlyOnceWith('Activity retention status refreshed.');
   });
 
   it('loads only while active and retains a draft across Settings tabs', async () => {

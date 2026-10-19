@@ -203,7 +203,10 @@ describe('Discord membership account allowances', () => {
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.getByLabelText('Access policy')).toHaveProperty('value', 'complimentary');
     expect(screen.getByLabelText('Complimentary account allowance')).toHaveProperty('value', '2');
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      'The membership changed. Review its policy again.',
+      true,
+    );
     expect(created).not.toHaveBeenCalled();
     expect(attempts).toBe(1);
 
@@ -502,7 +505,10 @@ describe('Discord membership account allowances', () => {
       expected_revision: membership.revision,
     });
     expect(created).not.toHaveBeenCalled();
-    expect(notify).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      'The tier allowance changed. Refresh and review again.',
+      true,
+    );
   });
   it('saves complimentary access for a non-paying member without creating or modifying media accounts', async () => {
     const requests: { path: string; options?: ApiOptions }[] = [];

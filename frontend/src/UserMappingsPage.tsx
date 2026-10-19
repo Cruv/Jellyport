@@ -22,7 +22,7 @@ export default function UserMappingsPage({
   users: Users;
   api: Api;
   notify: Notify;
-  refresh: () => Promise<void>;
+  refresh: (manual?: boolean) => Promise<void>;
   templateUserId?: string;
 }) {
   const [view, setView] = useRouteTab('mappings');
@@ -128,7 +128,10 @@ export default function UserMappingsPage({
       notify('User mapping saved. Review a migration preview before starting.');
       await refresh();
     } catch (reason) {
-      if (mounted.current) setError(errorMessage(reason));
+      if (mounted.current) {
+        setError(errorMessage(reason));
+        notify(errorMessage(reason), true);
+      }
     } finally {
       busyRef.current = false;
       if (mounted.current) setBusy(false);
@@ -152,7 +155,10 @@ export default function UserMappingsPage({
       notify('User mapping removed. The server accounts were preserved.');
       await refresh();
     } catch (reason) {
-      if (mounted.current) setError(errorMessage(reason));
+      if (mounted.current) {
+        setError(errorMessage(reason));
+        notify(errorMessage(reason), true);
+      }
     } finally {
       busyRef.current = false;
       if (mounted.current) setBusy(false);
@@ -173,7 +179,7 @@ export default function UserMappingsPage({
         title="User mappings"
         description="Connect Emby, Jellyfin, and Discord identities when usernames differ."
         actions={
-          <button className="btn btn-quiet" onClick={() => void refresh()} disabled={busy}>
+          <button className="btn btn-quiet" onClick={() => void refresh(true)} disabled={busy}>
             <Icon name="refresh" />
             Refresh
           </button>

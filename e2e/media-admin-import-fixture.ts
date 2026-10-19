@@ -13,6 +13,7 @@ import type { JellyfinAuthentication } from '../server/jellyfin-auth';
 import type { SourceSnapshots } from '../server/source-snapshots';
 import type { DestinationCatalogs } from '../server/destination-catalogs';
 import type { JellyfinBackupManifest } from '../server/jellyfin-backup-api';
+import type { MediaUserDataPatch } from '../server/media';
 
 export const sourceMember = '00112233445566778899aabbccddeeff';
 export const destinationMember = '112233445566778899aabbccddeeff00';
@@ -123,6 +124,9 @@ export interface ImportFixture {
   readonly servers: DemoServers;
   readonly exchange: string;
   readonly writes: Array<{ user: string; item: string }>;
+  readonly accountWrites: Array<{ method: string; id: string }>;
+  readonly userDataWrites: Array<{ user: string; item: string; value: MediaUserDataPatch }>;
+  protectDestinationAs: (kind: 'administrator' | 'template') => void;
   backup: (kind: Kind, state: BackupState) => Promise<void>;
   restart: (page: Page) => Promise<void>;
   stopHelper: () => Promise<void>;
@@ -295,6 +299,8 @@ export const test = base.extend<{ imports: ImportFixture }>({
       ];
       servers.played = { [destinationMember]: new Set([protectedMovieId]) };
       const writes: ImportFixture['writes'] = [];
+      const accountWrites: ImportFixture['accountWrites'] = [];
+      const userDataWrites: ImportFixture['userDataWrites'] = [];
       const identity = {
         serverId: destinationServer,
         userId: 'synthetic-admin',
@@ -349,6 +355,54 @@ export const test = base.extend<{ imports: ImportFixture }>({
               writes.push({ user, item });
               await mark(user, item, date);
             };
+            if (kind === 'jellyfin') {
+              const createUser = media.createUser.bind(media);
+              media.createUser = async (name, password) => {
+                accountWrites.push({ method: 'createUser', id: name });
+                return createUser(name, password);
+              };
+              const setPassword = media.setPassword.bind(media);
+              media.setPassword = async (id, password) => {
+                accountWrites.push({ method: 'setPassword', id });
+                return setPassword(id, password);
+              };
+              for (const method of [
+                'setPolicy',
+                'setConfiguration',
+                'setDisplayPreferences',
+              ] as const) {
+                const original = media[method]!.bind(media);
+                media[method] = async (id, value) => {
+                  accountWrites.push({ method, id });
+                  await original(id, value);
+                };
+              }
+              const setImage = media.setUserImage!.bind(media);
+              media.setUserImage = async (id, image) => {
+                accountWrites.push({ method: 'setUserImage', id });
+                await setImage(id, image);
+              };
+              const favorite = media.markFavorite!.bind(media);
+              media.markFavorite = async (userId, itemId) => {
+                accountWrites.push({ method: 'markFavorite', id: userId });
+                await favorite(userId, itemId);
+              };
+              const updateData = media.updateUserData!.bind(media);
+              media.updateUserData = async (userId, itemId, value) => {
+                userDataWrites.push({ user: userId, item: itemId, value: structuredClone(value) });
+                await updateData(userId, itemId, value);
+              };
+              const createPlaylist = media.createPlaylist!.bind(media);
+              media.createPlaylist = async (userId, name, mediaType, items) => {
+                accountWrites.push({ method: 'createPlaylist', id: userId });
+                return createPlaylist(userId, name, mediaType, items);
+              };
+              const addPlaylistItems = media.addPlaylistItems!.bind(media);
+              media.addPlaylistItems = async (id, userId, items) => {
+                accountWrites.push({ method: 'addPlaylistItems', id: userId });
+                await addPlaylistItems(id, userId, items);
+              };
+            }
             return media;
           },
         });
@@ -466,6 +520,17 @@ for(const object of [dns,dns.promises]) for(const name of Object.keys(object)) i
         servers,
         exchange,
         writes,
+        accountWrites,
+        userDataWrites,
+        protectDestinationAs: (kind) => {
+          const target = servers.users.jellyfin.find((user) => user.Id === destinationMember)!;
+          if (kind === 'administrator') target.Policy = { ...target.Policy, IsAdministrator: true };
+          else
+            app!.jellyport.store.saveSettings({
+              ...app!.jellyport.store.settings(),
+              template_user_id: destinationMember,
+            });
+        },
         backup,
         restart: async (page) => {
           const location = page.url();

@@ -396,6 +396,7 @@ it.each([
       expected,
       undefined,
       undefined,
+      undefined,
     );
   },
 );
@@ -418,6 +419,79 @@ it('rejects unknown or coerced migration scopes before preview or queue work sta
   expect(preview).not.toHaveBeenCalled();
   expect(migrate).not.toHaveBeenCalled();
   expect(app.jellyport.store.jobs()).toHaveLength(0);
+});
+
+it('passes protected-account pins only from the session-owned review and rejects client pins', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const other = await login(app);
+  const preview = await app.jellyport.service.preview(['e-alex']);
+  const pin = {
+    target_user_id: 'protected-destination',
+    target_username: 'Existing administrator',
+    server_id: 'reviewed-server',
+    administrator: true,
+    template: false,
+    template_user_id: 'template',
+  };
+  vi.spyOn(app.jellyport.service, 'preview').mockResolvedValue({
+    ...preview,
+    users: [
+      {
+        ...preview.users[0]!,
+        history_only: true,
+        target_user_id: pin.target_user_id,
+        target_exists: true,
+      },
+    ],
+    history_only_targets: { 'e-alex': pin },
+  });
+  const stamp = new Date().toISOString();
+  const migrate = vi.spyOn(app.jellyport.service, 'migrateUsers').mockResolvedValue({
+    id: 'synthetic-reviewed-job',
+    kind: 'migrate',
+    status: 'queued',
+    created_at: stamp,
+    updated_at: stamp,
+    progress: { processed: 0, total: 1 },
+    results: [],
+  });
+  const review = await readyPreview(app, headers);
+  const payload = { source_user_ids: ['e-alex'], preview_id: review.id };
+  expect(
+    (await app.inject({ method: 'POST', url: '/api/migrations', headers: other, payload }))
+      .statusCode,
+  ).toBe(400);
+  expect(
+    (
+      await app.inject({
+        method: 'POST',
+        url: '/api/migrations',
+        headers,
+        payload: {
+          ...payload,
+          history_only_targets: { 'e-alex': { ...pin, target_user_id: 'client-forged' } },
+        },
+      })
+    ).statusCode,
+  ).toBe(422);
+  expect(migrate).not.toHaveBeenCalled();
+  // A browser can edit its received JSON, but the server retains its own pin.
+  review.preview.history_only_targets['e-alex'].target_user_id = 'client-edited';
+  const accepted = await app.inject({ method: 'POST', url: '/api/migrations', headers, payload });
+  expect(accepted.statusCode).toBe(202);
+  expect(migrate).toHaveBeenCalledExactlyOnceWith(
+    ['e-alex'],
+    undefined,
+    { 'e-alex': null },
+    'watched_only',
+    undefined,
+    expect.objectContaining({ preview_id: review.id }),
+    { 'e-alex': pin },
+  );
+  expect(
+    (await app.inject({ url: `/api/migrations/preview/${review.id}`, headers })).statusCode,
+  ).toBe(404);
 });
 
 it('persists trusted whole-review preparation plus accepted job duration without dividing bulk review time', async () => {

@@ -159,6 +159,12 @@ export interface DestinationCatalogMetadata {
   expires_at: string;
 }
 export interface JobResult {
+  history_only?: boolean;
+  migration_outcome?: {
+    version: 1;
+    execution: 'verified' | 'needs_review';
+    unresolved_source_history: number;
+  };
   destination_catalog?: DestinationCatalogMetadata;
   timing?: {
     elapsed_ms: number;
@@ -420,6 +426,8 @@ export interface Overview {
   pending_subscriptions?: number;
 }
 export interface PreviewUser {
+  history_only?: boolean;
+  target_user_id?: string | null;
   source_snapshot?: SourceSnapshotMetadata;
   source_user_id: string;
   username: string;
@@ -445,7 +453,16 @@ export interface PreviewUser {
   unmatched?: ItemIssue[];
   ambiguous?: ItemIssue[];
 }
+export interface ReviewedHistoryTarget {
+  target_user_id: string;
+  target_username: string;
+  server_id: string;
+  administrator: boolean;
+  template: boolean;
+  template_user_id: string;
+}
 export interface Preview {
+  history_only_targets?: Record<string, ReviewedHistoryTarget>;
   users: PreviewUser[];
   migration_scope?: HistoricalMigrationScope;
   source_snapshot_ids?: Record<string, string>;

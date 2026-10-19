@@ -63,11 +63,12 @@ export default function UserMappingsPage({
   }, []);
 
   const destinations = users.jellyfin.filter(
-    (user) =>
-      user.Id !== templateUserId &&
-      user.Policy?.IsAdministrator === false &&
-      user.Policy?.IsDisabled === false,
+    (user) => typeof user.Policy?.IsAdministrator === 'boolean' && user.Policy.IsDisabled === false,
   );
+  const destination = users.jellyfin.find((user) => user.Id === targetId);
+  const historyOnly =
+    !!destination &&
+    (destination.Id === templateUserId || destination.Policy?.IsAdministrator === true);
   function reset() {
     setEditing(null);
     setSourceId('');
@@ -115,9 +116,9 @@ export default function UserMappingsPage({
           source_user_id: sourceId,
           target_user_id: targetId || null,
           ...(targetId ? {} : { target_username: targetName.trim() }),
-          discord_username: discordName.trim() || null,
-          discord_user_id: discordId.trim() || null,
-          ...(discordId.trim() && (membershipSlot !== 1 || editing?.membership_slot)
+          discord_username: historyOnly ? null : discordName.trim() || null,
+          discord_user_id: historyOnly ? null : discordId.trim() || null,
+          ...(!historyOnly && discordId.trim() && (membershipSlot !== 1 || editing?.membership_slot)
             ? { membership_slot: membershipSlot }
             : {}),
         },
@@ -373,7 +374,21 @@ export default function UserMappingsPage({
                     id="mapping-target"
                     value={targetId}
                     disabled={busy}
-                    onChange={(event) => setTargetId(event.target.value)}
+                    onChange={(event) => {
+                      const id = event.target.value;
+                      setTargetId(id);
+                      const selected = users.jellyfin.find((user) => user.Id === id);
+                      if (
+                        selected &&
+                        (selected.Id === templateUserId ||
+                          selected.Policy?.IsAdministrator === true)
+                      ) {
+                        setDiscordMember(null);
+                        setDiscordId('');
+                        setDiscordName('');
+                        setMembershipSlot(1);
+                      }
+                    }}
                   >
                     <option value="">Create a new account during migration</option>
                     {editing && targetId && !destinations.some((user) => user.Id === targetId) && (
@@ -382,6 +397,9 @@ export default function UserMappingsPage({
                     {destinations.map((user) => (
                       <option key={user.Id} value={user.Id}>
                         {user.Name}
+                        {user.Id === templateUserId || user.Policy?.IsAdministrator === true
+                          ? ' · watch history only'
+                          : ''}
                       </option>
                     ))}
                   </select>
@@ -408,6 +426,12 @@ export default function UserMappingsPage({
                   </small>
                 </div>
               )}
+              {historyOnly && (
+                <p className="status-summary form-stack">
+                  Watch history only: this administrator or template mapping adds played flags.
+                  Discord ownership and membership management cannot be assigned here.
+                </p>
+              )}
               <DiscordMemberPicker
                 key={editing?.id || sourceId || 'new-mapping'}
                 api={api}
@@ -425,7 +449,7 @@ export default function UserMappingsPage({
                   ''
                 }
                 allowInactive
-                disabled={busy}
+                disabled={busy || historyOnly}
                 id="mapping-discord-member"
               />
               <div className="field">
@@ -433,7 +457,7 @@ export default function UserMappingsPage({
                 <select
                   id="mapping-membership-slot"
                   value={membershipSlot}
-                  disabled={busy || !discordId.trim()}
+                  disabled={busy || historyOnly || !discordId.trim()}
                   onChange={(event) => setMembershipSlot(Number(event.target.value))}
                 >
                   <option value={1}>1 · Primary account</option>
@@ -464,7 +488,7 @@ export default function UserMappingsPage({
                         setDiscordName(event.target.value);
                       }}
                       maxLength={64}
-                      disabled={busy}
+                      disabled={busy || historyOnly}
                       autoComplete="off"
                       placeholder="Actual username, not a server nickname"
                     />
@@ -484,7 +508,7 @@ export default function UserMappingsPage({
                       inputMode="numeric"
                       pattern="[0-9]{5,22}"
                       maxLength={22}
-                      disabled={busy}
+                      disabled={busy || historyOnly}
                       autoComplete="off"
                     />
                     <small>

@@ -306,6 +306,8 @@ export async function migrateItemState(
   saved: () => void,
   options: {
     concurrency?: number;
+    /** Revalidate reviewed account boundaries before a bounded mutation batch. */
+    before_write?: () => Promise<void>;
     progress?: (processed: number, total: number, updated: number) => void;
     migration_scope?: MigrationScope;
     expectation?: (target: MediaItem, patch: MediaUserDataPatch, unsupported: string[]) => void;
@@ -387,6 +389,13 @@ export async function migrateItemState(
         throw new ServiceError(
           'An earlier played-flag update for this destination had an unverified outcome. No duplicate mutation was sent.',
         );
+      guard();
+      try {
+        await options.before_write?.();
+      } catch (error) {
+        latchFailure(error);
+        throw error;
+      }
       guard();
       attemptedTargets.add(target.Id);
       const began = performance.now();

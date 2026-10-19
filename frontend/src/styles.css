@@ -1481,6 +1481,15 @@ textarea::placeholder {
   color: var(--muted);
   margin-top: 8px;
 }
+.warning-block {
+  padding: 12px 15px;
+  background: #e7c38708;
+  border: 1px solid #e7c38730;
+  color: var(--yellow);
+  border-radius: 8px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
 .error-block {
   color: var(--red);
   background: #f2a3ab09;
@@ -1800,7 +1809,8 @@ textarea::placeholder {
   font-size: 12px;
   margin-top: 9px;
 }
-.job-result .error-block {
+.job-result .error-block,
+.job-result .warning-block {
   margin-top: 10px;
 }
 .job-meta {

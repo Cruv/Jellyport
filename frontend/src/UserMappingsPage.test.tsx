@@ -56,6 +56,46 @@ afterEach(() => {
 });
 
 describe('Manual user mappings', () => {
+  it('allows an enabled administrator as a watch-only destination and clears inherited Discord inputs', async () => {
+    const known = {
+      Id: 'jf-enabled-admin',
+      Name: 'Existing administrator',
+      Policy: { IsAdministrator: true, IsDisabled: false },
+    };
+    const api = vi.fn(async () => mapping) as Api;
+    render(
+      <UserMappingsPage
+        mappings={[]}
+        users={{ ...users, jellyfin: [...users.jellyfin, known] }}
+        api={api}
+        notify={vi.fn()}
+        refresh={async () => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole('tab', { name: 'Add mapping' }));
+    fireEvent.change(screen.getByLabelText('Emby account'), { target: { value: 'emby-alex' } });
+    fireEvent.change(screen.getByLabelText(/Discord user ID/), {
+      target: { value: '123456789012345678' },
+    });
+    fireEvent.change(screen.getByLabelText('Jellyfin destination'), {
+      target: { value: known.Id },
+    });
+    expect(
+      screen.getByText(/Watch history only: this administrator or template mapping/),
+    ).toBeTruthy();
+    expect(screen.getByLabelText(/Discord user ID/)).toHaveProperty('disabled', true);
+    expect(screen.getByLabelText(/Discord user ID/)).toHaveProperty('value', '');
+    expect(screen.getByLabelText('Membership account slot')).toHaveProperty('disabled', true);
+    fireEvent.click(screen.getByRole('button', { name: 'Save mapping' }));
+    await waitFor(() => expect(api).toHaveBeenCalledOnce());
+    expect(vi.mocked(api).mock.calls[0][1]?.body).toEqual({
+      source_user_id: 'emby-alex',
+      target_user_id: known.Id,
+      discord_user_id: null,
+      discord_username: null,
+    });
+  });
+
   it('restores the editor tab without putting account identities or a draft in the route', async () => {
     window.history.replaceState(null, '', '#/mappings');
     const first = page([mapping]);
@@ -402,7 +442,7 @@ describe('Manual user mappings', () => {
     expect(sessionStorage.length).toBe(0);
   });
 
-  it('selects an existing destination without sending a replacement name or password and excludes administrators', async () => {
+  it('selects an existing destination without sending a replacement name or password and excludes unverified policies', async () => {
     const { requests } = page();
     fireEvent.change(screen.getByLabelText('Emby account'), { target: { value: 'emby-alex' } });
     fireEvent.change(screen.getByLabelText('Jellyfin destination'), {

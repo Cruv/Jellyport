@@ -87,13 +87,16 @@ From 0.24.0, reports separate matching coverage from execution outcome. Coverage
 `matched / (matched + unmatched + ambiguous)` over identifiable source items;
 multiple source editions may map to one Jellyfin item. Unidentified backup-history
 rows are reported separately and are not counted as migrated or assumed deleted.
-At least 95% coverage plus confirmed successful writes and independent readback
-can display **Succeeded with warnings** for known source/matching diagnostics.
+A verified migration with at least 95% coverage uses the normal **Completed**
+status. Successful writes and independent readback are required. Expected
+source-history differences remain
+informational, including saved history whose media no longer exists; uncertain
+records are still not assumed obsolete or migrated.
 Low coverage, failed writes/readback, uncertain operations and unclassified warnings
-retain **Needs review** or **Failed**. Activity includes a separate successful-warning
-filter. Raw persisted statuses stay compatible; old partial reports without the
-new structured execution evidence remain **Needs review**, with their coverage
-shown where matching counts are available.
+retain **Needs review** or **Failed**. Activity's **Completed** filter includes these
+verified migrations alongside other completed work. Raw persisted statuses stay
+compatible; old partial reports without the new structured execution evidence
+remain **Needs review**, with their coverage shown where matching counts are available.
 
 Each user's saved migration result includes at most 200 unmatched items and 200 ambiguous items, with at most 20 candidate matches per ambiguous item. Summary statistics count all eligible matching work. Previews return deferred statistics rather than zero counts and empty matching-detail lists until execution. These bounds limit browser-response size and persisted diagnostics; migration matching and its result counts still cover all eligible items. A completed preview larger than 8 MiB is rejected with a request to select fewer users.
 

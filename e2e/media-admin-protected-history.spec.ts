@@ -167,7 +167,7 @@ for (const protection of ['administrator', 'template'] as const) {
   });
 }
 
-test('verified high matching coverage is a warning success while failed writes stay in review', async ({
+test('verified high matching coverage succeeds while failed writes stay in review', async ({
   page,
   imports,
 }, info) => {
@@ -184,7 +184,7 @@ test('verified high matching coverage is a warning success while failed writes s
     progress: { processed: 1, total: 1 },
     results: [
       {
-        username: 'Synthetic warning member',
+        username: 'Synthetic matched member',
         status: 'partial',
         created: false,
         target_user_id: destinationMember,
@@ -221,6 +221,26 @@ test('verified high matching coverage is a warning success while failed writes s
     ],
   };
   imports.app.jellyport.store.saveJob(job);
+  const completed = structuredClone(job);
+  completed.id = 'synthetic-completed-migration';
+  completed.status = 'completed';
+  const completedResult = completed.results[0]!;
+  completedResult.username = 'Synthetic completed member';
+  completedResult.status = 'completed';
+  completedResult.matched = 500;
+  completedResult.unmatched = 0;
+  completedResult.ambiguous = 0;
+  completedResult.already_played = 497;
+  completedResult.migration_outcome!.unresolved_source_history = 0;
+  completedResult.data!.verification = {
+    checked: 500,
+    verified: 498,
+    preserved_newer: 2,
+    missing: 0,
+    mismatched: 0,
+    unsupported_fields: 0,
+  };
+  imports.app.jellyport.store.saveJob(completed);
   const failedWrite = structuredClone(job);
   failedWrite.id = 'synthetic-failed-write-migration';
   const result = failedWrite.results[0]!;
@@ -249,12 +269,24 @@ test('verified high matching coverage is a warning success while failed writes s
 
   await page.goto('/#/activity');
   const status = page.getByRole('combobox', { name: 'Status', exact: true });
-  const warningRow = page.getByRole('row').filter({ hasText: 'Synthetic warning member' });
+  const matchedRow = page.getByRole('row').filter({ hasText: 'Synthetic matched member' });
+  const completedRow = page.getByRole('row').filter({ hasText: 'Synthetic completed member' });
   const failedRow = page.getByRole('row').filter({ hasText: 'Synthetic failed-write member' });
-  await expect(warningRow).toContainText('Succeeded with warnings');
+  await expect(matchedRow).toContainText('Completed');
+  await expect(completedRow).toContainText('Completed');
   await expect(failedRow).toContainText('Needs review');
+  await expect(page.getByText('Succeeded with warnings', { exact: true })).toHaveCount(0);
+  await expect(status.locator('option')).toHaveText([
+    'All operations',
+    'Running or queued',
+    'Completed',
+    'Needs review',
+    'Failed',
+    'Canceled',
+  ]);
   await status.selectOption('partial');
-  await expect(warningRow).toHaveCount(0);
+  await expect(matchedRow).toHaveCount(0);
+  await expect(completedRow).toHaveCount(0);
   await expect(failedRow).toBeVisible();
   await failedRow.getByRole('button', { name: 'View operation details', exact: true }).click();
   const failedDetails = page.getByRole('dialog', { name: 'Migration details', exact: true });
@@ -262,17 +294,19 @@ test('verified high matching coverage is a warning success while failed writes s
     failedDetails.getByText('Review this operation before retrying.', { exact: true }),
   ).toBeVisible();
   await failedDetails.getByRole('button', { name: 'Close', exact: true }).click();
-  await status.selectOption('succeeded_with_warnings');
+  await status.selectOption('completed');
   await expect(failedRow).toHaveCount(0);
-  await expect(warningRow).toBeVisible();
+  await expect(matchedRow).toBeVisible();
+  await expect(completedRow).toBeVisible();
   await expectContainedLayout(page);
   await page.screenshot({
-    path: info.outputPath('matching-warning-activity-filter.png'),
+    path: info.outputPath('matching-success-activity-filter.png'),
     fullPage: true,
   });
-  await warningRow.getByRole('button', { name: 'View operation details', exact: true }).click();
+  await matchedRow.getByRole('button', { name: 'View operation details', exact: true }).click();
   const details = page.getByRole('dialog', { name: 'Migration details', exact: true });
-  await expect(details.getByText('Succeeded with warnings', { exact: true })).toHaveCount(2);
+  await expect(details.getByText('Completed', { exact: true })).toHaveCount(2);
+  await expect(details.getByText('Succeeded with warnings', { exact: true })).toHaveCount(0);
   await expect(
     details.getByText('Review this operation before retrying.', { exact: true }),
   ).toHaveCount(0);
@@ -287,7 +321,7 @@ test('verified high matching coverage is a warning success while failed writes s
   await expect(coverage).toContainText('excluded from this percentage');
   await coverage.scrollIntoViewIfNeeded();
   await expectContainedLayout(page);
-  await page.screenshot({ path: info.outputPath('matching-warning-coverage.png'), fullPage: true });
+  await page.screenshot({ path: info.outputPath('matching-success-coverage.png'), fullPage: true });
   expect(imports.writes).toEqual([]);
   expect(imports.userDataWrites).toEqual([]);
   expect(imports.accountWrites).toEqual([]);

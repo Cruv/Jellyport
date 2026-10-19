@@ -2065,8 +2065,9 @@ function DialogContent({
             {result.data?.warnings.map((warning, index) => (
               <div
                 className={
-                  resultOutcome(result, job.migration_scope).label === 'Succeeded with warnings'
-                    ? 'warning-block'
+                  result.status === 'partial' &&
+                  resultOutcome(result, job.migration_scope).value === 'completed'
+                    ? 'info-block'
                     : 'error-block'
                 }
                 key={index}

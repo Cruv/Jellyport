@@ -136,16 +136,26 @@ describe('identifiable-source matching coverage', () => {
 });
 
 describe('migration execution display', () => {
-  it('distinguishes high matching coverage from verified execution without mutating persisted state', () => {
+  it('shows verified high-coverage migration as completed without mutating persisted state', () => {
     const source = result();
     const before = structuredClone(source);
     expect(resultOutcome(source, 'watched_only')).toEqual({
-      value: 'partial',
-      label: 'Succeeded with warnings',
+      value: 'completed',
       needsReview: false,
     });
     expect(source).toEqual(before);
   });
+
+  it.each([
+    [9500, 500, 'completed', false],
+    [9499, 501, 'partial', true],
+  ])(
+    'requires unrounded 95% coverage before classifying %i matched and %i unmatched as %s',
+    (matched, unmatched, value, needsReview) => {
+      const source = { ...result(), matched, unmatched, ambiguous: 0 };
+      expect(resultOutcome(source, 'watched_only')).toEqual({ value, needsReview });
+    },
+  );
 
   it.each([
     [
@@ -336,13 +346,13 @@ describe('migration execution display', () => {
     source.applied = 0;
     source.data!.items_updated = 0;
     Object.assign(source.data!.write_metrics!, { attempts: 0, succeeded: 0 });
-    expect(resultOutcome(source).label).toBe('Succeeded with warnings');
+    expect(resultOutcome(source)).toEqual({ value: 'completed', needsReview: false });
   });
 
   it('accepts independently verified preserved destination activity', () => {
     const source = result();
     Object.assign(source.data!.verification!, { verified: 2975, preserved_newer: 1 });
-    expect(resultOutcome(source).label).toBe('Succeeded with warnings');
+    expect(resultOutcome(source)).toEqual({ value: 'completed', needsReview: false });
   });
 
   it.each(['failed', 'interrupted', 'canceled', 'running', 'queued', 'completed'])(
@@ -357,14 +367,17 @@ describe('migration execution display', () => {
 describe('migration job outcome', () => {
   it('refines only a finished partial migration whose results all succeeded', () => {
     expect(jobOutcome(job())).toEqual({
-      value: 'partial',
-      label: 'Succeeded with warnings',
+      value: 'completed',
       needsReview: false,
     });
-    expect(jobOutcome(job([result(), { status: 'completed' }])).label).toBe(
-      'Succeeded with warnings',
-    );
-    expect(jobOutcome({ ...job(), kind: 'migration' }).label).toBe('Succeeded with warnings');
+    expect(jobOutcome(job([result(), { status: 'completed' }]))).toEqual({
+      value: 'completed',
+      needsReview: false,
+    });
+    expect(jobOutcome({ ...job(), kind: 'migration' })).toEqual({
+      value: 'completed',
+      needsReview: false,
+    });
   });
 
   it.each(['create', 'membership', 'role_update', 'disable'])(
@@ -388,7 +401,7 @@ describe('migration job outcome', () => {
 });
 
 describe('migration coverage presentation', () => {
-  it('keeps successful execution with warnings amber and explains the distinct denominators', () => {
+  it('shows verified execution as green completed while explaining historical differences', () => {
     const source = result();
     render(
       <>
@@ -396,7 +409,8 @@ describe('migration coverage presentation', () => {
         <MigrationCoverage result={source} />
       </>,
     );
-    expect(screen.getByText('Succeeded with warnings').className).toBe('status warn');
+    expect(screen.getByText('Completed').className).toBe('status good');
+    expect(screen.queryByText('Succeeded with warnings')).toBeNull();
     const coverage = screen.getByRole('region', { name: 'Matching coverage' });
     expect(coverage.textContent).toContain('99.6% matched');
     expect(coverage.textContent).toContain('2,978 of 2,991 identifiable source items');

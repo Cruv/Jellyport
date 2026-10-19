@@ -792,6 +792,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       minute: number;
       time_zone: string;
       expected_revision: string;
+      create_backup?: boolean;
     };
   }>(
     '/api/destination-catalog/schedule',
@@ -807,6 +808,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             minute: { type: 'integer', minimum: 0, maximum: 59 },
             time_zone: { type: 'string', minLength: 1, maxLength: 128 },
             expected_revision: id,
+            create_backup: { type: 'boolean' },
           },
         },
       },
@@ -815,6 +817,21 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   );
   app.post('/api/destination-catalog/refresh', noSnapshotBody, async (_request, reply) =>
     reply.code(202).send(await service.destinationSnapshots.refresh()),
+  );
+  app.post<{ Body: { expected_attempt_id: string } }>(
+    '/api/destination-catalog/backup/acknowledge',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['expected_attempt_id'],
+          properties: { expected_attempt_id: id },
+        },
+      },
+    },
+    async (request) =>
+      service.destinationSnapshots.acknowledgeBackup(request.body.expected_attempt_id),
   );
   app.delete('/api/destination-catalog', noSnapshotBody, async () =>
     service.destinationSnapshots.clear(),

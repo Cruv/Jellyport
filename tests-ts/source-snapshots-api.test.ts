@@ -446,6 +446,7 @@ it('saves only the strictly typed Jellyfin schedule with current administrator a
     minute: 15,
     time_zone: 'Etc/UTC',
     expected_revision: state.config.revision,
+    create_backup: true,
   };
   const request = {
     method: 'PUT' as const,
@@ -467,6 +468,7 @@ it('saves only the strictly typed Jellyfin schedule with current administrator a
   expect(configure).toHaveBeenCalledExactlyOnceWith(input);
   configure.mockClear();
   for (const invalid of [
+    { create_backup: 'true' },
     { enabled: 'true' },
     { hour: 24 },
     { hour: 1.5 },
@@ -483,7 +485,7 @@ it('saves only the strictly typed Jellyfin schedule with current administrator a
     expect(rejected.statusCode).toBe(422);
     expect(rejected.body).not.toContain('synthetic-private-submitted-secret');
   }
-  for (const omitted of Object.keys(input)) {
+  for (const omitted of Object.keys(input).filter((key) => key !== 'create_backup')) {
     const missing: Record<string, unknown> = { ...input };
     delete missing[omitted];
     expect((await app.inject({ ...request, headers, payload: missing })).statusCode).toBe(422);
@@ -492,6 +494,46 @@ it('saves only the strictly typed Jellyfin schedule with current administrator a
   revoke();
   expect((await app.inject({ ...request, headers })).statusCode).toBe(401);
   expect(configure).not.toHaveBeenCalled();
+});
+
+it('protects backup confirmation with administrator revalidation, CSRF and a strict attempt-bound body', async () => {
+  const { app, headers, revoke } = await setup();
+  const manager = app.jellyport.service.destinationSnapshots;
+  const state = await manager.status();
+  const confirm = vi.spyOn(manager, 'acknowledgeBackup').mockResolvedValue(state);
+  const expected_attempt_id = '00112233-4455-4677-8899-aabbccddeeff';
+  const request = {
+    method: 'POST' as const,
+    url: '/api/destination-catalog/backup/acknowledge',
+    payload: { expected_attempt_id },
+  };
+  expect((await app.inject(request)).statusCode).toBe(401);
+  expect((await app.inject({ ...request, headers: { cookie: headers.cookie } })).statusCode).toBe(
+    403,
+  );
+  expect(
+    (await app.inject({ ...request, headers: { ...headers, origin: 'https://attacker.example' } }))
+      .statusCode,
+  ).toBe(403);
+  for (const payload of [
+    {},
+    { expected_attempt_id: false },
+    { expected_attempt_id: '' },
+    { expected_attempt_id, api_key: 'synthetic-private' },
+  ]) {
+    const response = await app.inject({ ...request, headers, payload });
+    expect(response.statusCode).toBe(422);
+    expect(response.body).not.toContain('synthetic-private');
+  }
+  expect(confirm).not.toHaveBeenCalled();
+  const response = await app.inject({ ...request, headers });
+  expect(response.statusCode).toBe(200);
+  expect(response.headers['cache-control']).toBe('no-store');
+  expect(confirm).toHaveBeenCalledExactlyOnceWith(expected_attempt_id);
+  confirm.mockClear();
+  revoke();
+  expect((await app.inject({ ...request, headers })).statusCode).toBe(401);
+  expect(confirm).not.toHaveBeenCalled();
 });
 
 it('keeps the Jellyfin schedule readable in demo mode but never enables a real scheduled importer', async () => {

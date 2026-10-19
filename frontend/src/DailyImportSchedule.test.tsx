@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import DailyImportSchedule from './DailyImportSchedule';
-import type { ImportScheduleConfig } from './types';
+import type { DestinationCatalogConfig, ImportScheduleConfig } from './types';
 import { WorkspaceDraftProvider } from './workspace-drafts';
 
 const config: ImportScheduleConfig = {
@@ -18,6 +18,162 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 describe('shared daily import schedule editor', () => {
+  it('keeps fresh-backup creation absent from source import and capture schedules', () => {
+    const view = render(
+      <DailyImportSchedule id="source" config={config} busy="" demo={false} onSave={vi.fn()} />,
+    );
+    expect(screen.queryByLabelText(/Create a fresh Jellyfin backup/)).toBeNull();
+    view.rerender(
+      <DailyImportSchedule
+        id="source"
+        config={{ ...config, scope: 'watched_only' }}
+        busy=""
+        demo={false}
+        capture
+        onSave={vi.fn()}
+      />,
+    );
+    expect(screen.queryByLabelText(/Create a fresh Jellyfin backup/)).toBeNull();
+  });
+  it('defaults older Jellyfin schedules to import-only and explicitly saves the opt-in independently', async () => {
+    const save = vi.fn(async (input) => ({ ...input, revision: 'synthetic-revision-2' }));
+    const view = render(
+      <DailyImportSchedule
+        id="jellyfin"
+        config={config}
+        busy=""
+        demo={false}
+        createBackup
+        onSave={save}
+      />,
+    );
+    const checkbox = screen.getByLabelText(
+      'Create a fresh Jellyfin backup before each scheduled import',
+    );
+    expect(checkbox).toHaveProperty('checked', false);
+    expect(screen.getByText(/Scheduled workflow:/).textContent).toContain(
+      'Import an existing completed Jellyfin backup.',
+    );
+    fireEvent.submit(screen.getByRole('form', { name: 'Backup import schedule' }));
+    await act(async () => {});
+    expect(save).toHaveBeenLastCalledWith({
+      enabled: false,
+      hour: 3,
+      minute: 0,
+      time_zone: 'UTC',
+      create_backup: false,
+      expected_revision: config.revision,
+    });
+    view.rerender(
+      <DailyImportSchedule
+        id="jellyfin"
+        config={{ ...config, revision: 'synthetic-revision-2', create_backup: false }}
+        busy=""
+        demo={false}
+        createBackup
+        onSave={save}
+      />,
+    );
+    fireEvent.click(checkbox);
+    expect(screen.getByText('Unsaved schedule changes.')).toBeTruthy();
+    expect(screen.getByText(/Creating it uses the live Jellyfin database/)).toBeTruthy();
+    expect(screen.getByText(/Scheduled workflow:/).textContent).toContain(
+      'Import an existing completed Jellyfin backup.',
+    );
+    fireEvent.submit(screen.getByRole('form', { name: 'Backup import schedule' }));
+    await act(async () => {});
+    expect(save).toHaveBeenLastCalledWith(
+      expect.objectContaining({ create_backup: true, expected_revision: 'synthetic-revision-2' }),
+    );
+    expect(save).toHaveBeenCalledTimes(2);
+  });
+  it('retains the fresh-backup draft through remount and revision conflicts, then reloads the saved choice', () => {
+    const save = vi.fn();
+    function Workspace({
+      visible,
+      current = config,
+    }: {
+      visible: boolean;
+      current?: DestinationCatalogConfig;
+    }) {
+      return (
+        <WorkspaceDraftProvider>
+          {visible && (
+            <DailyImportSchedule
+              id="jellyfin"
+              config={current}
+              busy=""
+              demo={false}
+              createBackup
+              onSave={save}
+            />
+          )}
+        </WorkspaceDraftProvider>
+      );
+    }
+    const view = render(<Workspace visible />);
+    fireEvent.click(screen.getByLabelText(/Create a fresh Jellyfin backup/));
+    view.rerender(<Workspace visible={false} />);
+    const changed = { ...config, create_backup: false, revision: 'synthetic-revision-2' };
+    view.rerender(<Workspace visible current={changed} />);
+    expect(screen.getByLabelText(/Create a fresh Jellyfin backup/)).toHaveProperty('checked', true);
+    expect(screen.getByText('Unsaved schedule changes.')).toBeTruthy();
+    expect(screen.getByText(/The saved schedule changed/)).toBeTruthy();
+    fireEvent.submit(screen.getByRole('form', { name: 'Backup import schedule' }));
+    expect(save).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Reload saved schedule' }));
+    expect(screen.getByLabelText(/Create a fresh Jellyfin backup/)).toHaveProperty(
+      'checked',
+      false,
+    );
+    expect(screen.queryByText('Unsaved schedule changes.')).toBeNull();
+  });
+  it('preserves a later fresh-backup edit when an earlier save returns and recognizes disabling it as dirty', async () => {
+    let resolve!: (value: DestinationCatalogConfig) => void;
+    const save = vi.fn(() => new Promise<DestinationCatalogConfig>((done) => (resolve = done)));
+    const enabled = { ...config, create_backup: true };
+    render(
+      <DailyImportSchedule
+        id="jellyfin"
+        config={enabled}
+        busy=""
+        demo={false}
+        createBackup
+        onSave={save}
+      />,
+    );
+    expect(screen.getByText(/Scheduled workflow:/).textContent).toContain(
+      'Create a fresh Jellyfin backup, then import it after it finishes.',
+    );
+    fireEvent.submit(screen.getByRole('form', { name: 'Backup import schedule' }));
+    fireEvent.click(screen.getByLabelText(/Create a fresh Jellyfin backup/));
+    expect(screen.getByText('Unsaved schedule changes.')).toBeTruthy();
+    await act(async () => resolve({ ...enabled, revision: 'synthetic-revision-2' }));
+    expect(screen.getByLabelText(/Create a fresh Jellyfin backup/)).toHaveProperty(
+      'checked',
+      false,
+    );
+    expect(screen.getByText('Unsaved schedule changes.')).toBeTruthy();
+  });
+  it.each([
+    { busy: 'schedule', demo: false },
+    { busy: '', demo: true },
+  ])('disables the Jellyfin backup opt-in while busy or in demo mode (%s)', ({ busy, demo }) => {
+    render(
+      <DailyImportSchedule
+        id="jellyfin"
+        config={config}
+        busy={busy}
+        demo={demo}
+        createBackup
+        onSave={vi.fn()}
+      />,
+    );
+    expect(screen.getByLabelText(/Create a fresh Jellyfin backup/)).toHaveProperty(
+      'disabled',
+      true,
+    );
+  });
   it('retains only unsubmitted schedule inputs across page remount, rechecks revision, and clears them with the workspace', () => {
     const save = vi.fn();
     function Workspace({

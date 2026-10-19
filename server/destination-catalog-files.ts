@@ -1,6 +1,7 @@
 import type { SnapshotBinding } from './snapshot-files.js';
 import { snapshotId } from './snapshot-files.js';
 import { ServiceError } from './errors.js';
+import { validJellyfinBackupName } from './jellyfin-backup-api.js';
 
 export const DESTINATION_CATALOG_MAX_AGE = 48 * 60 * 60_000;
 export const DESTINATION_CATALOG_DEADLINE = 5 * 60_000;
@@ -131,6 +132,8 @@ export interface DestinationCatalogRequest {
   id: string;
   requested_at: string;
   binding: SnapshotBinding;
+  /** A completed native backup selected by the web process; no credentials or raw paths. */
+  expected_backup?: { name: string; created_at: string };
 }
 export interface DestinationCatalogResult extends DestinationCatalogRequest {
   ok: boolean;
@@ -202,7 +205,11 @@ export function validDestinationRequest(value: DestinationCatalogRequest): boole
     typeof value.binding.server_id === 'string' &&
     /^[a-fA-F0-9]{32}$/.test(value.binding.server_id) &&
     typeof value.binding.version === 'string' &&
-    normalizedServerVersion(value.binding.version)
+    normalizedServerVersion(value.binding.version) &&
+    (value.expected_backup === undefined ||
+      (validJellyfinBackupName(value.expected_backup?.name) &&
+        typeof value.expected_backup.created_at === 'string' &&
+        Number.isFinite(Date.parse(value.expected_backup.created_at))))
   );
 }
 export function validDestinationResult(value: DestinationCatalogResult): boolean {

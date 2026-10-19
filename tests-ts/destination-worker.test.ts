@@ -150,6 +150,45 @@ async function waitFor<T>(read: () => Promise<T>): Promise<T> {
 }
 
 describe('isolated destination catalog worker and helper', () => {
+  it('imports the exact newly completed native archive even when another filename sorts later', async () => {
+    const created_at = new Date(Date.now() - 1000).toISOString();
+    const value = await fixture(archive(created_at));
+    await writeFile(
+      join(value.backups, 'jellyfin-backup-20990102040000.zip'),
+      Buffer.from('unrelated incomplete backup'),
+    );
+    const result = await snapshotProcess<Capture>({
+      operation: 'destination_capture',
+      directory: value.backups,
+      output: value.output,
+      version: '12.2.0',
+      expected_backup: { name: 'jellyfin-backup-20260102030000.zip', created_at },
+    });
+    expect(Date.parse(result.backup_created_at)).toBe(Date.parse(created_at));
+    expect(result.backup_fingerprint).toBe(createHash('sha256').update(value.bytes).digest('hex'));
+  });
+  it('never falls back to an old archive when a requested native backup is absent or changed', async () => {
+    for (const expected_backup of [
+      { name: 'jellyfin-backup-20990102040000.zip', created_at: new Date().toISOString() },
+      { name: '../jellyfin-backup-20260102030000.zip', created_at: new Date().toISOString() },
+      {
+        name: 'jellyfin-backup-20260102030000.zip',
+        created_at: new Date(Date.now() - 3600000).toISOString(),
+      },
+    ]) {
+      const value = await fixture();
+      await expect(
+        snapshotProcess<Capture>({
+          operation: 'destination_capture',
+          directory: value.backups,
+          output: value.output,
+          version: '12.2.0',
+          expected_backup,
+        }),
+      ).rejects.toThrow(/backup|changed|found/i);
+      await expect(stat(value.output)).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+  });
   it('selects the latest completed archive, builds its index and reads only matching identity candidates', async () => {
     const value = await fixture(Buffer.from('older incomplete archive'));
     const bytes = archive();

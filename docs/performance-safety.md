@@ -613,6 +613,14 @@ failed reads are reported without upstream response bodies. These counters cover
 preparation reads, not a complete playback-impact metric or every write. They
 follow the same exclusions for credentials and personal playback details.
 
+Jellyfin's optional create-before-import schedule uses the native server backup
+API before the offline catalog import. This step performs live database work,
+including optimization, and cannot be described as an offline-only workload.
+It is opt-in, skips active library scans, serializes with other imports and never
+repeats an uncertain creation POST automatically. The helper mount remains
+read-only. See [creation, recovery and retention](jellyfin-backup-catalog.md#create-a-fresh-jellyfin-backup-before-nightly-import)
+for the separate observation deadline and operational limitations.
+
 Saved Jellyfin imports additionally report validated stage labels, aggregate
 source/provider/item/key counts, processed bytes and progress timestamps through
 the authenticated helper exchange. Current-attempt elapsed time and the latest

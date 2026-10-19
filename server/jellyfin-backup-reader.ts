@@ -88,6 +88,7 @@ export interface JellyfinBackupReadOptions {
   onProgress?: (progress: JellyfinBackupProgress) => void;
   /** The worker supplies its verified live version; reject stale input before table reads. */
   expectedServerVersion?: string;
+  expectedCreatedAt?: string;
   /** Deterministic private clock for synthetic tests, never accepted over IPC. */
   now?: number;
 }
@@ -498,6 +499,12 @@ export async function importJellyfinBackupCatalog(
       options,
     );
     const manifest = readManifest(Buffer.concat(buffers));
+    if (
+      options.expectedCreatedAt !== undefined &&
+      (!Number.isFinite(Date.parse(options.expectedCreatedAt)) ||
+        Date.parse(manifest.createdAt) !== Date.parse(options.expectedCreatedAt))
+    )
+      throw new DestinationCatalogError('backup_changed');
     if (options.expectedServerVersion !== undefined) {
       const now = options.now ?? Date.now();
       const created = Date.parse(manifest.createdAt);

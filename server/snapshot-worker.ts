@@ -55,6 +55,7 @@ type Request =
       directory: string;
       output: string;
       version: string;
+      expected_backup?: { name: string; created_at: string };
     }
   | {
       operation: 'destination_read';
@@ -229,7 +230,9 @@ async function captureDestination(request: Extract<Request, { operation: 'destin
       throw new DestinationCatalogError('backup_invalid');
     const names = (await readdir(request.directory)).filter(archiveName).sort().reverse();
     if (!names.length) throw new DestinationCatalogError('backup_missing');
-    const path = join(request.directory, names[0]!);
+    if (request.expected_backup && !names.includes(request.expected_backup.name))
+      throw new DestinationCatalogError('backup_missing');
+    const path = join(request.directory, request.expected_backup?.name ?? names[0]!);
     const initial = await lstat(path, { bigint: true });
     if (
       !initial.isFile() ||
@@ -240,6 +243,7 @@ async function captureDestination(request: Extract<Request, { operation: 'destin
       throw new DestinationCatalogError('backup_invalid');
     const imported = await importJellyfinBackupCatalog(path, request.output, {
       expectedServerVersion: request.version,
+      expectedCreatedAt: request.expected_backup?.created_at,
       onProgress: (value) =>
         observe(
           value.phase === 'items'

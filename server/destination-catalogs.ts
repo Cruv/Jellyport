@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Store } from './store.js';
@@ -9,10 +9,12 @@ import {
   isObject,
   type ClientFactory,
   type MediaItem,
+  type MediaAPI,
 } from './media.js';
 import type { Settings } from './types.js';
 import type { PathMapping } from './matching.js';
-import { ServiceError } from './errors.js';
+import { MediaError, ServiceError } from './errors.js';
+import { validJellyfinBackupName, type JellyfinBackupManifest } from './jellyfin-backup-api.js';
 import {
   dailyImportSchedule,
   ImportCoordinator,
@@ -44,11 +46,31 @@ import {
 const CLEANUP_ERROR =
   'Temporary Jellyfin catalog cleanup failed. Review private storage permissions before importing or reading more data.';
 const IDLE_MS = 60_000;
+export const JELLYFIN_BACKUP_WAIT_MS = 30 * 60_000;
+const BACKUP_POLL_MS = 15_000;
+type CatalogConfig = DailyImportConfig & { create_backup?: boolean };
+interface BackupCreation {
+  id: string;
+  binding: DestinationCatalogRequest['binding'];
+  connection: string;
+  phase: 'creating' | 'waiting' | 'uncertain';
+  started_at: string;
+  deadline_at: string;
+  baseline: string[];
+  completed?: JellyfinBackupManifest;
+}
+const connectionHash = (settings: Settings) =>
+  createHash('sha256')
+    .update(JSON.stringify([settings.jellyfin_url, settings.jellyfin_api_key]))
+    .digest('hex');
+const BACKUP_UNCERTAIN =
+  'Jellyfin backup completion could not be confirmed. No new backup will be requested automatically. Check Jellyfin Backups, then refresh status. Confirm it has finished or stopped before releasing this attempt. The last saved catalog is preserved.';
 interface State {
-  config: DailyImportConfig;
+  config: CatalogConfig;
   configured: boolean;
   generations: DestinationCatalogResult[];
   active?: DestinationCatalogRequest;
+  backup_creation?: BackupCreation;
   last_attempt_at: string | null;
   last_error: string | null;
   last_finished_at?: string | null;
@@ -160,6 +182,10 @@ export class DestinationCatalogs {
   private stopping = false;
   private clearing = false;
   private starting = false;
+  private backupSelectionSupported = false;
+  private backupClient?: MediaAPI;
+  private readonly backupReadClients = new Set<MediaAPI>();
+  private backupPollAt = 0;
   private readonly imports: ImportCoordinator;
   private revision = 0;
   private readonly reads = new AbortController();
@@ -198,6 +224,13 @@ export class DestinationCatalogs {
     if (!validDestinationDiagnostic(this.state.last_diagnostic)) delete this.state.last_diagnostic;
     if (!validDestinationErrorCode(this.state.last_error_code)) delete this.state.last_error_code;
     if (this.state.active) this.imports.restore(`jellyfin:${this.state.active.id}`);
+    if (this.state.backup_creation) {
+      // The server has no idempotency key or job cancellation API. A saved POST
+      // intent is reconciled read-only after restart, never sent a second time.
+      if (this.state.backup_creation.phase === 'creating')
+        this.state.backup_creation.phase = 'waiting';
+      this.imports.restore(`jellyfin:${this.state.backup_creation.id}`);
+    }
     if (!this.state.config) {
       this.state.config = {
         enabled: false,
@@ -208,7 +241,11 @@ export class DestinationCatalogs {
       };
       this.save();
     }
-    if (!this.state.active && this.state.last_outcome === 'running') {
+    if (
+      !this.state.active &&
+      !this.state.backup_creation &&
+      this.state.last_outcome === 'running'
+    ) {
       this.state.last_outcome = 'interrupted';
       this.state.last_error_code = 'interrupted';
       this.state.last_finished_at = new Date().toISOString();
@@ -242,6 +279,7 @@ export class DestinationCatalogs {
       const value = await readEnvelope<{
         version: number;
         jellyfin_catalog_enabled?: boolean;
+        jellyfin_backup_selection_enabled?: boolean;
         updated_at: string;
       }>(join(this.directory, 'helper.status'), this.key);
       if (
@@ -252,12 +290,14 @@ export class DestinationCatalogs {
         Math.abs(Date.now() - Date.parse(value.updated_at)) >= 20_000
       )
         return false;
+      this.backupSelectionSupported = value.jellyfin_backup_selection_enabled === true;
       if (!this.state.configured) {
         this.state.configured = true;
         this.save();
       }
       return true;
     } catch {
+      this.backupSelectionSupported = false;
       return false;
     }
   }
@@ -296,13 +336,24 @@ export class DestinationCatalogs {
       /* An expired/missing record remains visible, but cannot be selected. */
     }
     return {
-      config: this.state.config,
+      config: { ...this.state.config, create_backup: this.state.config.create_backup === true },
+      backup_creation: this.state.backup_creation
+        ? {
+            attempt_id: this.state.backup_creation.id,
+            phase: this.state.backup_creation.phase,
+            started_at: this.state.backup_creation.started_at,
+            deadline_at: this.state.backup_creation.deadline_at,
+          }
+        : null,
       next_run_at: dailyImportSchedule(this.state.config, this.state.last_scheduled_date)
         .next_run_at,
       configured: this.state.configured,
       available,
       usable,
-      running: this.starting || !!this.state.active,
+      running:
+        this.starting ||
+        !!this.state.active ||
+        !!(this.state.backup_creation && this.state.backup_creation.phase !== 'uncertain'),
       record,
       last_attempt_at: this.state.last_attempt_at,
       last_finished_at:
@@ -313,7 +364,9 @@ export class DestinationCatalogs {
       error_code: this.state.last_error_code ?? null,
       diagnostic: this.state.last_diagnostic ?? null,
       last_outcome:
-        this.starting || this.state.active
+        this.starting ||
+        this.state.active ||
+        (this.state.backup_creation && this.state.backup_creation.phase !== 'uncertain')
           ? ('running' as const)
           : (this.state.last_outcome ??
             (this.state.last_error
@@ -323,12 +376,16 @@ export class DestinationCatalogs {
                 : null)),
     };
   }
-  async configure(input: Omit<DailyImportConfig, 'revision'> & { expected_revision: string }) {
+  async configure(input: Omit<CatalogConfig, 'revision'> & { expected_revision: string }) {
     if (this.options.demo)
       throw new ServiceError('Jellyfin import changes are unavailable in demo mode.');
     if (input.expected_revision !== this.state.config.revision)
       throw new ServiceError('The import schedule changed. Reload it before saving.');
     validateDailyImportConfig(input);
+    if (input.create_backup !== undefined && typeof input.create_backup !== 'boolean')
+      throw new ServiceError(
+        'Choose whether to create a Jellyfin backup before the scheduled import.',
+      );
     if (input.enabled && (!this.key || !this.state.configured))
       throw new ServiceError('Configure the Jellyfin backup helper and shared directory first.');
     this.state.config = {
@@ -337,6 +394,7 @@ export class DestinationCatalogs {
       minute: input.minute,
       time_zone: input.time_zone,
       revision: randomUUID(),
+      create_backup: input.create_backup ?? this.state.config.create_backup ?? false,
     };
     this.save();
     return this.status();
@@ -360,13 +418,13 @@ export class DestinationCatalogs {
       );
     return latest.id;
   }
-  async refresh() {
+  async refresh(createBackup = false) {
     const revision = this.revision;
     if (this.stopping || this.clearing)
       throw new ServiceError('The Jellyfin import is changing or stopping. Retry shortly.');
     const id = randomUUID();
     const owner = `jellyfin:${id}`;
-    if (this.state.active || !this.imports.acquire(owner))
+    if (this.state.active || this.state.backup_creation || !this.imports.acquire(owner))
       throw new ServiceError(
         'A backup import or capture is already running. Wait for it to finish.',
       );
@@ -405,6 +463,8 @@ export class DestinationCatalogs {
         settings.jellyfin_api_key,
         'jellyfin',
       );
+      let keepClient = false;
+      if (createBackup) this.backupReadClients.add(client);
       let request: DestinationCatalogRequest;
       try {
         const info = await client.systemInfo();
@@ -425,8 +485,60 @@ export class DestinationCatalogs {
             version: info.Version,
           },
         };
+        if (createBackup) {
+          if (!this.backupSelectionSupported)
+            throw new ServiceError(
+              'Update both Jellyport and its snapshot helper before enabling automatic Jellyfin backup creation.',
+            );
+          if (
+            !client.jellyfinBackups ||
+            !client.createJellyfinBackup ||
+            !client.jellyfinBackupTasks
+          )
+            throw new ServiceError(
+              'The linked Jellyfin connection does not support native backup creation.',
+            );
+          const tasks = await client.jellyfinBackupTasks();
+          if (tasks.some((task) => task.key === 'RefreshLibrary' && task.state !== 'Idle'))
+            throw new ServiceError(
+              'Jellyfin is scanning its library. No backup was requested; schedule the import outside the library scan window.',
+            );
+          const baseline = await client.jellyfinBackups();
+          if (
+            this.stopping ||
+            this.clearing ||
+            this.revision !== revision ||
+            connectionHash(this.store.settings()) !== connectionHash(settings)
+          )
+            throw new ServiceError(
+              'The Jellyfin connection or import changed. Reload before importing.',
+            );
+          const started_at = new Date().toISOString();
+          const backup: BackupCreation = {
+            id,
+            binding: request.binding,
+            connection: connectionHash(settings),
+            phase: 'creating',
+            started_at,
+            deadline_at: new Date(Date.now() + JELLYFIN_BACKUP_WAIT_MS).toISOString(),
+            baseline: baseline.map((entry) => entry.name),
+          };
+          this.state.backup_creation = backup;
+          // Commit the intent BEFORE issuing this non-idempotent mutation.
+          this.save();
+          keepClient = true;
+          this.backupClient = client;
+          void this.createBackup(backup, client).catch(() => {
+            // A failed persistence/close cannot authorize another mutation.
+            try {
+              if (!this.stopping) this.uncertainBackup(backup);
+            } catch {}
+          });
+          return this.status();
+        }
       } finally {
-        await client.close();
+        this.backupReadClients.delete(client);
+        if (!keepClient) await client.close();
       }
       if (
         this.state.active ||
@@ -458,16 +570,217 @@ export class DestinationCatalogs {
       }
       return this.status();
     } catch (error) {
+      if (this.state.backup_creation) throw error;
       delete this.state.active;
       this.state.last_finished_at = new Date().toISOString();
       this.state.last_outcome = 'failed';
       this.state.last_error =
-        'Jellyfin catalog import could not start. Check the helper and configured Jellyfin connection. Any previously saved catalog is preserved.';
+        createBackup && error instanceof ServiceError
+          ? error.message
+          : 'Jellyfin catalog import could not start. Check the helper and configured Jellyfin connection. Any previously saved catalog is preserved.';
       this.save();
       throw error;
     } finally {
       this.starting = false;
-      if (!this.state.active) this.imports.release(owner);
+      if (!this.state.active && !this.state.backup_creation) this.imports.release(owner);
+    }
+  }
+  private matchesBackup(backup: BackupCreation, value: JellyfinBackupManifest): boolean {
+    const created = Date.parse(value.created_at);
+    return (
+      validJellyfinBackupName(value.name) &&
+      !backup.baseline.includes(value.name) &&
+      Number.isFinite(created) &&
+      created >= Date.parse(backup.started_at) - 60_000 &&
+      created <= Date.now() + 60_000 &&
+      normalizedServerVersion(value.server_version) ===
+        normalizedServerVersion(backup.binding.version) &&
+      value.backup_engine_version === '0.2.0' &&
+      value.database === true &&
+      value.metadata === false &&
+      value.trickplay === false &&
+      value.subtitles === false
+    );
+  }
+  private async createBackup(backup: BackupCreation, client: MediaAPI): Promise<void> {
+    try {
+      const completed = await client.createJellyfinBackup!();
+      if (this.stopping || this.state.backup_creation?.id !== backup.id) return;
+      if (!this.matchesBackup(backup, completed)) {
+        this.uncertainBackup(backup);
+        return;
+      }
+      backup.completed = completed;
+      backup.phase = 'waiting';
+      this.backupPollAt = 0;
+      this.save();
+    } catch (error) {
+      if (this.stopping || this.state.backup_creation?.id !== backup.id) return;
+      if (error instanceof MediaError && [401, 403, 404, 405].includes(error.statusCode ?? 0)) {
+        delete this.state.backup_creation;
+        this.imports.release(`jellyfin:${backup.id}`);
+        this.state.last_finished_at = new Date().toISOString();
+        this.state.last_outcome = 'failed';
+        this.state.last_error =
+          'Jellyfin rejected native backup creation. Check API-key administrator access and native backup support. No catalog import was started; the last saved catalog is preserved.';
+      } else {
+        // A network failure can leave Jellyfin working. Observe completed backups
+        // rather than repeating a mutation that has no idempotency token.
+        backup.phase = 'waiting';
+      }
+      this.save();
+    } finally {
+      if (this.backupClient === client) this.backupClient = undefined;
+      await client.close();
+    }
+  }
+  private uncertainBackup(backup: BackupCreation): void {
+    if (this.state.backup_creation?.id !== backup.id) return;
+    backup.phase = 'uncertain';
+    this.state.last_error = BACKUP_UNCERTAIN;
+    this.state.last_error_code = null;
+    this.state.last_outcome = 'interrupted';
+    this.state.last_finished_at = new Date().toISOString();
+    this.save();
+  }
+  /** Reconcile a durable mutation intent; this path never creates a backup. */
+  private async reconcileBackup(backup: BackupCreation): Promise<'queued' | 'empty' | 'blocked'> {
+    const settings = this.store.settings();
+    if (new URL(settings.jellyfin_url).toString() !== new URL(backup.binding.url).toString()) {
+      this.uncertainBackup(backup);
+      return 'blocked';
+    }
+    // A rotated key may safely observe the original verified server. Recheck
+    // the credentials used by each read before publishing any helper request.
+    const readConnection = connectionHash(settings);
+    const client = this.options.clientFactory()(
+      settings.jellyfin_url,
+      settings.jellyfin_api_key,
+      'jellyfin',
+    );
+    this.backupReadClients.add(client);
+    try {
+      const info = await client.systemInfo();
+      if (
+        !sameBinding(backup.binding, {
+          url: settings.jellyfin_url,
+          server_id: String(info.Id),
+          version: String(info.Version),
+        })
+      ) {
+        this.uncertainBackup(backup);
+        return 'blocked';
+      }
+      if (!client.jellyfinBackups) {
+        this.uncertainBackup(backup);
+        return 'blocked';
+      }
+      const candidates = backup.completed
+        ? [backup.completed]
+        : (await client.jellyfinBackups()).filter((entry) => this.matchesBackup(backup, entry));
+      if (
+        this.stopping ||
+        this.state.backup_creation?.id !== backup.id ||
+        connectionHash(this.store.settings()) !== readConnection
+      )
+        return 'blocked';
+      if (candidates.length > 1) {
+        this.uncertainBackup(backup);
+        return 'blocked';
+      }
+      if (!candidates.length) {
+        if (Date.now() >= Date.parse(backup.deadline_at)) this.uncertainBackup(backup);
+        return 'empty';
+      }
+      const value = candidates[0]!;
+      if (
+        !this.matchesBackup(backup, value) ||
+        !(await this.helper()) ||
+        !this.backupSelectionSupported
+      ) {
+        this.uncertainBackup(backup);
+        return 'blocked';
+      }
+      if (
+        this.stopping ||
+        this.state.backup_creation?.id !== backup.id ||
+        connectionHash(this.store.settings()) !== readConnection
+      )
+        return 'blocked';
+      const request: DestinationCatalogRequest = {
+        purpose: 'jellyfin_catalog',
+        id: backup.id,
+        requested_at: new Date().toISOString(),
+        binding: backup.binding,
+        expected_backup: { name: value.name, created_at: value.created_at },
+      };
+      // Persist the transition before publishing. Restarts resume checking this
+      // request, not the native mutation. Import gets its own five-minute window.
+      this.state.active = request;
+      delete this.state.backup_creation;
+      this.state.last_error = null;
+      this.state.last_outcome = 'running';
+      this.state.last_finished_at = null;
+      this.save();
+      try {
+        await writeEnvelope(
+          join(this.directory, `${destinationCatalogPrefix(request.id)}.request`),
+          request,
+          this.key!,
+        );
+      } catch {
+        // Keep the durable active attempt; IPC failure never replays the POST.
+        this.state.last_error =
+          'The completed Jellyfin backup could not be handed to the helper. Check shared-folder permissions and refresh status; no additional backup will be requested for this attempt.';
+        this.save();
+      }
+      return 'queued';
+    } finally {
+      this.backupReadClients.delete(client);
+      await client.close();
+    }
+  }
+  async acknowledgeBackup(expectedAttemptId: string) {
+    const backup = this.state.backup_creation;
+    const confirmedConnection = connectionHash(this.store.settings());
+    if (
+      !backup ||
+      backup.id !== expectedAttemptId ||
+      backup.phase !== 'uncertain' ||
+      this.starting ||
+      this.ticking ||
+      this.stopping
+    )
+      throw new ServiceError('Refresh status before confirming a stopped Jellyfin backup.');
+    this.starting = true;
+    try {
+      const outcome = await this.reconcileBackup(backup);
+      // Reconciliation also awaits client closure. An old confirmation cannot
+      // release the lease after shutdown, credential changes or a newer attempt.
+      if (
+        this.stopping ||
+        connectionHash(this.store.settings()) !== confirmedConnection ||
+        (this.state.backup_creation && this.state.backup_creation.id !== backup.id)
+      )
+        throw new ServiceError(
+          'The Jellyfin backup attempt or connection changed. Refresh status before confirming it again.',
+        );
+      if (outcome === 'blocked')
+        throw new ServiceError(
+          'Jellyfin backup completion is still inconclusive. Restore the original server connection and helper, then refresh status. No backup will be requested again automatically.',
+        );
+      if (outcome === 'empty' && this.state.backup_creation?.id === backup.id) {
+        delete this.state.backup_creation;
+        this.imports.release(`jellyfin:${backup.id}`);
+        this.state.last_outcome = 'interrupted';
+        this.state.last_finished_at = new Date().toISOString();
+        this.state.last_error =
+          'You confirmed the native Jellyfin backup has finished or stopped. No backup was deleted. The next scheduled run may create a backup; manual imports remain available.';
+        this.save();
+      }
+      return this.status();
+    } finally {
+      this.starting = false;
     }
   }
   private async validated(
@@ -621,6 +934,18 @@ export class DestinationCatalogs {
     this.ticking = true;
     try {
       await this.helper();
+      if (this.state.backup_creation) {
+        if (Date.now() >= this.backupPollAt) {
+          const backup = this.state.backup_creation;
+          this.backupPollAt = Date.now() + (backup.phase === 'uncertain' ? 60_000 : BACKUP_POLL_MS);
+          try {
+            await this.reconcileBackup(backup);
+          } catch {
+            if (Date.now() >= Date.parse(backup.deadline_at)) this.uncertainBackup(backup);
+          }
+        }
+        return;
+      }
       const active = this.state.active;
       if (active) {
         await this.readProgress(active);
@@ -664,6 +989,13 @@ export class DestinationCatalogs {
                   ? 'backup_future'
                   : 'backup_invalid';
             this.state.last_error = destinationCatalogFailureMessage(this.state.last_error_code);
+          } else if (
+            active.expected_backup &&
+            Date.parse(value.backup_created_at!) !== Date.parse(active.expected_backup.created_at)
+          ) {
+            this.state.last_error_code = 'backup_changed';
+            this.state.last_error =
+              'The imported catalog does not match the newly completed Jellyfin backup. Check the helper mount and import that backup again. The previous catalog is preserved.';
           } else {
             const previous = this.state.generations.find((record) =>
               sameBinding(record.binding, value!.binding),
@@ -726,7 +1058,7 @@ export class DestinationCatalogs {
         this.state.last_scheduled_date = due.date;
         this.save();
         try {
-          await this.refresh();
+          await this.refresh(this.state.config.create_backup === true);
         } catch {
           /* refresh records a sanitized failed attempt. */
         }
@@ -800,6 +1132,7 @@ export class DestinationCatalogs {
       this.ticking ||
       this.options.demo ||
       this.state.active ||
+      this.state.backup_creation ||
       this.pins().size ||
       [...this.databases.values()].some((value) => value.users)
     )
@@ -824,6 +1157,8 @@ export class DestinationCatalogs {
     this.revision++;
     clearInterval(this.timer);
     this.reads.abort();
+    await this.backupClient?.close();
+    await Promise.all([...this.backupReadClients].map((client) => client.close()));
     while (this.ticking || [...this.databases.values()].some((value) => value.users))
       await new Promise((resolve) => setTimeout(resolve, 20));
     for (const id of this.databases.keys()) await this.removeDatabase(id);

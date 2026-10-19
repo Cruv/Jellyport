@@ -27,6 +27,22 @@ const manifest = {
   DatabaseTables: ['DbSet`1'],
   Options: { Database: true, Metadata: false, Subtitles: false, Trickplay: false },
 };
+it('checks the requested native backup timestamp before creating a projection', async () => {
+  const source = await fixture([item(1)]);
+  await expect(
+    importJellyfinBackupCatalog(source.archive, source.output, {
+      expectedCreatedAt: '2026-10-16T05:15:08.425Z',
+    }),
+  ).rejects.toMatchObject({ error_code: 'backup_changed' });
+  await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect(
+    importJellyfinBackupCatalog(source.archive, source.output, {
+      expectedCreatedAt: '2026-10-16T05:15:07.425Z',
+    }),
+  ).resolves.toMatchObject({
+    manifest: { createdAt: new Date(manifest.DateCreated).toISOString() },
+  });
+});
 interface SyntheticEntry {
   name: string;
   text: string;

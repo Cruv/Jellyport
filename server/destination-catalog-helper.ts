@@ -120,6 +120,7 @@ export async function processDestinationCatalogRequest(
         directory: backups,
         output,
         version: request.binding.version,
+        expected_backup: request.expected_backup,
       },
       signal,
       DESTINATION_CATALOG_DEADLINE,

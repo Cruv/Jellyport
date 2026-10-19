@@ -152,8 +152,8 @@ export default function DestinationCatalogPanel({
               ? 'Jellyfin is creating a fresh backup before the scheduled import.'
               : 'Waiting for Jellyfin to finish the fresh backup before importing it.'}{' '}
             Backup preparation elapsed:{' '}
-            {importDuration(Math.max(0, now - Date.parse(preparation.started_at)))}. A backup is
-            imported only after it has finished. Avoid starting another backup in Jellyfin.
+            {importDuration(Math.max(0, Date.now() - Date.parse(preparation.started_at)))}. A backup
+            is imported only after it has finished. Avoid starting another backup in Jellyfin.
           </Callout>
         )}
         {backupUncertain && (

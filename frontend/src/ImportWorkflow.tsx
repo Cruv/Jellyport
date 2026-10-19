@@ -205,7 +205,12 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
 
   useEffect(() => {
     if (!active || !status || busy) return;
-    const delay = status.running ? 2000 : 30_000;
+    const next = Date.parse(status.next_run_at ?? '');
+    const untilNext = next - Date.now();
+    // This polls Jellyport's local status, never the media server. Discover an
+    // imminent/due scheduled start promptly instead of showing idle for 30s.
+    const imminent = Number.isFinite(next) && untilNext < 30_000 && untilNext > -60 * 60_000;
+    const delay = status.running || imminent ? 2000 : 30_000;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
@@ -217,7 +222,7 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
       stopped = true;
       clearTimeout(timer);
     };
-  }, [active, status?.running, busy, load]);
+  }, [active, status?.running, status?.next_run_at, busy, load]);
 
   async function change(
     kind: ChangeKind,

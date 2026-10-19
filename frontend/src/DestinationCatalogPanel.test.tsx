@@ -132,6 +132,7 @@ describe('saved destination catalog settings', () => {
       expect(screen.queryByRole('button', { name: 'Confirm backup stopped…' })).toBeNull();
       await act(async () => vi.advanceTimersByTimeAsync(2000));
       expect(calls).toHaveLength(2);
+      expect(screen.getByText(/Backup preparation elapsed: 2m 2s/)).toBeTruthy();
       expect(calls.every((call) => !call.options?.method)).toBe(true);
     },
   );

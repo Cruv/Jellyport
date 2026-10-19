@@ -58,6 +58,7 @@ directory. Demo startup refuses production data. Vite proxies `/api` to port 800
 | `npm run build`                           | Typecheck, compile server and build production interface; do not also typecheck unchanged inputs |
 | `HOST=127.0.0.1 npm start`                | Run an existing build; use the demo environment above for isolated checks                        |
 | `npm audit --omit=dev --audit-level=high` | Current production dependency advisory check                                                     |
+| `npm run benchmark:jellyfin-import`      | Optional full-scale synthetic Jellyfin ZIP import/index benchmark; accepts no external inputs     |
 | `npm run benchmark:snapshots`             | Optional synthetic-only benchmark; accepts no production paths or URLs                           |
 
 `npm run format` rewrites many code/config files. For a narrow edit use

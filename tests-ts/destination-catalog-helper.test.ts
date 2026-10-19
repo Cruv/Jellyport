@@ -17,6 +17,8 @@ import {
   writeEnvelope,
 } from '../server/snapshot-files.js';
 import {
+  DESTINATION_CATALOG_DEADLINE,
+  DESTINATION_CATALOG_REQUEST_MAX_AGE,
   destinationCatalogMetadata,
   destinationCatalogPrefix,
   validDestinationRequest,
@@ -114,6 +116,32 @@ it('publishes only encrypted neutral projection and authenticated original-age m
         name.endsWith('.request'),
     ),
   ).toBe(false);
+});
+it('gives offline import its own thirty-minute budget and accepts completion after five minutes', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
+  vi.spyOn(console, 'info').mockImplementation(() => {});
+  const f = await fixture();
+  const importWorker = f.worker.getMockImplementation()!;
+  f.worker.mockImplementation(async (...args) => {
+    const value = await importWorker(...args);
+    vi.setSystemTime(new Date(Date.parse(f.request.requested_at) + 5 * 60_000 + 1));
+    return value;
+  });
+  await f.process();
+  expect(DESTINATION_CATALOG_DEADLINE).toBe(30 * 60_000);
+  expect(DESTINATION_CATALOG_REQUEST_MAX_AGE).toBe(5 * 60_000);
+  expect(f.worker).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ operation: 'destination_capture' }),
+    expect.any(AbortSignal),
+    30 * 60_000,
+    expect.objectContaining({ onProgress: expect.any(Function) }),
+  );
+  const result = await f.result();
+  expect(validDestinationResult(result)).toBe(true);
+  expect(Date.parse(result.finished_at) - Date.parse(result.started_at)).toBeGreaterThan(
+    5 * 60_000,
+  );
 });
 it('logs aggregate phase wall times without resetting repeated progress or changing persisted diagnostics', async () => {
   const f = await fixture();
@@ -441,6 +469,27 @@ it('rejects expired requests before reading the backup and leaves Emby requests 
     ),
   ).toBe(false);
 });
+it.each([-1, 1])(
+  'keeps five-minute request freshness separate from the longer worker budget (direction %s)',
+  async (direction) => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
+    const f = await fixture();
+    await writeEnvelope(
+      join(f.root, `${f.prefix}.request`),
+      {
+        ...f.request,
+        requested_at: new Date(Date.now() + direction * (5 * 60_000 + 1)).toISOString(),
+      },
+      f.key,
+    );
+    await f.process();
+    expect(f.worker).not.toHaveBeenCalled();
+    expect(await readdir(f.root)).not.toContain(`${f.prefix}.request`);
+    expect(await readdir(f.root)).not.toContain(`${f.prefix}.working`);
+    expect(await readdir(f.root)).not.toContain(`${f.prefix}.result`);
+  },
+);
 it('retains a completely committed generation during helper restart recovery', async () => {
   const f = await fixture();
   await f.process();

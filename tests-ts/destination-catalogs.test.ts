@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DestinationCatalogs } from '../server/destination-catalogs.js';
 import {
+  DESTINATION_CATALOG_RECOVERY_DEADLINE,
   destinationCatalogPrefix,
   type DestinationCatalogRequest,
   type DestinationCatalogResult,
@@ -413,11 +414,55 @@ describe('safe Jellyfin import diagnostics', () => {
       expect((await f.manager.status()).record?.id).toBe(good?.id);
     },
   );
-  it('does not let fresh progress extend the absolute helper deadline or turn an observation into success', async () => {
+  it('retains the import lease after five minutes and throughout legal helper delay before accepting success', async () => {
     vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
-    const f = await fixture('backup');
+    const imports = new ImportCoordinator();
+    const f = await fixture('backup', imports);
     const request = await f.request();
-    vi.setSystemTime(new Date(Date.now() + 6 * 60_000 + 1));
+    const requested = Date.parse(request.requested_at);
+    const helperStarted = new Date(requested + 5 * 60_000 - 1).toISOString();
+    for (const elapsed of [6 * 60_000 + 1, 36 * 60_000 - 1]) {
+      vi.setSystemTime(new Date(requested + elapsed));
+      await f.heartbeat();
+      const diagnostic = {
+        ...observation(helperStarted),
+        updated_at: new Date().toISOString(),
+      };
+      await writeEnvelope(
+        join(f.shared, `${destinationCatalogPrefix(request.id)}.progress`),
+        { ...request, diagnostic },
+        f.key,
+      );
+      await f.tick();
+      expect(await f.manager.status()).toMatchObject({
+        running: true,
+        last_outcome: 'running',
+        error_code: null,
+        record: null,
+        diagnostic,
+      });
+      expect(imports.busy).toBe(true);
+      expect(imports.acquire('synthetic-overlapping-import')).toBe(false);
+      await expect(f.manager.refresh()).rejects.toThrow('already running');
+    }
+    await f.finish(request, { started_at: helperStarted });
+    expect(await f.manager.status()).toMatchObject({
+      running: false,
+      last_outcome: 'succeeded',
+      error_code: null,
+      record: { id: request.id },
+    });
+    expect(imports.busy).toBe(false);
+    expect(f.factory).toHaveBeenCalledOnce();
+  });
+  it('does not let fresh progress extend the absolute recovery deadline or replace the last saved catalog', async () => {
+    vi.setSystemTime(new Date('2026-10-18T12:00:00Z'));
+    const imports = new ImportCoordinator();
+    const f = await fixture('backup', imports);
+    const good = await f.complete();
+    const request = await f.request();
+    expect(DESTINATION_CATALOG_RECOVERY_DEADLINE).toBe(36 * 60_000);
+    vi.setSystemTime(new Date(Date.now() + DESTINATION_CATALOG_RECOVERY_DEADLINE + 1));
     await f.heartbeat();
     const diagnostic = {
       ...observation(request.requested_at),
@@ -433,9 +478,10 @@ describe('safe Jellyfin import diagnostics', () => {
       running: false,
       last_outcome: 'failed',
       error_code: 'timeout',
-      record: null,
+      record: { id: good.id },
       diagnostic,
     });
+    expect(imports.busy).toBe(false);
     expect((await f.manager.status()).last_attempt_at).toBe(request.requested_at);
     await expect(
       stat(join(f.shared, `${destinationCatalogPrefix(request.id)}.progress`)),

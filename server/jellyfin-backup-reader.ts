@@ -1,14 +1,20 @@
-import { constants, closeSync, fstatSync, lstatSync, openSync, rmSync } from 'node:fs';
+import { constants, read, closeSync, fstatSync, lstatSync, openSync, rmSync } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
-import { Transform, Writable } from 'node:stream';
+import { Readable, Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { setImmediate as yieldTurn } from 'node:timers/promises';
 import { crc32 } from 'node:zlib';
 import type { Token } from 'stream-json/parser.js';
 import { batch } from 'stream-json/utils/batch.js';
 import { withParser } from 'stream-json/utils/with-parser.js';
-import { fromFdPromise, type Entry, type ZipFile } from 'yauzl';
+import {
+  fromFdPromise,
+  fromRandomAccessReaderPromise,
+  RandomAccessReader,
+  type Entry,
+  type ZipFile,
+} from 'yauzl';
 import { projectCatalogItem, type MediaItem } from './media.js';
 import { jellyfinAsciiPathKey } from './jellyfin-library-membership.js';
 import {
@@ -430,6 +436,59 @@ async function entryPipeline(
       { signal: options.signal },
     );
   } else await pipeline(input, integrity, sink, { signal: options.signal });
+}
+
+/** Inspect only the bounded manifest through an already-open, caller-owned descriptor. */
+export async function inspectJellyfinBackupManifest(fd: number, signal?: AbortSignal) {
+  // yauzl's fromFd closes its descriptor even when autoClose is false once
+  // close() is called. This reader explicitly borrows the caller's descriptor.
+  class BorrowedReader extends RandomAccessReader {
+    _readStreamForRange(start: number, end: number) {
+      return Readable.from(
+        (async function* () {
+          for (let position = start; position < end;) {
+            const buffer = Buffer.alloc(Math.min(64 * 1024, end - position));
+            const bytes = await new Promise<number>((resolve, reject) =>
+              read(fd, buffer, 0, buffer.length, position, (error, size) =>
+                error ? reject(error) : resolve(size),
+              ),
+            );
+            if (!bytes) throw invalid();
+            position += bytes;
+            yield buffer.subarray(0, bytes);
+          }
+        })(),
+      );
+    }
+    close(callback: (error: Error | null) => void) {
+      callback(null);
+    }
+  }
+  const zip = await fromRandomAccessReaderPromise(new BorrowedReader(), fstatSync(fd).size, {
+    autoClose: false,
+    lazyEntries: true,
+    strictFileNames: true,
+    validateEntrySizes: true,
+  });
+  zip.on('error', () => {});
+  try {
+    const entries = await selectedEntries(zip, signal);
+    const buffers: Buffer[] = [];
+    await entryPipeline(
+      zip,
+      entries.get(MANIFEST)!,
+      new Writable({
+        write(chunk: Buffer, _encoding, callback) {
+          buffers.push(chunk);
+          callback();
+        },
+      }),
+      { signal },
+    );
+    return readManifest(Buffer.concat(buffers));
+  } finally {
+    zip.close();
+  }
 }
 
 /**

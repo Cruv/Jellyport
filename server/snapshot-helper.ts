@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, readdir, rename, rm, readFile, lstat } from 'node:fs/pr
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { snapshotProcess } from './snapshot-process.js';
+import { processJellyfinBackupCleanupRequest } from './jellyfin-backup-retention.js';
 import {
   processDestinationCatalogRequest,
   recoverDestinationCatalogHelper,
@@ -26,6 +27,7 @@ import {
 const directory = process.env.JELLYPORT_SNAPSHOT_DIR;
 const workDirectory = process.env.JELLYPORT_SNAPSHOT_WORK_DIR;
 const jellyfinBackups = process.env.JELLYPORT_JELLYFIN_BACKUP_DIR;
+const jellyfinBackupCleanup = process.env.JELLYPORT_JELLYFIN_BACKUP_CLEANUP === 'true';
 const captureMethod = snapshotCaptureMethod(process.env.JELLYPORT_SNAPSHOT_METHOD);
 const source =
   captureMethod === 'plugin_backup'
@@ -71,6 +73,7 @@ const heartbeat = setInterval(() => {
           capture_method: captureMethod,
           jellyfin_catalog_enabled: !!jellyfinBackups,
           jellyfin_backup_selection_enabled: !!jellyfinBackups,
+          jellyfin_backup_cleanup_enabled: !!jellyfinBackups && jellyfinBackupCleanup,
           updated_at: new Date().toISOString(),
         },
         key,
@@ -107,12 +110,24 @@ while (!stopping) {
         capture_method: captureMethod,
         jellyfin_catalog_enabled: !!jellyfinBackups,
         jellyfin_backup_selection_enabled: !!jellyfinBackups,
+        jellyfin_backup_cleanup_enabled: !!jellyfinBackups && jellyfinBackupCleanup,
         updated_at: new Date().toISOString(),
       },
       key,
     );
     for (const name of await readdir(directory)) {
       if (stopping) break;
+      if (
+        await processJellyfinBackupCleanupRequest(
+          name,
+          directory,
+          jellyfinBackups,
+          jellyfinBackupCleanup,
+          key,
+          controller.signal,
+        )
+      )
+        continue;
       if (
         await processDestinationCatalogRequest(
           name,

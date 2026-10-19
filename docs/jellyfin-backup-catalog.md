@@ -16,8 +16,9 @@ Fresh destination account access and playback activity remain authoritative.
 2. Mount only the actual directory containing completed
    `jellyfin-backup-YYYYMMDDHHMMSS.zip` files read-only into the snapshot helper at
    `/jellyfin-backups`. Set its `JELLYPORT_JELLYFIN_BACKUP_DIR=/jellyfin-backups`.
-   Keep this raw archive mount out of the web container. Archives contain sensitive
-   accounts and credentials, even though the importer ignores those entries.
+   Keep this raw archive mount out of the web container. Optional cleanup below
+   requires narrowly scoped write permission on this helper mount. Archives contain
+   sensitive accounts and credentials, even though the importer ignores those entries.
 3. Set `JELLYPORT_JELLYFIN_CATALOG_MODE=backup` on the **web** service. This disables
    live destination catalog scans even before the helper's first heartbeat. Both
    services must use the same 0.15.0-or-later image and private exchange directory.
@@ -58,9 +59,10 @@ there are **no additional mounts, credentials or environment variables**.
 The web app uses its saved administrator API key to request Jellyfin's native
 backup API with database enabled and metadata, subtitles and trickplay disabled.
 Jellyfin also includes configuration and supporting files in this native archive.
-The helper keeps its read-only backup mount and receives only the completed
-archive's safe filename and original timestamp, never the API key. Manual
-**Import latest Jellyfin backup** remains import-only.
+The helper receives only the completed archive's safe filename and original
+timestamp, never the API key. Its backup mount stays read-only unless the separate
+cleanup feature below is enabled. Manual **Import latest Jellyfin backup** remains
+import-only.
 
 Jellyfin does the live database work, including database optimization. Its native
 backup is supported while the server is running, but can consume CPU, I/O and
@@ -71,8 +73,12 @@ and avoid starting another backup manually while Jellyport is preparing one.
 Changing or disabling the schedule does not cancel already accepted server work.
 
 Backup preparation has a separate **30-minute observation window**; the completed
-archive then gets the existing five-minute import limit. The UI distinguishes
-creation, waiting for completion, and import. The original archive timestamp
+archive then gets a separate **30-minute offline import worker limit** in 0.23.0
+and later. Request admission still expires after five minutes; recovery allows
+36 minutes from that request (five for admission, thirty for the worker and one
+for finalization). Progress does not renew these limits. These are preprocessing
+safety limits, separate from the per-user migration performance target. The UI
+distinguishes creation, waiting for completion, and import. The original archive timestamp
 continues to determine expiry. A failed or missing new archive never causes an
 older backup to be imported as a successful fresh backup.
 
@@ -93,10 +99,10 @@ reconcile the same verified server; a changed server URL/identity requires resto
 the original connection. Successful confirmation with no new archive releases the
 attempt for the next scheduled date without replaying today's creation request.
 
-The native API currently has no archive deletion or retention endpoint. Jellyport
-retains its existing catalog cleanup rules and does not delete raw Jellyfin ZIPs.
-Apply a suitable retention policy to the server's backup directory separately.
-The native service requires free space before starting, but that is not retention.
+The native API currently has no archive deletion or retention endpoint. Optional
+Jellyport cleanup uses the helper's local backup-folder mount instead, as described
+below. The native service requires free space before starting, but that is not
+retention.
 
 API behavior is verified against the official [backup controller](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Api/Controllers/BackupController.cs)
 and [backup service](https://github.com/jellyfin/jellyfin/blob/ca0f16eb7c195f720a1493ed469a27c4657db0c6/Jellyfin.Server.Implementations/FullSystemBackup/BackupService.cs).
@@ -104,6 +110,44 @@ The [Jellyfin backup guide](https://jellyfin.org/docs/general/administration/bac
 describes native backup contents and live-server limitations. Jellyport rejects
 unsupported server versions before requesting a backup. Insufficient API-key
 permissions report a failed attempt without an import.
+
+### Clean up Jellyport-created Jellyfin backups
+
+Starting with **0.23.0**, open **Settings → Saved history → Jellyfin catalog →
+Automatic backup cleanup**. Enable it and choose how many completed Jellyport-created
+backups to keep (1–100; **7 is recommended**). This saves independently from the
+import schedule and is off by default, including after upgrades. Saving does not
+delete anything immediately. Cleanup follows the next successful catalog import;
+its outcome and removed count appear separately from import status. A cleanup
+failure does not discard the imported matching catalog.
+
+This feature needs two deployment changes on the **helper only**:
+
+- Set `JELLYPORT_JELLYFIN_BACKUP_CLEANUP=true`.
+- Make only its existing `/jellyfin-backups` bind mount writable and grant the
+  configured UID/GID permission to remove files in that directory. In the
+  [plugin Compose example](../examples/compose.plugin-backups.yaml), change
+  `read_only: true` to `read_only: false` for that one mount. Keep the container's
+  root filesystem read-only, the Emby backup mount read-only, and raw backups out
+  of the web container.
+
+Only future archives whose native creation and successful import Jellyport can
+verify are eligible. Manual backups, pre-existing untracked ZIPs and archives
+recovered after an uncertain creation remain untouched. Enabling this setting
+cannot retrospectively identify who created an old archive. An archive changed
+since import, an active/uncertain operation or an unverifiable identity is
+protected rather than guessed. Each pass handles at most sixteen archives, with
+sequential fingerprint checks and a fifteen-minute execution watchdog. Fingerprint
+reads use storage bandwidth, although cleanup never scans the live catalog.
+Protected files and bounded cleanup batches can temporarily exceed the configured
+count. Keep any separate policy you already use for manual Jellyfin or Emby backups.
+
+The helper remains network-isolated and receives fixed authenticated requests,
+not arbitrary deletion paths or media-server credentials. Writable permission is
+limited to the completed Jellyfin backup directory; do not mount the entire
+Jellyfin configuration writable. Disabling cleanup prevents future passes and
+does not restore removed archives. Without the helper flag and writable mount,
+ordinary imports still work but automatic cleanup cannot complete.
 
 Timing rules are the same for both import schedules:
 
@@ -196,7 +240,7 @@ The projection contains only allowlisted matching metadata, names, runtime and
 neutral library/root associations; it is encrypted in the shared directory and temporarily decrypted only in
 private application storage. Protect exchange, work and application directories.
 
-This archive manifest lacks a server ID. The administrator's trusted read-only
+This archive manifest lacks a server ID. The administrator's trusted backup-folder
 mount supplies provenance; the requested import is bound to the linked server's
 fresh API ID, URL and version. Before use, every candidate is checked through the
 actual user's API access and matching identity. Archive metadata cannot authorize
@@ -216,8 +260,9 @@ fresh fingerprints are checked before trusting saved access hints and again duri
 verification, so old already-played flags cannot silently count as accessible.
 
 Limits: 8 GiB archive and projection, two million supported projected items,
-200,000 candidates / 64 MiB per account, five-minute worker deadline. The helper's
-CPU/memory limits also apply. Reserve private work/exchange space for projection,
+200,000 candidates / 64 MiB per account, and a 30-minute offline import worker
+deadline since 0.23.0. Per-account candidate workers retain their five-minute
+limit. The helper's CPU/memory limits also apply. Reserve private work/exchange space for projection,
 index construction, encryption and temporary reads. Validation errors remain
 sanitized; no credentials, item identities or personal playback data enter logs.
 Starting with **0.22.1**, provider validation uses a single indexed insert per row,
@@ -232,7 +277,9 @@ the displayed matching-item count is the total projection, not indexed progress.
 the private catalog database file size once the helper receives the completed
 projection, before encryption. Neither value measures archive transfer throughput.
 See the [dated offline measurements](performance-safety.md#jellyfin-backup-import-performance--0221)
-for scope and limits. The five-minute deadline and validation rules are unchanged.
+for scope and limits. Those 0.22.1 measurements used the previous five-minute
+import deadline; 0.23.0 changes only this offline worker watchdog to thirty minutes.
+Validation, freshness, page-memory, per-account and live-source limits remain intact.
 
 Unknown or apparently denied access checks are limited to 2,048 IDs, four read-only
 workers and 60 seconds per phase. The normal known-access path remains batched;

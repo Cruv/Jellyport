@@ -20,6 +20,12 @@ import {
   writeEnvelope,
 } from '../server/snapshot-files.js';
 import { DEFAULT_SETTINGS, Store } from '../server/store.js';
+import {
+  backupCleanupPrefix,
+  type BackupCleanupRequest,
+  type BackupCleanupResult,
+  type OwnedJellyfinBackup,
+} from '../server/jellyfin-backup-retention.js';
 
 const serverId = 'a'.repeat(32);
 const initialTime = Date.parse('2026-10-18T02:00:00.000Z');
@@ -88,6 +94,7 @@ async function fixture() {
   await manager.start();
   clearInterval((manager as unknown as { timer: ReturnType<typeof setInterval> }).timer);
   const key = await snapshotKey(shared);
+  let cleanupSupported = false;
   async function heartbeat(selection = true) {
     await writeEnvelope(
       join(shared, 'helper.status'),
@@ -95,6 +102,7 @@ async function fixture() {
         version: 1,
         jellyfin_catalog_enabled: true,
         jellyfin_backup_selection_enabled: selection,
+        jellyfin_backup_cleanup_enabled: cleanupSupported,
         updated_at: new Date().toISOString(),
       },
       key,
@@ -189,6 +197,10 @@ async function fixture() {
     old,
     key,
     heartbeat,
+    enableCleanupHelper: async () => {
+      cleanupSupported = true;
+      await heartbeat();
+    },
     tick,
     enable,
     due,
@@ -684,4 +696,303 @@ describe('scheduled native Jellyfin backup creation', () => {
     expect((await f.manager.status()).backup_creation?.phase).toBe('uncertain');
     expect(f.imports.busy).toBe(true);
   });
+});
+
+describe('owned Jellyfin backup retention', () => {
+  async function ownedFixture(count = 9) {
+    const f = await fixture();
+    const state = f.savedState();
+    const owned: OwnedJellyfinBackup[] = Array.from({ length: count }, (_, index) => ({
+      attempt_id: randomUUID(),
+      binding: { url: 'http://jellyfin.test:8096/', server_id: serverId, version: '12.2.0.0' },
+      manifest: manifest(initialTime - index * 60_000),
+      fingerprint: createHash('sha256').update(`synthetic-${index}`).digest('hex'),
+    }));
+    state.owned_backups = owned;
+    f.client.jellyfinBackups.mockResolvedValue([f.old, ...owned.map((entry) => entry.manifest)]);
+    f.store.db
+      .prepare('INSERT OR REPLACE INTO destination_catalog_state VALUES(1,?)')
+      .run(f.store.encrypt(state));
+    await f.restart();
+    await f.enableCleanupHelper();
+    const config = (await f.manager.status()).backup_cleanup.config;
+    await f.manager.configureRetention({
+      enabled: true,
+      keep: 7,
+      expected_revision: config.revision,
+    });
+    return { f, owned };
+  }
+  async function cleanupRequest(f: Awaited<ReturnType<typeof fixture>>) {
+    const name = (await readdir(f.shared)).find((name) =>
+      /^jellyfin-cleanup-.*\.request$/.test(name),
+    )!;
+    return readEnvelope<BackupCleanupRequest>(join(f.shared, name), f.key);
+  }
+  it('never claims pre-existing or uncertain recovered native backups as owned', async () => {
+    const f = await fixture();
+    await f.enable();
+    f.client.createJellyfinBackup.mockRejectedValueOnce(
+      new MediaError('Synthetic network uncertainty.'),
+    );
+    await f.due();
+    await vi.waitFor(async () =>
+      expect((await f.manager.status()).backup_creation?.phase).toBe('waiting'),
+    );
+    f.client.jellyfinBackups.mockResolvedValue([f.old, manifest(dueTime)]);
+    await f.tick();
+    await f.finish((await f.requests())[0]!);
+    expect((await f.manager.status()).backup_cleanup.owned_backups).toBe(0);
+    expect((await f.manager.status()).backup_cleanup.last_outcome).toBeNull();
+  });
+  it('records ownership only from a positive creation response and confirms fingerprint after successful import', async () => {
+    const f = await fixture();
+    await f.enable();
+    await f.due();
+    f.creation.resolve(manifest(dueTime));
+    await vi.waitFor(async () =>
+      expect((await f.manager.status()).backup_creation?.phase).toBe('waiting'),
+    );
+    expect(f.savedState()).toMatchObject({
+      owned_backups: [
+        { attempt_id: expect.any(String), manifest: { name: manifest(dueTime).name } },
+      ],
+    });
+    expect((f.savedState().owned_backups as OwnedJellyfinBackup[])[0]!.fingerprint).toBeUndefined();
+    await f.tick();
+    const result = await f.finish((await f.requests())[0]!);
+    expect((f.savedState().owned_backups as OwnedJellyfinBackup[])[0]!.fingerprint).toBe(
+      result.backup_fingerprint,
+    );
+  });
+  it('queues only eligible older owned files after success, retains seven, and durably blocks overlapping work', async () => {
+    const { f, owned } = await ownedFixture();
+    expect((await f.manager.status()).backup_cleanup).toMatchObject({
+      running: false,
+      last_outcome: null,
+    });
+    expect((await readdir(f.shared)).some((name) => name.startsWith('jellyfin-cleanup-'))).toBe(
+      false,
+    );
+    const good = await f.seedGood(),
+      request = await cleanupRequest(f);
+    expect(request.backups.map((entry) => entry.manifest.name)).toEqual(
+      owned.slice(7).map((entry) => entry.manifest.name),
+    );
+    expect(f.imports.busy).toBe(true);
+    expect(await f.manager.status()).toMatchObject({
+      running: true,
+      last_outcome: 'succeeded',
+      record: { id: good.id },
+      backup_cleanup: { running: true },
+    });
+    await expect(f.manager.refresh()).rejects.toBeInstanceOf(ServiceError);
+    const config = (await f.manager.status()).backup_cleanup.config;
+    await expect(
+      f.manager.configureRetention({ enabled: false, keep: 7, expected_revision: config.revision }),
+    ).rejects.toBeInstanceOf(ServiceError);
+    await f.restart();
+    expect(f.imports.busy).toBe(true);
+    expect((await cleanupRequest(f)).id).toBe(request.id);
+    const result: BackupCleanupResult = {
+      ...request,
+      ok: true,
+      removed: request.backups.map((entry) => entry.manifest.name),
+      finished_at: new Date().toISOString(),
+    };
+    await writeEnvelope(join(f.shared, `${backupCleanupPrefix(request.id)}.result`), result, f.key);
+    await f.tick();
+    expect(await f.manager.status()).toMatchObject({
+      running: false,
+      last_outcome: 'succeeded',
+      backup_cleanup: { last_outcome: 'succeeded', last_deleted: 2, owned_backups: 7 },
+    });
+    expect(f.imports.busy).toBe(false);
+    expect(
+      await readEnvelope(join(f.shared, `${backupCleanupPrefix(request.id)}.result`), f.key),
+    ).toEqual(result);
+  });
+  it('preserves wrong-server, unconfirmed and last-good archives and reports cleanup failure separately', async () => {
+    const { f, owned } = await ownedFixture(11);
+    const state = f.savedState(),
+      entries = state.owned_backups as OwnedJellyfinBackup[];
+    entries[7]!.binding.server_id = 'b'.repeat(32);
+    delete entries[8]!.fingerprint;
+    f.store.db
+      .prepare('INSERT OR REPLACE INTO destination_catalog_state VALUES(1,?)')
+      .run(f.store.encrypt(state));
+    await f.restart();
+    await f.enableCleanupHelper();
+    const good = await f.seedGood(),
+      request = await cleanupRequest(f);
+    expect(request.backups.map((entry) => entry.manifest.name)).toEqual(
+      owned.slice(9).map((entry) => entry.manifest.name),
+    );
+    const invalid = {
+      ...request,
+      ok: true,
+      removed: request.backups.map((entry) => entry.manifest.name),
+      finished_at: new Date().toISOString(),
+      binding: { ...request.binding, server_id: 'b'.repeat(32) },
+    };
+    await writeEnvelope(
+      join(f.shared, `${backupCleanupPrefix(request.id)}.result`),
+      invalid,
+      f.key,
+    );
+    await f.tick();
+    expect((await f.manager.status()).backup_cleanup.running).toBe(true);
+    await writeEnvelope(
+      join(f.shared, `${backupCleanupPrefix(request.id)}.result`),
+      { ...request, ok: false, removed: [], finished_at: new Date().toISOString() },
+      f.key,
+    );
+    await f.tick();
+    expect(await f.manager.status()).toMatchObject({
+      last_outcome: 'succeeded',
+      last_error: null,
+      record: { id: good.id },
+      backup_cleanup: {
+        last_outcome: 'failed',
+        last_deleted: 0,
+        owned_backups: 11,
+        error: expect.any(String),
+      },
+    });
+  });
+  it('counts only positively present archives so a missing newest ZIP cannot consume a retention slot', async () => {
+    const { f, owned } = await ownedFixture(9);
+    f.client.jellyfinBackups.mockResolvedValue([
+      f.old,
+      ...owned.slice(1).map((entry) => entry.manifest),
+    ]);
+    await f.seedGood();
+    const request = await cleanupRequest(f);
+    expect(request.backups.map((entry) => entry.manifest.name)).toEqual([owned[8]!.manifest.name]);
+    expect(request.backups.some((entry) => entry.manifest.name === owned[7]!.manifest.name)).toBe(
+      false,
+    );
+    expect(
+      (f.savedState().owned_backups as OwnedJellyfinBackup[]).some(
+        (entry) => entry.manifest.name === owned[0]!.manifest.name,
+      ),
+    ).toBe(false);
+    expect((await f.manager.status()).backup_cleanup.owned_backups).toBe(8);
+    expect(f.client.jellyfinBackups).toHaveBeenCalledTimes(1);
+  });
+  it('preserves changed archives and does not count them toward the seven matching owned files', async () => {
+    const { f, owned } = await ownedFixture(9);
+    const changed = { ...owned[0]!.manifest, created_at: new Date(initialTime + 1).toISOString() };
+    f.client.jellyfinBackups.mockResolvedValue([
+      f.old,
+      changed,
+      ...owned.slice(1).map((entry) => entry.manifest),
+    ]);
+    await f.seedGood();
+    const request = await cleanupRequest(f);
+    expect(request.backups.map((entry) => entry.manifest.name)).toEqual([owned[8]!.manifest.name]);
+    expect((await f.manager.status()).backup_cleanup.owned_backups).toBe(9);
+  });
+  it.each(['unavailable', 'changed-server'] as const)(
+    'fails cleanup independently and retains ownership on %s evidence',
+    async (failure) => {
+      const { f } = await ownedFixture(9);
+      if (failure === 'unavailable')
+        f.client.jellyfinBackups.mockRejectedValue(
+          new MediaError('Synthetic backup listing unavailable.'),
+        );
+      else
+        f.client.systemInfo
+          .mockResolvedValueOnce({ Id: serverId, Version: '12.2.0.0' })
+          .mockResolvedValue({ Id: 'b'.repeat(32), Version: '12.2.0.0' });
+      const good = await f.seedGood();
+      expect(await f.manager.status()).toMatchObject({
+        last_outcome: 'succeeded',
+        last_error: null,
+        record: { id: good.id },
+        backup_cleanup: {
+          running: false,
+          last_outcome: 'failed',
+          last_deleted: 0,
+          owned_backups: 9,
+          error: expect.any(String),
+        },
+      });
+      expect((await readdir(f.shared)).some((name) => name.startsWith('jellyfin-cleanup-'))).toBe(
+        false,
+      );
+      expect(f.imports.busy).toBe(false);
+      if (failure === 'changed-server') expect(f.client.jellyfinBackups).not.toHaveBeenCalled();
+    },
+  );
+  it('does not queue cleanup after a failed import or with an uncertain native creation', async () => {
+    const { f } = await ownedFixture();
+    await f.manager.refresh();
+    const request = (await f.requests())[0]!;
+    await writeEnvelope(
+      join(f.shared, `${destinationCatalogPrefix(request.id)}.result`),
+      {
+        ...request,
+        ok: false,
+        error_code: 'backup_invalid',
+        started_at: new Date().toISOString(),
+        finished_at: new Date().toISOString(),
+      },
+      f.key,
+    );
+    await f.tick();
+    expect((await f.manager.status()).backup_cleanup.last_outcome).toBeNull();
+    expect((await readdir(f.shared)).some((name) => name.startsWith('jellyfin-cleanup-'))).toBe(
+      false,
+    );
+    await f.enable();
+    await f.due();
+    vi.setSystemTime(dueTime + JELLYFIN_BACKUP_WAIT_MS);
+    await f.tick();
+    const config = (await f.manager.status()).backup_cleanup.config;
+    await expect(
+      f.manager.configureRetention({ enabled: false, keep: 7, expected_revision: config.revision }),
+    ).rejects.toBeInstanceOf(ServiceError);
+  });
+});
+
+it('keeps last-good raw archives protected and bounds each cleanup batch to sixteen files', async () => {
+  const f = await fixture(),
+    state = f.savedState();
+  const owned: OwnedJellyfinBackup[] = Array.from({ length: 30 }, (_, index) => ({
+    attempt_id: randomUUID(),
+    binding: { url: 'http://jellyfin.test:8096/', server_id: serverId, version: '12.2.0.0' },
+    manifest: manifest(initialTime - index * 60_000),
+    fingerprint: 'b'.repeat(64),
+  }));
+  owned[1]!.manifest = f.old;
+  state.owned_backups = owned;
+  f.client.jellyfinBackups.mockResolvedValue(owned.map((entry) => entry.manifest));
+  f.store.db
+    .prepare('INSERT OR REPLACE INTO destination_catalog_state VALUES(1,?)')
+    .run(f.store.encrypt(state));
+  await f.restart();
+  await f.enableCleanupHelper();
+  const config = (await f.manager.status()).backup_cleanup.config;
+  await f.manager.configureRetention({
+    enabled: true,
+    keep: 1,
+    expected_revision: config.revision,
+  });
+  await f.seedGood();
+  const name = (await readdir(f.shared)).find((name) =>
+    /^jellyfin-cleanup-.*\.request$/.test(name),
+  )!;
+  const request = await readEnvelope<BackupCleanupRequest>(join(f.shared, name), f.key);
+  expect(request.backups).toHaveLength(16);
+  expect(request.backups.some((entry) => entry.manifest.name === f.old.name)).toBe(false);
+  vi.setSystemTime(initialTime + 21 * 60_000 + 1);
+  await f.tick();
+  expect(await f.manager.status()).toMatchObject({
+    running: false,
+    last_outcome: 'succeeded',
+    last_error: null,
+    backup_cleanup: { last_outcome: 'interrupted', error: expect.any(String) },
+  });
+  expect(f.imports.busy).toBe(false);
 });

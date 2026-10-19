@@ -189,7 +189,9 @@ Automatic capture/import scheduling is off by default. Plugin-backed web migrati
 **Settings → Saved history** provides independent daily schedules for the Emby
 history import and Jellyfin matching catalog. Both show the saved time/zone, next
 run and last attempt/outcome, and share the same progress treatment. They import
-completed backups rather than creating backups on either server. See
+completed backups by default. Jellyport can optionally request a fresh native
+Jellyfin backup first and clean up its verified Jellyport-created archives afterward
+(keep seven is recommended); manual backups remain protected. See
 [daily scheduling and recovery](docs/jellyfin-backup-catalog.md#daily-import-scheduling)
 for daylight-saving, missed-run, restart and overlap behavior.
 

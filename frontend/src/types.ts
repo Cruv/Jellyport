@@ -301,6 +301,21 @@ export interface DestinationBackupCreation {
   started_at: string;
   deadline_at: string;
 }
+export interface JellyfinBackupRetentionConfig {
+  enabled: boolean;
+  keep: number;
+  revision: string;
+}
+export interface JellyfinBackupCleanupStatus {
+  config: JellyfinBackupRetentionConfig;
+  supported: boolean;
+  running: boolean;
+  owned_backups: number;
+  last_run_at: string | null;
+  last_outcome: 'succeeded' | 'failed' | 'interrupted' | null;
+  last_deleted: number;
+  error: string | null;
+}
 export type ImportOutcome = 'running' | 'succeeded' | 'failed' | 'interrupted' | null;
 export interface ImportWorkflowStatus {
   running: boolean;
@@ -353,6 +368,8 @@ export interface DestinationCatalogStatus extends ImportWorkflowStatus {
   diagnostic?: DestinationCatalogDiagnostic | null;
   error_code?: DestinationCatalogErrorCode | null;
   backup_creation?: DestinationBackupCreation | null;
+  /** Missing until both services support scoped native-backup retention. */
+  backup_cleanup?: JellyfinBackupCleanupStatus;
 }
 export interface SourceSnapshotStatus extends ImportWorkflowStatus {
   available?: boolean;

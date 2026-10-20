@@ -166,6 +166,15 @@ describe('reviewed independent Jellyfin account clones', () => {
       ),
     ).toBe(false);
     expect(writes()).toEqual([]);
+    expect(publicReview.warnings).not.toContain(
+      'Unsupported or account-specific permission fields were excluded.',
+    );
+    expect(publicReview.warnings).toContain(
+      'Unsupported or account-specific configuration fields were excluded.',
+    );
+    expect(publicReview.warnings).toContain(
+      'Unsupported display fields and custom preferences were excluded. Client-local options cannot be copied.',
+    );
     expect(JSON.stringify(publicReview)).not.toMatch(
       /source-never-copy|source-token|source-secret|source-provider|parameters|EnabledFolders/,
     );

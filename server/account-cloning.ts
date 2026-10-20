@@ -93,7 +93,6 @@ export function validateCloneInput(input: CloneAccountsInput): void {
   }
 }
 export function cloneParameters(user: MediaUser, preferences: JsonObject | null) {
-  const captured = captureRoleParameters(user, preferences);
   // A partial projection must never silently remove a child's access restriction.
   // Only these identity/login bookkeeping fields are deliberately not inherited.
   const bookkeeping = new Set([
@@ -103,6 +102,15 @@ export function cloneParameters(user: MediaUser, preferences: JsonObject | null)
     'AuthenticationProviderId',
     'PasswordResetProviderId',
   ]);
+  const captured = captureRoleParameters(
+    {
+      ...user,
+      Policy: Object.fromEntries(
+        Object.entries(user.Policy ?? {}).filter(([key]) => !bookkeeping.has(key)),
+      ),
+    },
+    preferences,
+  );
   for (const key of Object.keys(user.Policy ?? {}))
     if (!bookkeeping.has(key) && !Object.hasOwn(captured.parameters.policy, key))
       throw new ServiceError(

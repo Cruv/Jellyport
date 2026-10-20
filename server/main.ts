@@ -16,6 +16,7 @@ import { resolve } from 'node:path';
 import { Store } from './store.js';
 import { Service } from './service.js';
 import { PreviewTasks } from './preview-tasks.js';
+import { CloneReviews, type CloneAccountsInput } from './account-cloning.js';
 import type { MigrationScope } from './migration.js';
 import { BotManager, BotError } from './bot.js';
 import { UserOrganization } from './user-organization.js';
@@ -174,6 +175,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   }
   const service = new Service(store, { demo, clientFactory });
   const previews = new PreviewTasks((ids, controls) => service.preview(ids, controls));
+  const cloneReviews = new CloneReviews();
   const acceptingPreviews = new Set<string>();
   const previewContext = () =>
     createHash('sha256').update(JSON.stringify(store.settings())).digest('hex');
@@ -204,6 +206,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     if (!value) return undefined;
     sessions.delete(sid);
     previews.cancelOwner(sid);
+    cloneReviews.cancelOwner(sid);
     authenticatedSessions.delete(sid);
     anonymousSessions.delete(sid);
     const owned = addresses.get(value.address);
@@ -908,6 +911,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         settings[key] = settings[key].replace(/\/+$/, '');
       store.saveSettings(settings);
       previews.close();
+      cloneReviews.close();
       await bot.restart(settings);
       return publicSettings();
     },
@@ -959,6 +963,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         )
           throw new JellyfinAuthError('Server configuration changed. Reload the page.', 403);
         previews.close();
+        cloneReviews.close();
         await bot.restart(store.settings());
         return publicSettings();
       } finally {
@@ -1140,6 +1145,110 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             request.body.discord_user_id ?? undefined,
           ),
         ),
+  );
+  app.post<{ Body: CloneAccountsInput }>(
+    '/api/accounts/clone/review',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['source_user_id', 'expected_source_username', 'accounts'],
+          properties: {
+            source_user_id: id,
+            expected_source_username: { type: 'string', minLength: 1, maxLength: 256 },
+            accounts: {
+              type: 'array',
+              minItems: 1,
+              maxItems: 10,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['username', 'family'],
+                properties: {
+                  username: accountFields.username,
+                  family: { type: 'boolean' },
+                  owner_name: { type: 'string', maxLength: 120 },
+                  notes: { type: 'string', maxLength: 2000 },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (request) => {
+      const owner = request.cookies[COOKIE]!;
+      const original = session(request);
+      const context = previewContext();
+      const review = await service.reviewCloneAccounts(request.body);
+      if (!original?.authenticated || session(request) !== original || previewContext() !== context)
+        throw new ServiceError(
+          'The administrator session or settings changed. Prepare a new clone review.',
+        );
+      return cloneReviews.save(owner, context, review);
+    },
+  );
+  app.post<{ Body: { review_id: string } }>(
+    '/api/accounts/clone',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['review_id'],
+          properties: { review_id: snapshotId },
+        },
+      },
+    },
+    async (request, reply) => {
+      const original = session(request);
+      const context = previewContext();
+      const reviewed = cloneReviews.take(request.cookies[COOKIE]!, context, request.body.review_id);
+      const job = await service.cloneAccounts(reviewed, () => {
+        if (
+          !original?.authenticated ||
+          session(request) !== original ||
+          previewContext() !== context
+        )
+          throw new ServiceError(
+            'The administrator session or settings changed. Prepare a new clone review.',
+          );
+      });
+      return reply.code(202).send(job);
+    },
+  );
+  app.post<{ Body: Parameters<Service['renameAccount']>[0] }>(
+    '/api/accounts/rename',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['user_id', 'expected_username', 'username'],
+          properties: {
+            user_id: id,
+            expected_username: { type: 'string', minLength: 1, maxLength: 256 },
+            username: accountFields.username,
+          },
+        },
+      },
+    },
+    async (request) => service.renameAccount(request.body),
+  );
+  app.get<{ Querystring: { user_id: string } }>(
+    '/api/accounts/rename/recovery',
+    {
+      schema: {
+        querystring: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['user_id'],
+          properties: { user_id: id },
+        },
+      },
+    },
+    async (request) => service.renameAccountRecovery(request.query.user_id),
   );
   app.get<{ Querystring: { username: string } }>(
     '/api/accounts/recovery',
@@ -1500,6 +1609,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     clearInterval(retention);
     clearInterval(maintenance);
     previews.close();
+    cloneReviews.close();
     await Promise.all([bot.stop(), service.stop()]);
     await upkeep;
     await Promise.all([...sessions.values()].map((value) => revoke(value)));

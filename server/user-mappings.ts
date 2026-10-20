@@ -125,6 +125,36 @@ function validateInput(input: SaveUserMapping): void {
 export class UserMappings {
   constructor(readonly store: Store) {}
 
+  /** Invalidate after an enclosing transaction commits or rolls back a rename. */
+  invalidateCache(): void {
+    mappingCaches.delete(this.store);
+  }
+
+  /** Caller owns the transaction and verifies the live, stable Jellyfin identity. */
+  renameTarget(userId: string, oldUsername: string, username: string, settings: Settings): void {
+    const records = this.list(settings);
+    const existing = records.find((mapping) => mapping.target_user_id === userId);
+    if (
+      records.some(
+        (mapping) =>
+          mapping.target_user_id !== userId &&
+          nameKey(mapping.target_username) === nameKey(username),
+      ) ||
+      (existing && ![oldUsername, username].includes(existing.target_username))
+    )
+      throw new ServiceError('A conflicting user mapping prevents this account rename.');
+    if (!existing || existing.target_username === username) return;
+    const updated: UserMapping = {
+      ...existing,
+      target_username: username,
+      revision: randomUUID(),
+    };
+    this.store.db
+      .prepare('UPDATE user_mappings SET encrypted=? WHERE id=?')
+      .run(this.store.encrypt(updated), existing.id);
+    this.invalidateCache();
+  }
+
   private all(): UserMapping[] {
     const cached = mappingCaches.get(this.store);
     if (cached) return cached.records;

@@ -69,6 +69,16 @@ import { MigrationCatalogCache, type MigrationCatalog } from './migration-catalo
 import { snapshotHistoryWarnings } from './emby-snapshot-reader.js';
 import { validateActivityRetentionDays } from './settings.js';
 import {
+  accountConfigurationHash,
+  cloneParameters,
+  newCloneReview,
+  validateCloneInput,
+  type CloneAccountsInput,
+  type ReviewedCloneSource,
+  type StoredCloneReview,
+} from './account-cloning.js';
+import { AccountRenames } from './account-rename.js';
+import {
   JOB_RETENTION_INTERVAL_SECONDS,
   JOB_RETENTION_BATCH_LIMIT,
   type JobRetentionCursor,
@@ -86,6 +96,8 @@ export interface ReviewedHistoryTarget {
   template_user_id: string;
 }
 export interface JobRequest {
+  clone_source?: ReviewedCloneSource;
+  clone_profile?: { family: boolean; owner_name: string; notes: string };
   history_only_target?: ReviewedHistoryTarget;
   source_snapshot_id?: string;
   migration_scope?: MigrationScope;
@@ -142,6 +154,8 @@ export interface MigrationAmbiguitySummary extends MigrationItemSummary {
 /** Per account, including both result lists; full matching counts remain unbounded by display. */
 export const MAX_RESULT_DIAGNOSTIC_BYTES = 1024 * 1024;
 export interface JobResult extends Partial<JobStats> {
+  cloned_from_user_id?: string;
+  cloned_from_username?: string;
   history_only?: true;
   migration_outcome?: {
     version: 1;
@@ -480,6 +494,7 @@ export class Service {
   readonly roles: AccountRoles;
   readonly memberships: Memberships;
   readonly profiles: AccountProfiles;
+  readonly renames: AccountRenames;
   readonly adminAlerts: AdminAlerts;
   readonly sourceSnapshots: SourceSnapshots;
   readonly destinationSnapshots: DestinationCatalogs;
@@ -545,6 +560,7 @@ export class Service {
     this.roles = new AccountRoles(store, this.demo);
     this.memberships = new Memberships(store);
     this.profiles = new AccountProfiles(store);
+    this.renames = new AccountRenames(store, this.mappings, this.roles);
     this.adminAlerts = new AdminAlerts(store);
     const imports = new ImportCoordinator();
     this.sourceSnapshots = new SourceSnapshots(store, {
@@ -1020,6 +1036,12 @@ export class Service {
   }
   async createAccount(username: string, discordUserId?: string | null): Promise<Job> {
     validateUsername(username);
+    if (
+      ['clone_uncertain', 'clone_incomplete'].includes(this.store.account(username)?.status ?? '')
+    )
+      throw new ServiceError(
+        'This account is an incomplete clone. Inspect its identity and restrictions in Jellyfin before continuing, or choose a fresh clone username. Default account recovery cannot replace its restrictions.',
+      );
     this.assertDestinationMapping(null, null, username, this.store.settings());
     if (discordUserId && this.resolveDiscordMapping(discordUserId))
       throw new ServiceError(
@@ -1048,6 +1070,261 @@ export class Service {
         ...(member ? { membership_slot: 1, membership_revision: member.revision } : {}),
       },
     ]);
+  }
+  private assertCloneSource(
+    user: MediaUser,
+    pin: { source_user_id: string; source_username: string },
+    settings: Settings,
+  ) {
+    if (
+      user.Id !== pin.source_user_id ||
+      user.Name !== pin.source_username ||
+      user.Policy?.IsAdministrator !== false ||
+      user.Policy.IsDisabled !== false ||
+      user.Id === settings.template_user_id ||
+      user.Id === this.store.settings().template_user_id
+    )
+      throw new ServiceError(
+        'Choose an enabled, non-administrator Jellyfin account that is not the template. The original account was preserved.',
+      );
+  }
+  private async reviewedCloneSource(
+    client: MediaAPI,
+    pin: { source_user_id: string; source_username: string },
+    settings: Settings,
+  ): Promise<ReviewedCloneSource> {
+    this.assertConnections(settings);
+    const info = await client.systemInfo();
+    this.assertConnections(settings);
+    const auth = this.store.authState();
+    if (
+      typeof info.Id !== 'string' ||
+      !info.Id ||
+      (auth?.kind === 'configured' &&
+        (info.Id !== auth.serverId ||
+          normalizeJellyfinUrl(settings.jellyfin_url) !== normalizeJellyfinUrl(auth.serverUrl)))
+    )
+      throw new ServiceError('The paired Jellyfin server identity changed. No account was cloned.');
+    const user = await client.user(pin.source_user_id);
+    this.assertCloneSource(user, pin, settings);
+    let display: JsonObject | null = null;
+    if (client.displayPreferences) {
+      try {
+        display = await client.displayPreferences(user.Id);
+      } catch {
+        this.checkStopped();
+      }
+    }
+    this.assertConnections(settings);
+    const captured = cloneParameters(user, display);
+    return {
+      server_id: info.Id,
+      ...pin,
+      parameters: captured.parameters,
+      parameters_hash: captured.hash,
+      warnings: captured.warnings,
+    };
+  }
+  async reviewCloneAccounts(input: CloneAccountsInput): Promise<StoredCloneReview> {
+    if (this.demo) throw new ServiceError('Demo account cloning is read-only.');
+    validateCloneInput(input);
+    const settings = this.store.settings();
+    return this.withClient(settings, 'jellyfin', async (client) => {
+      const source = await this.reviewedCloneSource(
+        client,
+        {
+          source_user_id: input.source_user_id,
+          source_username: input.expected_source_username,
+        },
+        settings,
+      );
+      await this.assertNewCloneNames(
+        client,
+        input.accounts.map((account) => account.username),
+        settings,
+      );
+      return newCloneReview(input, source);
+    });
+  }
+  private async assertNewCloneNames(client: MediaAPI, names: string[], settings: Settings) {
+    const users = await client.users();
+    this.assertConnections(settings);
+    for (const username of names) {
+      validateUsername(username);
+      if (users.some((user) => caseFold(user.Name) === caseFold(username)))
+        throw new ServiceError(
+          'A requested Jellyfin username already exists. Choose a new name; existing accounts were preserved.',
+        );
+      if (
+        this.store.account(username) &&
+        ['uncertain', 'provisioning', 'clone_uncertain', 'clone_incomplete'].includes(
+          this.store.account(username)!.status,
+        )
+      )
+        throw new ServiceError(
+          'A requested username has an unfinished creation. Inspect account recovery before cloning again.',
+        );
+      this.assertDestinationMapping(null, null, username, settings);
+    }
+  }
+  async cloneAccounts(
+    reviewed: StoredCloneReview,
+    acceptGuard: () => void = () => {},
+  ): Promise<Job> {
+    if (this.demo) throw new ServiceError('Demo account cloning is read-only.');
+    const input: CloneAccountsInput = {
+      source_user_id: reviewed.review.source_user_id,
+      expected_source_username: reviewed.review.source_username,
+      accounts: reviewed.review.accounts,
+    };
+    validateCloneInput(input);
+    if (
+      Date.parse(reviewed.review.expires_at) <= Date.now() ||
+      reviewed.source.source_user_id !== input.source_user_id ||
+      reviewed.source.source_username !== input.expected_source_username
+    )
+      throw new ServiceError('This account clone review expired. Prepare a new review.');
+    const settings = this.store.settings();
+    await this.withClient(settings, 'jellyfin', async (client) => {
+      const fresh = await this.reviewedCloneSource(client, reviewed.source, settings);
+      if (
+        fresh.server_id !== reviewed.source.server_id ||
+        fresh.parameters_hash !== reviewed.source.parameters_hash
+      )
+        throw new ServiceError('The source account settings changed. Prepare a new clone review.');
+      await this.assertNewCloneNames(
+        client,
+        input.accounts.map((account) => account.username),
+        settings,
+      );
+    });
+    acceptGuard();
+    return this.queue(
+      'clone',
+      input.accounts.map((account) => ({
+        username: account.username,
+        clone_source: structuredClone(reviewed.source),
+        clone_profile: {
+          family: account.family,
+          owner_name: account.owner_name ?? '',
+          notes: account.notes ?? '',
+        },
+        migration_scope: 'watched_only',
+      })),
+    );
+  }
+  async renameAccount(input: { user_id: string; expected_username: string; username: string }) {
+    if (this.demo) throw new ServiceError('Demo account renaming is read-only.');
+    validateUsername(input.username);
+    if (
+      !input.user_id ||
+      input.user_id.length > 128 ||
+      !input.expected_username ||
+      input.expected_username.length > 256
+    )
+      throw new ServiceError('Choose an existing account and a new username.');
+    return this.mutationMutex.run(async () => {
+      this.checkStopped();
+      const settings = this.store.settings();
+      await this.confirmPairedServer(settings);
+      return this.withClient(settings, 'jellyfin', async (client) => {
+        if (!client.renameUser)
+          throw new ServiceError('This Jellyfin integration cannot rename accounts.');
+        const info = await client.systemInfo();
+        if (typeof info.Id !== 'string' || !info.Id)
+          throw new ServiceError('The Jellyfin server identity could not be verified.');
+        const target = await client.user(input.user_id);
+        this.assertManageableAccount(target, input.user_id, settings, 'jellyfin');
+        const pending = this.renames.get(input.user_id, settings);
+        if (pending) {
+          if (
+            pending.old_username !== input.expected_username ||
+            pending.username !== input.username ||
+            target.Name !== pending.username ||
+            !isObject(target.Configuration) ||
+            accountConfigurationHash(target.Configuration) !== pending.configuration_hash
+          )
+            throw new ServiceError(
+              'An earlier rename has an uncertain outcome. Inspect this account in Jellyfin before retrying; no rename was repeated.',
+            );
+          return this.renames.commit(pending, settings);
+        }
+        if (target.Name !== input.expected_username || !isObject(target.Configuration))
+          throw new ServiceError(
+            'The account changed or its preferences could not be read. Refresh before renaming.',
+          );
+        if (target.Name === input.username) throw new ServiceError('Choose a different username.');
+        const users = await client.users();
+        if (
+          users.some(
+            (user) => user.Id !== target.Id && caseFold(user.Name) === caseFold(input.username),
+          )
+        )
+          throw new ServiceError(
+            'That Jellyfin username already exists. Existing accounts were preserved.',
+          );
+        this.assertConnections(settings);
+        this.checkStopped();
+        const pin = this.renames.prepare(
+          {
+            user_id: target.Id,
+            old_username: target.Name,
+            username: input.username,
+            server_id: info.Id,
+            configuration_hash: accountConfigurationHash(target.Configuration),
+          },
+          settings,
+        );
+        try {
+          await client.renameUser(target.Id, input.username, structuredClone(target.Configuration));
+        } catch {
+          /* Never replay an uncertain write. Only exact-ID readback can confirm it. */
+        }
+        let confirmed: MediaUser;
+        try {
+          confirmed = await client.user(target.Id);
+        } catch {
+          throw new ServiceError(
+            'The rename outcome is uncertain. Inspect this account in Jellyfin before retrying; no password or history was changed.',
+          );
+        }
+        this.assertConnections(settings);
+        this.assertManageableAccount(confirmed, target.Id, settings, 'jellyfin');
+        if (
+          confirmed.Name !== input.username ||
+          accountConfigurationHash(confirmed.Configuration) !== pin.configuration_hash
+        )
+          throw new ServiceError(
+            'The rename could not be fully confirmed. Inspect this account in Jellyfin before retrying.',
+          );
+        return this.renames.commit(pin, settings);
+      });
+    });
+  }
+  async renameAccountRecovery(userId: string) {
+    if (!userId || userId.length > 128) throw new ServiceError('Choose an existing account.');
+    const settings = this.store.settings();
+    await this.confirmPairedServer(settings);
+    const pin = this.renames.get(userId, settings);
+    if (!pin) return { pending: null };
+    return this.withClient(settings, 'jellyfin', async (client) => {
+      if ((await client.systemInfo()).Id !== pin.server_id)
+        throw new ServiceError('The Jellyfin server identity changed. No rename was confirmed.');
+      const target = await client.user(userId);
+      this.assertManageableAccount(target, userId, settings, 'jellyfin');
+      this.assertConnections(settings);
+      return {
+        pending: {
+          user_id: userId,
+          expected_username: pin.old_username,
+          username: pin.username,
+          can_confirm:
+            target.Name === pin.username &&
+            isObject(target.Configuration) &&
+            accountConfigurationHash(target.Configuration) === pin.configuration_hash,
+        },
+      };
+    });
   }
   listMemberships(): Array<Membership & { links: Link[] }> {
     const settings = this.store.settings();
@@ -1593,9 +1870,11 @@ export class Service {
       target_exists: Boolean(target),
       target_user_id: target?.Id ?? null,
       eligible,
-      reason: eligible
-        ? 'Inspect this Jellyfin account. Recovery will reset its password and apply your account defaults; watch history is preserved.'
-        : 'Recovery is available only for an incomplete Jellyport creation with an existing, unprotected Jellyfin account.',
+      reason: ['clone_uncertain', 'clone_incomplete'].includes(local?.status ?? '')
+        ? 'This account is an incomplete clone. Inspect its identity and restrictions in Jellyfin before continuing, or choose a fresh clone username. Default account recovery cannot replace its restrictions.'
+        : eligible
+          ? 'Inspect this Jellyfin account. Recovery will reset its password and apply your account defaults; watch history is preserved.'
+          : 'Recovery is available only for an incomplete Jellyport creation with an existing, unprotected Jellyfin account.',
     };
   }
   async recoverAccount(
@@ -1604,6 +1883,10 @@ export class Service {
     discordUserId?: string | null,
   ): Promise<Job> {
     const info = await this.recoveryInfo(username);
+    if (
+      ['clone_uncertain', 'clone_incomplete'].includes(this.store.account(username)?.status ?? '')
+    )
+      throw new ServiceError(info.reason);
     if (!info.eligible || info.target_user_id !== targetUserId)
       throw new ServiceError(
         'The inspected recovery target is no longer eligible. Refresh its details before proceeding.',
@@ -2016,6 +2299,7 @@ export class Service {
       job.destination_catalog_id = this.destinationSnapshots.queuedSelection(settings);
     if (
       kind !== 'role_update' &&
+      kind !== 'clone' &&
       requests.some((request) => request.access_disabled === undefined) &&
       settings.default_role_id
     ) {
@@ -2038,7 +2322,7 @@ export class Service {
     const controller = this.jobControllers.get(job.id)!;
     const task = Promise.resolve()
       .then(() =>
-        requests.some((request) => request.source_user_id)
+        requests.some((request) => request.source_user_id || request.clone_source)
           ? this.migrationMutex.run(() => this.run(job, requests, settings), controller.signal)
           : this.run(job, requests, settings),
       )
@@ -2183,6 +2467,8 @@ export class Service {
     recoverTargetId?: string,
     mapping: UserMapping | null = null,
     guard: () => void = () => {},
+    beforeConfigure?: (target: MediaUser) => Promise<void>,
+    deferActivation = false,
   ): Promise<[MediaUser, boolean, string | null]> {
     const roleGuard = async () => {
       if (template.accountRole) await this.requireRoleServer(jellyfin, template.accountRole);
@@ -2197,6 +2483,10 @@ export class Service {
     );
     guard();
     const local = this.store.account(username);
+    if (['clone_uncertain', 'clone_incomplete'].includes(local?.status ?? '') && !deferActivation)
+      throw new ServiceError(
+        'This account is an incomplete clone. Default account recovery cannot replace its restrictions. Inspect it in Jellyfin before continuing.',
+      );
     if (target?.Id === template.Id || (target && target.Id === settings.template_user_id))
       throw new ServiceError('The template account cannot be a destination account.');
     if (target?.Policy?.IsAdministrator)
@@ -2232,7 +2522,12 @@ export class Service {
           'Recovery target changed. Inspect the account again; no password was reset.',
         );
       password = preparedPassword(this.store.accountPassword(local) ?? generatePassword(settings));
-      this.store.saveAccount(username, target.Id, 'provisioning', password);
+      this.store.saveAccount(
+        username,
+        target.Id,
+        deferActivation ? 'clone_incomplete' : 'provisioning',
+        password,
+      );
       await roleGuard();
       await jellyfin.setPassword(target.Id, password);
     }
@@ -2251,7 +2546,7 @@ export class Service {
           'This Jellyfin username already exists. Its password and permissions were preserved. Use migration to merge watch history.',
         );
     } else {
-      if (local?.status === 'uncertain')
+      if (['uncertain', 'clone_uncertain', 'clone_incomplete'].includes(local?.status ?? ''))
         throw new ServiceError(
           'An earlier creation request had an uncertain outcome. Inspect Jellyfin before retrying this username.',
         );
@@ -2259,7 +2554,12 @@ export class Service {
       await roleGuard();
       // Persist before the POST: a process exit between sending the request and receiving
       // its response must require inspection, rather than replaying account creation.
-      this.store.saveAccount(username, null, 'uncertain', password);
+      this.store.saveAccount(
+        username,
+        null,
+        deferActivation ? 'clone_uncertain' : 'uncertain',
+        password,
+      );
       try {
         target = await jellyfin.createUser(username, password);
       } catch (error) {
@@ -2267,13 +2567,25 @@ export class Service {
           this.store.saveAccount(username, null, 'rejected');
           throw error;
         }
-        this.store.saveAccount(username, null, 'uncertain', password);
+        this.store.saveAccount(
+          username,
+          null,
+          deferActivation ? 'clone_uncertain' : 'uncertain',
+          password,
+        );
         throw new ServiceError(
           'Account creation outcome is uncertain. Inspect Jellyfin before retrying; no password was reset.',
         );
       }
-      this.store.saveAccount(username, target.Id, 'provisioning', password);
+      this.store.saveAccount(
+        username,
+        target.Id,
+        deferActivation ? 'clone_incomplete' : 'provisioning',
+        password,
+      );
     }
+    guard();
+    await beforeConfigure?.(target);
     guard();
     if (template.accountRole) {
       await roleGuard();
@@ -2297,11 +2609,335 @@ export class Service {
         ),
       );
     } else {
-      await jellyfin.setPolicy(target.Id, templatePolicy(template));
+      const policy = templatePolicy(template);
+      if (deferActivation) policy.IsDisabled = true;
+      await jellyfin.setPolicy(target.Id, policy);
       guard();
       await jellyfin.setConfiguration(target.Id, structuredClone(template.Configuration ?? {}));
     }
     return [target, true, password];
+  }
+  private async oneClone(
+    job: Job,
+    request: JobRequest,
+    settings: Settings,
+    jellyfin: MediaAPI,
+    context: { source?: MediaItem[]; key?: string },
+  ): Promise<void> {
+    const pin = request.clone_source!;
+    const username = request.username!;
+    const guard = () => {
+      this.checkJobStopped(job);
+      this.assertConnections(settings);
+    };
+    const phase = (value: NonNullable<Job['progress']['phase']>) => {
+      job.progress.phase = value;
+      this.save(job);
+    };
+    const sourceGuard = async (full = false) => {
+      guard();
+      if ((await jellyfin.systemInfo()).Id !== pin.server_id)
+        throw new ServiceError('The Jellyfin server changed. No further clone work was started.');
+      const source = await jellyfin.user(pin.source_user_id);
+      this.assertCloneSource(source, pin, settings);
+      if (full) {
+        const fresh = await this.reviewedCloneSource(jellyfin, pin, settings);
+        if (fresh.parameters_hash !== pin.parameters_hash || fresh.server_id !== pin.server_id)
+          throw new ServiceError(
+            'The source account settings changed. Prepare a new clone review.',
+          );
+      }
+      guard();
+    };
+    job.progress.current_user = username;
+    phase('reading_source');
+    await sourceGuard(true);
+    if (!jellyfin.clonePlayedItems || !jellyfin.destinationItems)
+      throw new ServiceError('This Jellyfin integration cannot perform bounded account cloning.');
+    const sourceKey = JSON.stringify([pin.server_id, pin.source_user_id, pin.parameters_hash]);
+    if (context.key && context.key !== sourceKey)
+      throw new ServiceError('The clone source changed during this job. Review it again.');
+    if (!context.source) {
+      try {
+        const items = await jellyfin.clonePlayedItems(pin.source_user_id);
+        guard();
+        const ids = new Set<string>();
+        let bytes = 0;
+        context.source = items.map((item) => {
+          if (
+            !item.Id ||
+            ids.has(item.Id) ||
+            item.UserData?.Played !== true ||
+            ![
+              'Movie',
+              'Episode',
+              'Audio',
+              'MusicVideo',
+              'Video',
+              'Book',
+              'AudioBook',
+              'Trailer',
+            ].includes(item.Type ?? '')
+          )
+            throw new ServiceError('The account clone source history could not be verified.');
+          ids.add(item.Id);
+          const value = { ...item, UserData: { Played: true } };
+          delete value.SeriesProviderIds; // Same-server exact IDs need no derived cross-server series aliases.
+          bytes += Buffer.byteLength(JSON.stringify(value));
+          if (ids.size > 100_000 || bytes > 32 * 1024 * 1024)
+            throw new ServiceError('The account clone source history exceeds its supported size.');
+          return value;
+        });
+        context.key = sourceKey;
+      } catch (error) {
+        guard();
+        throw new SourcePreparationError(
+          error instanceof MediaError || error instanceof ServiceError
+            ? error.message
+            : 'Clone source history could not be prepared. No account was created.',
+        );
+      }
+    }
+    await sourceGuard(true);
+    await this.assertNewCloneNames(jellyfin, [username], settings);
+    const sourceItems = context.source;
+    const result: JobResult = {
+      username,
+      status: 'running',
+      created: false,
+      applied: 0,
+      cloned_from_user_id: pin.source_user_id,
+      cloned_from_username: pin.source_username,
+      source_username: pin.source_username,
+      source_played: sourceItems.length,
+      source_items: sourceItems.length,
+      matched: 0,
+      unmatched: 0,
+      ambiguous: 0,
+      already_played: 0,
+      discord_delivery: 'not_requested',
+      data: migrationDetails(),
+      warnings: [...pin.warnings],
+    };
+    job.results.push(result);
+    this.save(job);
+    let destinationId: string | undefined;
+    let activated = false;
+    const targetGuard = async () => {
+      await sourceGuard();
+      const target = await jellyfin.user(destinationId!);
+      if (
+        target.Id !== destinationId ||
+        target.Name !== username ||
+        target.Policy?.IsAdministrator !== false ||
+        target.Policy.IsDisabled !== !activated ||
+        target.Id === settings.template_user_id ||
+        target.Id === this.store.settings().template_user_id ||
+        target.Id === pin.source_user_id
+      )
+        throw new ServiceError('The clone destination is not a new independent account.');
+      guard();
+    };
+    try {
+      phase('preparing_account');
+      const [target, created, password] = await this.provision(
+        jellyfin,
+        settings,
+        {
+          Id: pin.source_user_id,
+          Name: pin.source_username,
+          Policy: { ...structuredClone(pin.parameters.policy), IsDisabled: false },
+          Configuration: structuredClone(pin.parameters.configuration),
+        },
+        username,
+        false,
+        undefined,
+        null,
+        guard,
+        async (createdTarget) => {
+          destinationId = createdTarget.Id;
+          const newAccount = await jellyfin.user(createdTarget.Id);
+          this.assertRoleTarget(newAccount, createdTarget.Id, username, settings);
+          if (newAccount.Id === pin.source_user_id)
+            throw new ServiceError('The clone destination is not a new independent account.');
+          result.created = true;
+          result.target_user_id = newAccount.Id;
+          this.save(job);
+          await jellyfin.setPolicy(newAccount.Id, {
+            ...structuredClone(pin.parameters.policy),
+            IsDisabled: true,
+          });
+          await targetGuard();
+          await sourceGuard(true);
+        },
+        true,
+      );
+      destinationId = target.Id;
+      result.created = created;
+      result.target_user_id = target.Id;
+      if (!created || !password)
+        throw new ServiceError('The clone did not create an independent account.');
+      const publicUrl = settings.jellyfin_public_url || settings.jellyfin_url;
+      if (!request.clone_profile)
+        throw new ServiceError('The reviewed account profile is unavailable.');
+      await targetGuard();
+      this.profiles.save(
+        { kind: 'jellyfin', user_id: target.Id, ...request.clone_profile },
+        settings,
+        '',
+      );
+      if (pin.parameters.display !== null) {
+        if (!jellyfin.displayPreferences || !jellyfin.setDisplayPreferences)
+          throw new ServiceError(
+            'Shared Home screen preferences could not be copied. The new account and credentials were preserved.',
+          );
+        const display = await jellyfin.displayPreferences(target.Id);
+        await targetGuard();
+        await jellyfin.setDisplayPreferences(
+          target.Id,
+          mergeRoleSection('display', display, pin.parameters),
+        );
+      }
+      await targetGuard();
+      const configured = await jellyfin.user(target.Id);
+      const display =
+        pin.parameters.display !== null ? await jellyfin.displayPreferences!(target.Id) : null;
+      const contains = (expected: unknown, actual: unknown): boolean => {
+        if (isObject(expected))
+          return (
+            isObject(actual) &&
+            Object.entries(expected).every(([key, value]) => contains(value, actual[key]))
+          );
+        return JSON.stringify(expected) === JSON.stringify(actual);
+      };
+      if (
+        !contains(pin.parameters.policy, configured.Policy) ||
+        !contains(pin.parameters.configuration, configured.Configuration) ||
+        (pin.parameters.display !== null && !contains(pin.parameters.display, display))
+      )
+        throw new ServiceError(
+          'The new account settings could not be fully verified. Its credentials were preserved for review.',
+        );
+      await targetGuard();
+      await sourceGuard(true);
+      await jellyfin.setPolicy(target.Id, {
+        ...structuredClone(configured.Policy!),
+        IsAdministrator: false,
+        IsDisabled: false,
+      });
+      activated = true;
+      await targetGuard();
+      this.store.saveCredentials(
+        job.id,
+        username,
+        password,
+        publicUrl,
+        accountCredentialMessage(settings, username, password),
+      );
+      this.store.saveAccount(username, target.Id, 'ready');
+      phase('reading_target');
+      const targetItems = await jellyfin.destinationItems(target.Id, sourceItems);
+      await targetGuard();
+      const targets = new Map(targetItems.map((item) => [item.Id, item]));
+      const plan: MatchPlan = { matches: [], unmatched: [], ambiguous: [] };
+      for (const item of sourceItems) {
+        const targetItem = targets.get(item.Id);
+        if (targetItem)
+          plan.matches.push({ source: item, target: targetItem, method: 'Same Jellyfin item ID' });
+        else plan.unmatched.push(item);
+      }
+      result.matched = plan.matches.length;
+      result.unmatched = plan.unmatched.length;
+      result.already_played = plan.matches.filter(
+        (match) => match.target.UserData?.Played === true,
+      ).length;
+      const expectations = new Map<string, VerificationExpectation>();
+      phase('transferring_history');
+      let remaining = 0;
+      let pendingGuard: Promise<void> | undefined;
+      let lastCheckpoint = performance.now();
+      const beforeWrite = async () => {
+        if (remaining <= 0) {
+          pendingGuard ??= targetGuard()
+            .then(() => {
+              remaining = 100;
+            })
+            .finally(() => {
+              pendingGuard = undefined;
+            });
+          await pendingGuard;
+        }
+        guard();
+        remaining--;
+      };
+      result.applied = await migrateItemState(
+        jellyfin,
+        target.Id,
+        plan,
+        result.data!,
+        guard,
+        () => {},
+        {
+          migration_scope: 'watched_only',
+          before_write: beforeWrite,
+          expectation: (item, patch, unsupported) => {
+            const expectation = captureExpectation(item, patch, 'watched_only');
+            expectation.unsupported_fields = unsupported;
+            expectations.set(item.Id, expectation);
+          },
+          progress: (processed, total, updated) => {
+            Object.assign(job.progress, {
+              items_processed: processed,
+              items_total: total,
+              items_updated: updated,
+            });
+            if (performance.now() - lastCheckpoint > 1000) {
+              this.save(job);
+              lastCheckpoint = performance.now();
+            }
+          },
+        },
+      );
+      phase('verifying_history');
+      await targetGuard();
+      const observed = new Map(
+        (await jellyfin.destinationItems(target.Id, targetItems)).map((item) => [item.Id, item]),
+      );
+      await targetGuard();
+      const verification = (result.data!.verification = {
+        checked: expectations.size,
+        verified: 0,
+        preserved_newer: 0,
+        missing: 0,
+        mismatched: 0,
+        unsupported_fields: 0,
+      });
+      for (const [id, expectation] of expectations) {
+        const evaluation = evaluateExpectation(expectation, observed.get(id));
+        if (evaluation.status === 'missing') verification.missing++;
+        else if (evaluation.status === 'mismatch') verification.mismatched++;
+        else verification.verified++;
+        verification.unsupported_fields += evaluation.unsupported_fields.length;
+      }
+      result.status =
+        result.unmatched ||
+        result.data!.failed_items ||
+        verification.missing ||
+        verification.mismatched ||
+        verification.unsupported_fields ||
+        result.data!.warnings.length
+          ? 'partial'
+          : 'completed';
+    } catch (error) {
+      if (error instanceof StoppedError) throw error;
+      guard();
+      result.status = 'failed';
+      result.error =
+        error instanceof MediaError || error instanceof ServiceError
+          ? error.message
+          : 'The clone could not finish. The original account and any created accounts were preserved.';
+    }
+    this.save(job);
   }
   private async destinationItemsFor(
     job: Job,
@@ -3183,6 +3819,7 @@ export class Service {
     this.activeJobs.set(job.id, job);
     const catalogContext: { key?: string; value?: MigrationCatalog } = {};
     const destinationContext: DestinationCatalogContext = {};
+    const cloneContext: { source?: MediaItem[]; key?: string } = {};
     job.status = 'running';
     job.started_at = new Date().toISOString();
     job.queue_ms = Math.max(0, Date.parse(job.started_at) - Date.parse(job.created_at));
@@ -3228,6 +3865,7 @@ export class Service {
           }
           const template =
             job.kind === 'role_update' ||
+            job.kind === 'clone' ||
             requests.every((request) => request.access_disabled !== undefined)
               ? null
               : await this.template(jellyfin, settings);
@@ -3285,7 +3923,9 @@ export class Service {
                           }
                         : {}),
                     });
-                  } else if (job.kind === 'role_update')
+                  } else if (job.kind === 'clone')
+                    await this.oneClone(job, request, settings, jellyfin, cloneContext);
+                  else if (job.kind === 'role_update')
                     await this.oneRoleUpdate(job, request, settings, jellyfin);
                   else
                     await this.one(
@@ -3335,7 +3975,7 @@ export class Service {
                 delete job.progress.catalog_cache_hit;
                 this.save(job);
               });
-            if (request.source_user_id)
+            if (request.source_user_id || request.clone_source)
               await this.historyMutex.run(work, this.jobControllers.get(job.id)?.signal);
             else await work();
           }

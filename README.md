@@ -226,6 +226,42 @@ For a newly created first Discord link, a primary account's username must match 
 
 When a recipient is selected, account provisioning stores the Discord user ID and Jellyfin account ID as a durable link. Membership actions use this link even if the member later changes their Discord username.
 
+### Clone and rename Jellyfin accounts
+
+From **Users → Clone Jellyfin account**, select an enabled Jellyfin account and
+enter 1–10 new usernames. Review the proposed copies before creating them.
+Cloning copies supported permissions (including parental and library restrictions),
+account playback and shared Home preferences, and played flags. It preserves the
+source account and gives each copy its own generated password and independent
+future history. The **Family** choice starts with the source flag; it can be
+changed before creation. Discord ownership and paid account allowances are not
+inherited. Unsupported permissions stop cloning rather than relaxing restrictions.
+
+For a shared Kids account, finish its Emby migration first, make two copies, then
+use **Users → Rename Jellyfin account** for the original. Renaming keeps its account
+ID, password, settings and history. Reveal any pending credentials first. Existing
+local ownership, mappings and roles follow the verified account ID; legacy records
+without a verified server binding require a saved user mapping first. Administrator
+and template accounts remain protected from cloning and renaming.
+
+Review does not scan history. Accepted cloning reads the source's currently played
+playable items once for the whole job, creates accounts serially and verifies the
+new flags through each account's actual access. It needs no Emby or Jellyfin backup.
+New accounts remain disabled until their copied settings are verified. Retrieve
+their one-time credentials from the Activity report. Resume positions, counts,
+timestamps, favorites, playlists, avatars, sessions and client-specific preferences
+are outside the copy. See [cloning limits](docs/migration-capabilities.md#jellyfin-account-cloning--0250).
+
+Incomplete copies retain a safety journal and cannot use ordinary recovery that
+would replace their restrictions with the default account settings. Inspect them
+in Jellyfin before repairing or deleting them. A fresh reviewed copy must use a
+new username; Jellyport keeps the incomplete identity journal rather than guessing
+that a deleted or replaced account is safe to adopt.
+For an uncertain rename, reopen **Rename Jellyfin account** to inspect the pinned
+old and new names. **Confirm previous rename** reconciles a verified rename without
+sending another update. If it has not applied, complete the intended rename in
+Jellyfin first; Jellyport does not blindly repeat an uncertain write.
+
 ### Paid, complimentary, and independent access
 
 **Memberships** has two access policies. Subscription-managed members follow your reviewed or automatic MEE6/Discord membership events. Complimentary members have an administrator-controlled allowance of 1–3 accounts. Subscription cancellations, expiry, missing subscriber roles, and leaving Discord never revoke complimentary media access. The recipient must still be a current human member of the configured Discord server for bot commands or credential delivery; leaving Discord does not disable their media accounts.

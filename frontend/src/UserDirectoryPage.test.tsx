@@ -105,6 +105,30 @@ function page(custom?: Api, values = settings) {
       if (path === '/api/accounts/link') return {};
       if (path === '/api/account-profiles') return {};
       if (path === '/api/accounts/access') return {};
+      if (path === '/api/accounts/clone/review') {
+        const body = options?.body as {
+          source_user_id: string;
+          expected_source_username: string;
+          accounts: { username: string; family: boolean }[];
+        };
+        return {
+          id: 'clone-review',
+          source_user_id: body.source_user_id,
+          source_username: body.expected_source_username,
+          accounts: body.accounts,
+          warnings: [],
+          expires_at: '2026-10-20T16:00:00Z',
+        };
+      }
+      if (path === '/api/accounts/clone')
+        return {
+          id: 'clone-job',
+          kind: 'clone',
+          status: 'queued',
+          created_at: '2026-10-20T15:00:00Z',
+        };
+      if (path === '/api/accounts/rename') return {};
+      if (path.startsWith('/api/accounts/rename/recovery?')) return { pending: null };
       if (path === '/api/discord/tag-roles')
         return {
           can_manage_roles: true,
@@ -134,13 +158,21 @@ function page(custom?: Api, values = settings) {
     }) as Api);
   const notify = vi.fn();
   const navigate = vi.fn();
+  const created = vi.fn();
   return {
     ...render(
-      <UserDirectoryPage settings={values} api={api} notify={notify} navigate={navigate} />,
+      <UserDirectoryPage
+        settings={values}
+        api={api}
+        notify={notify}
+        navigate={navigate}
+        created={created}
+      />,
     ),
     requests,
     notify,
     navigate,
+    created,
   };
 }
 async function accountAction(name: string) {
@@ -519,6 +551,262 @@ describe('User directory and Discord organization', () => {
     expect(screen.getByText('@family_owner')).toBeTruthy();
     expect(screen.queryByText('Legacy')).toBeNull();
   });
+
+  it('reviews clones without changing accounts, then starts only the server-retained review', async () => {
+    const p = page();
+    fireEvent.click(await accountAction('Clone Jellyfin account for Family'));
+    expect(screen.getByLabelText('Mark the new accounts as family')).toHaveProperty(
+      'checked',
+      true,
+    );
+    fireEvent.change(screen.getByLabelText('New username 1'), { target: { value: 'FirstChild' } });
+    fireEvent.change(screen.getByLabelText('New username 2'), { target: { value: 'SecondChild' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Review clone' }));
+    await screen.findByRole('heading', { name: 'Review account clones' });
+    expect(p.requests.filter((entry) => entry.options?.method)).toEqual([
+      expect.objectContaining({
+        path: '/api/accounts/clone/review',
+        options: expect.objectContaining({
+          method: 'POST',
+          body: {
+            source_user_id: 'jf-family',
+            expected_source_username: 'Family',
+            accounts: [
+              { username: 'FirstChild', family: true },
+              { username: 'SecondChild', family: true },
+            ],
+          },
+        }),
+      }),
+    ]);
+    expect(p.created).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Create 2 accounts' }));
+    await waitFor(() =>
+      expect(p.created).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ id: 'clone-job', kind: 'clone' }),
+      ),
+    );
+    expect(p.requests.find((entry) => entry.path === '/api/accounts/clone')?.options?.body).toEqual(
+      { review_id: 'clone-review' },
+    );
+    expect(p.requests.some((entry) => entry.path === '/api/accounts/rename')).toBe(false);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(p.notify).toHaveBeenCalledWith(
+      'Account cloning started. Open the report to retrieve the new credentials.',
+    );
+    expect(localStorage.length + sessionStorage.length).toBe(0);
+  });
+
+  it('displays only server-reviewed destination names and warnings, with a separate explicit acceptance', async () => {
+    const api = vi.fn(async (path: string) => {
+      if (path === '/api/user-directory') return { users };
+      if (path === '/api/accounts/clone/review')
+        return {
+          id: 'authoritative-review',
+          source_user_id: 'jf-child',
+          source_username: 'Child',
+          accounts: [{ username: 'ReviewedChild', family: false }],
+          warnings: ['Some client-specific preferences cannot be copied.'],
+          expires_at: '2026-10-20T16:00:00Z',
+        };
+      throw new Error(`Unexpected request ${path}`);
+    }) as Api;
+    const p = page(api);
+    fireEvent.click(await accountAction('Clone Jellyfin account for Child'));
+    fireEvent.change(screen.getByLabelText('New username 1'), {
+      target: { value: 'RequestedChild' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Remove new account 2' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review clone' }));
+    await screen.findByRole('heading', { name: 'Review account clones' });
+    expect(screen.getByText('ReviewedChild')).toBeTruthy();
+    expect(screen.queryByText('RequestedChild')).toBeNull();
+    expect(screen.getByText('Some client-specific preferences cannot be copied.')).toBeTruthy();
+    expect(api).not.toHaveBeenCalledWith('/api/accounts/clone', expect.anything());
+    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    expect(p.created).not.toHaveBeenCalled();
+  });
+
+  it('ignores repeated clone acceptance while its request is pending and retains the review on failure', async () => {
+    let rejectClone!: (reason: Error) => void;
+    const api = vi.fn(async (path: string) => {
+      if (path === '/api/user-directory') return { users };
+      if (path === '/api/accounts/clone/review')
+        return {
+          id: 'clone-review',
+          source_user_id: 'jf-child',
+          source_username: 'Child',
+          accounts: [{ username: 'NewChild', family: false }],
+          warnings: [],
+          expires_at: '2026-10-20T16:00:00Z',
+        };
+      if (path === '/api/accounts/clone')
+        return await new Promise((_, reject) => {
+          rejectClone = reject;
+        });
+      throw new Error(`Unexpected request ${path}`);
+    }) as Api;
+    const p = page(api);
+    fireEvent.click(await accountAction('Clone Jellyfin account for Child'));
+    fireEvent.change(screen.getByLabelText('New username 1'), { target: { value: 'NewChild' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Remove new account 2' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review clone' }));
+    await screen.findByRole('heading', { name: 'Review account clones' });
+    const create = screen.getByRole('button', { name: 'Create 1 account' });
+    fireEvent.click(create);
+    fireEvent.click(create);
+    expect(
+      vi.mocked(api).mock.calls.filter(([path]) => path === '/api/accounts/clone'),
+    ).toHaveLength(1);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.getByRole('dialog')).toBeTruthy();
+    await act(async () => {
+      rejectClone(new Error('The review expired. Build a new review.'));
+    });
+    expect(screen.getByRole('alert').textContent).toContain('review expired');
+    expect(screen.getByText('NewChild')).toBeTruthy();
+    expect(p.created).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+    expect(screen.getByLabelText('New username 1')).toHaveProperty('value', 'NewChild');
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('renames the original only after a separate explicit action and retains its exact account identity', async () => {
+    const p = page();
+    fireEvent.click(await accountAction('Rename Jellyfin account for Family'));
+    fireEvent.change(await screen.findByLabelText('New sign-in username'), {
+      target: { value: 'ThirdChild' },
+    });
+    expect(p.requests.filter((entry) => entry.options?.method)).toHaveLength(0);
+    fireEvent.click(screen.getByRole('button', { name: 'Rename account' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(p.requests.filter((entry) => entry.options?.method)).toEqual([
+      expect.objectContaining({
+        path: '/api/accounts/rename',
+        options: expect.objectContaining({
+          method: 'POST',
+          body: { user_id: 'jf-family', expected_username: 'Family', username: 'ThirdChild' },
+        }),
+      }),
+    ]);
+    expect(p.created).not.toHaveBeenCalled();
+    expect(p.notify).toHaveBeenCalledWith(
+      'Jellyfin account renamed. Its password, settings, and media data are preserved.',
+    );
+  });
+
+  it('reloads pending rename intent by exact ID and confirms its original reviewed names without inventing a new rename', async () => {
+    const renamed = {
+      ...users[1]!,
+      jellyfin: [{ ...users[1]!.jellyfin[0]!, name: 'RenamedChild' }],
+    };
+    const requests: { path: string; options?: ApiOptions }[] = [];
+    const api = vi.fn(async (path: string, options?: ApiOptions) => {
+      requests.push({ path, options });
+      if (path === '/api/user-directory') return { users: [renamed] };
+      if (path === '/api/accounts/rename/recovery?user_id=jf-child')
+        return {
+          pending: {
+            user_id: 'jf-child',
+            expected_username: 'Child',
+            username: 'RenamedChild',
+            can_confirm: true,
+          },
+        };
+      if (path === '/api/accounts/rename') return {};
+      throw new Error(`Unexpected request ${path}`);
+    }) as Api;
+    page(api);
+    fireEvent.click(await accountAction('Rename Jellyfin account for RenamedChild'));
+    const confirm = await screen.findByRole('button', { name: 'Confirm previous rename' });
+    expect(screen.queryByLabelText('New sign-in username')).toBeNull();
+    expect(requests.filter((entry) => entry.options?.method)).toHaveLength(0);
+    fireEvent.click(confirm);
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(requests.filter((entry) => entry.options?.method)).toEqual([
+      expect.objectContaining({
+        path: '/api/accounts/rename',
+        options: expect.objectContaining({
+          method: 'POST',
+          body: { user_id: 'jf-child', expected_username: 'Child', username: 'RenamedChild' },
+        }),
+      }),
+    ]);
+  });
+
+  it('aborts clone review on unmount and ignores a late response without opening credentials', async () => {
+    let finish!: (value: unknown) => void;
+    let signal: AbortSignal | undefined;
+    const api = vi.fn(async (path: string, options?: ApiOptions) => {
+      if (path === '/api/user-directory') return { users };
+      if (path === '/api/accounts/clone/review') {
+        signal = options?.signal;
+        return await new Promise((resolve) => {
+          finish = resolve;
+        });
+      }
+      throw new Error(`Unexpected request ${path}`);
+    }) as Api;
+    const p = page(api);
+    fireEvent.click(await accountAction('Clone Jellyfin account for Child'));
+    fireEvent.change(screen.getByLabelText('New username 1'), { target: { value: 'NewChild' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Remove new account 2' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review clone' }));
+    p.unmount();
+    expect(signal?.aborted).toBe(true);
+    await act(async () => {
+      finish({ id: 'late-review' });
+    });
+    expect(p.created).not.toHaveBeenCalled();
+    expect(p.notify).not.toHaveBeenCalled();
+  });
+
+  it('offers cloning only for enabled unprotected Jellyfin accounts and never copies protected neighbors', async () => {
+    const row: DirectoryUser = {
+      ...users[1]!,
+      id: 'mixed-row',
+      protected: true,
+      jellyfin: [
+        { id: 'admin', name: 'Administrator', disabled: false, protected: true },
+        { id: 'disabled', name: 'Disabled', disabled: true, protected: false },
+        { id: 'normal', name: 'Normal', disabled: false, protected: false },
+      ],
+    };
+    const api = vi.fn(async (path: string) => {
+      if (path === '/api/user-directory') return { users: [row] };
+      throw new Error(`Unexpected request ${path}`);
+    }) as Api;
+    page(api);
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage Disabled' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Clone Jellyfin account for Normal' }));
+    const source = screen.getByLabelText('Source Jellyfin account');
+    expect(within(source).getAllByRole('option')).toHaveLength(1);
+    expect(source).toHaveProperty('value', 'normal');
+    expect(screen.queryByRole('button', { name: 'Create 2 accounts' })).toBeNull();
+    expect(api).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['clone', 'rename'] as const)(
+    'dismisses an unsubmitted %s dialog on tab navigation without saving',
+    async (action) => {
+      const p = page();
+      fireEvent.click(
+        await accountAction(
+          `${action === 'clone' ? 'Clone' : 'Rename'} Jellyfin account for Child`,
+        ),
+      );
+      fireEvent.change(
+        await screen.findByLabelText(
+          action === 'clone' ? 'New username 1' : 'New sign-in username',
+        ),
+        { target: { value: 'UnsubmittedChild' } },
+      );
+      fireEvent.click(screen.getByRole('tab', { name: 'Discord organization' }));
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(p.requests.filter((entry) => entry.options?.method)).toHaveLength(0);
+      expect(p.created).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(['emby', 'jellyfin'] as const)(
     'allows exact-account family and access review when the matching %s account is protected',

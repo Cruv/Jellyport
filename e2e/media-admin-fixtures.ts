@@ -8,6 +8,7 @@ import { MediaError } from '../server/errors';
 import { DEFAULT_SETTINGS } from '../server/types';
 import type { BotAdapter } from '../server/service';
 import type { JellyfinAuthentication } from '../server/jellyfin-auth';
+import type { MediaUserDataPatch } from '../server/media';
 
 export const paidOwner = '111111111111111111';
 export const guestOwner = '222222222222222222';
@@ -22,7 +23,11 @@ export interface AdminFixture {
   url: string;
   client: APIRequestContext;
   writes: Array<{ kind: string; method: string; id: string }>;
+  cloneHistoryReads: string[];
+  stateWrites: Array<{ user: string; item: string; value: MediaUserDataPatch }>;
+  createdCredentials: Array<{ username: string; password: string }>;
   loseCreateResponse: (name: string) => void;
+  loseRenameReadback: (name: string) => void;
 }
 
 // Writable end-to-end fixtures exercise the real HTTP handlers, Store and workers.
@@ -56,7 +61,12 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
         Configuration: { SubtitleMode: 'None' },
       });
       const writes: AdminFixture['writes'] = [];
+      const cloneHistoryReads: string[] = [];
+      const stateWrites: AdminFixture['stateWrites'] = [];
+      const createdCredentials: AdminFixture['createdCredentials'] = [];
       let loseName: string | null = null;
+      let loseRenameName: string | null = null;
+      let lostRenameReadbackId: string | null = null;
       const identity = {
         serverId: 'demo-jellyfin',
         userId: 'synthetic-admin',
@@ -85,14 +95,42 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
               throw new MediaError('Synthetic offline server.');
             };
           const create = client.createUser.bind(client);
+          const readUser = client.user.bind(client);
+          client.user = async (id) => {
+            if (id === lostRenameReadbackId) {
+              lostRenameReadbackId = null;
+              throw new MediaError('Synthetic connection lost during rename confirmation.');
+            }
+            return readUser(id);
+          };
           client.createUser = async (name, password) => {
             writes.push({ kind: kind || 'jellyfin', method: 'create', id: name });
             const user = await create(name, password);
+            createdCredentials.push({ username: name, password });
             if (name === loseName) {
               loseName = null;
               throw new MediaError('Synthetic connection lost after account creation.');
             }
             return user;
+          };
+          const clonePlayedItems = client.clonePlayedItems!.bind(client);
+          client.clonePlayedItems = async (id) => {
+            cloneHistoryReads.push(id);
+            return clonePlayedItems(id);
+          };
+          const updateUserData = client.updateUserData!.bind(client);
+          client.updateUserData = async (user, item, value) => {
+            stateWrites.push({ user, item, value: structuredClone(value) });
+            await updateUserData(user, item, value);
+          };
+          const renameUser = client.renameUser!.bind(client);
+          client.renameUser = async (id, name, configuration) => {
+            writes.push({ kind: kind || 'jellyfin', method: 'rename', id });
+            await renameUser(id, name, configuration);
+            if (name === loseRenameName) {
+              loseRenameName = null;
+              lostRenameReadbackId = id;
+            }
           };
           for (const method of [
             'setPolicy',
@@ -167,7 +205,11 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
         url,
         client,
         writes,
+        cloneHistoryReads,
+        stateWrites,
+        createdCredentials,
         loseCreateResponse: (name) => (loseName = name),
+        loseRenameReadback: (name) => (loseRenameName = name),
       });
     } finally {
       try {

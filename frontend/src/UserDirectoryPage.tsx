@@ -4,6 +4,12 @@ import { useWorkspaceDraftState } from './workspace-drafts';
 import { Callout, Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import DiscordMemberPicker from './DiscordMemberPicker';
+import AccountCloneDialog, {
+  AccountRenameDialog,
+  type AccountCloneRequest,
+  type AccountCloneReview,
+  type AccountRenameRecovery,
+} from './AccountCloneDialog';
 import { safeUrl } from './types';
 import type {
   Api,
@@ -12,6 +18,7 @@ import type {
   DiscordMember,
   DiscordTagPreview,
   DiscordTagRole,
+  Job,
   Notify,
   Page,
   Settings,
@@ -52,17 +59,23 @@ const profileAccounts = (user: DirectoryUser): ProfileAccount[] =>
   );
 const familyAccount = (user: DirectoryUser) =>
   !!user.family || [...user.emby, ...user.jellyfin].some((account) => account.profile?.family);
+const cloneAccounts = (user: DirectoryUser) =>
+  user.jellyfin.filter((account) => account.protected === false && account.disabled === false);
+const renameAccounts = (user: DirectoryUser) =>
+  user.jellyfin.filter((account) => account.protected === false);
 
 export default function UserDirectoryPage({
   settings,
   api,
   notify,
   navigate,
+  created,
 }: {
   settings: Settings;
   api: Api;
   notify: Notify;
   navigate: (page: Page) => void;
+  created?: (job: Job) => void;
 }) {
   const [users, setUsers] = useState<DirectoryUser[]>([]);
   const [loading, setLoading] = useState(true);
@@ -88,6 +101,10 @@ export default function UserDirectoryPage({
   const [accessReview, setAccessReview] = useState<DirectoryUser | null>(null);
   const [accessTarget, setAccessTarget] = useState('');
   const [accessDisabled, setAccessDisabled] = useState(false);
+  const [cloning, setCloning] = useState<DirectoryUser | null>(null);
+  const [cloneReview, setCloneReview] = useState<AccountCloneReview | null>(null);
+  const [renaming, setRenaming] = useState<DirectoryUser | null>(null);
+  const [renameRecovery, setRenameRecovery] = useState<AccountRenameRecovery | undefined>();
   const [linking, setLinking] = useState<DirectoryUser | null>(null);
   const [member, setMember] = useState<DiscordMember | null>(null);
   const [target, setTarget] = useState('');
@@ -127,6 +144,10 @@ export default function UserDirectoryPage({
     if (busyRef.current) return;
     setEditing(null);
     setAccessReview(null);
+    setCloning(null);
+    setCloneReview(null);
+    setRenaming(null);
+    setRenameRecovery(undefined);
     setLinking(null);
     setPreview(null);
   }, [section]);
@@ -301,6 +322,57 @@ export default function UserDirectoryPage({
       await reload();
     });
   }
+  function prepareClone(request: AccountCloneRequest) {
+    void run(async (signal) => {
+      const result = await api<AccountCloneReview>('/api/accounts/clone/review', {
+        method: 'POST',
+        body: request,
+        signal,
+      });
+      if (!mounted.current || signal.aborted) return;
+      setCloneReview(result);
+      notify('Clone review ready. Confirm the new accounts before creating them.');
+    });
+  }
+  function startClone(reviewId: string) {
+    if (!created) return;
+    void run(async (signal) => {
+      const job = await api<Job>('/api/accounts/clone', {
+        method: 'POST',
+        body: { review_id: reviewId },
+        signal,
+      });
+      if (!mounted.current || signal.aborted) return;
+      setCloning(null);
+      setCloneReview(null);
+      notify('Account cloning started. Open the report to retrieve the new credentials.');
+      created(job);
+    });
+  }
+  function renameAccount(request: {
+    user_id: string;
+    expected_username: string;
+    username: string;
+  }) {
+    void run(async (signal) => {
+      await api('/api/accounts/rename', { method: 'POST', body: request, signal });
+      if (!mounted.current || signal.aborted) return;
+      setRenaming(null);
+      notify('Jellyfin account renamed. Its password, settings, and media data are preserved.');
+      await reload();
+    });
+  }
+  function inspectRename(userId: string) {
+    setRenameRecovery(undefined);
+    void run(async (signal) => {
+      const result = await api<{ pending: AccountRenameRecovery['pending'] }>(
+        `/api/accounts/rename/recovery?user_id=${encodeURIComponent(userId)}`,
+        { signal },
+      );
+      if (!mounted.current || signal.aborted) return;
+      setRenameRecovery({ user_id: userId, pending: result.pending });
+    });
+  }
   function loadRoles() {
     const version = sectionGeneration.current.version;
     setOrganizer(true);
@@ -433,7 +505,7 @@ export default function UserDirectoryPage({
           setActionUser('');
         }}
       />
-      {error && !linking && !editing && !accessReview && (
+      {error && !linking && !editing && !accessReview && !cloning && !renaming && (
         <div className="error-block" role="alert">
           {error}
         </div>
@@ -688,6 +760,36 @@ export default function UserDirectoryPage({
                                   Family and notes
                                 </button>
                               )}
+                              {created && cloneAccounts(user).length > 0 && (
+                                <button
+                                  className="btn btn-quiet"
+                                  disabled={busy}
+                                  onClick={() => {
+                                    setActionUser('');
+                                    setError('');
+                                    setCloneReview(null);
+                                    setCloning(user);
+                                  }}
+                                  aria-label={`Clone Jellyfin account for ${cloneAccounts(user)[0]!.name}`}
+                                >
+                                  Clone account
+                                </button>
+                              )}
+                              {renameAccounts(user).length > 0 && (
+                                <button
+                                  className="btn btn-quiet"
+                                  disabled={busy}
+                                  onClick={() => {
+                                    setActionUser('');
+                                    setError('');
+                                    setRenaming(user);
+                                    inspectRename(renameAccounts(user)[0]!.id);
+                                  }}
+                                  aria-label={`Rename Jellyfin account for ${renameAccounts(user)[0]!.name}`}
+                                >
+                                  Rename account
+                                </button>
+                              )}
                               {profileAccounts(user).length > 0 && (
                                 <button
                                   className="btn btn-quiet"
@@ -909,6 +1011,47 @@ export default function UserDirectoryPage({
           )}
         </section>
       </TabPanel>
+      {cloning && (
+        <AccountCloneDialog
+          accounts={cloneAccounts(cloning)}
+          existingUsernames={users.flatMap((user) => user.jellyfin.map((account) => account.name))}
+          busy={busy}
+          error={error}
+          review={cloneReview}
+          prepare={prepareClone}
+          edit={() => {
+            if (!busy) {
+              setCloneReview(null);
+              setError('');
+            }
+          }}
+          close={() => {
+            if (!busy) {
+              setCloning(null);
+              setCloneReview(null);
+              setError('');
+            }
+          }}
+          submit={startClone}
+        />
+      )}
+      {renaming && (
+        <AccountRenameDialog
+          accounts={renameAccounts(renaming)}
+          existingUsernames={users.flatMap((user) => user.jellyfin.map((account) => account.name))}
+          busy={busy}
+          error={error}
+          recovery={renameRecovery}
+          inspect={inspectRename}
+          close={() => {
+            if (!busy) {
+              setRenaming(null);
+              setError('');
+            }
+          }}
+          submit={renameAccount}
+        />
+      )}
       {accessReview && (
         <Modal
           title="Review account access"

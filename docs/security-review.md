@@ -62,6 +62,42 @@ remain sensitive and must not be mounted in the web container. Validation used
 private copies and fake destination clients; no production API writes or
 deployments were performed, and no real backup data enters fixtures or commits.
 
+## Reviewed account cloning and rename — 0.25.0
+
+Clone reviews are short-lived, session-owned and private to memory, with at most
+one per administrator session and sixteen globally. They expose proposed names,
+Family choices and warnings, not source settings or playback history. Acceptance
+takes only the retained review ID and revalidates server, source identity, policy,
+preferences and destination names. Both endpoints require authentication, CSRF and
+same-origin checks. Source settings are retained only in encrypted queued requests;
+passwords use the existing encrypted, expiring one-time credentials path.
+
+Only enabled non-administrator/non-template sources can clone. New accounts get
+separate IDs and passwords. They remain disabled until copied permissions and
+preferences pass readback; unknown restrictive policy fields fail closed. No
+source mutations, ownership inheritance, token copying or automatic credential
+delivery occur. Played flags are read once per job with explicit payload/time
+bounds and rechecked through each new account's access. Upstream writes cannot be
+atomic: a short create-to-disable interval exists, and already accepted changes
+survive cancellation. Generated passwords are not exposed before settings pass.
+
+Rename durably pins the current server, exact user ID, old/new names and a hash of
+the live configuration before the remote POST. An uncertain write is never
+automatically replayed; only exact-ID readback can reconcile it. Local journal,
+mapping, role and ownership references update atomically, preserving pending
+disable flags and account slots. Family profiles stay keyed to the original ID.
+Pending unrevealed credentials block rename instead of being discarded. New
+account/link records retain encrypted server bindings; legacy unscoped rows need
+current scoped corroboration before mutation. Different-server bindings always
+block. External concurrent configuration changes remain an upstream race which
+readback detects when observable.
+
+Incomplete clone journals remain distinct from ordinary provisioning and survive
+report retention. Generic account recovery cannot replace their copied child
+restrictions with default permissions. The rename recovery read returns only the
+pinned names, user ID and whether readback permits confirmation. Confirmation uses
+the durable pin and never repeats the uncertain remote POST.
+
 ## Protected-account played-history migration — 0.24.0
 
 A session-owned, authenticated and CSRF-protected migration review can authorize

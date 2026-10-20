@@ -58,6 +58,49 @@ Suppose a user finished season 2 in Emby and season 3 is not yet in Jellyfin. Je
 
 This does not guarantee a permanent Next Up tile. Jellyfin applies playback-date cutoffs, library exclusions, special-episode settings and client display choices. Jellyport does not copy dates or manufacture activity to force a tile onto the home screen. Continue Watching positions and watch order are outside the migration scope. See Jellyfin's [Next Up implementation](https://github.com/jellyfin/jellyfin/blob/v12.2/Emby.Server.Implementations/TV/TVSeriesManager.cs).
 
+## Jellyfin account cloning — 0.25.0
+
+Cloning is a separate, explicitly reviewed same-server operation for 1–10 new
+accounts. It copies the source's supported policy, account configuration and shared
+Home preferences, plus played flags for accessible movies, episodes, audio, music
+videos, videos, books, audiobooks and trailers. Aggregate series/season flags are
+derived from episodes. It does not copy resumes, counts, timestamps, favorites,
+playlists, images, sessions, device authentication or per-device settings. The
+source must be enabled, non-administrator and outside the selected template.
+
+Family is an explicit per-copy choice, defaulted in the interface from the source.
+Ownership notes, Discord links, memberships and role assignments are not inherited.
+Each copy gets its own password using the configured password/message defaults.
+The source account is never written. Rename is a separate action preserving the
+original ID and configuration; it does not reset passwords or transfer history.
+
+Review reads account settings and names only. Accepted jobs read played items once
+per source/job, in sequential pages of at most 100 without repeated total counts.
+No Emby scan, cross-server matching or neutral full-catalog index is involved.
+The read has a five-minute safety limit, 100,000-item and 32 MiB projection bounds.
+Documented name ordering and OFFSET pagination cannot provide an atomic view of a
+library changing during collection; repeated IDs fail rather than silently merge.
+Changes which shift pages without duplicates can still omit a newly changed flag;
+avoid source/library edits during cloning and inspect the result before retiring
+the shared account. Clones are independent copies, not ongoing synchronization.
+
+Accounts are created serially, kept disabled while settings are applied and
+verified, then activated. Played flags use bounded existing workers and exact
+Jellyfin item IDs, with fresh access/state reads and independent readback. If an
+item is unavailable under the copied restrictions it is reported rather than
+granted extra access. A settings failure retains a disabled, journaled account;
+an uncertain creation is never adopted just by matching its name. The source and
+any partial copies remain available for administrator inspection. Credentials are
+revealed only through the existing private one-time endpoint after settings pass.
+
+Cloning uses the supported role-parameter allowlist. Unknown or malformed policy
+fields stop the copy so parental restrictions are not dropped; unsupported cosmetic
+preferences produce a review warning. Jellyfin's login-attempt limit is retained,
+while counters and authentication providers are not copied. Rename sends the live
+configuration because Jellyfin's update-user endpoint replaces it even when the
+intent is only a name change. Concurrent external settings changes cannot be locked
+atomically. Verify the account after any interrupted or uncertain operation.
+
 ## Data outside the migration scope
 
 | Data                                                                                                 | Treatment                                                                                                                                                        |

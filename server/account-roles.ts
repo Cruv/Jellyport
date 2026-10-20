@@ -235,6 +235,27 @@ export class AccountRoles {
   getAssignment(userId: string, settings: Settings): RoleAssignment | null {
     return this.assignments(settings).find((assignment) => assignment.user_id === userId) ?? null;
   }
+  /** Caller owns the transaction after verifying the same live account ID. */
+  renameAssignment(
+    userId: string,
+    oldUsername: string,
+    username: string,
+    settings: Settings,
+  ): void {
+    const scope = this.requiredScope(settings);
+    const assignment = this.getAssignment(userId, settings);
+    if (!assignment || assignment.username === username) return;
+    if (assignment.username !== oldUsername)
+      throw new ServiceError(
+        'The role assignment changed. Review it before renaming this account.',
+      );
+    this.store.saveAccountRoleAssignmentRecord(assignmentId(scope, userId), {
+      ...assignment,
+      username,
+      revision: randomUUID(),
+      updated_at: new Date().toISOString(),
+    });
+  }
   private transaction<T>(callback: () => T): T {
     this.store.db.exec('BEGIN IMMEDIATE');
     try {

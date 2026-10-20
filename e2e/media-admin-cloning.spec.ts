@@ -321,7 +321,9 @@ test('a rename with uncertain readback can be confirmed after reload without rep
     .getByRole('textbox', { name: 'New sign-in username', exact: true })
     .fill('renamed_family');
   await dialog.getByRole('button', { name: 'Rename account', exact: true }).click();
-  await expect(dialog.getByRole('alert')).toContainText('rename outcome is uncertain');
+  await expect(dialog.locator('form').getByRole('alert')).toContainText(
+    'rename outcome is uncertain',
+  );
   expect(admin.servers.users.jellyfin.find((user) => user.Id === sourceId)).toEqual({
     ...before,
     Name: 'renamed_family',

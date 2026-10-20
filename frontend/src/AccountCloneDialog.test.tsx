@@ -64,6 +64,8 @@ describe('Account cloning review', () => {
       true,
     );
     names(' FirstChild ', 'SecondChild');
+    const body = screen.getByRole('dialog').querySelector('.modal-body')!;
+    body.scrollTop = 300;
     fireEvent.click(screen.getByRole('button', { name: 'Review clone' }));
     expect(p.submit).not.toHaveBeenCalled();
     expect(p.prepare).toHaveBeenCalledExactlyOnceWith({
@@ -74,7 +76,11 @@ describe('Account cloning review', () => {
         { username: 'SecondChild', family: true },
       ],
     });
-    serverReview(p);
+    const review = serverReview(p);
+    expect(body.scrollTop).toBe(0);
+    body.scrollTop = 120;
+    p.rerender(<AccountCloneDialog {...p.props} review={review} />);
+    expect(body.scrollTop).toBe(120);
     expect(screen.getByRole('heading', { name: 'Review account clones' })).toBeTruthy();
     expect(screen.getByText('kids-id')).toBeTruthy();
     expect(screen.getByText('FirstChild · Family, SecondChild · Family')).toBeTruthy();

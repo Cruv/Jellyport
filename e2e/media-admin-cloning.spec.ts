@@ -107,6 +107,7 @@ test('family clones copy played flags and settings into independent accounts bef
   await dialog.getByRole('button', { name: 'Review clone', exact: true }).click();
   dialog = page.getByRole('dialog', { name: 'Review account clones', exact: true });
   await expect(dialog).toContainText(sourceId);
+  await expect(dialog.getByText('river', { exact: true })).toBeInViewport({ ratio: 1 });
   await expect(dialog).toContainText('family_child_two · Family, family_child_three · Family');
   await expect(dialog).toContainText(
     'Resume positions, favorites, playlists, passwords, Discord links, and subscription ownership are not copied.',

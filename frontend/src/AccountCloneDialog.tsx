@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react';
+import { useLayoutEffect, useRef, useState, type FormEvent } from 'react';
 import { Callout, Loading, Modal } from './components';
 import type { DirectoryAccount } from './types';
 
@@ -53,6 +53,12 @@ export default function AccountCloneDialog({
   const [usernames, setUsernames] = useState(['', '']);
   const [family, setFamily] = useState(accounts[0]?.profile?.family === true);
   const [validation, setValidation] = useState('');
+  const reviewContent = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    if (!review) return;
+    const body = reviewContent.current?.closest<HTMLElement>('.modal-body');
+    if (body) body.scrollTop = 0;
+  }, [review?.id]);
   const source = accounts.find((account) => account.id === sourceId);
   function requestReview(event: FormEvent) {
     event.preventDefault();
@@ -114,7 +120,7 @@ export default function AccountCloneDialog({
       }
     >
       {review ? (
-        <div className="form-stack">
+        <div className="form-stack" ref={reviewContent}>
           <div className="summary-card">
             <dl>
               <dt>Existing Jellyfin account</dt>

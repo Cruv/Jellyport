@@ -33,6 +33,23 @@ const valid = (): RoleParameters => ({
 });
 
 describe('role parameter snapshots', () => {
+  it.each([-1, 0, 4, 2_147_483_647])(
+    'preserves a supported login lockout threshold %s',
+    (value) => {
+      const captured = captureRoleParameters({
+        Id: 'u',
+        Name: 'Source',
+        Policy: { LoginAttemptsBeforeLockout: value },
+      });
+      expect(captured.parameters.policy.LoginAttemptsBeforeLockout).toBe(value);
+      expect(() => validateRoleParameters(captured.parameters)).not.toThrow();
+    },
+  );
+  it.each([-2, 1.5, 2_147_483_648, '4'])('rejects invalid login lockout threshold %s', (value) => {
+    expect(() =>
+      validateRoleParameters({ ...valid(), policy: { LoginAttemptsBeforeLockout: value } }),
+    ).toThrow();
+  });
   it('captures supported settings while stripping identity, credentials, admin and disabled state', () => {
     const source = {
       Id: 'source-user',
@@ -72,6 +89,7 @@ describe('role parameter snapshots', () => {
     });
     expect(captured.parameters.policy).toEqual({
       ...valid().policy,
+      LoginAttemptsBeforeLockout: 4,
       AccessSchedules: [{ DayOfWeek: 'Weekday', StartHour: 8, EndHour: 22 }],
     });
     expect(captured.parameters.configuration).toEqual(valid().configuration);
@@ -263,7 +281,7 @@ describe('role parameter snapshots', () => {
     { policy: { AuthenticationProviderId: 'provider' } },
     { policy: { PasswordResetProviderId: 'provider' } },
     { policy: { InvalidLoginAttemptCount: 0 } },
-    { policy: { LoginAttemptsBeforeLockout: -1 } },
+    { policy: { LoginAttemptsBeforeLockout: -2 } },
     { configuration: { EnableLocalPassword: true } },
     { configuration: { CastReceiverId: 'device' } },
     { display: { Id: 'private-user' } },

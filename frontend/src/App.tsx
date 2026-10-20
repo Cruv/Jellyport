@@ -1086,7 +1086,13 @@ export default function App() {
     );
   else if (page === 'users' && settings)
     content = (
-      <UserDirectoryPage settings={settings} api={api} notify={notify} navigate={navigate} />
+      <UserDirectoryPage
+        settings={settings}
+        api={api}
+        notify={notify}
+        navigate={navigate}
+        created={created}
+      />
     );
   else if (page === 'memberships' && settings)
     content = <MembershipsPage settings={settings} api={api} notify={notify} created={created} />;
@@ -1742,6 +1748,7 @@ function DialogContent({
   if (dialog.kind === 'job') {
     const job = dialog.job;
     const migrationJob = ['migrate', 'migration'].includes(job.kind);
+    const cloneJob = job.kind === 'clone';
     const historicalMigration =
       migrationJob &&
       (job.migration_scope !== 'watched_only' ||
@@ -1765,12 +1772,18 @@ function DialogContent({
     return (
       <Modal
         title={
-          ['migrate', 'migration'].includes(job.kind) ? 'Migration details' : 'Operation details'
+          migrationJob
+            ? 'Migration details'
+            : cloneJob
+              ? 'Account cloning details'
+              : 'Operation details'
         }
         description={
-          job.migration_scope === 'watched_only'
-            ? 'Played-status migration. Review matching coverage and verified transfers.'
-            : 'Follow account changes and review delivery results.'
+          cloneJob
+            ? 'New independent accounts with copied settings and played flags. The source account is preserved.'
+            : job.migration_scope === 'watched_only'
+              ? 'Played-status migration. Review matching coverage and verified transfers.'
+              : 'Follow account changes and review delivery results.'
         }
         close={close}
         footer={
@@ -1911,7 +1924,10 @@ function DialogContent({
                 preferences, or Discord ownership changes were requested.
               </p>
             )}
-            {result.source_username && result.source_username !== result.username && (
+            {result.cloned_from_username && (
+              <p className="muted">Cloned from Jellyfin: {result.cloned_from_username}</p>
+            )}
+            {!cloneJob && result.source_username && result.source_username !== result.username && (
               <p className="subtle text-small">
                 Emby: {result.source_username} → Jellyfin: {result.username}
               </p>

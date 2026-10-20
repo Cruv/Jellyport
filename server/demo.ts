@@ -139,6 +139,33 @@ export class DemoClient implements MediaAPI {
   async setConfiguration(id: string, configuration: JsonObject): Promise<void> {
     this.findUser(id).Configuration = structuredClone(configuration);
   }
+  async renameUser(id: string, name: string, configuration: JsonObject): Promise<void> {
+    const user = this.findUser(id);
+    if (
+      this.servers.users[this.kind].some(
+        (other) => other.Id !== id && caseFold(other.Name) === caseFold(name),
+      )
+    )
+      throw new MediaError('Demo username already exists.');
+    user.Name = name;
+    user.Configuration = structuredClone(configuration);
+  }
+  async clonePlayedItems(userId: string): Promise<MediaItem[]> {
+    this.findUser(userId);
+    const playable = new Set([
+      'Movie',
+      'Episode',
+      'Audio',
+      'MusicVideo',
+      'Video',
+      'Book',
+      'AudioBook',
+      'Trailer',
+    ]);
+    return (await this.items(userId)).filter(
+      (item) => playable.has(item.Type ?? '') && item.UserData?.Played === true,
+    );
+  }
   async displayPreferences(userId: string): Promise<JsonObject> {
     this.findUser(userId);
     return structuredClone(this.servers.display[userId] ?? { CustomPrefs: {} });

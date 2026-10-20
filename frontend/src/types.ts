@@ -175,6 +175,8 @@ export interface JobResult {
   source_snapshot?: SourceSnapshotMetadata;
   username?: string;
   source_username?: string;
+  cloned_from_user_id?: string;
+  cloned_from_username?: string;
   mapping_id?: string;
   role_id?: string;
   role_name?: string;

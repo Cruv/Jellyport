@@ -74,6 +74,7 @@ const schedule: Check = (value) =>
 
 const policy: Record<string, Check> = {
   IsAdministrator: (value) => value === false,
+  LoginAttemptsBeforeLockout: integer(2_147_483_647, -1),
   IsHidden: boolean,
   EnableCollectionManagement: boolean,
   EnableSubtitleManagement: boolean,

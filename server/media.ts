@@ -72,6 +72,10 @@ export interface MediaAPI {
   user(id: string): Promise<MediaUser>;
   items(userId?: string): Promise<MediaItem[]>;
   createUser(name: string, password: string): Promise<MediaUser>;
+  /** Same-server account clone: only current, accessible played items, with bounded pages. */
+  clonePlayedItems?(userId: string): Promise<MediaItem[]>;
+  /** Rename an existing stable ID, preserving its freshly read configuration. */
+  renameUser?(userId: string, name: string, configuration: JsonObject): Promise<void>;
   setPassword(id: string, password: string): Promise<void>;
   setPolicy(id: string, policy: JsonObject): Promise<void>;
   setConfiguration(id: string, configuration: JsonObject): Promise<void>;
@@ -1844,6 +1848,93 @@ export class MediaClient implements MediaAPI {
     return this.validUser(
       await this.request('POST', 'Users/New', undefined, { Name: name, Password: password }),
     );
+  }
+  async renameUser(userId: string, name: string, configuration: JsonObject): Promise<void> {
+    if (this.kind !== 'jellyfin' || !name.trim() || !isObject(configuration))
+      throw new MediaError('A Jellyfin username and current account configuration are required.');
+    // UpdateUser also updates configuration. Never submit a default/empty replacement
+    // for an omitted live configuration, and never send credentials or policy here.
+    await this.request(
+      'POST',
+      'Users',
+      { userId: this.id(userId) },
+      { Id: userId, Name: name, Configuration: structuredClone(configuration) },
+      false,
+    );
+  }
+  async clonePlayedItems(userId: string): Promise<MediaItem[]> {
+    if (this.kind !== 'jellyfin') throw new MediaError('Account cloning requires Jellyfin.');
+    this.id(userId);
+    const started = performance.now();
+    const result: MediaItem[] = [];
+    const seen = new Set<string>();
+    let bytes = 0;
+    let start = 0;
+    const pageSize = Math.min(100, this.pageSize);
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1)
+      throw new MediaError('Invalid account clone page size.');
+    const playable = new Set([
+      'Movie',
+      'Episode',
+      'Audio',
+      'MusicVideo',
+      'Video',
+      'Book',
+      'AudioBook',
+      'Trailer',
+    ]);
+    // SortName is the documented common order. No undocumented Id sort/cursor is
+    // assumed; concurrent library edits can shift OFFSET pages and repeated IDs fail.
+    while (true) {
+      if (performance.now() - started > 5 * 60_000)
+        throw new MediaError('Reading account clone history reached its five-minute safety limit.');
+      await this.yieldRead();
+      if (start && this.catalogIdleMs > 0)
+        await delay(this.catalogIdleMs, undefined, { signal: this.controller.signal });
+      const data = await this.destinationRead('user_state', async (onAttempt) =>
+        this.object(
+          await this.request(
+            'GET',
+            'Items',
+            {
+              UserId: userId,
+              IsPlayed: 'true',
+              Recursive: 'true',
+              IncludeItemTypes: [...playable].join(','),
+              Fields: 'ProviderIds,Path',
+              EnableImages: 'false',
+              EnableUserData: 'true',
+              EnableTotalRecordCount: 'false',
+              CollapseBoxSetItems: 'false',
+              SortBy: 'SortName',
+              SortOrder: 'Ascending',
+              StartIndex: start,
+              Limit: pageSize,
+            },
+            undefined,
+            true,
+            undefined,
+            { onAttempt },
+          ),
+        ),
+      );
+      if (!Array.isArray(data.Items) || data.Items.length > pageSize)
+        throw new MediaError('Jellyfin returned an invalid account clone history page.');
+      if (!data.Items.length) break;
+      for (const value of data.Items) {
+        const item = projectMigrationItem(value);
+        if (!playable.has(item.Type ?? '') || item.UserData?.Played !== true || seen.has(item.Id))
+          throw new MediaError('Jellyfin returned unexpected or repeated account clone history.');
+        bytes += Buffer.byteLength(JSON.stringify(item));
+        if (result.length >= MAX_MIGRATION_STATE_ITEMS || bytes > MAX_MIGRATION_STATE_BYTES)
+          throw new MediaError('Account clone history exceeds its supported size.');
+        seen.add(item.Id);
+        result.push(item);
+      }
+      start += data.Items.length;
+      // A short page may be a server-side cap; continue to an empty page.
+    }
+    return result;
   }
   async setPassword(id: string, password: string): Promise<void> {
     if (this.kind !== 'jellyfin' || !password)

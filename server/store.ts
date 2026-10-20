@@ -5,6 +5,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { SecretCipher } from './crypto.js';
 import { nameKey } from './identity.js';
+import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { DEFAULT_SETTINGS, DEMO_SETTINGS, type Settings } from './types.js';
 import { jobRetentionTimestamp, type JobRetentionCursor } from './job-retention.js';
 import type {
@@ -23,6 +24,12 @@ export interface Account {
   status: string;
   password: Uint8Array | null;
   expires: number | null;
+}
+export interface AccountIdentityBinding {
+  server_url: string;
+  server_id: string;
+  remote_id: string | null;
+  username: string;
 }
 export interface Link {
   discord_user_id: string;
@@ -128,6 +135,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS account_role_assignments (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS memberships (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS account_profiles (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS account_renames (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS account_identity_bindings (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS admin_alert_config (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS admin_alert_receipts (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS source_snapshot_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
@@ -163,6 +172,8 @@ export class Store {
       UNION ALL SELECT 1 FROM migration_playlists UNION ALL SELECT 1 FROM user_mappings
       UNION ALL SELECT 1 FROM account_roles UNION ALL SELECT 1 FROM account_role_assignments
       UNION ALL SELECT 1 FROM memberships UNION ALL SELECT 1 FROM account_profiles
+      UNION ALL SELECT 1 FROM account_renames
+      UNION ALL SELECT 1 FROM account_identity_bindings
       UNION ALL SELECT 1 FROM admin_alert_config UNION ALL SELECT 1 FROM admin_alert_receipts
       UNION ALL SELECT 1 FROM source_snapshot_state UNION ALL SELECT 1 FROM destination_catalog_state
       UNION ALL SELECT 1 FROM job_retention_config UNION ALL SELECT 1 FROM job_retention LIMIT 1`,
@@ -362,6 +373,61 @@ export class Store {
   deleteAccountRoleAssignmentRecord(id: string): void {
     this.db.prepare('DELETE FROM account_role_assignments WHERE id=?').run(id);
   }
+  accountRenameRecord<T>(id: string): T | null {
+    const row = this.db.prepare('SELECT encrypted FROM account_renames WHERE id=?').get(id);
+    return row ? this.decrypt<T>(row.encrypted as Uint8Array) : null;
+  }
+  saveAccountRenameRecord(id: string, value: unknown): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO account_renames (id,encrypted) VALUES (?,?)')
+      .run(id, this.encrypt(value));
+  }
+  deleteAccountRenameRecord(id: string): void {
+    this.db.prepare('DELETE FROM account_renames WHERE id=?').run(id);
+  }
+  private identityBindingId(kind: 'account' | 'link', key: string): string {
+    return createHash('sha256')
+      .update(JSON.stringify([kind, key]))
+      .digest('hex');
+  }
+  accountIdentityBinding(kind: 'account' | 'link', key: string): AccountIdentityBinding | null {
+    const row = this.db
+      .prepare('SELECT encrypted FROM account_identity_bindings WHERE id=?')
+      .get(this.identityBindingId(kind, key));
+    return row ? this.decrypt<AccountIdentityBinding>(row.encrypted as Uint8Array) : null;
+  }
+  deleteAccountIdentityBinding(kind: 'account' | 'link', key: string): void {
+    this.db
+      .prepare('DELETE FROM account_identity_bindings WHERE id=?')
+      .run(this.identityBindingId(kind, key));
+  }
+  saveAccountIdentityBinding(
+    kind: 'account' | 'link',
+    key: string,
+    remoteId: string | null,
+    username: string,
+  ): void {
+    const auth = this.authState();
+    const settings = this.settings();
+    if (
+      auth?.kind !== 'configured' ||
+      normalizeJellyfinUrl(auth.serverUrl) !== normalizeJellyfinUrl(settings.jellyfin_url)
+    ) {
+      this.deleteAccountIdentityBinding(kind, key);
+      return;
+    }
+    this.db
+      .prepare('INSERT OR REPLACE INTO account_identity_bindings (id,encrypted) VALUES (?,?)')
+      .run(
+        this.identityBindingId(kind, key),
+        this.encrypt({
+          server_url: normalizeJellyfinUrl(auth.serverUrl),
+          server_id: auth.serverId,
+          remote_id: remoteId,
+          username,
+        } satisfies AccountIdentityBinding),
+      );
+  }
   authState(): AuthState | null {
     const row = this.db.prepare('SELECT encrypted FROM auth_state WHERE id=1').get();
     return row ? this.decrypt<AuthState>(row.encrypted as Uint8Array) : null;
@@ -532,7 +598,12 @@ export class Store {
         else {
           for (const row of usernames.iterate(id)) {
             const account = typeof row.username === 'string' ? this.account(row.username) : null;
-            if (account && ['uncertain', 'provisioning'].includes(account.status)) {
+            if (
+              account &&
+              ['uncertain', 'provisioning', 'clone_uncertain', 'clone_incomplete'].includes(
+                account.status,
+              )
+            ) {
               reason = 'recovery_required';
               break;
             }
@@ -612,16 +683,24 @@ export class Store {
     status: string,
     password?: string | null,
   ): void {
-    this.db
-      .prepare('INSERT OR REPLACE INTO accounts VALUES (?,?,?,?,?,?)')
-      .run(
-        nameKey(username),
-        username,
-        remoteId,
-        status,
-        password ? this.encrypt(password) : null,
-        password ? Date.now() / 1000 + 86400 : null,
-      );
+    this.db.exec('SAVEPOINT jellyport_save_account');
+    try {
+      this.db
+        .prepare('INSERT OR REPLACE INTO accounts VALUES (?,?,?,?,?,?)')
+        .run(
+          nameKey(username),
+          username,
+          remoteId,
+          status,
+          password ? this.encrypt(password) : null,
+          password ? Date.now() / 1000 + 86400 : null,
+        );
+      this.saveAccountIdentityBinding('account', nameKey(username), remoteId, username);
+      this.db.exec('RELEASE jellyport_save_account');
+    } catch (error) {
+      this.db.exec('ROLLBACK TO jellyport_save_account; RELEASE jellyport_save_account');
+      throw error;
+    }
   }
   accountPassword(account: Account): string | null {
     return account.password && (account.expires ?? 0) > Date.now() / 1000
@@ -692,11 +771,22 @@ export class Store {
   ): void {
     if (!Number.isInteger(slot) || slot < 1 || slot > 3)
       throw new Error('Invalid membership account slot.');
-    this.db
-      .prepare(
-        'INSERT INTO links (discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled) VALUES (?,?,?,?,?,NULL) ON CONFLICT(discord_user_id,membership_slot) DO UPDATE SET username=excluded.username, remote_id=excluded.remote_id, disabled_by_jellyport=excluded.disabled_by_jellyport, pending_disabled=NULL',
-      )
-      .run(String(discordId), slot, username, remoteId, Number(disabled));
+    this.db.exec('SAVEPOINT jellyport_save_link');
+    try {
+      const previous = this.link(discordId, slot);
+      this.db
+        .prepare(
+          'INSERT INTO links (discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled) VALUES (?,?,?,?,?,NULL) ON CONFLICT(discord_user_id,membership_slot) DO UPDATE SET username=excluded.username, remote_id=excluded.remote_id, disabled_by_jellyport=excluded.disabled_by_jellyport, pending_disabled=NULL',
+        )
+        .run(String(discordId), slot, username, remoteId, Number(disabled));
+      if (previous && previous.remote_id !== remoteId)
+        this.deleteAccountIdentityBinding('link', previous.remote_id);
+      this.saveAccountIdentityBinding('link', remoteId, remoteId, username);
+      this.db.exec('RELEASE jellyport_save_link');
+    } catch (error) {
+      this.db.exec('ROLLBACK TO jellyport_save_link; RELEASE jellyport_save_link');
+      throw error;
+    }
   }
   setLinkPending(discordId: string, disabled: boolean | null, slot = 1): void {
     this.db

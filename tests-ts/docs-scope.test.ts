@@ -123,16 +123,14 @@ describe('browser regression checks gate the required runtime job', () => {
   }
 
   it('runs Chromium and WebKit interface checks on Node 24 after the build and before the success marker', () => {
-    expect(testJob).toContain('node: [22, 24]');
+    expect(testJob).toContain('node: [24]');
     const install = namedStep('Install browser for interface regression tests');
     const browser = namedStep('Run desktop and mobile interface regression tests');
     const marker = namedStep('Runtime checks passed');
     expect(install).toContain('        run: npx playwright install --with-deps chromium webkit\n');
     expect(browser).toContain('        run: npm run test:e2e\n');
     for (const step of [install, browser]) {
-      expect(step).toContain(
-        "        if: needs.scope.outputs.docs_only != 'true' && matrix.node == 24\n",
-      );
+      expect(step).toContain("        if: needs.scope.outputs.docs_only != 'true'\n");
       expect(step).not.toMatch(/continue-on-error|\|\|\s*true|always\(\)|set\s+\+e/);
     }
     expect(marker).toContain("        if: needs.scope.outputs.docs_only != 'true'\n");
@@ -158,7 +156,6 @@ describe('image publication requires actual runtime validation', () => {
     conclusion: 'success',
   };
   const jobs = [
-    { name: 'test (22)', marker: 'Runtime checks passed' },
     { name: 'test (24)', marker: 'Runtime checks passed' },
     { name: 'docker', marker: 'Runtime Docker checks passed' },
   ].map(({ name, marker }) => ({
@@ -240,7 +237,7 @@ describe('image publication requires actual runtime validation', () => {
     }
   }
 
-  it('accepts exact current main with all three successful runtime markers', () => {
+  it('accepts exact current main with successful Node 24 and Docker runtime markers', () => {
     const result = verify();
     expect(result.status, result.log).toBe(0);
     expect(result.output).toContain(`sha=${sha}\n`);
@@ -298,8 +295,9 @@ describe('image publication requires actual runtime validation', () => {
     'rejects %s publication after browser checks fail in the required Node 24 job',
     (event) => {
       const checkedJobs = structuredClone(jobs);
-      checkedJobs[1].conclusion = 'failure';
-      checkedJobs[1].steps.push({
+      const nodeJob = checkedJobs.find((job) => job.name === 'test (24)')!;
+      nodeJob.conclusion = 'failure';
+      nodeJob.steps.push({
         name: 'Run desktop and mobile interface regression tests',
         conclusion: 'failure',
       });
@@ -313,7 +311,9 @@ describe('image publication requires actual runtime validation', () => {
   it.each([
     'missing-marker',
     'failed-marker',
-    'missing-arm-runtime',
+    'missing-node-runtime',
+    'missing-docker-runtime',
+    'obsolete-node-runtime',
     'skipped-job',
     'wrong-job-sha',
     'duplicate-job',
@@ -322,7 +322,9 @@ describe('image publication requires actual runtime validation', () => {
     const checkedJobs = structuredClone(jobs);
     if (scenario === 'missing-marker') checkedJobs[0].steps = [];
     if (scenario === 'failed-marker') checkedJobs[0].steps[0].conclusion = 'failure';
-    if (scenario === 'missing-arm-runtime') checkedJobs.splice(1, 1);
+    if (scenario === 'missing-node-runtime') checkedJobs.splice(0, 1);
+    if (scenario === 'missing-docker-runtime') checkedJobs.splice(1, 1);
+    if (scenario === 'obsolete-node-runtime') checkedJobs[0].name = 'test (22)';
     if (scenario === 'skipped-job') checkedJobs[0].conclusion = 'skipped';
     if (scenario === 'wrong-job-sha') checkedJobs[0].head_sha = 'b'.repeat(40);
     if (scenario === 'duplicate-job') checkedJobs.push(checkedJobs[0]);

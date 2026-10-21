@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Self-hosted Emby to Jellyfin migration and Discord account management",
   "engines": {
-    "node": "^22.16.0 || ^24.0.0"
+    "node": "^24.15.0"
   },
   "scripts": {
     "docs:check": "node scripts/check-docs.mjs",

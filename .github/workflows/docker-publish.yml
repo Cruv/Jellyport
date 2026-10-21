@@ -67,10 +67,10 @@ jobs:
             [[ "$run_id" =~ ^[0-9]+$ ]]
             jobs=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?filter=latest&per_page=100")
             if jq -e --arg sha "$SOURCE_SHA" '
-              [.[].jobs[] | select(.name == "test (22)" or .name == "test (24)" or .name == "docker")] as $required |
-                ([$required[].name] | sort) == ["docker", "test (22)", "test (24)"] and
+              [.[].jobs[] | select(.name == "test (24)" or .name == "docker")] as $required |
+                ([$required[].name] | sort) == ["docker", "test (24)"] and
                 all($required[]; .head_sha == $sha and .status == "completed" and .conclusion == "success" and
-                  (((.name == "test (22)" or .name == "test (24)") and
+                  ((.name == "test (24)" and
                     any(.steps[]?; .name == "Runtime checks passed" and .conclusion == "success")) or
                     (.name == "docker" and any(.steps[]?;
                       .name == "Runtime Docker checks passed" and .conclusion == "success"))))' <<< "$jobs" > /dev/null; then
@@ -78,8 +78,8 @@ jobs:
               break
             fi
             if jq -e --arg sha "$SOURCE_SHA" '
-              [.[].jobs[] | select(.name == "test (22)" or .name == "test (24)" or .name == "docker")] as $required |
-                ([$required[].name] | sort) == ["docker", "test (22)", "test (24)"] and
+              [.[].jobs[] | select(.name == "test (24)" or .name == "docker")] as $required |
+                ([$required[].name] | sort) == ["docker", "test (24)"] and
                 all($required[]; .head_sha == $sha and .status == "completed" and .conclusion == "success" and
                   any(.steps[]?; .name == "Documentation-only checks passed" and .conclusion == "success") and
                   all(.steps[]?;

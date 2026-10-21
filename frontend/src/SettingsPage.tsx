@@ -15,6 +15,7 @@ import AdminAlertsPanel from './AdminAlertsPanel';
 import SourceSnapshotsPanel from './SourceSnapshotsPanel';
 import DestinationCatalogPanel from './DestinationCatalogPanel';
 import ActivityRetentionPanel from './ActivityRetentionPanel';
+import StripeIntegrationPanel from './StripeIntegrationPanel';
 import { navigateWorkspace, useRouteTab } from './routing';
 import { useWorkspaceDraftState } from './workspace-drafts';
 import {
@@ -39,6 +40,7 @@ const settingsTabs = [
   { id: 'media', label: 'Servers' },
   { id: 'accounts', label: 'Account defaults' },
   { id: 'discord', label: 'Discord' },
+  { id: 'stripe', label: 'Stripe' },
   { id: 'automation', label: 'Automation' },
   { id: 'history', label: 'Saved history' },
   { id: 'activity', label: 'Activity' },
@@ -611,7 +613,7 @@ export default function SettingsPage({
       <SettingsDraftDirty.Provider value={{ dirty, latest: latestDirty }}>
         <form
           id="settings-form"
-          hidden={activeTab === 'activity' || activeTab === 'history'}
+          hidden={activeTab === 'activity' || activeTab === 'history' || activeTab === 'stripe'}
           noValidate
           onSubmit={save}
           onChangeCapture={(event) => {
@@ -1503,6 +1505,15 @@ export default function SettingsPage({
           </fieldset>
         </form>
       </SettingsDraftDirty.Provider>
+      <TabPanel id="settings" tabId="stripe" active={activeTab === 'stripe'}>
+        <StripeIntegrationPanel
+          api={api}
+          notify={notify}
+          demo={demo}
+          tiers={s.membership_tiers || defaultMembershipTiers}
+          active={activeTab === 'stripe'}
+        />
+      </TabPanel>
       <TabPanel id="settings" tabId="history" active={activeTab === 'history'}>
         <section className="settings-group" data-settings-main="history" aria-label="Saved history">
           <p className="section-note">

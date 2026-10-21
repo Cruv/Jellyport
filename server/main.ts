@@ -9,6 +9,8 @@ import staticFiles from '@fastify/static';
 import { registerUserMappingRoutes } from './user-mappings.js';
 import { registerDiscordMemberRoutes } from './discord-members.js';
 import { registerAccountRoleRoutes } from './account-roles.js';
+import { registerStripeRoutes } from './stripe-routes.js';
+import { StripeIntegration, type StripeIntegrationOptions } from './stripe-integration.js';
 import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
@@ -85,9 +87,10 @@ export interface CreateAppOptions {
   staticDir?: string;
   authClient?: JellyfinAuthentication;
   allowedHosts?: string[];
+  stripeClientFactory?: StripeIntegrationOptions['clientFactory'];
 }
 export type JellyportApp = FastifyInstance & {
-  jellyport: { store: Store; service: Service; bot: BotManager };
+  jellyport: { store: Store; service: Service; bot: BotManager; stripe: StripeIntegration };
 };
 
 const equal = (left: string, right: string): boolean => {
@@ -181,6 +184,16 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     createHash('sha256').update(JSON.stringify(store.settings())).digest('hex');
   const bot = new BotManager(service);
   service.bot = bot;
+  const stripe = new StripeIntegration(store, {
+    clientFactory: options.stripeClientFactory,
+    resolveDiscordMember: async (id) => {
+      const identity = await service.bot!.recipientIdentity(id, false);
+      if (identity.id !== id)
+        throw new ServiceError('The Discord member identity could not be verified.');
+      return { id, username: identity.username };
+    },
+  });
+  bot.onIdentityHint = (hint) => stripe.recordDiscordHint(hint);
   const app = Fastify({
     logger: false,
     bodyLimit: 65536,
@@ -192,7 +205,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     ajv: { customOptions: { coerceTypes: false, removeAdditional: false, useDefaults: false } },
   }) as unknown as JellyportApp;
   app.server.headersTimeout = 15_000;
-  app.decorate('jellyport', { store, service, bot });
+  app.decorate('jellyport', { store, service, bot, stripe });
   const sessions = new Map<string, Session>();
   const anonymousSessions = new Map<string, Session>();
   const authenticatedSessions = new Map<string, Session>();
@@ -1519,6 +1532,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   registerUserMappingRoutes(app);
   registerDiscordMemberRoutes(app);
   registerAccountRoleRoutes(app);
+  registerStripeRoutes(app, stripe, demo);
   app.post<{
     Body: {
       role_id: string;
@@ -1592,6 +1606,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       });
   }, 300000);
   maintenance.unref();
+  const stripePolling = setInterval(() => {
+    if (!demo && store.authState()?.kind === 'configured' && stripe.status().sync_enabled)
+      void stripe.sync().catch(() => {});
+  }, 15 * 60_000);
+  stripePolling.unref();
   let closing = false;
   const retention = setInterval(() => {
     try {
@@ -1608,9 +1627,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     closing = true;
     clearInterval(retention);
     clearInterval(maintenance);
+    clearInterval(stripePolling);
     previews.close();
     cloneReviews.close();
-    await Promise.all([bot.stop(), service.stop()]);
+    await Promise.all([stripe.stop(), bot.stop(), service.stop()]);
     await upkeep;
     await Promise.all([...sessions.values()].map((value) => revoke(value)));
     sessions.clear();

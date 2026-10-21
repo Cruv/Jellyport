@@ -401,7 +401,7 @@ Keep the same data mount and back it up before updating the image. On the first 
 
 ## Development and local demo
 
-Use Node.js 24 or the supported Node 22 range in `package.json`. Install the pinned lockfile:
+Use Node.js 24.15.0 or newer within the Node 24 release line, as specified by `package.json`. Install the pinned lockfile:
 
 ```sh
 npm ci

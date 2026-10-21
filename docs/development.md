@@ -31,8 +31,8 @@ the current task's acceptance conditions.
 
 ## Commands and isolated development
 
-Use Node 24, or a supported Node 22 release as specified by `package.json`, and
-install the lockfile with `npm ci`.
+Use Node 24.15.0 or newer within the Node 24 release line, as specified by
+`package.json`, and install the lockfile with `npm ci`.
 The workflow regression tests also use Git, Bash and `jq`, as available on the
 GitHub Ubuntu runners; install those tools before running that corpus locally.
 
@@ -72,8 +72,8 @@ reformat unrelated Markdown tables or foreign work. Finish owned changes with
 selections, stale recovery responses, independent saves, cancelled confirmations,
 and failed-save retries. The required Node 24 CI job also runs Chromium and WebKit
 browser tests after building the app. A browser failure fails that required job
-and prevents image publication. Node 22 continues to run the full unit/component
-suite and production build.
+and prevents image publication. Node 24 is the only supported runtime and runs
+the full unit/component suite and production build.
 
 To run the browser suite locally:
 
@@ -170,12 +170,12 @@ automated; the owner has not established a separate release cadence.
 The workflows define the executable gates:
 
 - Documentation-only changes run documentation validation. The required
-  `test (22)`, `test (24)` and `docker` checks remain present and cannot pass if
+  `test (24)` and `docker` checks remain present and cannot pass if
   that validation fails; they skip application work only for the explicit docs
   allowlist. Any code, script, configuration or workflow change gets full checks.
   Keep `docs/` assets exclusive to documentation; if runtime code begins consuming
   them, change the classifier and its tests before relying on this exemption.
-- Runtime verification covers Node 22/24, the full suite, production builds and
+- Runtime verification covers Node 24, the full suite, production builds and
   dependency audit, Compose examples, and demo/setup/secure-cookie/unprivileged
   container smoke. `Checks` manual dispatch always runs full verification.
 - Automatic publication requires a successful same-repository main-push check

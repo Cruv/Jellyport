@@ -32,7 +32,7 @@ const pageTabs: Partial<Record<Page, readonly string[]>> = {
   accounts: ['create', 'recover'],
   memberships: ['list', 'editor'],
   subscriptions: ['review', 'history', 'all'],
-  settings: ['media', 'accounts', 'discord', 'automation', 'history', 'activity'],
+  settings: ['media', 'accounts', 'discord', 'stripe', 'automation', 'history', 'activity'],
 };
 const settingsSubtabs: Record<string, readonly string[]> = {
   media: ['emby', 'jellyfin', 'paths'],

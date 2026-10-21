@@ -1233,6 +1233,36 @@ describe('Trusted subscription sources', () => {
     expect(enabled.service.migrateUsers).not.toHaveBeenCalled();
   });
 
+  it('records trusted identity-only announcements without invoking subscription actions', async () => {
+    const { manager, service, guild } = await fixture(sourceSettings);
+    const receive = vi.fn();
+    manager.onIdentityHint = receive;
+    await manager.handleSubscriptionMessage(
+      subscriptionMessage({ content: 'JELLYPORT_IDENTITY_V1 discord=22' }),
+    );
+    expect(receive).toHaveBeenCalledExactlyOnceWith({
+      id: '22',
+      username: 'jlogan35',
+      tier: '',
+      source_event: '1000',
+    });
+    expect(service.recordSubscription).not.toHaveBeenCalled();
+    receive.mockClear();
+    await manager.handleSubscriptionMessage(
+      subscriptionMessage({
+        content: 'JELLYPORT_IDENTITY_V1 discord=22',
+        author: { id: '801', bot: true },
+      }),
+    );
+    expect(receive).not.toHaveBeenCalled();
+    guild.members.fetch.mockRejectedValue(new Error('private Discord failure'));
+    await manager.handleSubscriptionMessage(
+      subscriptionMessage({ content: 'JELLYPORT_IDENTITY_V1 discord=22' }),
+    );
+    expect(receive).not.toHaveBeenCalled();
+    expect(JSON.stringify(manager.status())).not.toContain('private Discord failure');
+  });
+
   it.each([
     [['jlogan35'], '22'],
     [['other-user'], null],

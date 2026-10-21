@@ -27,6 +27,7 @@ import {
   renderCredentialMessage,
 } from './credential-message.js';
 import { discordCredentialContent } from './credentials.js';
+import { parseMee6Identity } from './mee6-identity.js';
 
 export class BotError extends Error {}
 class MissingMember extends BotError {}
@@ -316,6 +317,12 @@ async function bounded<T>(
 
 export class BotManager {
   readonly service: BotService;
+  onIdentityHint?: (hint: {
+    id: string;
+    username: string;
+    tier: string;
+    source_event: string;
+  }) => void;
   private settings: Settings = {};
   private client: Client | null = null;
   private error: string | null = null;
@@ -1327,6 +1334,18 @@ export class BotManager {
       message.webhookId != null
     )
       return;
+    const identityId = parseMee6Identity(message.content);
+    if (identityId) {
+      try {
+        const identity = await this.recipientIdentity(identityId, false);
+        this.checkActive();
+        this.onIdentityHint?.({ ...identity, tier: '', source_event: message.id });
+      } catch (error) {
+        if (error instanceof Stopped) throw error;
+        this.error = 'A MEE6 identity hint could not be verified. Check Discord connectivity.';
+      }
+      return;
+    }
     const parsed = parseSubscriptionMessage(message.content);
     if (!parsed) return;
     let identity: Identity | null = null;
@@ -1339,6 +1358,12 @@ export class BotManager {
     }
     this.checkActive();
     try {
+      if (parsed.action === 'subscribe' && identity)
+        this.onIdentityHint?.({
+          ...identity,
+          tier: parsed.detail,
+          source_event: message.id,
+        });
       await this.service.recordSubscription({
         ...parsed,
         id: message.id,

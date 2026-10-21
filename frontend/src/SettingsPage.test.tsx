@@ -823,6 +823,43 @@ describe('New account password and message settings', () => {
 });
 
 describe('Settings draft and submission safeguards', () => {
+  it('keeps Stripe credentials outside the general settings form and preserves its route', async () => {
+    const stripe = {
+      configured: false,
+      mode: null,
+      review_only: true,
+      revision: 'synthetic-revision',
+      running: false,
+      sync_enabled: false,
+      last_sync: null,
+      last_error: null,
+      subscription_count: 0,
+      linked_customer_count: 0,
+      price_tiers: [],
+      hints: [],
+    };
+    const p = page(oldSettings, (async () => stripe) as Api);
+    expect(p.requests.some((request) => request.path.startsWith('/api/stripe'))).toBe(false);
+    settingsTab('Stripe');
+    await screen.findByText('Not connected');
+    expect(window.location.hash).toBe('#/settings/stripe');
+    const stripeForm = screen.getByRole('form', { name: 'Stripe connection' });
+    expect(stripeForm.closest('#settings-form')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Save settings' })).toBeNull();
+    const key = screen.getByLabelText('Restricted Stripe API key');
+    fireEvent.change(key, { target: { value: 'rk_test_synthetic_only' } });
+    fireEvent.submit(stripeForm);
+    await waitFor(() =>
+      expect(p.notify).toHaveBeenCalledWith(
+        'Stripe settings saved. Account changes remain under review.',
+      ),
+    );
+    expect(p.requests.some((request) => request.path === '/api/settings')).toBe(false);
+    expect(
+      p.requests.find((request) => request.path === '/api/stripe/config')?.options?.body,
+    ).toMatchObject({ api_key: 'rk_test_synthetic_only', expected_revision: 'synthetic-revision' });
+  });
+
   it('keeps dirty server/password/message/default drafts when newer settings arrive', () => {
     const p = passwordPage({ ...oldSettings, default_role_id: 'old-role' });
     fireEvent.change(screen.getByLabelText('Generated password length'), {

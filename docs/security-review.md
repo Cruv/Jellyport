@@ -62,6 +62,32 @@ remain sensitive and must not be mounted in the web container. Validation used
 private copies and fake destination clients; no production API writes or
 deployments were performed, and no real backup data enters fixtures or commits.
 
+## Stripe billing observations — 0.26.0
+
+The Stripe connector uses restricted keys and GET requests to a fixed HTTPS
+Stripe origin. It pins the API version, forbids redirects, bounds response bytes,
+pagination, request concurrency, retries and total sync time, and checks each of
+the five documented Read permissions. Upstream bodies and errors are not logged
+or echoed. Keys, minimized customer/subscription observations, Checkout identity
+hints and approved Discord links use the existing authenticated encryption.
+Normal settings/status responses never return the key or customer contact data.
+Customer review routes require the central current-administrator, same-origin,
+CSRF and no-store protections. There is no public Stripe webhook endpoint.
+
+Sync and link approval cannot call media-server or membership mutations. A
+billing period is not reported as a paid-through date. Candidate identity fields
+remain unverified until an administrator selects a freshly verified human guild
+member. Reviews carry the catalog's own revision; key/guild changes and disconnect
+invalidate saved links and stale asynchronous work. Failed or incomplete reads
+preserve the previous complete catalog. Trusted MEE6 identity announcements only
+record bounded hints and do not infer payment or customer ownership.
+
+Verification uses synthetic Stripe, Discord and media adapters, including
+desktop and iPhone browser workflows. Live MEE6 subscription visibility and
+the actual source of Discord identity require verification after an operator
+supplies a restricted key. Invoice-backed access enforcement and signed billing
+webhooks are outside this connector's current scope.
+
 ## Reviewed account cloning and rename — 0.25.0
 
 Clone reviews are short-lived, session-owned and private to memory, with at most

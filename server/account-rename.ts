@@ -8,6 +8,7 @@ import { AccountProfiles } from './account-profiles.js';
 import type { Store } from './store.js';
 import type { Settings } from './types.js';
 import type { UserMappings } from './user-mappings.js';
+import { MediaOwnerships } from './media-ownership.js';
 
 export interface RenameInput {
   user_id: string;
@@ -102,6 +103,13 @@ export class AccountRenames {
 
   private assertAvailable(input: RenameInput, settings: Settings): void {
     const scope = this.scope(settings, input.server_id);
+    new MediaOwnerships(this.store).assertRenameTarget(
+      input.server_id,
+      input.user_id,
+      input.old_username,
+      input.username,
+      settings,
+    );
     const oldKey = nameKey(input.old_username),
       newKey = nameKey(input.username);
     const original = this.store.account(input.old_username);
@@ -217,6 +225,13 @@ export class AccountRenames {
       if (!isDeepStrictEqual(this.get(pin.user_id, settings), pin))
         throw new ServiceError('The saved rename changed. Inspect the account before retrying.');
       this.assertAvailable(pin, settings);
+      new MediaOwnerships(this.store).renameTarget(
+        pin.server_id,
+        pin.user_id,
+        pin.old_username,
+        pin.username,
+        settings,
+      );
       this.mappings.renameTarget(pin.user_id, pin.old_username, pin.username, settings);
       this.roles.renameAssignment(pin.user_id, pin.old_username, pin.username, settings);
       this.store.db

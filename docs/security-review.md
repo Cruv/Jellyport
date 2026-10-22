@@ -76,8 +76,10 @@ and an unexpired inventory revision. Fresh source checks precede one SQLite
 transaction that saves encrypted Stripe links, media ownership, review notes and
 a durable informational-role task. Source failure, changed review or changed
 ownership rejects the approval. Legacy migration, mapping and access paths also
-check approved ownership before acting. Gap annotations do not grant access or
-change subscription/Family exemptions, and missing observations never justify
+check approved ownership before acting. Verified account renames update the
+ownership label inside the existing rename transaction while preserving owner,
+slot and approval time; uncertain writes still require exact-ID readback. Gap
+annotations do not grant access or change subscription/Family exemptions, and missing observations never justify
 an automatic disable.
 
 Role tasks return within a four-second delivery budget, continue with bounded

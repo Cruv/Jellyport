@@ -6,6 +6,7 @@ import { DemoServers } from '../server/demo.js';
 import { Service, type BotAdapter, type Job } from '../server/service.js';
 import { Store, DEFAULT_SETTINGS } from '../server/store.js';
 import type { MediaOwnership } from '../server/media-ownership.js';
+import { MediaError } from '../server/errors.js';
 
 const owner = '100001',
   other = '100002';
@@ -403,4 +404,167 @@ describe('approved media ownership in existing migration workflows', () => {
     expect(store.link(owner)?.disabled_by_jellyport).toBe(1);
     expect(bot.delivered).not.toHaveBeenCalled();
   });
+
+  it('keeps approved ownership and its slot through an exact-ID rename so existing billing access still works', async () => {
+    store.saveLink(owner, 'river', 'j-river', false, 2);
+    registered('jellyfin', 'j-river', owner, 2);
+    registered('emby', 'e-river', owner, 2);
+    const before = service.mediaOwnerships.get(
+      'jellyfin',
+      'demo-jellyfin',
+      'j-river',
+      store.settings(),
+    )!;
+    const source = service.mediaOwnerships.get('emby', 'demo-emby', 'e-river', store.settings());
+    const preferences = structuredClone(
+      servers.users.jellyfin.find((account) => account.Id === 'j-river')!.Configuration,
+    );
+    await service.renameAccount({
+      user_id: 'j-river',
+      expected_username: 'river',
+      username: 'RiverRenamed',
+    });
+    expect(
+      service.mediaOwnerships.get('jellyfin', 'demo-jellyfin', 'j-river', store.settings()),
+    ).toEqual({ ...before, username: 'RiverRenamed' });
+    expect(service.mediaOwnerships.get('emby', 'demo-emby', 'e-river', store.settings())).toEqual(
+      source,
+    );
+    expect(store.link(owner, 2)).toMatchObject({
+      username: 'RiverRenamed',
+      membership_slot: 2,
+      discord_user_id: owner,
+      remote_id: 'j-river',
+    });
+    expect(
+      servers.users.jellyfin.find((account) => account.Id === 'j-river')?.Configuration,
+    ).toEqual(preferences);
+    await service.recordSubscription({
+      id: 'renamed-expire',
+      action: 'expire',
+      discord_user_id: owner,
+      source: 'mee6_message',
+    });
+    expect((await service.applySubscription('renamed-expire')).status).toBe('applied');
+    expect(
+      servers.users.jellyfin.find((account) => account.Id === 'j-river')?.Policy?.IsDisabled,
+    ).toBe(true);
+    expect(store.link(owner, 2)?.disabled_by_jellyport).toBe(1);
+    expect(bot.delivered).not.toHaveBeenCalled();
+  });
+
+  it('updates the existing ownership label only after uncertain rename readback is recovered without repeating the remote rename', async () => {
+    store.saveLink(owner, 'river', 'j-river', false, 1);
+    registered('jellyfin', 'j-river');
+    const before = service.mediaOwnerships.get(
+      'jellyfin',
+      'demo-jellyfin',
+      'j-river',
+      store.settings(),
+    )!;
+    const original = service.clientFactory;
+    let failReadback = false,
+      renames = 0;
+    service.clientFactory = (...args) => {
+      const client = original(...args),
+        rename = client.renameUser!.bind(client),
+        read = client.user.bind(client);
+      client.renameUser = async (...parameters) => {
+        renames++;
+        await rename(...parameters);
+        failReadback = true;
+        throw new MediaError('Synthetic lost rename response');
+      };
+      client.user = async (id) => {
+        if (failReadback) {
+          failReadback = false;
+          throw new MediaError('Synthetic readback timeout');
+        }
+        return read(id);
+      };
+      return client;
+    };
+    const request = { user_id: 'j-river', expected_username: 'river', username: 'RiverRecovered' };
+    await expect(service.renameAccount(request)).rejects.toThrow('outcome is uncertain');
+    expect(renames).toBe(1);
+    expect(
+      service.mediaOwnerships.get('jellyfin', 'demo-jellyfin', 'j-river', store.settings()),
+    ).toEqual(before);
+    expect(store.link(owner)?.username).toBe('river');
+    expect((await service.renameAccountRecovery('j-river')).pending?.can_confirm).toBe(true);
+    await service.renameAccount(request);
+    expect(renames).toBe(1);
+    expect(
+      service.mediaOwnerships.get('jellyfin', 'demo-jellyfin', 'j-river', store.settings()),
+    ).toEqual({ ...before, username: 'RiverRecovered' });
+    expect(await service.renameAccountRecovery('j-river')).toEqual({ pending: null });
+    await service.recordSubscription({
+      id: 'recovered-expire',
+      action: 'expire',
+      discord_user_id: owner,
+      source: 'mee6_message',
+    });
+    expect((await service.applySubscription('recovered-expire')).status).toBe('applied');
+    expect(store.link(owner)?.disabled_by_jellyport).toBe(1);
+  });
+
+  it('rejects an unexpected registry label before sending a rename or creating an uncertain pin', async () => {
+    registered('jellyfin', 'j-river', owner, 1, { username: 'unexpected-label' });
+    await expect(
+      service.renameAccount({
+        user_id: 'j-river',
+        expected_username: 'river',
+        username: 'Renamed',
+      }),
+    ).rejects.toThrow('approved media account label changed');
+    expect(calls.filter((call) => call.method === 'renameUser')).toEqual([]);
+    expect(service.renames.get('j-river', store.settings())).toBeNull();
+    expect(servers.users.jellyfin.find((account) => account.Id === 'j-river')?.Name).toBe('river');
+  });
+
+  it.each(['other_server', 'other_scope'])(
+    'keeps an unrelated %s ownership record unchanged during rename',
+    async (scope) => {
+      const settings = store.settings();
+      const unrelatedSettings =
+        scope === 'other_scope'
+          ? { ...settings, discord_guild_id: '987654321012345678' }
+          : settings;
+      const serverId = scope === 'other_server' ? 'retired-jellyfin' : 'demo-jellyfin';
+      service.mediaOwnerships.save(
+        [
+          {
+            kind: 'jellyfin',
+            server_id: serverId,
+            account_id: 'j-river',
+            username: 'UnrelatedLabel',
+            discord_user_id: other,
+            slot: 3,
+          },
+        ],
+        unrelatedSettings,
+      );
+      const before = service.mediaOwnerships.get(
+        'jellyfin',
+        serverId,
+        'j-river',
+        unrelatedSettings,
+      );
+      await service.renameAccount({
+        user_id: 'j-river',
+        expected_username: 'river',
+        username: 'UnrelatedLabel',
+      });
+      expect(
+        service.mediaOwnerships.get('jellyfin', serverId, 'j-river', unrelatedSettings),
+      ).toEqual(before);
+      expect(
+        service.mediaOwnerships.get('jellyfin', 'demo-jellyfin', 'j-river', settings),
+      ).toBeNull();
+      expect(store.links()).toEqual([]);
+      expect(servers.users.jellyfin.find((account) => account.Id === 'j-river')?.Name).toBe(
+        'UnrelatedLabel',
+      );
+    },
+  );
 });

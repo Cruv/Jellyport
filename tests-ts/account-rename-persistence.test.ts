@@ -8,6 +8,7 @@ import { UserMappings } from '../server/user-mappings.js';
 import { AccountRoles } from '../server/account-roles.js';
 import { AccountProfiles } from '../server/account-profiles.js';
 import { AccountRenames, type RenameInput } from '../server/account-rename.js';
+import { MediaOwnerships } from '../server/media-ownership.js';
 
 const stores: Store[] = [];
 const directories: string[] = [];
@@ -301,14 +302,34 @@ describe('durable scoped account rename reconciliation', () => {
     const mapping = map(mappings);
     store.saveLink('111111', 'Kids', input().user_id);
     store.setLinkPending('111111', true);
+    const ownerships = new MediaOwnerships(store);
+    ownerships.save(
+      [
+        {
+          kind: 'jellyfin',
+          server_id: input().server_id,
+          account_id: input().user_id,
+          username: 'Kids',
+          discord_user_id: '111111',
+          slot: 1,
+        },
+      ],
+      settings,
+    );
+    const owner = ownerships.get('jellyfin', input().server_id, input().user_id, settings);
     const pin = renames.prepare(input(), settings);
     vi.spyOn(roles, 'renameAssignment').mockImplementation(() => {
       expect(mappings.get(mapping.id, settings)!.target_username).toBe('Taylor');
+      expect(ownerships.get('jellyfin', input().server_id, input().user_id, settings)).toEqual({
+        ...owner,
+        username: 'Taylor',
+      });
       throw new Error('Synthetic local disk failure.');
     });
     expect(() => renames.commit(pin, settings)).toThrow('Synthetic local disk failure.');
     expect(mappings.get(mapping.id, settings)).toEqual(mapping);
     expect(store.link('111111')).toMatchObject({ username: 'Kids', pending_disabled: 1 });
+    expect(ownerships.get('jellyfin', input().server_id, input().user_id, settings)).toEqual(owner);
     expect(renames.get(input().user_id, settings)).toEqual(pin);
     expect(store.db.prepare('SELECT COUNT(*) AS count FROM account_renames').get()!.count).toBe(1);
   });
@@ -390,6 +411,30 @@ describe('durable scoped account rename reconciliation', () => {
       settings.jellyfin_url,
     );
     expect(() => renames.commit(pin, settings)).toThrow('Reveal the pending account credentials');
+    expect(renames.get(input().user_id, settings)).toEqual(pin);
+  });
+
+  it('retains the pending rename and old registry when the Discord identity scope changes after preparation', () => {
+    const { store, renames } = fixture();
+    const ownerships = new MediaOwnerships(store);
+    ownerships.save(
+      [
+        {
+          kind: 'jellyfin',
+          server_id: input().server_id,
+          account_id: input().user_id,
+          username: 'Kids',
+          discord_user_id: '111111',
+          slot: 1,
+        },
+      ],
+      settings,
+    );
+    const owner = ownerships.get('jellyfin', input().server_id, input().user_id, settings);
+    const pin = renames.prepare(input(), settings);
+    store.saveSettings({ ...settings, discord_guild_id: '987654321012345678' });
+    expect(() => renames.commit(pin, settings)).toThrow('ownership scope changed');
+    expect(ownerships.get('jellyfin', input().server_id, input().user_id, settings)).toEqual(owner);
     expect(renames.get(input().user_id, settings)).toEqual(pin);
   });
 

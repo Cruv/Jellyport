@@ -65,6 +65,42 @@ export class MediaOwnerships {
       throw new ServiceError('The saved media ownership identity could not be authenticated.');
     return value;
   }
+  /** Exact-ID label validation for the existing, reviewed Jellyfin rename.
+   * Other servers, scopes and accounts never reserve this account's new name. */
+  assertRenameTarget(
+    serverId: string,
+    accountId: string,
+    oldUsername: string,
+    username: string,
+    settings: Settings,
+  ): MediaOwnership | null {
+    if (this.scope(settings) !== this.scope(this.store.settings()))
+      throw new ServiceError('The media ownership scope changed. Review the account rename again.');
+    const owner = this.get('jellyfin', serverId, accountId, settings);
+    if (owner && ![oldUsername, username].includes(owner.username))
+      throw new ServiceError(
+        'The approved media account label changed. Review its identity before renaming.',
+      );
+    return owner;
+  }
+  /** Caller owns the durable rename SAVEPOINT and verified exact-ID readback.
+   * Update only the label; retain the approved owner, slot, scope and audit time. */
+  renameTarget(
+    serverId: string,
+    accountId: string,
+    oldUsername: string,
+    username: string,
+    settings: Settings,
+  ): void {
+    const owner = this.assertRenameTarget(serverId, accountId, oldUsername, username, settings);
+    if (!owner || owner.username === username) return;
+    this.store.db
+      .prepare('UPDATE media_ownership SET encrypted=? WHERE id=?')
+      .run(
+        this.store.encrypt({ ...owner, username }),
+        hash([owner.scope, 'jellyfin', serverId, accountId]),
+      );
+  }
   /** Caller preflights exact IDs/names, scope and all conflicts before opening its transaction. */
   save(records: Omit<MediaOwnership, 'scope' | 'approved_at'>[], settings: Settings): void {
     const scope = this.scope(settings);

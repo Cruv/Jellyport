@@ -127,8 +127,14 @@ describe('complimentary and standalone account access', () => {
     });
   }
   async function provisionFree(limit = 1) {
-    await complimentary(limit);
-    return finish(await service.provisionMembership(owner, 'complimentary'));
+    const member = await complimentary(limit);
+    return finish(
+      await service.provisionMembership(owner, 'complimentary', member.revision, {
+        account_limit: limit,
+        usernames: ['Jim', 'Jim_2', 'Jim_3'].slice(0, limit),
+        provision_jellyfin: true,
+      }),
+    );
   }
   function automation() {
     store.saveSettings({

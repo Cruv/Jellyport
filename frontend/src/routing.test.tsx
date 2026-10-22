@@ -51,7 +51,6 @@ describe('allowlisted structural workspace routes', () => {
     'roles',
     'accounts',
     'memberships',
-    'subscriptions',
     'activity',
   ])('round trips the %s page without including record state', (page) => {
     const route = parseWorkspaceRoute(`#/${page}`);
@@ -64,12 +63,28 @@ describe('allowlisted structural workspace routes', () => {
     ['#/roles/editor', 'roles', 'editor'],
     ['#/roles/apply', 'roles', 'apply'],
     ['#/accounts/recover', 'accounts', 'recover'],
-    ['#/memberships/editor', 'memberships', 'editor'],
-    ['#/subscriptions/history', 'subscriptions', 'history'],
-    ['#/subscriptions/all', 'subscriptions', 'all'],
   ])('round trips selected structural tab %s', (hash, page, tab) => {
     expect(parseWorkspaceRoute(hash)).toEqual({ page, tab });
     expect(workspaceRouteHash(parseWorkspaceRoute(hash))).toBe(hash);
+  });
+  it.each([
+    ['#/memberships/accounts/list', 'accounts', 'list'],
+    ['#/memberships/accounts/editor', 'accounts', 'editor'],
+    ['#/memberships/events/review', 'events', 'review'],
+    ['#/memberships/events/history', 'events', 'history'],
+    ['#/memberships/events/all', 'events', 'all'],
+  ])('round trips unified membership task %s', (hash, tab, subtab) => {
+    expect(parseWorkspaceRoute(hash)).toEqual({ page: 'memberships', tab, subtab });
+    expect(workspaceRouteHash(parseWorkspaceRoute(hash))).toBe(hash);
+  });
+  it.each([
+    ['#/subscriptions', '#/memberships/events/review'],
+    ['#/subscriptions/history', '#/memberships/events/history'],
+    ['#/subscriptions/all', '#/memberships/events/all'],
+    ['#/memberships/editor', '#/memberships/accounts/editor'],
+    ['#/memberships/list', '#/memberships/accounts/list'],
+  ])('restores legacy membership bookmark %s as %s', (old, canonical) => {
+    expect(workspaceRouteHash(parseWorkspaceRoute(old))).toBe(canonical);
   });
   it.each([
     ['media', 'emby'],

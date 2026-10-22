@@ -28,6 +28,7 @@ import {
 } from './credential-message.js';
 import { discordCredentialContent } from './credentials.js';
 import { parseMee6Identity } from './mee6-identity.js';
+import type { IdentityRoster } from './identity-review-types.js';
 
 export class BotError extends Error {}
 class MissingMember extends BotError {}
@@ -57,6 +58,8 @@ export interface DiscordTagRole {
   name: string;
   manageable: boolean;
 }
+
+export type DiscordIdentityRoster = IdentityRoster;
 
 export function snowflake(value: unknown): string | null {
   // Discord IDs cannot pass through JS numbers once they exceed the safe integer range.
@@ -335,6 +338,7 @@ export class BotManager {
   private registered = false;
   private adminAlertTimer: ReturnType<typeof setInterval> | null = null;
   private adminAlertTask: Promise<void> | null = null;
+  private identityRosterTask: Promise<DiscordIdentityRoster> | null = null;
   private readonly clientFactory: (options: ClientOptions) => Client;
 
   constructor(
@@ -893,6 +897,112 @@ export class BotManager {
       });
     } catch (error) {
       return isMissingMember(error) ? false : null;
+    }
+  }
+
+  /** Explicit read-only refresh; never treats a cached gateway roster as complete. */
+  async listIdentityMembers(): Promise<DiscordIdentityRoster> {
+    if (!this.identityRosterTask) {
+      const task = this.readIdentityMembers();
+      this.identityRosterTask = task;
+      void task
+        .finally(() => {
+          if (this.identityRosterTask === task) this.identityRosterTask = null;
+        })
+        .catch(() => {});
+    }
+    // Independent callers cannot modify one another's review inputs.
+    return structuredClone(await this.identityRosterTask);
+  }
+
+  private async readIdentityMembers(): Promise<DiscordIdentityRoster> {
+    if (!botIntents(this.settings).includes(GatewayIntentBits.GuildMembers))
+      throw new BotError(
+        'A full Discord roster requires Server Members Intent. Enable it in the Discord Developer Portal and enable trusted subscription messages or membership role events in Jellyport before refreshing.',
+      );
+    const guild = this.guild();
+    const client = this.client;
+    const settings = this.settings;
+    const deadline = AbortSignal.timeout(60_000);
+    const members: DiscordIdentityRoster['members'] = [];
+    const seen = new Set<string>();
+    let after: string | undefined;
+    let count = 0;
+    try {
+      for (;;) {
+        // Discord documents limit <=1000 and an `after` cursor containing the
+        // highest prior user ID. cache:false bounds client memory independently
+        // of the gateway member cache. At the cap, one probe distinguishes an
+        // exactly-full roster from an incomplete one without retaining more.
+        const limit = count === 10_000 ? 1 : 1000;
+        const page = await this.wait(
+          guild.members.list({ limit, cache: false, ...(after ? { after } : {}) }),
+          20_000,
+          deadline,
+        );
+        this.checkActive();
+        if (client !== this.client || settings !== this.settings) throw new Stopped();
+        if (page.size > limit) throw new Error('Invalid roster page');
+        if (count === 10_000)
+          return { members, complete: page.size === 0, fetched_at: new Date().toISOString() };
+        let last = after ?? '0';
+        for (const [key, member] of page) {
+          const id = snowflake(member.id);
+          if (
+            !id ||
+            snowflake(key) !== id ||
+            snowflake(member.user.id) !== id ||
+            (after !== undefined && BigInt(id) <= BigInt(after)) ||
+            seen.has(id) ||
+            snowflake(member.guild.id) !== snowflake(settings.discord_guild_id) ||
+            member.partial ||
+            typeof member.user.bot !== 'boolean'
+          )
+            throw new Error('Invalid roster member');
+          seen.add(id);
+          count++;
+          if (BigInt(id) > BigInt(last)) last = id;
+          if (member.user.bot) continue;
+          if (
+            typeof member.user.username !== 'string' ||
+            !member.user.username ||
+            member.user.username.length > 32 ||
+            /\p{C}/u.test(member.user.username) ||
+            member.roles.cache.size > 250
+          )
+            throw new Error('Invalid roster identity');
+          const roles = [...member.roles.cache.keys()].map((role) => snowflake(role));
+          if (roles.some((role) => !role)) throw new Error('Invalid roster role');
+          const label = (value: unknown): string | undefined =>
+            typeof value === 'string' &&
+            value.length > 0 &&
+            [...value].length <= 64 &&
+            !/\p{C}/u.test(value)
+              ? value
+              : undefined;
+          const display = label(member.user.globalName);
+          const nickname = label(member.nickname);
+          members.push({
+            id,
+            username: member.user.username,
+            ...(display ? { display_name: display } : {}),
+            ...(nickname ? { nickname } : {}),
+            roles: roles as string[],
+          });
+        }
+        if (page.size < limit)
+          return { members, complete: true, fetched_at: new Date().toISOString() };
+        if (last === after) throw new Error('Invalid roster cursor');
+        after = last;
+      }
+    } catch (error) {
+      if (error instanceof Stopped)
+        throw new BotError(
+          'The Discord connection changed. Refresh the roster after the bot reconnects.',
+        );
+      throw new BotError(
+        'The full Discord roster could not be read. Check bot access and Server Members Intent in the Discord Developer Portal. No complete roster was adopted.',
+      );
     }
   }
 

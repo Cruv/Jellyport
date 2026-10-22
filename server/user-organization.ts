@@ -61,25 +61,32 @@ export class UserOrganization {
       throw new ServiceError(
         'A media server could not be queried. Refresh after restoring the connection; organization roles were preserved.',
       );
-    if (settings.jellyfin_url && settings.jellyfin_api_key) {
-      const client = this.service.client(settings, 'jellyfin');
+    const servers: Partial<Record<'emby' | 'jellyfin', string>> = {};
+    for (const kind of ['emby', 'jellyfin'] as const) {
+      if (!settings[`${kind}_url`] || !settings[`${kind}_api_key`]) continue;
+      const client = this.service.client(settings, kind);
       try {
         const info = await client.systemInfo();
         const auth = this.service.store.authState();
-        if (auth?.kind === 'configured' && info.Id !== auth.serverId)
+        if (kind === 'jellyfin' && auth?.kind === 'configured' && info.Id !== auth.serverId)
           throw new ServiceError(
             'The paired Jellyfin server changed. Organization roles were preserved.',
           );
+        if (typeof info.Id !== 'string' || !info.Id)
+          throw new ServiceError(
+            'The media server identity could not be verified. Roles were preserved.',
+          );
+        servers[kind] = info.Id;
       } finally {
         await client.close();
       }
     }
     if (JSON.stringify(settings) !== JSON.stringify(this.service.store.settings()))
       throw new ServiceError('Configuration changed. Refresh the user directory.');
-    return { settings, users };
+    return { settings, users, servers };
   }
   async directory(): Promise<{ users: DirectoryUser[] }> {
-    const { settings, users } = await this.catalog();
+    const { settings, users, servers } = await this.catalog();
     const memberships = this.service.memberships.list(settings);
     const mappings = this.service.mappings.list(settings);
     const rows: DirectoryUser[] = [];
@@ -130,6 +137,10 @@ export class UserOrganization {
       (kind === 'emby' ? usedEmby : usedJellyfin).add(user.Id);
     };
     for (const member of memberships) getRow(member.discord_user_id, '');
+    for (const ownership of this.service.mediaOwnerships.list(settings, servers)) {
+      const account = users[ownership.kind].find((user) => user.Id === ownership.account_id);
+      if (account) add(getRow(ownership.discord_user_id, ''), ownership.kind, account);
+    }
     for (const mapping of mappings) {
       const source = users.emby.find(
         (user) => user.Id === mapping.source_user_id && user.Name === mapping.source_username,
@@ -171,6 +182,20 @@ export class UserOrganization {
     for (const target of users.jellyfin)
       if (!usedJellyfin.has(target.Id))
         add(getRow(null, `jellyfin:${target.Id}`), 'jellyfin', target);
+    const assigned = new Map<string, string>();
+    for (const row of rows)
+      if (row.discord_user_id) {
+        for (const kind of ['emby', 'jellyfin'] as const)
+          for (const account of row[kind]) {
+            const key = `${kind}:${account.id}`,
+              owner = assigned.get(key);
+            if (owner && owner !== row.discord_user_id)
+              throw new ServiceError(
+                'Conflicting media account owners require review. Discord roles were preserved.',
+              );
+            assigned.set(key, row.discord_user_id);
+          }
+      }
     return {
       users: rows.sort((a, b) =>
         (a.discord_username ?? a.jellyfin[0]?.name ?? a.emby[0]?.name ?? a.id).localeCompare(
@@ -314,6 +339,82 @@ export class UserOrganization {
           'Accounts, mappings, or Discord roles changed. Preview the current changes again.',
         );
       return await this.write(current, settings);
+    } finally {
+      this.applying = false;
+    }
+  }
+  /** Identity approvals synchronize only the reviewed owners. The full user lists
+   * are read once per plan, and subsequent checks target the owner's exact IDs.
+   * This keeps bulk linking from repeatedly enumerating every server account. */
+  async syncOwners(ownerIds: string[], authorize: () => void = () => {}) {
+    if (this.service.demo) throw new ServiceError('Demo organization is read-only.');
+    if (this.applying) throw new ServiceError('Wait for the current Discord role update.');
+    this.applying = true;
+    try {
+      const settings = this.service.store.settings();
+      const plan = await this.plan();
+      const directory = await this.directory();
+      if (fingerprint({ settings, directory }) !== plan.fingerprint)
+        throw new ServiceError('Ownership changed. Refresh the role review.');
+      const desired = new Set(ownerIds);
+      const localState = () => {
+        const hash = createHash('sha256').update(
+          JSON.stringify([
+            this.service.store.settings(),
+            this.service.store.authState(),
+            this.service.store.links(),
+          ]),
+        );
+        for (const table of [
+          'media_ownership',
+          'user_mappings',
+          'memberships',
+          'account_profiles',
+        ]) {
+          for (const row of this.service.store.db
+            .prepare(`SELECT id,encrypted FROM ${table} ORDER BY id`)
+            .iterate()) {
+            const bytes = row.encrypted as Uint8Array;
+            hash.update(JSON.stringify([table, row.id, bytes.byteLength])).update(bytes);
+          }
+        }
+        return hash.digest('hex');
+      };
+      const before = localState();
+      let updated = 0,
+        failed = 0;
+      for (const change of plan.changes) {
+        if (!desired.has(change.discord_user_id)) continue;
+        authorize();
+        if (before !== localState())
+          throw new ServiceError('Ownership changed. Refresh remaining role updates.');
+        const row = directory.users.find(
+          (item) => item.discord_user_id === change.discord_user_id,
+        )!;
+        for (const kind of ['emby', 'jellyfin'] as const) {
+          if (!row[kind].length) continue;
+          const client = this.service.client(settings, kind);
+          try {
+            for (const account of row[kind]) {
+              const actual = await client.user(account.id);
+              if (actual.Id !== account.id || actual.Name !== account.name)
+                throw new ServiceError('A media account changed. Refresh remaining role updates.');
+            }
+          } finally {
+            await client.close();
+          }
+        }
+        authorize();
+        if (before !== localState())
+          throw new ServiceError('Ownership changed. Refresh remaining role updates.');
+        try {
+          await this.bot().updateTagRoles!(change.discord_user_id, change.add, change.remove);
+          updated++;
+        } catch {
+          failed++;
+        }
+      }
+      return { updated, failed };
     } finally {
       this.applying = false;
     }

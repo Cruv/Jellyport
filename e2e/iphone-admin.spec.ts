@@ -60,7 +60,6 @@ test('quick administration visits every task without overflow, tiny controls or 
     'User mappings',
     'Account roles',
     'Memberships',
-    'Subscriptions',
     'Activity',
     'Settings',
   ]) {

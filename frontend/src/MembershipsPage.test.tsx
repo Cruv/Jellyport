@@ -91,11 +91,11 @@ describe('Discord membership account allowances', () => {
   });
 
   it('retains a selected member policy across history navigation while reloading without the private owner selection', async () => {
-    window.history.replaceState(null, '', '#/memberships');
+    window.history.replaceState(null, '', '#/memberships/accounts/list');
     const first = page([membership]);
     fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
     fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
-    expect(window.location.hash).toBe('#/memberships/editor');
+    expect(window.location.hash).toBe('#/memberships/accounts/editor');
     act(() => window.history.back());
     await waitFor(() =>
       expect(
@@ -169,6 +169,7 @@ describe('Discord membership account allowances', () => {
       discord_user_id: ownerId,
       tier_id: 'brigantine',
       expected_account_limit: 2,
+      provision_jellyfin: true,
       expected_usernames: ['Jim', 'Jim_2'],
       expected_revision: membership.revision,
     });
@@ -223,6 +224,7 @@ describe('Discord membership account allowances', () => {
     expect(mutations(requests)[1].options?.body).toEqual({
       discord_user_id: ownerId,
       access_mode: 'complimentary',
+      provision_jellyfin: true,
       account_limit: 2,
       expected_revision: membership.revision,
     });
@@ -270,6 +272,7 @@ describe('Discord membership account allowances', () => {
     fireEvent.click(screen.getByRole('tab', { name: 'Add member' }));
     fireEvent.change(screen.getByLabelText('Discord member'), { target: { value: 'Jim' } });
     fireEvent.click(await screen.findByRole('button', { name: 'Select @Jim' }));
+    fireEvent.click(screen.getByLabelText('Enable Jellyfin account provisioning'));
     fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'galleon' } });
     expect(screen.getByText('SimplifiedJim, FamilyJim, SimplifiedJim_3')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
@@ -284,6 +287,7 @@ describe('Discord membership account allowances', () => {
     await screen.findByText('Give each member their account allowance.');
     fireEvent.change(screen.getByLabelText('Discord member'), { target: { value: 'Captain Jim' } });
     fireEvent.click(await screen.findByRole('button', { name: 'Select @Jim' }));
+    fireEvent.click(screen.getByLabelText('Enable Jellyfin account provisioning'));
     fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'galleon' } });
     expect(screen.getByText('Jim, Jim_2, Jim_3')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
@@ -301,6 +305,7 @@ describe('Discord membership account allowances', () => {
           discord_user_id: ownerId,
           tier_id: 'galleon',
           expected_account_limit: 3,
+          provision_jellyfin: true,
           expected_usernames: ['Jim', 'Jim_2', 'Jim_3'],
         },
       },
@@ -310,6 +315,7 @@ describe('Discord membership account allowances', () => {
       'tier_id',
       'expected_account_limit',
       'expected_usernames',
+      'provision_jellyfin',
     ]);
     expect(localStorage.length).toBe(0);
     expect(sessionStorage.length).toBe(0);
@@ -341,6 +347,7 @@ describe('Discord membership account allowances', () => {
       discord_user_id: ownerId,
       tier_id: 'sloop',
       expected_account_limit: 1,
+      provision_jellyfin: true,
       expected_usernames: ['Jim'],
       expected_revision: membership.revision,
     });
@@ -397,6 +404,7 @@ describe('Discord membership account allowances', () => {
       discord_user_id: ownerId,
       tier_id: 'sloop',
       expected_account_limit: 1,
+      provision_jellyfin: true,
       expected_usernames: ['Jim'],
     });
   });
@@ -501,6 +509,7 @@ describe('Discord membership account allowances', () => {
       discord_user_id: ownerId,
       tier_id: 'sloop',
       expected_account_limit: 1,
+      provision_jellyfin: true,
       expected_usernames: ['Jim'],
       expected_revision: membership.revision,
     });
@@ -550,11 +559,105 @@ describe('Discord membership account allowances', () => {
         path: '/api/memberships/access',
         options: expect.objectContaining({
           method: 'POST',
-          body: { discord_user_id: ownerId, access_mode: 'complimentary', account_limit: 2 },
+          body: {
+            discord_user_id: ownerId,
+            access_mode: 'complimentary',
+            provision_jellyfin: false,
+            account_limit: 2,
+          },
         }),
       },
     ]);
     expect(created).not.toHaveBeenCalled();
+  });
+
+  it('defaults a new subscription member to no Jellyfin provisioning and saves access without creating an account', async () => {
+    const requests: { path: string; options?: ApiOptions }[] = [];
+    const api = vi.fn(async (path: string, options?: ApiOptions) => {
+      requests.push({ path, options });
+      if (path === '/api/memberships') return { memberships: [] };
+      if (path === '/api/user-mappings') return { mappings: [] };
+      if (path.startsWith('/api/discord/members?')) return { members: [member], truncated: false };
+      if (path === '/api/memberships/access')
+        return { ...membership, links: [], provision_jellyfin: false };
+      throw new Error(`Unexpected request ${path}`);
+    }) as Api;
+    const { created, notify } = page([], api);
+    await screen.findByText('Give each member their account allowance.');
+    fireEvent.click(screen.getByRole('tab', { name: 'Add member' }));
+    fireEvent.change(screen.getByLabelText('Discord member'), { target: { value: 'Jim' } });
+    fireEvent.click(await screen.findByRole('button', { name: 'Select @Jim' }));
+    expect(screen.getByLabelText('Enable Jellyfin account provisioning')).toHaveProperty(
+      'checked',
+      false,
+    );
+    expect(screen.getByRole('button', { name: 'Review membership update' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    fireEvent.submit(screen.getByLabelText('Access policy').closest('form')!);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Save access policy' }));
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledWith(
+        'Access policy saved. Media accounts have not been changed.',
+      ),
+    );
+    expect(mutations(requests)).toEqual([
+      expect.objectContaining({
+        path: '/api/memberships/access',
+        options: expect.objectContaining({
+          body: {
+            discord_user_id: ownerId,
+            access_mode: 'subscription',
+            tier_id: 'sloop',
+            provision_jellyfin: false,
+          },
+        }),
+      }),
+    ]);
+    expect(created).not.toHaveBeenCalled();
+  });
+
+  it('preserves a saved Emby-only opt-out when reviewing an existing member', async () => {
+    page([{ ...membership, provision_jellyfin: false, links: [] }]);
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
+    expect(screen.getByLabelText('Enable Jellyfin account provisioning')).toHaveProperty(
+      'checked',
+      false,
+    );
+    expect(screen.getByRole('button', { name: 'Review membership update' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    fireEvent.click(screen.getByLabelText('Enable Jellyfin account provisioning'));
+    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
+    expect(screen.getByRole('dialog')).toBeTruthy();
+  });
+
+  it('can review existing Jellyfin access without opting into missing-account creation', async () => {
+    const { requests, created } = page([
+      { ...membership, provision_jellyfin: false, links: [membership.links[0]] },
+    ]);
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
+    expect(screen.getByLabelText('Enable Jellyfin account provisioning')).toHaveProperty(
+      'checked',
+      false,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText(/Update existing linked Jellyfin accounts only/)).toBeTruthy();
+    expect(within(dialog).queryByText(/Migrate a matching Emby account/)).toBeNull();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Queue membership update' }));
+    await waitFor(() => expect(created).toHaveBeenCalledWith(job));
+    expect(mutations(requests)[0].options?.body).toEqual({
+      discord_user_id: ownerId,
+      tier_id: 'galleon',
+      expected_account_limit: 3,
+      expected_usernames: ['Jim'],
+      expected_revision: membership.revision,
+      provision_jellyfin: false,
+    });
   });
 
   it('saves a reviewed complimentary policy before queuing accounts using the newly saved revision', async () => {
@@ -593,6 +696,7 @@ describe('Discord membership account allowances', () => {
       discord_user_id: ownerId,
       tier_id: 'complimentary',
       expected_account_limit: 1,
+      provision_jellyfin: true,
       expected_usernames: ['Jim'],
       expected_revision: 'free-revision',
     });

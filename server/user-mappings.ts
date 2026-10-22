@@ -7,6 +7,7 @@ import type { MediaAPI, MediaUser } from './media.js';
 import type { Store } from './store.js';
 import type { Settings } from './types.js';
 import { validateMembershipSlot } from './memberships.js';
+import { MediaOwnerships } from './media-ownership.js';
 
 export interface UserMapping {
   id: string;
@@ -273,9 +274,33 @@ export class UserMappings {
     const mapping = byId ?? byName;
     return mapping ? structuredClone(mapping) : null;
   }
-  private checkLinks(mapping: SaveUserMapping): void {
-    if (!mapping.discord_user_id) return;
+  private checkLinks(mapping: SaveUserMapping, settings: Settings): void {
     const slot = mapping.membership_slot ?? 1;
+    for (const ownership of new MediaOwnerships(this.store).list(settings)) {
+      const selected =
+        ownership.kind === 'emby'
+          ? ownership.account_id === mapping.source_user_id
+          : ownership.account_id === mapping.target_user_id;
+      if (
+        selected &&
+        (ownership.discord_user_id !== mapping.discord_user_id || ownership.slot !== slot)
+      )
+        throw new ServiceError(
+          'This media account already has a different confirmed Discord owner or slot.',
+        );
+      if (
+        ownership.discord_user_id === mapping.discord_user_id &&
+        ownership.slot === slot &&
+        ((ownership.kind === 'emby' && ownership.account_id !== mapping.source_user_id) ||
+          (ownership.kind === 'jellyfin' &&
+            mapping.target_user_id &&
+            ownership.account_id !== mapping.target_user_id))
+      )
+        throw new ServiceError(
+          'This Discord owner already has another confirmed media account in that slot.',
+        );
+    }
+    if (!mapping.discord_user_id) return;
     const byDiscord = this.store.link(mapping.discord_user_id, slot);
     const byTarget = mapping.target_user_id
       ? this.store.linkForRemote(mapping.target_user_id)
@@ -329,7 +354,7 @@ export class UserMappings {
         )
           throw new ServiceError('This Discord user is already mapped to another Emby user.');
       }
-      this.checkLinks(input);
+      this.checkLinks(input, settings);
       const mapping: UserMapping = {
         id: input.id ?? randomUUID(),
         source_server_url: servers[0],

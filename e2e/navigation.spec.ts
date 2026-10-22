@@ -8,7 +8,6 @@ const pages = [
   ['User mappings', '#/mappings'],
   ['Account roles', '#/roles'],
   ['Memberships', '#/memberships'],
-  ['Subscriptions', '#/subscriptions'],
   ['Activity', '#/activity'],
   ['Settings', '#/settings/media/emby'],
 ] as const;
@@ -43,8 +42,8 @@ test('structural tab bookmarks restore only their task, leaving private drafts a
     ['#/mappings/editor', 'User mappings', 'Add mapping'],
     ['#/roles/apply', 'Account roles', 'Apply role'],
     ['#/accounts/recover', 'Create account', 'Recover interrupted creation'],
-    ['#/memberships/editor', 'Memberships', 'Add member'],
-    ['#/subscriptions/history', 'Subscriptions', 'Processed'],
+    ['#/memberships/accounts/editor', 'Memberships', 'Add member'],
+    ['#/memberships/events/history', 'Memberships', 'Processed'],
     ['#/settings/history/jellyfin', 'Settings', 'Jellyfin catalog'],
   ] as const) {
     await page.goto(`/${hash}`);
@@ -206,4 +205,40 @@ test.describe('bookmarks behind administrator authentication', () => {
     expect(new URL(page.url()).hash).toBe('#/settings/history/jellyfin');
     expect(mutations).toEqual(['POST /api/login']);
   });
+});
+
+test('legacy subscription bookmarks join the membership workspace and keep Jellyfin optional', async ({
+  page,
+  mutations,
+}) => {
+  await page.goto('/#/subscriptions/history');
+  await expect(
+    page.getByRole('heading', { level: 1, name: 'Memberships', exact: true }),
+  ).toBeVisible();
+  await expect.poll(() => new URL(page.url()).hash).toBe('#/memberships/events/history');
+  await expect(page.getByRole('tab', { name: 'Processed', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await expect(
+    page
+      .locator('#workspace-navigation')
+      .getByRole('button', { name: 'Subscriptions', exact: true }),
+  ).toHaveCount(0);
+  await page.getByRole('tab', { name: 'Accounts & access', exact: true }).click();
+  await page.getByRole('tab', { name: 'Add member', exact: true }).click();
+  await expect(
+    page.getByRole('checkbox', { name: 'Enable Jellyfin account provisioning' }),
+  ).not.toBeChecked();
+  await expect(
+    page.getByRole('button', { name: 'Review membership update', exact: true }),
+  ).toBeDisabled();
+  await expectContainedLayout(page);
+  await page.reload();
+  await expect(page.getByRole('tab', { name: 'Add member', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
+  await expect(page.getByRole('searchbox', { name: 'Discord member' })).toHaveValue('');
+  expect(mutations).toEqual([]);
 });

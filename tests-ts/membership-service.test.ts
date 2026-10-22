@@ -95,6 +95,164 @@ describe('multi-account Discord membership provisioning', () => {
     return service.applySubscription(value.id);
   }
 
+  it('saves an Emby-only member policy without a Jellyfin account, media reads, or a job', async () => {
+    let reads = 0;
+    const factory = service.clientFactory;
+    service.clientFactory = (...args) => {
+      reads++;
+      return factory(...args);
+    };
+    const member = await service.setMembershipAccess({
+      discord_user_id: owner,
+      access_mode: 'subscription',
+      tier_id: 'brigantine',
+    });
+    expect(member).toMatchObject({ provision_jellyfin: false, active: true, account_limit: 2 });
+    expect(reads).toBe(0);
+    expect(store.jobs()).toEqual([]);
+    expect(store.links()).toEqual([]);
+    await expect(service.provisionMembership(owner, 'brigantine')).rejects.toThrow(
+      'not opted into Jellyfin',
+    );
+    expect(reads).toBe(0);
+    expect(passwords.size).toBe(0);
+    expect(bot.delivered).toEqual([]);
+    const preserved = await service.setMembershipAccess({
+      discord_user_id: owner,
+      access_mode: 'complimentary',
+      account_limit: 2,
+      expected_revision: member.revision,
+    });
+    expect(preserved.provision_jellyfin).toBe(false);
+  });
+
+  it('requires an explicit reviewed opt-in before a membership policy can create Jellyfin accounts', async () => {
+    const member = await service.setMembershipAccess({
+      discord_user_id: owner,
+      access_mode: 'subscription',
+      tier_id: 'sloop',
+      provision_jellyfin: false,
+    });
+    const result = await finish(
+      await service.provisionMembership(owner, 'sloop', member.revision, {
+        account_limit: 1,
+        usernames: ['Jim'],
+        provision_jellyfin: true,
+      }),
+    );
+    expect(result.status).toBe('completed');
+    expect(passwords.size).toBe(1);
+    expect(service.memberships.get(owner, store.settings())?.provision_jellyfin).toBe(true);
+  });
+
+  it('applies new subscription tiers, renewals and cancellation as policy only until the member opts into Jellyfin', async () => {
+    let reads = 0;
+    const factory = service.clientFactory;
+    service.clientFactory = (...args) => {
+      reads++;
+      return factory(...args);
+    };
+    store.saveSettings({ ...store.settings(), auto_provision: true });
+    const subscribed = await service.recordSubscription({
+      id: 'new-member-policy',
+      action: 'subscribe',
+      discord_user_id: owner,
+      source: 'mee6_message',
+      detail: 'Brigantine Crewman Plan',
+    });
+    expect(subscribed).toMatchObject({ status: 'applied', account_limit: 2 });
+    expect(subscribed.job_id).toBeUndefined();
+    expect(service.memberships.get(owner, store.settings())).toMatchObject({
+      provision_jellyfin: false,
+      active: true,
+      tier_id: 'brigantine',
+    });
+    expect((await event({ action: 'cancel' })).status).toBe('applied');
+    expect(service.memberships.get(owner, store.settings())).toMatchObject({
+      provision_jellyfin: false,
+      active: false,
+    });
+    expect((await event({ detail: 'Galleon Crewman Plan' })).status).toBe('applied');
+    expect(service.memberships.get(owner, store.settings())).toMatchObject({
+      provision_jellyfin: false,
+      active: true,
+      tier_id: 'galleon',
+    });
+    expect(reads).toBe(0);
+    expect(store.jobs()).toEqual([]);
+    expect(store.links()).toEqual([]);
+    expect(passwords.size).toBe(0);
+    expect(bot.delivered).toEqual([]);
+  });
+
+  it('honors opt-out for new slots while renewing existing linked Jellyfin access', async () => {
+    await provision('sloop');
+    const primary = linked(1);
+    const current = service.memberships.get(owner, store.settings())!;
+    await service.setMembershipAccess({
+      discord_user_id: owner,
+      access_mode: 'subscription',
+      tier_id: 'sloop',
+      provision_jellyfin: false,
+      expected_revision: current.revision,
+    });
+    expect((await event({ action: 'cancel' })).status).toBe('applied');
+    expect(primary.Policy?.IsDisabled).toBe(true);
+    expect((await event({ detail: 'Galleon Crewman Plan' })).status).toBe('applied');
+    expect(primary.Policy?.IsDisabled).toBe(false);
+    expect(store.linksForMember(owner)).toHaveLength(1);
+    expect(passwords.size).toBe(1);
+    expect(service.memberships.get(owner, store.settings())).toMatchObject({
+      provision_jellyfin: false,
+      account_limit: 3,
+    });
+  });
+
+  it('reconciles an Emby-only membership role without creating or requiring Jellyfin accounts', async () => {
+    await service.setMembershipAccess({
+      discord_user_id: owner,
+      access_mode: 'subscription',
+      tier_id: 'sloop',
+      provision_jellyfin: false,
+    });
+    let mediaClients = 0;
+    const factory = service.clientFactory;
+    service.clientFactory = (...args) => {
+      mediaClients++;
+      return factory(...args);
+    };
+    store.saveSettings({
+      ...store.settings(),
+      discord_role_events: true,
+      discord_member_role_id: '7654321',
+      auto_provision: true,
+      auto_disable: true,
+    });
+    bot.active = false;
+    await service.reconcileMemberships();
+    await service.reconcileMemberships();
+    expect(service.memberships.get(owner, store.settings())).toMatchObject({
+      provision_jellyfin: false,
+      active: false,
+      inactive_reason: 'expire',
+    });
+    expect(store.subscriptions()).toHaveLength(1);
+    expect(store.subscriptions()[0]).toMatchObject({
+      status: 'applied',
+      result: expect.stringContaining('no Jellyfin account was required or modified'),
+    });
+    bot.active = true;
+    await service.reconcileMemberships();
+    expect(service.memberships.get(owner, store.settings())).toMatchObject({
+      provision_jellyfin: false,
+      active: true,
+    });
+    expect(mediaClients).toBe(0);
+    expect(store.links()).toEqual([]);
+    expect(store.jobs()).toEqual([]);
+    expect(bot.delivered).toEqual([]);
+  });
+
   it.each([
     ['sloop', 1],
     ['brigantine', 2],
@@ -494,6 +652,12 @@ describe('multi-account Discord membership provisioning', () => {
   });
 
   it('ignores an older tier announcement after a newer subscription was applied', async () => {
+    await service.setMembershipAccess({
+      discord_user_id: owner,
+      access_mode: 'subscription',
+      tier_id: 'galleon',
+      provision_jellyfin: true,
+    });
     expect(
       (
         await event({

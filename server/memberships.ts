@@ -23,6 +23,8 @@ export interface MembershipInput {
   account_limit: number;
   /** Omitted legacy inputs retain subscription-managed behavior. */
   access_mode?: MembershipAccessMode;
+  /** Legacy decisions default to true. New reviewed members explicitly opt in. */
+  provision_jellyfin?: boolean;
   active?: boolean;
   inactive_reason?: 'cancel' | 'expire';
 }
@@ -114,6 +116,7 @@ function validateInput(value: MembershipInput): void {
     (value.access_mode !== undefined &&
       !['subscription', 'complimentary'].includes(value.access_mode)) ||
     (value.active !== undefined && typeof value.active !== 'boolean') ||
+    (value.provision_jellyfin !== undefined && typeof value.provision_jellyfin !== 'boolean') ||
     (value.inactive_reason !== undefined && !['cancel', 'expire'].includes(value.inactive_reason))
   )
     throw new ServiceError('The membership contains invalid identity fields.');
@@ -159,6 +162,7 @@ export class Memberships {
       tier_id: value.tier_id,
       account_limit: value.account_limit,
       access_mode: value.access_mode ?? 'subscription',
+      provision_jellyfin: value.provision_jellyfin ?? true,
       active: value.active ?? true,
       ...(value.active === false && value.inactive_reason
         ? { inactive_reason: value.inactive_reason }
@@ -221,6 +225,7 @@ export class Memberships {
         existing.tier_id === input.tier_id &&
         existing.account_limit === input.account_limit &&
         existing.access_mode === (input.access_mode ?? 'subscription') &&
+        existing.provision_jellyfin === (input.provision_jellyfin ?? true) &&
         existing.active === (input.active ?? true) &&
         existing.inactive_reason === (input.active === false ? input.inactive_reason : undefined)
       ) {
@@ -233,6 +238,7 @@ export class Memberships {
         tier_id: input.tier_id,
         account_limit: input.account_limit,
         access_mode: input.access_mode ?? 'subscription',
+        provision_jellyfin: input.provision_jellyfin ?? true,
         active: input.active ?? true,
         ...(input.active === false && input.inactive_reason
           ? { inactive_reason: input.inactive_reason }

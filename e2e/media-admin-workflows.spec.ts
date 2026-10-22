@@ -257,7 +257,7 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   admin,
 }) => {
   test.setTimeout(60_000);
-  await page.goto('/#/memberships');
+  await page.goto('/#/memberships/accounts/list');
   await page.getByRole('button', { name: 'Add member', exact: true }).click();
   await page
     .getByRole('combobox', { name: 'Access policy', exact: true })
@@ -280,6 +280,7 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   await page.getByRole('tab', { name: /^Managed memberships(?: \d+)?$/ }).click();
   await page.getByRole('button', { name: 'Add member', exact: true }).click();
   await chooseMember(page, 'crew_owner');
+  await page.getByRole('checkbox', { name: 'Enable Jellyfin account provisioning' }).check();
   expect((await queueMembership(page, admin, 'galleon')).status).toBe('completed');
   const slots = [1, 2, 3].map((slot) => admin.app.jellyport.store.link(paidOwner, slot)!);
   expect(slots.map((slot) => slot.username)).toEqual([
@@ -317,7 +318,12 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   await expect(notice).not.toContainText('Access policy saved.');
   expect(await notice.evaluate((element) => getComputedStyle(element).position)).toBe('fixed');
   const action = page.getByRole('button', { name: 'Review membership update', exact: true });
-  await action.scrollIntoViewIfNeeded();
+  // Nearest-edge scrolling can leave a fractional pixel below the viewport
+  // after the dialog restores focus. Center the control before checking its
+  // entire area and testing that the notification does not intercept input.
+  await action.evaluate((element) =>
+    element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }),
+  );
   await expect(action).toBeInViewport({ ratio: 1 });
   expect(
     await action.evaluate((element) => {
@@ -350,11 +356,19 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   expect(admin.writes).toHaveLength(writesBeforeReview);
 });
 
-test('subscription review provisions the trusted tier and ignoring a later cancellation preserves access', async ({
+test('subscription review provisions the trusted tier for an opted-in member and ignoring a later cancellation preserves access', async ({
   page,
   admin,
   mutations,
 }) => {
+  // Membership approval alone is entitlement-only. This scenario separately
+  // covers provisioning after the owner explicitly opts into Jellyfin.
+  await admin.app.jellyport.service.setMembershipAccess({
+    discord_user_id: paidOwner,
+    access_mode: 'subscription',
+    tier_id: 'sloop',
+    provision_jellyfin: true,
+  });
   await admin.app.jellyport.service.recordSubscription({
     id: 'synthetic-subscribe',
     action: 'subscribe',
@@ -387,7 +401,7 @@ test('subscription review provisions the trusted tier and ignoring a later cance
     username: 'crew_owner',
     source: 'mee6_message',
   });
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.getByRole('button', { name: 'Refresh events', exact: true }).click();
   await page.getByRole('button', { name: 'Ignore', exact: true }).click();
   await expect
     .poll(() => admin.app.jellyport.store.subscription('synthetic-cancel')?.status)
@@ -450,7 +464,8 @@ test('a manually flagged Family account is preserved when a reviewed cancellatio
     username: 'crew_owner',
     source: 'mee6_message',
   });
-  await navigate(page, 'Subscriptions');
+  await navigate(page, 'Memberships');
+  await page.getByRole('tab', { name: /^Events/ }).click();
   await page.getByRole('button', { name: 'Review', exact: true }).click();
   const review = page.getByRole('dialog', { name: 'Process cancellation', exact: true });
   await expect(review).toContainText('Accounts, passwords, and watch history are preserved');
@@ -534,4 +549,49 @@ test('reduced motion removes spinner and status animation while leaving loading 
   await expect(page.getByRole('heading', { name: 'Overview', level: 1 })).toBeVisible();
   await expectContainedLayout(page);
   expect(admin.writes).toEqual([]);
+});
+
+test('an existing one-account owner can keep a three-slot allowance without provisioning Jellyfin extras', async ({
+  page,
+  admin,
+}) => {
+  const existing = {
+    Id: 'j-optout-crew',
+    Name: 'crew_owner',
+    Policy: { IsAdministrator: false, IsDisabled: false },
+    Configuration: {},
+  };
+  admin.servers.users.jellyfin.push(existing);
+  admin.app.jellyport.store.saveLink(paidOwner, existing.Name, existing.Id, false, 1);
+  await admin.app.jellyport.service.setMembershipAccess({
+    discord_user_id: paidOwner,
+    access_mode: 'subscription',
+    tier_id: 'galleon',
+    provision_jellyfin: false,
+  });
+  const initialUsers = structuredClone(admin.servers.users.jellyfin);
+  await page.goto('/#/memberships/accounts/list');
+  await page.getByRole('button', { name: 'Manage membership for crew_owner', exact: true }).click();
+  await expect(
+    page.getByRole('checkbox', { name: 'Enable Jellyfin account provisioning' }),
+  ).not.toBeChecked();
+  const submitted = page.waitForRequest(
+    (request) =>
+      new URL(request.url()).pathname === '/api/memberships/provision' &&
+      request.method() === 'POST',
+  );
+  expect((await queueMembership(page, admin, 'galleon')).status).toBe('completed');
+  expect((await submitted).postDataJSON()).toMatchObject({
+    expected_account_limit: 3,
+    expected_usernames: ['crew_owner'],
+    provision_jellyfin: false,
+  });
+  expect(
+    admin.app.jellyport.service.memberships.get(paidOwner, admin.app.jellyport.store.settings()),
+  ).toMatchObject({ account_limit: 3, provision_jellyfin: false });
+  expect(admin.servers.users.jellyfin).toEqual(initialUsers);
+  expect(admin.app.jellyport.store.linksForMember(paidOwner)).toHaveLength(1);
+  expect(admin.writes).toEqual([]);
+  expect(admin.stateWrites).toEqual([]);
+  expect(admin.createdCredentials).toEqual([]);
 });

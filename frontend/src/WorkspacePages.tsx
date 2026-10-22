@@ -1042,14 +1042,16 @@ export function SubscriptionsPage({
   review,
   ignore,
   busy,
+  embedded = false,
 }: Common & {
+  embedded?: boolean;
   events: SubscriptionEvent[];
   refresh: () => void;
   review: (event: SubscriptionEvent) => void;
   ignore: (event: SubscriptionEvent) => void;
   busy: boolean;
 }) {
-  const [scope, setScope] = useRouteTab('subscriptions');
+  const [scope, setScope] = useRouteTab('memberships', 'events');
   const [query, setQuery] = useState('');
   const needsReview = (event: SubscriptionEvent) => ['pending', 'failed'].includes(event.status);
   const filtered = events.filter(
@@ -1070,26 +1072,43 @@ export function SubscriptionsPage({
   };
   return (
     <div className="page-stack">
-      <Heading
-        title="Subscriptions"
-        description="Review trusted Discord membership events before making account changes."
-        actions={
-          <>
-            <button className="btn btn-quiet" onClick={refresh}>
-              <Icon name="refresh" />
-              Refresh
-            </button>
-            <button
-              className="btn btn-quiet"
-              onClick={() =>
-                navigateWorkspace({ page: 'settings', tab: 'automation', subtab: 'rules' })
-              }
-            >
-              Automation settings
-            </button>
-          </>
-        }
-      />
+      {!embedded && (
+        <Heading
+          title="Subscriptions"
+          description="Review trusted Discord membership events before making account changes."
+          actions={
+            <>
+              <button className="btn btn-quiet" onClick={refresh}>
+                <Icon name="refresh" />
+                Refresh
+              </button>
+              <button
+                className="btn btn-quiet"
+                onClick={() =>
+                  navigateWorkspace({ page: 'settings', tab: 'automation', subtab: 'rules' })
+                }
+              >
+                Automation settings
+              </button>
+            </>
+          }
+        />
+      )}
+      {embedded && (
+        <div className="form-actions">
+          <button className="btn btn-quiet" onClick={refresh}>
+            <Icon name="refresh" /> Refresh events
+          </button>
+          <button
+            className="btn btn-quiet"
+            onClick={() =>
+              navigateWorkspace({ page: 'settings', tab: 'automation', subtab: 'rules' })
+            }
+          >
+            Automation settings
+          </button>
+        </div>
+      )}
       <Tabs
         id="subscription-queue"
         label="Subscription view"

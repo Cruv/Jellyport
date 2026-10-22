@@ -76,6 +76,7 @@ export interface MembershipLink {
 }
 export interface Membership {
   access_mode?: 'subscription' | 'complimentary';
+  provision_jellyfin?: boolean;
   discord_user_id: string;
   base_username: string;
   tier_id: string;

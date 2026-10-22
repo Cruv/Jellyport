@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { Callout, Icon, Modal } from './components';
 import DiscordMemberPicker from './DiscordMemberPicker';
+import {
+  IdentityReviewResult,
+  StripeIdentityAccountReview,
+  useIdentityRolePolling,
+} from './IdentityReviewPanel';
+import type { IdentityReviewApplyResult } from '../../server/identity-review-types';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import { date, num, type Api, type DiscordMember, type MembershipTier, type Notify } from './types';
 
@@ -61,6 +67,19 @@ export default function StripeIntegrationPanel({
   const [query, setQuery] = useState('');
   const [scope, setScope] = useState('unlinked');
   const [review, setReview] = useState<StripeSubscriptionReview | null>(null);
+  const [mediaReview, setMediaReview] = useState(false);
+  const [mediaBusy, setMediaBusy] = useState(false);
+  const [identityResult, setIdentityResult] = useState<IdentityReviewApplyResult | null>(null);
+  const [identityRoleRefresh, setIdentityRoleRefresh] = useState(0);
+  useIdentityRolePolling(
+    api,
+    notify,
+    active,
+    demo,
+    identityResult,
+    setIdentityResult,
+    identityRoleRefresh,
+  );
   const [reviewRevision, setReviewRevision] = useState('');
   const [disconnectRevision, setDisconnectRevision] = useState<string | null>(null);
   const [member, setMember] = useState<DiscordMember | null>(null);
@@ -96,6 +115,7 @@ export default function StripeIntegrationPanel({
   const read = useCallback(
     async (manual = false, rows = false) => {
       if (changing.current || demo) return;
+      if (manual) setIdentityRoleRefresh((value) => value + 1);
       controller.current?.abort();
       const abort = new AbortController();
       controller.current = abort;
@@ -333,6 +353,7 @@ export default function StripeIntegrationPanel({
         disable, or change media accounts. Family and complimentary access remain admin-managed.
       </Callout>
       {demo && <p className="section-note">Stripe connections are unavailable in the demo.</p>}
+      <IdentityReviewResult result={identityResult} />
       <Tabs
         id="settings-stripe"
         label="Stripe integration sections"
@@ -653,7 +674,19 @@ export default function StripeIntegrationPanel({
                           setError('');
                           setReview(row);
                           setReviewRevision(rowsRevision);
-                          setMember(null);
+                          setMediaReview(false);
+                          setIdentityResult(null);
+                          setMember(
+                            row.linked_discord_id && row.linked_discord_username
+                              ? {
+                                  id: row.linked_discord_id,
+                                  username: row.linked_discord_username,
+                                  display_name: null,
+                                  nickname: null,
+                                  membership_active: null,
+                                }
+                              : null,
+                          );
                         }}
                       >
                         {row.linked_discord_id ? 'Review or change link' : 'Review Discord link'}
@@ -677,151 +710,166 @@ export default function StripeIntegrationPanel({
         </section>
         {review && active && tab === 'review' && (
           <Modal
-            title="Approve Discord identity"
+            title={mediaReview ? 'Confirm Stripe & media accounts' : 'Approve Discord identity'}
             description={review.customer_name || review.customer_email || review.customer_id}
             close={() => {
-              if (!busy) {
+              if (!busy && !mediaBusy) {
                 reviewEpoch.current++;
                 setReview(null);
                 setMember(null);
               }
             }}
-            closeDisabled={!!busy}
+            closeDisabled={!!busy || mediaBusy}
             footer={
-              <>
-                <button
-                  className="btn btn-primary"
-                  type="button"
-                  disabled={
-                    demo ||
-                    !!busy ||
-                    !member ||
-                    status?.running ||
-                    status?.revision !== reviewRevision
-                  }
-                  onClick={() => {
-                    reviewEpoch.current++;
-                    if (member && status)
-                      void mutate(
-                        'link',
-                        '/api/stripe/links',
-                        {
-                          customer_id: review.customer_id,
-                          discord_user_id: member.id,
-                          expected_revision: reviewRevision,
-                        },
-                        'Stripe customer linked to the selected Discord member.',
-                      );
-                  }}
-                >
-                  Approve customer link
-                </button>
-                {review.linked_discord_id && (
+              mediaReview ? undefined : (
+                <>
                   <button
-                    className="btn btn-danger"
+                    className="btn btn-primary"
                     type="button"
                     disabled={
-                      demo || !!busy || status?.running || status?.revision !== reviewRevision
+                      demo ||
+                      !!busy ||
+                      !member ||
+                      status?.running ||
+                      status?.revision !== reviewRevision
                     }
                     onClick={() => {
-                      if (status)
-                        void mutate(
-                          'unlink',
-                          `/api/stripe/links/${encodeURIComponent(review.customer_id)}`,
-                          { expected_revision: reviewRevision },
-                          'Stripe customer link removed.',
-                          'DELETE',
-                        );
+                      reviewEpoch.current++;
+                      if (member && status) setMediaReview(true);
                     }}
                   >
-                    Remove approved link
+                    Review media accounts
                   </button>
-                )}
-                <button
-                  className="btn btn-quiet"
-                  type="button"
-                  disabled={!!busy}
-                  onClick={() => {
-                    reviewEpoch.current++;
-                    setReview(null);
-                    setMember(null);
-                  }}
-                >
-                  Cancel review
-                </button>
-              </>
+                  {review.linked_discord_id && (
+                    <button
+                      className="btn btn-danger"
+                      type="button"
+                      disabled={
+                        demo || !!busy || status?.running || status?.revision !== reviewRevision
+                      }
+                      onClick={() => {
+                        if (status)
+                          void mutate(
+                            'unlink',
+                            `/api/stripe/links/${encodeURIComponent(review.customer_id)}`,
+                            { expected_revision: reviewRevision },
+                            'Stripe customer link removed.',
+                            'DELETE',
+                          );
+                      }}
+                    >
+                      Remove approved link
+                    </button>
+                  )}
+                  <button
+                    className="btn btn-quiet"
+                    type="button"
+                    disabled={!!busy}
+                    onClick={() => {
+                      reviewEpoch.current++;
+                      setReview(null);
+                      setMember(null);
+                    }}
+                  >
+                    Cancel review
+                  </button>
+                </>
+              )
             }
           >
-            <div className="form-stack">
-              {error && (
-                <p className="error-block" role="alert">
-                  {error}
-                </p>
-              )}
-              {status?.revision !== reviewRevision && (
-                <p className="error-block" role="alert">
-                  Billing data changed during this review. Cancel and reopen the customer review
-                  before approving a link.
-                </p>
-              )}
-              <p className="section-note">
-                Confirm this Discord member owns Stripe customer {review.customer_id}. A matching
-                email, plan, or username alone does not establish ownership.
-              </p>
-              {review.current_period_end && (
-                <p className="text-small">
-                  Current billing period ends: {date(review.current_period_end)}
-                </p>
-              )}
-              {review.proposed_discord_id && (
-                <p className="text-small">
-                  Unconfirmed Discord candidate: <code>{review.proposed_discord_id}</code>
-                  {review.identity_source ? ` (${review.identity_source})` : ''}
-                </p>
-              )}
-              {review.proposed_discord_id && (
-                <div className="form-stack">
-                  <button
-                    className="btn"
-                    type="button"
-                    aria-busy={busy === 'resolve'}
-                    disabled={
-                      demo || !!busy || status?.running || status?.revision !== reviewRevision
-                    }
-                    onClick={() => void resolveCandidate()}
-                  >
-                    {busy === 'resolve'
-                      ? 'Finding Discord member…'
-                      : 'Find suggested Discord member'}
-                  </button>
-                  <small>
-                    Looks up the suggested account in your connected Discord server. Subscription
-                    ownership remains unconfirmed until you approve the customer link.
-                  </small>
-                </div>
-              )}
-              <DiscordMemberPicker
+            {mediaReview && member ? (
+              <StripeIdentityAccountReview
                 api={api}
-                value={member}
-                onChange={setMember}
-                suggestedQuery={suggested?.username || review.linked_discord_username || ''}
-                disabled={demo || !!busy || status?.running}
-                allowInactive
+                notify={notify}
+                demo={demo}
+                active={active && tab === 'review'}
+                customerId={review.customer_id}
+                member={member}
+                onApplied={(result) => {
+                  setIdentityResult(result);
+                  reviewEpoch.current++;
+                  setReview(null);
+                  setMember(null);
+                  setMediaReview(false);
+                  setLoadedRows(false);
+                  void read(false, true);
+                }}
+                onCancel={() => setMediaReview(false)}
+                onBusyChange={setMediaBusy}
               />
-              <details className="help-disclosure">
-                <summary>Stripe record identifiers</summary>
-                <div className="support-note">
-                  <p>Customer: {review.customer_id}</p>
-                  <p>Subscription: {review.subscription_id}</p>
-                  {review.prices.map((price) => (
-                    <p key={price.id}>
-                      Price: {price.id}
-                      {price.product_id ? ` · Product: ${price.product_id}` : ''}
-                    </p>
-                  ))}
-                </div>
-              </details>
-            </div>
+            ) : (
+              <div className="form-stack">
+                {error && (
+                  <p className="error-block" role="alert">
+                    {error}
+                  </p>
+                )}
+                {status?.revision !== reviewRevision && (
+                  <p className="error-block" role="alert">
+                    Billing data changed during this review. Cancel and reopen the customer review
+                    before approving a link.
+                  </p>
+                )}
+                <p className="section-note">
+                  Confirm this Discord member owns Stripe customer {review.customer_id}. A matching
+                  email, plan, or username alone does not establish ownership. Next, review their
+                  existing Emby or Jellyfin accounts. Jellyfin is optional.
+                </p>
+                {review.current_period_end && (
+                  <p className="text-small">
+                    Current billing period ends: {date(review.current_period_end)}
+                  </p>
+                )}
+                {review.proposed_discord_id && (
+                  <p className="text-small">
+                    Unconfirmed Discord candidate: <code>{review.proposed_discord_id}</code>
+                    {review.identity_source ? ` (${review.identity_source})` : ''}
+                  </p>
+                )}
+                {review.proposed_discord_id && (
+                  <div className="form-stack">
+                    <button
+                      className="btn"
+                      type="button"
+                      aria-busy={busy === 'resolve'}
+                      disabled={
+                        demo || !!busy || status?.running || status?.revision !== reviewRevision
+                      }
+                      onClick={() => void resolveCandidate()}
+                    >
+                      {busy === 'resolve'
+                        ? 'Finding Discord member…'
+                        : 'Find suggested Discord member'}
+                    </button>
+                    <small>
+                      Looks up the suggested account in your connected Discord server. Subscription
+                      ownership remains unconfirmed until you approve the customer link.
+                    </small>
+                  </div>
+                )}
+                <DiscordMemberPicker
+                  api={api}
+                  value={member}
+                  onChange={setMember}
+                  suggestedQuery={suggested?.username || review.linked_discord_username || ''}
+                  disabled={demo || !!busy || status?.running}
+                  allowInactive
+                />
+                <details className="help-disclosure">
+                  <summary>Stripe record identifiers</summary>
+                  <div className="support-note">
+                    <p>Customer: {review.customer_id}</p>
+                    <p>Subscription: {review.subscription_id}</p>
+                    {review.prices.map((price) => (
+                      <p key={price.id}>
+                        Price: {price.id}
+                        {price.product_id ? ` · Product: ${price.product_id}` : ''}
+                      </p>
+                    ))}
+                  </div>
+                </details>
+              </div>
+            )}
           </Modal>
         )}
       </TabPanel>

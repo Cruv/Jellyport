@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { generatePassword, accountCredentialMessage } from './credentials.js';
 import { MediaError, ServiceError } from './errors.js';
 import {
@@ -78,6 +78,8 @@ import {
   type StoredCloneReview,
 } from './account-cloning.js';
 import { AccountRenames } from './account-rename.js';
+import { MediaOwnerships, type MediaOwnership } from './media-ownership.js';
+import type { IdentityRoster } from './identity-review-types.js';
 import {
   JOB_RETENTION_INTERVAL_SECONDS,
   JOB_RETENTION_BATCH_LIMIT,
@@ -103,6 +105,7 @@ export interface JobRequest {
   migration_scope?: MigrationScope;
   username?: string;
   source_user_id?: string;
+  source_ownership?: { server_id?: string; identity_hash: string | null };
   discord_user_id?: string | null;
   recover_target_id?: string;
   mapping_id?: string;
@@ -302,6 +305,7 @@ export interface BotAdapter {
   membershipActive(id: string): Promise<boolean | null>;
   activeMembers(): Promise<Array<{ id: string; username: string }> | null>;
   searchMembers?(query: string): Promise<DiscordMemberSearchResult>;
+  listIdentityMembers?(): Promise<IdentityRoster>;
 }
 export interface ServiceOptions {
   clientFactory?: ClientFactory;
@@ -334,6 +338,7 @@ interface MigrationPreviewOptions {
   use_snapshots?: boolean;
 }
 interface PreviewUser {
+  membership_slot?: number;
   history_only?: true;
   source_snapshot?: SnapshotMetadata;
   source_user_id: string;
@@ -493,6 +498,7 @@ export class Service {
   readonly mappings: UserMappings;
   readonly roles: AccountRoles;
   readonly memberships: Memberships;
+  readonly mediaOwnerships: MediaOwnerships;
   readonly profiles: AccountProfiles;
   readonly renames: AccountRenames;
   readonly adminAlerts: AdminAlerts;
@@ -559,6 +565,7 @@ export class Service {
     this.mappings = new UserMappings(store);
     this.roles = new AccountRoles(store, this.demo);
     this.memberships = new Memberships(store);
+    this.mediaOwnerships = new MediaOwnerships(store);
     this.profiles = new AccountProfiles(store);
     this.renames = new AccountRenames(store, this.mappings, this.roles);
     this.adminAlerts = new AdminAlerts(store);
@@ -840,6 +847,55 @@ export class Service {
     )
       throw new ServiceError('The user mapping changed. Review a new preview before migrating.');
   }
+  private ownershipHash(value: MediaOwnership | null): string | null {
+    // Reapproving the same association does not invalidate queued work merely
+    // because its audit timestamp changed. Every identity field remains pinned.
+    return value
+      ? createHash('sha256')
+          .update(
+            JSON.stringify([
+              value.scope,
+              value.kind,
+              value.server_id,
+              value.account_id,
+              value.username,
+              value.discord_user_id,
+              value.slot,
+            ]),
+          )
+          .digest('hex')
+      : null;
+  }
+  private sourceOwnership(
+    request: JobRequest,
+    settings: Settings,
+    serverId: string,
+  ): MediaOwnership | null {
+    if (!request.source_user_id) return null;
+    const pin = request.source_ownership;
+    if (this.mediaOwnerships.scope(settings) !== this.mediaOwnerships.scope(this.store.settings()))
+      throw new ServiceError(
+        'The identity server configuration changed. Review a new preview before migrating.',
+      );
+    const current = this.mediaOwnerships.get('emby', serverId, request.source_user_id, settings);
+    if (
+      (pin?.server_id && pin.server_id !== serverId) ||
+      this.ownershipHash(current) !== (pin?.identity_hash ?? null)
+    )
+      throw new ServiceError(
+        'The approved Emby ownership changed after this migration was queued. Review a new preview before migrating.',
+      );
+    if (
+      current &&
+      request.discord_user_id &&
+      (current.discord_user_id !== request.discord_user_id ||
+        current.slot !== (request.membership_slot ?? 1))
+    )
+      throw new ServiceError(
+        'The selected recipient or account slot differs from this Emby account’s approved owner.',
+      );
+    return current;
+  }
   async preview(sourceUserIds: string[], options: MigrationPreviewOptions = {}) {
     return this.previewRead(sourceUserIds, options);
   }
@@ -878,8 +934,20 @@ export class Service {
           const snapshotIds: Record<string, string> = {};
           const historyOnlyTargets: Record<string, ReviewedHistoryTarget> = {};
           let destinationServerId: string | undefined;
-          const snapshotInfo = options.use_snapshots ? await emby.systemInfo() : null;
+          const registeredSources = this.mediaOwnerships
+            .list(settings)
+            .filter((owner) => owner.kind === 'emby');
+          const snapshotInfo =
+            options.use_snapshots || registeredSources.length ? await emby.systemInfo() : null;
           if (
+            registeredSources.length &&
+            (typeof snapshotInfo?.Id !== 'string' || !snapshotInfo.Id)
+          )
+            throw new ServiceError(
+              'The Emby server identity could not be verified for account ownership.',
+            );
+          if (
+            options.use_snapshots &&
             snapshotInfo &&
             (snapshotInfo.Version !== '4.10.1.0' || typeof snapshotInfo.Id !== 'string')
           )
@@ -898,6 +966,22 @@ export class Service {
             const mapping = this.mappings.getForSource(sourceId, settings);
             if (mapping && sourceUser.Name !== mapping.source_username)
               throw new ServiceError('The mapped Emby account was renamed. Review its mapping.');
+            const registeredOwner = registeredSources.find(
+              (owner) => owner.account_id === sourceId && owner.server_id === snapshotInfo?.Id,
+            );
+            if (registeredOwner && registeredOwner.username !== sourceUser.Name)
+              throw new ServiceError(
+                'The approved Emby account was renamed. Review its ownership before migrating.',
+              );
+            if (
+              registeredOwner &&
+              mapping?.discord_user_id &&
+              (registeredOwner.discord_user_id !== mapping.discord_user_id ||
+                registeredOwner.slot !== mapping.membership_slot)
+            )
+              throw new ServiceError(
+                'The Emby account has conflicting approved ownership and mapping records.',
+              );
             const username = mapping?.target_user_id
                 ? validateExistingMappingUsername(mapping.target_username)
                 : validateUsername(mapping?.target_username ?? sourceUser.Name),
@@ -912,6 +996,17 @@ export class Service {
                 target.Id === settings.template_user_id ||
                 target.Policy?.IsAdministrator === true),
             );
+            const registeredIdentity =
+              !mapping && !historyOnly && registeredOwner
+                ? await this.requireBot().recipientIdentity(registeredOwner.discord_user_id, false)
+                : null;
+            if (
+              registeredIdentity?.id &&
+              registeredIdentity.id !== registeredOwner?.discord_user_id
+            )
+              throw new ServiceError(
+                'Discord returned a different approved account owner. Review the identity.',
+              );
             if (target && historyOnly) {
               if (typeof target.Policy?.IsAdministrator !== 'boolean')
                 throw new ServiceError('The destination account protection could not be verified.');
@@ -965,8 +1060,14 @@ export class Service {
               ambiguous: [],
               mapping_id: mapping?.id ?? null,
               mapping_revision: mapping?.revision ?? null,
-              discord_user_id: mapping?.discord_user_id ?? null,
-              discord_username: mapping?.discord_username ?? null,
+              discord_user_id: historyOnly
+                ? null
+                : (mapping?.discord_user_id ??
+                  (registeredIdentity ? registeredOwner!.discord_user_id : null)),
+              discord_username: historyOnly
+                ? null
+                : (mapping?.discord_username ?? registeredIdentity?.username ?? null),
+              ...(!mapping && registeredIdentity ? { membership_slot: registeredOwner!.slot } : {}),
               warnings: [
                 snapshot
                   ? 'Saved history is available. Preview checks account identity and backup freshness only. Exact watched-status counts and matching details are deferred until approval; results report unmatched and ambiguous items. Approval uses this backup generation and a shared Jellyfin matching catalog.'
@@ -1342,6 +1443,7 @@ export class Service {
         base_username: primary.username,
         tier_id: 'sloop',
         access_mode: 'subscription',
+        provision_jellyfin: true,
         account_limit: 1,
         active: !Boolean(primary.disabled_by_jellyport),
         revision: '',
@@ -1462,6 +1564,7 @@ export class Service {
     access_mode: MembershipAccessMode;
     account_limit?: number;
     tier_id?: string;
+    provision_jellyfin?: boolean;
     expected_revision?: string;
   }): Promise<Membership> {
     if (this.demo) throw new ServiceError('Demo memberships are read-only.');
@@ -1477,6 +1580,10 @@ export class Service {
           throw new ServiceError('The membership changed. Review it before retrying.');
         if (!['subscription', 'complimentary'].includes(input.access_mode))
           throw new ServiceError('Choose subscription or complimentary access.');
+        if (input.provision_jellyfin !== undefined && typeof input.provision_jellyfin !== 'boolean')
+          throw new ServiceError(
+            'Choose whether this member has opted into Jellyfin provisioning.',
+          );
         const tier =
           input.access_mode === 'complimentary'
             ? {
@@ -1505,6 +1612,7 @@ export class Service {
               this.mappings.getForDiscord(input.discord_user_id, settings)?.target_username ??
               identity!.username,
             access_mode: input.access_mode,
+            provision_jellyfin: input.provision_jellyfin ?? previous?.provision_jellyfin ?? false,
             tier_id: tier.id,
             account_limit: tier.account_limit,
             active: input.access_mode === 'complimentary' ? true : (previous?.active ?? true),
@@ -1537,6 +1645,16 @@ export class Service {
           if (auth?.kind === 'configured' && info.Id !== auth.serverId)
             throw new ServiceError('The paired Jellyfin server changed. No identity was linked.');
           const target = await client.user(targetId);
+          const confirmedOwner = this.mediaOwnerships
+            .list(settings, { jellyfin: String(info.Id) })
+            .find((item) => item.kind === 'jellyfin' && item.account_id === targetId);
+          if (
+            confirmedOwner &&
+            (confirmedOwner.discord_user_id !== discordId || confirmedOwner.slot !== slot)
+          )
+            throw new ServiceError(
+              'This Jellyfin account already has a different confirmed Discord owner or slot.',
+            );
           if (
             target.Id !== targetId ||
             target.Policy?.IsAdministrator !== false ||
@@ -1601,7 +1719,7 @@ export class Service {
     discordId: string,
     tierId?: string,
     expectedRevision?: string,
-    review?: { account_limit: number; usernames: string[] },
+    review?: { account_limit: number; usernames: string[]; provision_jellyfin?: boolean },
   ): Promise<Job> {
     if (this.demo) throw new ServiceError('Demo memberships are read-only.');
     return this.membershipMutex.run(() =>
@@ -1612,6 +1730,13 @@ export class Service {
           throw new ServiceError('Discord returned a different member. Reload and try again.');
         const settings = this.store.settings();
         const existing = this.memberships.get(discordId, settings);
+        if (
+          review?.provision_jellyfin !== undefined &&
+          typeof review.provision_jellyfin !== 'boolean'
+        )
+          throw new ServiceError(
+            'Choose whether this member has opted into Jellyfin provisioning.',
+          );
         if (!existing && this.memberships.hasOtherScope(discordId, settings))
           throw new ServiceError(
             'This member belongs to a different paired server configuration. Restore the original server URL before managing its accounts.',
@@ -1658,11 +1783,17 @@ export class Service {
           primaryMapping?.target_username ??
           identity.username;
         const links = this.store.linksForMember(discordId);
+        const allowNewAccounts = review?.provision_jellyfin ?? existing?.provision_jellyfin ?? true;
+        if (!allowNewAccounts && !links.length)
+          throw new ServiceError(
+            'This member has not opted into Jellyfin provisioning. Their membership can be managed without a Jellyfin account.',
+          );
         const requests: JobRequest[] = [];
-        const needsNewSlot = Array.from(
-          { length: tier.account_limit },
-          (_, index) => index + 1,
-        ).some((slot) => !links.some((link) => link.membership_slot === slot));
+        const needsNewSlot =
+          allowNewAccounts &&
+          Array.from({ length: tier.account_limit }, (_, index) => index + 1).some(
+            (slot) => !links.some((link) => link.membership_slot === slot),
+          );
         const sources =
           needsNewSlot && settings.emby_url && settings.emby_api_key ? await this.embyUsers() : [];
         await this.withClient(settings, 'jellyfin', async (jellyfin) => {
@@ -1696,7 +1827,7 @@ export class Service {
               });
               continue;
             }
-            if (slot > tier.account_limit) continue;
+            if (slot > tier.account_limit || !allowNewAccounts) continue;
             const username = mapping?.target_username ?? membershipUsername(baseUsername, slot);
             if (mapping?.target_user_id) validateExistingMappingUsername(username);
             else validateUsername(username);
@@ -1772,6 +1903,7 @@ export class Service {
             base_username: baseUsername,
             tier_id: tier.id,
             access_mode: existing?.access_mode ?? 'subscription',
+            provision_jellyfin: allowNewAccounts,
             account_limit: tier.account_limit,
             active: true,
           },
@@ -1816,13 +1948,38 @@ export class Service {
     if (!link) throw new ServiceError('The membership account link no longer exists.');
     const target = await jellyfin.user(link.remote_id);
     const auth = this.store.authState();
-    if (auth?.kind === 'configured' && (await jellyfin.systemInfo()).Id !== auth.serverId)
+    const registered = this.mediaOwnerships
+      .list(settings)
+      .some((owner) => owner.kind === 'jellyfin' && owner.account_id === target.Id);
+    const info = auth?.kind === 'configured' || registered ? await jellyfin.systemInfo() : null;
+    if (auth?.kind === 'configured' && info?.Id !== auth.serverId)
       throw new ServiceError('The paired Jellyfin server changed. No account access was modified.');
     guard();
     this.assertLinkedTarget(target, link, settings);
     // Family is a per-account manual decision. Never reconcile pending billing
     // flags or change access automatically for this selected target ID.
     if (this.profiles.get('jellyfin', target.Id, this.store.settings())?.family) return false;
+    if (registered && (typeof info?.Id !== 'string' || !info.Id))
+      throw new ServiceError(
+        'The Jellyfin server identity could not be verified for account ownership.',
+      );
+    const ownershipGuard = () => {
+      guard();
+      const owner =
+        typeof info?.Id === 'string'
+          ? this.mediaOwnerships.get('jellyfin', info.Id, target.Id, this.store.settings())
+          : null;
+      if (
+        owner &&
+        (owner.discord_user_id !== memberId ||
+          owner.slot !== slot ||
+          owner.username !== target.Name)
+      )
+        throw new ServiceError(
+          'The linked account contradicts its approved media owner or slot. No automatic access change was authorized.',
+        );
+    };
+    ownershipGuard();
     const policy = structuredClone(target.Policy!);
     const isDisabled = policy.IsDisabled === true;
     if (link.pending_disabled !== null && isDisabled === Boolean(link.pending_disabled)) {
@@ -1831,13 +1988,15 @@ export class Service {
     }
     if (disabled && !isDisabled) {
       policy.IsDisabled = true;
-      guard();
+      ownershipGuard();
       await this.setAccess(jellyfin, target.Id, policy, memberId, true, slot);
+      ownershipGuard();
       this.store.saveLink(memberId, link.username, target.Id, true, slot);
     } else if (!disabled && isDisabled && link.disabled_by_jellyport) {
       policy.IsDisabled = false;
-      guard();
+      ownershipGuard();
       await this.setAccess(jellyfin, target.Id, policy, memberId, false, slot);
+      ownershipGuard();
       this.store.saveLink(memberId, link.username, target.Id, false, slot);
     } else if (!isDisabled) {
       this.store.saveLink(memberId, link.username, target.Id, false, slot);
@@ -1969,6 +2128,19 @@ export class Service {
     const settings = this.store.settings();
     this.requireServer(settings, 'emby');
     this.requireServer(settings, 'jellyfin');
+    const registeredSources = this.mediaOwnerships
+      .list(settings)
+      .filter((owner) => owner.kind === 'emby' && sourceUserIds.includes(owner.account_id));
+    let ownershipServerId: string | undefined;
+    if (registeredSources.length)
+      await this.withClient(settings, 'emby', async (client) => {
+        const info = await client.systemInfo();
+        if (typeof info.Id !== 'string' || !info.Id)
+          throw new ServiceError(
+            'The Emby server identity could not be verified for approved ownership.',
+          );
+        ownershipServerId = info.Id;
+      });
     if (sourceSnapshotIds) {
       if (
         Object.keys(sourceSnapshotIds).length !== sourceUserIds.length ||
@@ -2001,7 +2173,21 @@ export class Service {
         throw new ServiceError(
           'History-only migration cannot send credentials or change Discord ownership.',
         );
-      const slot = mapping?.membership_slot ?? 1;
+      const registeredOwner = registeredSources.find(
+        (owner) => owner.account_id === id && owner.server_id === ownershipServerId,
+      );
+      const slot = mapping?.membership_slot ?? registeredOwner?.slot ?? 1;
+      if (
+        !historyOnly &&
+        registeredOwner &&
+        ((recipient && recipient !== registeredOwner.discord_user_id) ||
+          (mapping?.discord_user_id &&
+            mapping.discord_user_id !== registeredOwner.discord_user_id) ||
+          slot !== registeredOwner.slot)
+      )
+        throw new ServiceError(
+          'The selected recipient or mapping differs from this Emby account’s approved owner or slot.',
+        );
       const member = recipient ? this.memberships.get(recipient, settings) : null;
       if (recipient) {
         const slotKey = `${recipient}:${slot}`;
@@ -2027,6 +2213,10 @@ export class Service {
         ...(historyOnly ? { history_only_target: structuredClone(historyOnly) } : {}),
         ...(sourceSnapshotIds ? { source_snapshot_id: sourceSnapshotIds[id] } : {}),
         source_user_id: id,
+        source_ownership: {
+          ...(ownershipServerId ? { server_id: ownershipServerId } : {}),
+          identity_hash: this.ownershipHash(registeredOwner ?? null),
+        },
         discord_user_id: recipient,
         membership_slot: slot,
         ...(member ? { membership_revision: member.revision } : {}),
@@ -2046,6 +2236,8 @@ export class Service {
       throw new ServiceError(
         'Configuration changed during migration preparation. Prepare a new review.',
       );
+    for (const request of requests)
+      if (ownershipServerId) this.sourceOwnership(request, settings, ownershipServerId);
     return this.queue('migrate', requests, requestedAt, previewTiming);
   }
   private async requireRoleServer(client: MediaAPI, role: AccountRole): Promise<void> {
@@ -2265,6 +2457,25 @@ export class Service {
     previewTiming?: Job['preview_timing'],
   ): Job {
     if (this.stopping) throw new ServiceError('The app is stopping. Retry after it restarts.');
+    const owners = this.mediaOwnerships.list(this.store.settings());
+    requests = requests.map((request) => {
+      if (!request.source_user_id || request.source_ownership !== undefined) return request;
+      const candidates = owners.filter(
+        (owner) => owner.kind === 'emby' && owner.account_id === request.source_user_id,
+      );
+      if (candidates.length > 1)
+        throw new ServiceError(
+          'Verify this Emby account’s current server ownership before queueing migration.',
+        );
+      const owner = candidates[0] ?? null;
+      return {
+        ...request,
+        source_ownership: {
+          ...(owner ? { server_id: owner.server_id } : {}),
+          identity_hash: this.ownershipHash(owner),
+        },
+      };
+    });
     requests = requests.map((request) =>
       request.source_user_id
         ? { ...request, migration_scope: migrationScope(request.migration_scope) }
@@ -3108,6 +3319,12 @@ export class Service {
     const informationalWarnings = new Set<string>();
     let mapping = this.requestMapping(request, settings);
     let destinationId: string | null = null;
+    let sourceOwnershipServerId: string | undefined;
+    const registeredSource: { value: MediaOwnership | null } = { value: null };
+    const registeredAccounts = this.mediaOwnerships.list(settings);
+    const auth = this.store.authState();
+    let targetOwnershipServerId = auth?.kind === 'configured' ? auth.serverId : undefined;
+    let targetOwnershipPin: { id: string; identity_hash: string | null } | undefined;
     let username: string;
     const phase = (value: NonNullable<Job['progress']['phase']>) => {
       recordPhase();
@@ -3123,7 +3340,33 @@ export class Service {
       if (!request.history_only_target) this.assertDefaultRole(template, request, settings);
       this.assertMapping(mapping, request.source_user_id, settings);
       this.assertDestinationMapping(mapping, destinationId, username, settings);
+      if (sourceOwnershipServerId)
+        registeredSource.value = this.sourceOwnership(request, settings, sourceOwnershipServerId);
+      if (targetOwnershipPin && targetOwnershipServerId && !request.history_only_target) {
+        const owner = this.mediaOwnerships.get(
+          'jellyfin',
+          targetOwnershipServerId,
+          targetOwnershipPin.id,
+          this.store.settings(),
+        );
+        if (this.ownershipHash(owner) !== targetOwnershipPin.identity_hash)
+          throw new ServiceError(
+            'The approved Jellyfin account ownership changed during this migration. Review before retrying.',
+          );
+      }
     };
+    if (registeredAccounts.length || request.source_ownership?.identity_hash) {
+      const info = await jellyfin.systemInfo();
+      if (
+        typeof info.Id !== 'string' ||
+        !info.Id ||
+        (targetOwnershipServerId && info.Id !== targetOwnershipServerId)
+      )
+        throw new ServiceError(
+          'The Jellyfin server identity changed. Review account ownership before migrating.',
+        );
+      targetOwnershipServerId = info.Id;
+    }
     if (request.source_user_id) {
       phase('reading_source');
       try {
@@ -3140,6 +3383,8 @@ export class Service {
               this.checkJobStopped(job);
               if (typeof info.Id !== 'string' || !info.Id || typeof info.Version !== 'string')
                 throw new ServiceError('The Emby source identity could not be verified.');
+              sourceOwnershipServerId = info.Id;
+              registeredSource.value = this.sourceOwnership(request, settings, info.Id);
               const key = MigrationCatalogCache.key(
                 settings.emby_url,
                 settings.emby_api_key,
@@ -3180,6 +3425,8 @@ export class Service {
             const info = await emby.systemInfo();
             if (info.Version !== '4.10.1.0' || typeof info.Id !== 'string')
               throw new ServiceError('Emby version or identity changed. Review a new preview.');
+            sourceOwnershipServerId = info.Id;
+            registeredSource.value = this.sourceOwnership(request, settings, info.Id);
             const selected = await this.sourceSnapshots.select(
               request.source_user_id!,
               settings,
@@ -3223,6 +3470,10 @@ export class Service {
       if (savedMetadata) savedMetadata.source_username = source.user.Name;
       if (mapping && source.user.Name !== mapping.source_username)
         throw new ServiceError('The mapped Emby account was renamed. Review its mapping.');
+      if (registeredSource.value && source.user.Name !== registeredSource.value.username)
+        throw new ServiceError(
+          'The approved Emby account was renamed. Review its ownership before migrating.',
+        );
       username = mapping?.target_user_id
         ? validateExistingMappingUsername(mapping.target_username)
         : validateUsername(mapping?.target_username ?? source.user.Name);
@@ -3247,6 +3498,40 @@ export class Service {
       Boolean(request.history_only_target),
     );
     destinationId = currentTarget?.Id ?? null;
+    if (!request.history_only_target && targetOwnershipServerId) {
+      const owner = destinationId
+        ? this.mediaOwnerships.get('jellyfin', targetOwnershipServerId, destinationId, settings)
+        : null;
+      const expectedOwner =
+        registeredSource.value?.discord_user_id ??
+        request.discord_user_id ??
+        mapping?.discord_user_id;
+      const expectedSlot =
+        request.membership_slot ?? mapping?.membership_slot ?? registeredSource.value?.slot ?? 1;
+      if (
+        owner &&
+        (!expectedOwner || owner.discord_user_id !== expectedOwner || owner.slot !== expectedSlot)
+      )
+        throw new ServiceError(
+          'This Jellyfin account belongs to a different approved Discord owner or account slot. Review the account mapping.',
+        );
+      const reservedSlot = registeredAccounts.find(
+        (account) =>
+          account.kind === 'jellyfin' &&
+          account.server_id === targetOwnershipServerId &&
+          account.discord_user_id === expectedOwner &&
+          account.slot === expectedSlot,
+      );
+      if (
+        reservedSlot &&
+        (reservedSlot.account_id !== destinationId || reservedSlot.username !== username)
+      )
+        throw new ServiceError(
+          'The approved owner already has a different Jellyfin account in this slot. Select that account through a user mapping.',
+        );
+      if (destinationId)
+        targetOwnershipPin = { id: destinationId, identity_hash: this.ownershipHash(owner) };
+    }
     guard();
     const recipient = request.discord_user_id;
     const historyOnly = request.history_only_target;
@@ -3308,7 +3593,16 @@ export class Service {
         member &&
         username === membershipUsername(member.base_username, slot),
       );
-      if (slot > 1 && !link && mapping?.discord_user_id !== recipient && !approvedHouseholdName)
+      const registeredIdentity =
+        registeredSource.value?.discord_user_id === recipient &&
+        registeredSource.value.slot === slot;
+      if (
+        slot > 1 &&
+        !link &&
+        mapping?.discord_user_id !== recipient &&
+        !approvedHouseholdName &&
+        !registeredIdentity
+      )
         throw new ServiceError(
           'Numbered membership accounts require an approved account slot and username.',
         );
@@ -3316,7 +3610,8 @@ export class Service {
         !link &&
         username !== identity.username &&
         mapping?.discord_user_id !== recipient &&
-        !approvedHouseholdName
+        !approvedHouseholdName &&
+        !registeredIdentity
       )
         throw new ServiceError(
           "The destination username must match this recipient's Discord username or an approved mapping with their verified user ID.",
@@ -3349,6 +3644,27 @@ export class Service {
     guard();
     job.results.push(result);
     this.save(job);
+    const pinCreatedTarget = async (target: MediaUser) => {
+      destinationId = target.Id;
+      if (!historyOnly && targetOwnershipServerId && !targetOwnershipPin) {
+        const owner = this.mediaOwnerships.get(
+          'jellyfin',
+          targetOwnershipServerId,
+          target.Id,
+          settings,
+        );
+        const expectedOwner =
+          registeredSource.value?.discord_user_id ?? recipient ?? mapping?.discord_user_id;
+        const expectedSlot =
+          request.membership_slot ?? mapping?.membership_slot ?? registeredSource.value?.slot ?? 1;
+        if (owner && (owner.discord_user_id !== expectedOwner || owner.slot !== expectedSlot))
+          throw new ServiceError(
+            'The new Jellyfin account acquired a different approved owner before migration completed. Credentials were not delivered.',
+          );
+        targetOwnershipPin = { id: target.Id, identity_hash: this.ownershipHash(owner) };
+      }
+      guard();
+    };
     try {
       const [target, created, password] = historyOnly
         ? ([currentTarget!, false, null] as const)
@@ -3361,6 +3677,7 @@ export class Service {
             request.recover_target_id,
             mapping,
             guard,
+            pinCreatedTarget,
           );
       Object.assign(result, { created, target_user_id: target.Id });
       destinationId = target.Id;
@@ -4152,19 +4469,72 @@ export class Service {
             );
           event.tier_id = tier.id;
           event.account_limit = tier.account_limit;
-          const job = await this.provisionMembership(memberId, tier.id);
-          event.job_id = job.id;
-          delete event.report_cleared;
-          this.store.saveSubscription(event);
-          await this.jobTasks.get(job.id);
-          const outcome = this.getJob(job.id);
+          const existing = this.memberships.get(memberId, settings);
           if (
-            ['failed', 'interrupted'].includes(outcome.status) ||
-            outcome.results.some((result) => result.status === 'failed')
-          )
-            throw new ServiceError('Account provisioning failed. Review the linked job.');
-          event.result =
-            'Membership account allowance applied; existing passwords and history preserved.';
+            (!existing || existing.provision_jellyfin === false) &&
+            !this.store.linksForMember(memberId).length
+          ) {
+            // A subscription establishes entitlement. It must not silently opt a
+            // new member into a second media server or start a history migration.
+            await this.membershipMutex.run(() =>
+              this.mutationMutex.run(async () => {
+                const current = this.memberships.get(memberId, this.store.settings());
+                if (
+                  JSON.stringify(settings) !== JSON.stringify(this.store.settings()) ||
+                  current?.revision !== existing?.revision
+                )
+                  throw new ServiceError(
+                    'Configuration or membership changed. Review and try again.',
+                  );
+                if (!current && this.memberships.hasOtherScope(memberId, settings))
+                  throw new ServiceError(
+                    'Restore the original paired server before changing this membership.',
+                  );
+                const identity = await this.requireBot().recipientIdentity(memberId, false);
+                if (identity.id && identity.id !== memberId)
+                  throw new ServiceError(
+                    'Discord returned a different member. Reload and try again.',
+                  );
+                if (
+                  JSON.stringify(settings) !== JSON.stringify(this.store.settings()) ||
+                  this.memberships.get(memberId, settings)?.revision !== existing?.revision
+                )
+                  throw new ServiceError(
+                    'Configuration or membership changed. Review and try again.',
+                  );
+                this.checkStopped();
+                this.memberships.save(
+                  {
+                    discord_user_id: memberId,
+                    base_username: current?.base_username ?? identity.username,
+                    tier_id: tier.id,
+                    account_limit: tier.account_limit,
+                    access_mode: 'subscription',
+                    provision_jellyfin: false,
+                    active: true,
+                  },
+                  settings,
+                  current?.revision,
+                );
+              }),
+            );
+            event.result =
+              'Membership entitlement updated. Jellyfin provisioning remains opt-in; no media account was created or migrated.';
+          } else {
+            const job = await this.provisionMembership(memberId, tier.id);
+            event.job_id = job.id;
+            delete event.report_cleared;
+            this.store.saveSubscription(event);
+            await this.jobTasks.get(job.id);
+            const outcome = this.getJob(job.id);
+            if (
+              ['failed', 'interrupted'].includes(outcome.status) ||
+              outcome.results.some((result) => result.status === 'failed')
+            )
+              throw new ServiceError('Account provisioning failed. Review the linked job.');
+            event.result =
+              'Membership account allowance applied; existing passwords and history preserved.';
+          }
         } else {
           if (
             automatic &&
@@ -4173,6 +4543,7 @@ export class Service {
             throw new ServiceError(
               'This access change requires administrator review under the current automation settings.',
             );
+          let linkedAccessUpdated = false;
           await this.membershipMutex.run(() =>
             this.mutationMutex.run(async () => {
               this.checkStopped();
@@ -4193,16 +4564,14 @@ export class Service {
                   'This Discord member has no Jellyport identity link. No account was disabled.',
                 );
               const primary = this.store.link(memberId) ?? links[0];
-              await this.withClient(settings, 'jellyfin', async (jellyfin) => {
-                // Capture all slots after an in-flight account mutation finishes.
-                for (const link of links)
-                  this.assertLinkedTarget(await jellyfin.user(link.remote_id), link, settings);
-                const member = this.memberships.save(
+              const saveInactive = () =>
+                this.memberships.save(
                   {
                     discord_user_id: memberId,
                     base_username: previous?.base_username ?? primary!.username,
                     tier_id: previous?.tier_id ?? 'sloop',
                     access_mode: previous?.access_mode ?? 'subscription',
+                    provision_jellyfin: previous?.provision_jellyfin ?? true,
                     account_limit: previous?.account_limit ?? 1,
                     active: false,
                     inactive_reason: event.action as 'cancel' | 'expire',
@@ -4210,6 +4579,17 @@ export class Service {
                   settings,
                   previous?.revision,
                 );
+              if (!links.length) {
+                if (JSON.stringify(settings) !== JSON.stringify(this.store.settings()))
+                  throw new ServiceError('Configuration changed. Review and try again.');
+                saveInactive();
+                return;
+              }
+              await this.withClient(settings, 'jellyfin', async (jellyfin) => {
+                // Capture all slots after an in-flight account mutation finishes.
+                for (const link of links)
+                  this.assertLinkedTarget(await jellyfin.user(link.remote_id), link, settings);
+                const member = saveInactive();
                 const guard = () => {
                   this.checkStopped();
                   if (
@@ -4230,12 +4610,14 @@ export class Service {
                     true,
                     guard,
                   );
+                linkedAccessUpdated = true;
               });
             }),
           );
           if (event.status !== 'ignored')
-            event.result =
-              'Eligible linked account access disabled; manually flagged Family accounts, passwords, and watch history preserved.';
+            event.result = linkedAccessUpdated
+              ? 'Eligible linked account access disabled; manually flagged Family accounts, passwords, and watch history preserved.'
+              : 'Membership entitlement marked inactive; no Jellyfin account was required or modified.';
         }
         if (event.status !== 'ignored') event.status = 'applied';
       } catch (error) {
@@ -4328,7 +4710,10 @@ export class Service {
   async reconcileMemberships(): Promise<void> {
     const settings = this.store.settings();
     if (!settings.discord_role_events || !settings.discord_member_role_id || !this.bot) return;
-    const memberIds = new Set(this.store.links().map((link) => link.discord_user_id));
+    const memberIds = new Set([
+      ...this.store.links().map((link) => link.discord_user_id),
+      ...this.memberships.list(settings).map((member) => member.discord_user_id),
+    ]);
     for (const memberId of memberIds) {
       const links = this.store.linksForMember(memberId);
       const member = this.memberships.get(memberId, settings);

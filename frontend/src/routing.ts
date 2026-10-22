@@ -30,7 +30,7 @@ const pageTabs: Partial<Record<Page, readonly string[]>> = {
   mappings: ['list', 'editor'],
   roles: ['list', 'editor', 'apply'],
   accounts: ['create', 'recover'],
-  memberships: ['list', 'editor'],
+  memberships: ['overview', 'accounts', 'events'],
   subscriptions: ['review', 'history', 'all'],
   settings: ['media', 'accounts', 'discord', 'stripe', 'automation', 'history', 'activity'],
 };
@@ -41,17 +41,28 @@ const settingsSubtabs: Record<string, readonly string[]> = {
   automation: ['tiers', 'rules'],
   history: ['emby', 'jellyfin'],
 };
+const membershipSubtabs: Record<string, readonly string[]> = {
+  accounts: ['list', 'editor'],
+  events: ['review', 'history', 'all'],
+};
 const routeEvent = 'jellyport:routechange';
 const skipAnchor = '#workspace-content';
 
 function normalized(route: WorkspaceRoute): WorkspaceRoute {
+  // Preserve bookmarks from the former separate subscriptions and membership editors.
+  if (route.page === 'subscriptions')
+    route = { page: 'memberships', tab: 'events', subtab: route.tab };
+  else if (route.page === 'memberships' && ['list', 'editor'].includes(route.tab || ''))
+    route = { page: 'memberships', tab: 'accounts', subtab: route.tab };
   const page = pages.includes(route.page) ? route.page : 'overview';
   const tabs = pageTabs[page];
   const tab = tabs ? (tabs.includes(route.tab ?? '') ? route.tab! : tabs[0]!) : undefined;
   const nested =
     page === 'settings' && tab && Object.hasOwn(settingsSubtabs, tab)
       ? settingsSubtabs[tab]
-      : undefined;
+      : page === 'memberships' && tab && Object.hasOwn(membershipSubtabs, tab)
+        ? membershipSubtabs[tab]
+        : undefined;
   const subtab = nested
     ? nested.includes(route.subtab ?? '')
       ? route.subtab!
@@ -121,7 +132,7 @@ export function useRouteTab(
 ): [string, Dispatch<SetStateAction<string>>] {
   const route = useRouteSnapshot();
   const allowed = settingsSection
-    ? (settingsSubtabs[settingsSection] ?? [])
+    ? ((page === 'memberships' ? membershipSubtabs : settingsSubtabs)[settingsSection] ?? [])
     : (pageTabs[page] ?? []);
   const fallback = allowed[0] ?? '';
   const selected =

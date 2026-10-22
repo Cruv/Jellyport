@@ -26,7 +26,7 @@ import AuthScreen from './AuthScreen';
 import UserMappingsPage from './UserMappingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import AccountRolesPage from './AccountRolesPage';
-import MembershipsPage from './MembershipsPage';
+import MemberManagementPage from './MemberManagementPage';
 import UserDirectoryPage from './UserDirectoryPage';
 import {
   AccountsPage,
@@ -74,7 +74,7 @@ const pages: Record<Page, { title: string; icon: string }> = {
 };
 const navigationGroups: { title: string; pages: Page[] }[] = [
   { title: 'Workspace', pages: ['overview', 'users', 'migrate', 'accounts'] },
-  { title: 'Account management', pages: ['mappings', 'roles', 'memberships', 'subscriptions'] },
+  { title: 'Account management', pages: ['mappings', 'roles', 'memberships'] },
   { title: 'System', pages: ['activity', 'settings'] },
 ];
 
@@ -485,6 +485,10 @@ export default function App() {
         } else if (target === 'memberships' || target === 'users') {
           const value = await api<Settings>('/api/settings');
           if (version === loadVersion.current) setSettings(value);
+          if (target === 'memberships') {
+            const listed = await api<{ events: SubscriptionEvent[] }>('/api/subscriptions');
+            if (version === loadVersion.current) setEvents(listed.events || []);
+          }
         } else if (target === 'accounts') {
           const [value, summary] = await Promise.all([
             api<Settings>('/api/settings'),
@@ -562,7 +566,10 @@ export default function App() {
     if (target !== 'migrate') cancelPreview();
     closeDialog();
     setMobileOpen(false);
-    if (target === page) void load(target);
+    if (target === 'subscriptions') {
+      navigateWorkspace({ page: 'memberships', tab: 'events' });
+      if (page === 'memberships') void load('memberships');
+    } else if (target === page) void load(target);
     else {
       setLoading(true);
       navigateWorkspace({ page: target });
@@ -977,7 +984,7 @@ export default function App() {
               : 'Subscription event status refreshed.',
         result.status === 'failed',
       );
-      await load('subscriptions');
+      await load('memberships');
     });
   }
   function ignore(event: SubscriptionEvent) {
@@ -987,7 +994,7 @@ export default function App() {
         body: {},
       });
       notify('Subscription event ignored.');
-      await load('subscriptions');
+      await load('memberships');
     });
   }
   let content;
@@ -1095,7 +1102,22 @@ export default function App() {
       />
     );
   else if (page === 'memberships' && settings)
-    content = <MembershipsPage settings={settings} api={api} notify={notify} created={created} />;
+    content = (
+      <MemberManagementPage
+        settings={settings}
+        api={api}
+        notify={notify}
+        created={created}
+        demo={!!session?.demo}
+        events={events}
+        refresh={() => void load('memberships', true)}
+        navigate={navigate}
+        openJob={openJob}
+        review={(event) => showDialog({ kind: 'event', event })}
+        ignore={ignore}
+        busy={busy.has('event')}
+      />
+    );
   else if (page === 'accounts' && overview && settings)
     content = (
       <AccountsPage
@@ -2278,13 +2300,39 @@ function DialogContent({
         warning={!subscribe}
         title={
           subscribe
-            ? 'Provision this member’s Jellyfin accounts.'
-            : 'Disable all linked Jellyfin accounts now.'
+            ? 'Apply this member’s subscription allowance.'
+            : 'Update this member’s access now.'
         }
       >
-        {subscribe
-          ? 'Jellyport uses the member’s subscription tier to provision account slots, preserves linked usernames, and disables extras after a downgrade. Accounts and their data are kept for future upgrades.'
-          : 'Approving this event manually disables all linked account slots immediately, even when automatic disabling is off. Accounts, passwords, and watch history are preserved.'}
+        {subscribe ? (
+          <>
+            <p>
+              Jellyport records the member’s subscription tier and account allowance. Emby-only and
+              Discord-only members do not need a Jellyfin account.
+            </p>
+            <p>
+              Jellyfin accounts are created or migrated only when the member has enabled Jellyfin
+              provisioning. Existing linked accounts follow the allowance; eligible extra accounts
+              are disabled after a downgrade with their data preserved.
+            </p>
+            <p>Manually flagged Family accounts and complimentary memberships remain protected.</p>
+          </>
+        ) : (
+          <>
+            <p>
+              Approving this event manually disables eligible linked Jellyfin account slots
+              immediately, even when automatic disabling is off.
+            </p>
+            <p>
+              Manually flagged Family accounts and complimentary memberships are spared. Accounts,
+              passwords, and watch history are preserved.
+            </p>
+            <p>
+              When no Jellyfin accounts are linked, Jellyport updates the membership status without
+              creating or requiring an account.
+            </p>
+          </>
+        )}
       </Callout>
       {subscribe && event.source === 'mee6_message' && event.detail && (
         <p className="muted text-small">

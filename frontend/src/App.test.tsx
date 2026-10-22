@@ -172,6 +172,8 @@ beforeEach(() => {
     '/api/settings': settings,
     '/api/users': { emby: [], jellyfin: [] },
     '/api/user-mappings': { mappings: [] },
+    '/api/memberships': { memberships: [] },
+    '/api/subscriptions': { events: [] },
     '/api/account-roles': { roles: [], assignments: [] },
     '/api/jobs/retention': {
       retention_days: 0,
@@ -841,8 +843,9 @@ describe('React account safeguards', () => {
     responses['/api/subscriptions/processing-event/apply'] = { ...event, status: 'processing' };
     render(<App />);
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
-    fireEvent.click(screen.getByRole('button', { name: 'Subscriptions' }));
-    await screen.findByRole('heading', { name: 'Subscriptions', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Memberships' }));
+    await screen.findByRole('heading', { name: 'Memberships', level: 1 });
+    fireEvent.click(screen.getByRole('tab', { name: /^Events/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Review' }));
     const dialog = await screen.findByRole('dialog');
     fireEvent.click(within(dialog).getByRole('button', { name: /Apply/ }));
@@ -989,7 +992,7 @@ describe('React account safeguards', () => {
     ['roles', 'Account roles'],
     ['accounts', 'Create account'],
     ['memberships', 'Memberships'],
-    ['subscriptions', 'Subscriptions'],
+    ['subscriptions', 'Memberships'],
     ['activity', 'Activity'],
     ['settings', 'Settings'],
   ])(
@@ -1002,7 +1005,11 @@ describe('React account safeguards', () => {
       const view = render(<App />);
       await screen.findByRole('heading', { name: title, level: 1 });
       expect(window.location.hash).toBe(
-        target === 'settings' ? '#/settings/media/emby' : `#/${target}`,
+        target === 'settings'
+          ? '#/settings/media/emby'
+          : target === 'subscriptions'
+            ? '#/memberships/events/review'
+            : `#/${target}`,
       );
       view.unmount();
       render(<App />);
@@ -1379,6 +1386,7 @@ describe('React account safeguards', () => {
     responses['/api/logout'] = { ...session, authenticated: false, user: undefined };
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Memberships' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Accounts & access' }));
     await screen.findByText('private-family-account');
     fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     await screen.findByLabelText('Jellyfin username');
@@ -1725,6 +1733,49 @@ describe('React account safeguards', () => {
       vi.useRealTimers();
     }
   });
+  it('reviews subscription entitlement without promising a mandatory Jellyfin account', async () => {
+    const event = {
+      id: 'entitlement-only-event',
+      username: 'synthetic-emby-owner',
+      discord_user_id: '123456789012345678',
+      action: 'subscribe',
+      status: 'pending',
+      source: 'mee6_message',
+      detail: 'Sloop Crewman Plan',
+      account_limit: 1,
+      created_at: '2026-10-22T12:00:00Z',
+    };
+    responses['/api/subscriptions'] = { events: [event] };
+    responses['/api/subscriptions/entitlement-only-event/apply'] = { ...event, status: 'applied' };
+    window.history.replaceState(null, '', '#/memberships/events/review');
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /^Review$/ }));
+    const dialog = await screen.findByRole('dialog', { name: 'Process subscription' });
+    expect(within(dialog).getByText('Apply this member’s subscription allowance.')).toBeTruthy();
+    expect(
+      within(dialog).getByText(/Emby-only and Discord-only members do not need a Jellyfin account/),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /Jellyfin accounts are created or migrated only when the member has enabled Jellyfin provisioning/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /Manually flagged Family accounts and complimentary memberships remain protected/,
+      ),
+    ).toBeTruthy();
+    expect(within(dialog).queryByText('Provision this member’s Jellyfin accounts.')).toBeNull();
+    expect(requests.some((request) => request.options?.method === 'POST')).toBe(false);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Apply subscription' }));
+    await screen.findByText('Subscription event applied.');
+    expect(
+      requests
+        .filter((request) => request.options?.method === 'POST')
+        .map((request) => request.path),
+    ).toEqual(['/api/subscriptions/entitlement-only-event/apply']);
+  });
+
   it('states that manual cancellation approval disables access immediately before sending the request', async () => {
     const event = {
       id: 'event-1',
@@ -1738,13 +1789,24 @@ describe('React account safeguards', () => {
     responses['/api/subscriptions/event-1/apply'] = { ...event, status: 'applied' };
     render(<App />);
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
-    fireEvent.click(screen.getByRole('button', { name: 'Subscriptions' }));
-    await screen.findByRole('heading', { name: 'Subscriptions', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Memberships' }));
+    await screen.findByRole('heading', { name: 'Memberships', level: 1 });
+    fireEvent.click(screen.getByRole('tab', { name: /^Events/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Review' }));
     const dialog = await screen.findByRole('dialog');
     expect(
       within(dialog).getByText(
-        /Approving this event manually disables all linked account slots immediately/,
+        /Approving this event manually disables eligible linked Jellyfin account slots immediately/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /Manually flagged Family accounts and complimentary memberships are spared/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /When no Jellyfin accounts are linked.*without creating or requiring an account/,
       ),
     ).toBeTruthy();
     expect(requests.some((request) => request.path.endsWith('/apply'))).toBe(false);

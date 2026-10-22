@@ -142,6 +142,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS source_snapshot_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS destination_catalog_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS stripe_integration_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS media_ownership (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS identity_review_exceptions (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS identity_role_sync_tasks (id TEXT PRIMARY KEY, created_ms REAL NOT NULL, encrypted BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS credentials_expiry ON credentials(expires);
       CREATE INDEX IF NOT EXISTS subscriptions_job_id ON subscriptions(json_extract(payload,'$.job_id'));
     `);
@@ -178,6 +181,8 @@ export class Store {
       UNION ALL SELECT 1 FROM admin_alert_config UNION ALL SELECT 1 FROM admin_alert_receipts
       UNION ALL SELECT 1 FROM source_snapshot_state UNION ALL SELECT 1 FROM destination_catalog_state
       UNION ALL SELECT 1 FROM stripe_integration_state
+      UNION ALL SELECT 1 FROM media_ownership UNION ALL SELECT 1 FROM identity_review_exceptions
+      UNION ALL SELECT 1 FROM identity_role_sync_tasks
       UNION ALL SELECT 1 FROM job_retention_config UNION ALL SELECT 1 FROM job_retention LIMIT 1`,
         )
         .get();

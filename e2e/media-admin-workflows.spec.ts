@@ -318,7 +318,12 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   await expect(notice).not.toContainText('Access policy saved.');
   expect(await notice.evaluate((element) => getComputedStyle(element).position)).toBe('fixed');
   const action = page.getByRole('button', { name: 'Review membership update', exact: true });
-  await action.scrollIntoViewIfNeeded();
+  // Nearest-edge scrolling can leave a fractional pixel below the viewport
+  // after the dialog restores focus. Center the control before checking its
+  // entire area and testing that the notification does not intercept input.
+  await action.evaluate((element) =>
+    element.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' }),
+  );
   await expect(action).toBeInViewport({ ratio: 1 });
   expect(
     await action.evaluate((element) => {

@@ -351,11 +351,19 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   expect(admin.writes).toHaveLength(writesBeforeReview);
 });
 
-test('subscription review provisions the trusted tier and ignoring a later cancellation preserves access', async ({
+test('subscription review provisions the trusted tier for an opted-in member and ignoring a later cancellation preserves access', async ({
   page,
   admin,
   mutations,
 }) => {
+  // Membership approval alone is entitlement-only. This scenario separately
+  // covers provisioning after the owner explicitly opts into Jellyfin.
+  await admin.app.jellyport.service.setMembershipAccess({
+    discord_user_id: paidOwner,
+    access_mode: 'subscription',
+    tier_id: 'sloop',
+    provision_jellyfin: true,
+  });
   await admin.app.jellyport.service.recordSubscription({
     id: 'synthetic-subscribe',
     action: 'subscribe',
@@ -388,7 +396,7 @@ test('subscription review provisions the trusted tier and ignoring a later cance
     username: 'crew_owner',
     source: 'mee6_message',
   });
-  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.getByRole('button', { name: 'Refresh events', exact: true }).click();
   await page.getByRole('button', { name: 'Ignore', exact: true }).click();
   await expect
     .poll(() => admin.app.jellyport.store.subscription('synthetic-cancel')?.status)
@@ -451,7 +459,8 @@ test('a manually flagged Family account is preserved when a reviewed cancellatio
     username: 'crew_owner',
     source: 'mee6_message',
   });
-  await navigate(page, 'Subscriptions');
+  await navigate(page, 'Memberships');
+  await page.getByRole('tab', { name: /^Events/ }).click();
   await page.getByRole('button', { name: 'Review', exact: true }).click();
   const review = page.getByRole('dialog', { name: 'Process cancellation', exact: true });
   await expect(review).toContainText('Accounts, passwords, and watch history are preserved');

@@ -6,9 +6,10 @@ import { useWorkspaceRoute } from './routing';
 import { defaultMembershipTiers, type Api, type Settings } from './types';
 
 vi.mock('./IdentityReviewPanel', () => ({
-  default: () => (
+  default: ({ onApplied }: { onApplied?: () => void }) => (
     <section aria-label="Identity review">
       <h2>Identity links and access gaps</h2>
+      <button onClick={onApplied}>Approve synthetic identity</button>
     </section>
   ),
 }));
@@ -75,6 +76,19 @@ describe('unified membership workspace', () => {
     expect(screen.getByText('synthetic-member')).toBeTruthy();
     expect(screen.getAllByRole('heading', { level: 1 })).toHaveLength(1);
     expect(screen.queryByRole('heading', { level: 1, name: 'Subscriptions' })).toBeNull();
+  });
+  it('refreshes linked membership accounts after an identity approval', async () => {
+    window.history.replaceState(null, '', '#/memberships');
+    const { api } = page();
+    const reads = () =>
+      vi.mocked(api).mock.calls.filter(([path]) => path === '/api/memberships').length;
+    await waitFor(() => expect(reads()).toBe(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Approve synthetic identity' }));
+    await waitFor(() => expect(reads()).toBe(2));
+    expect(window.location.hash).toBe('#/memberships');
+    expect(screen.getByRole('tab', { name: 'Identity & gaps' }).getAttribute('aria-selected')).toBe(
+      'true',
+    );
   });
   it('opens existing subscriptions bookmarks on the events tab without applying any event', async () => {
     window.history.replaceState(null, '', '#/subscriptions/history');

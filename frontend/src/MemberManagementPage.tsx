@@ -67,7 +67,14 @@ export default function MemberManagementPage({
         )}
       </TabPanel>
       <TabPanel id="member-management" tabId="accounts" active={tab === 'accounts'}>
-        <MembershipsPage settings={settings} api={api} notify={notify} created={created} embedded />
+        <MembershipsPage
+          settings={settings}
+          api={api}
+          notify={notify}
+          created={created}
+          refreshKey={identityVersion}
+          embedded
+        />
       </TabPanel>
       <TabPanel id="member-management" tabId="events" active={tab === 'events'}>
         <SubscriptionsPage

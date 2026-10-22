@@ -980,6 +980,138 @@ describe('Bot lifecycle and commands', () => {
   });
 });
 
+describe('Explicit complete Discord identity roster', () => {
+  it('requires the privileged roster intent without performing a request', async () => {
+    const { manager, guild } = await fixture();
+    await expect(manager.listIdentityMembers()).rejects.toThrow('Server Members Intent');
+    expect(guild.members.list).not.toHaveBeenCalled();
+  });
+
+  it('includes human members regardless of subscription roles and exposes only review fields', async () => {
+    const { manager, guild, recipient } = await fixture({ discord_role_events: true });
+    const free = member('23', 'non_media_member', {
+      roles: [],
+      displayName: 'Social only',
+      nickname: 'Sailor',
+    });
+    const robot = member('24', 'robot', { bot: true });
+    guild.members.list.mockResolvedValue(
+      new Collection([
+        ['22', recipient],
+        ['23', free],
+        ['24', robot],
+      ]),
+    );
+    const roster = await manager.listIdentityMembers();
+    expect(roster).toEqual({
+      members: [
+        { id: '22', username: 'jlogan35', nickname: 'Display alias', roles: ['55'] },
+        {
+          id: '23',
+          username: 'non_media_member',
+          display_name: 'Social only',
+          nickname: 'Sailor',
+          roles: [],
+        },
+      ],
+      complete: true,
+      fetched_at: expect.any(String),
+    });
+    expect(guild.members.list).toHaveBeenCalledExactlyOnceWith({ limit: 1000, cache: false });
+    expect(recipient.send).not.toHaveBeenCalled();
+    expect(free.send).not.toHaveBeenCalled();
+    expect(guild.members.fetch).not.toHaveBeenCalled();
+  });
+
+  it('shares a concurrent refresh and serially advances the documented highest-ID cursor', async () => {
+    const { manager, guild } = await fixture({ discord_role_events: true });
+    const page = new Collection(
+      Array.from({ length: 1000 }, (_, index) => {
+        const item = member(String(index + 1000), `user${index}`, { roles: [] });
+        return [item.id, item] as const;
+      }),
+    );
+    guild.members.list
+      .mockResolvedValueOnce(page)
+      .mockResolvedValueOnce(new Collection([['2001', member('2001', 'last')]]));
+    const [first, second] = await Promise.all([
+      manager.listIdentityMembers(),
+      manager.listIdentityMembers(),
+    ]);
+    expect(first.complete).toBe(true);
+    expect(first.members).toHaveLength(1001);
+    expect(second).toEqual(first);
+    expect(guild.members.list).toHaveBeenCalledTimes(2);
+    expect(guild.members.list.mock.calls[1]![0]).toEqual({
+      limit: 1000,
+      cache: false,
+      after: '1999',
+    });
+    first.members[0]!.username = 'edited';
+    expect(second.members[0]!.username).toBe('user0');
+  });
+
+  it.each([false, true])(
+    'caps retained rows and requests and reports completeness at exactly 10,000 members (%s)',
+    async (more) => {
+      const { manager, guild } = await fixture({ discord_role_events: true });
+      for (let pageIndex = 0; pageIndex < 10; pageIndex++) {
+        guild.members.list.mockResolvedValueOnce(
+          new Collection(
+            Array.from({ length: 1000 }, (_, index) => {
+              const item = member(
+                String(1000 + pageIndex * 1000 + index),
+                `user${pageIndex}_${index}`,
+                { roles: [] },
+              );
+              return [item.id, item] as const;
+            }),
+          ),
+        );
+      }
+      guild.members.list.mockResolvedValueOnce(
+        new Collection(more ? [['11000', member('11000', 'overflow')]] : []),
+      );
+      const result = await manager.listIdentityMembers();
+      expect(result.complete).toBe(!more);
+      expect(result.members).toHaveLength(10_000);
+      expect(guild.members.list).toHaveBeenCalledTimes(11);
+      expect(guild.members.list.mock.calls[10]![0]).toEqual({
+        limit: 1,
+        cache: false,
+        after: '10999',
+      });
+    },
+  );
+
+  it.each(['foreign', 'partial', 'mismatched', 'malformed-role', 'upstream'])(
+    'fails closed without returning a partial roster on %s',
+    async (failure) => {
+      const { manager, guild } = await fixture({ discord_role_events: true });
+      const item = member('22', 'member', {
+        guildId: failure === 'foreign' ? '456' : '123',
+        roles: failure === 'malformed-role' ? ['invalid'] : [],
+      });
+      if (failure === 'partial') Object.assign(item, { partial: true });
+      if (failure === 'mismatched') item.user.id = '23';
+      if (failure === 'upstream') guild.members.list.mockRejectedValue(new Error('private-token'));
+      else guild.members.list.mockResolvedValue(new Collection([['22', item]]));
+      await expect(manager.listIdentityMembers()).rejects.toThrow('No complete roster was adopted');
+      expect(JSON.stringify(manager.status())).not.toContain('private-token');
+    },
+  );
+
+  it('aborts a pending roster refresh on disconnect', async () => {
+    const { manager, guild } = await fixture({ discord_role_events: true });
+    guild.members.list.mockImplementation(() => new Promise(() => {}));
+    const result = manager.listIdentityMembers();
+    const rejected = expect(result).rejects.toThrow('connection changed');
+    await manager.stop();
+    await rejected;
+    expect(guild.members.list).toHaveBeenCalledOnce();
+  });
+});
+
 describe('Private credential delivery and membership', () => {
   it('delivers the captured plain account message without using changed settings or interpreting Markdown', async () => {
     const { manager, recipient } = await fixture({

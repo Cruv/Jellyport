@@ -129,6 +129,42 @@ describe('membership tiers and slot names', () => {
   });
 });
 
+describe('independent Jellyfin opt-in', () => {
+  it('preserves legacy provisioning decisions while retaining an explicit opt-out across restarts', () => {
+    const { memberships, store } = fixture();
+    const legacy = memberships.save(input(), settings);
+    const row = store.membershipRecords()[0]!;
+    const { provision_jellyfin: _optIn, ...oldRecord } = legacy;
+    store.saveMembershipRecord(row.id, oldRecord);
+    expect(memberships.get(legacy.discord_user_id, settings)).toMatchObject({
+      provision_jellyfin: true,
+      revision: legacy.revision,
+    });
+    const optedOut = memberships.save(
+      { ...legacy, provision_jellyfin: false },
+      settings,
+      legacy.revision,
+    );
+    expect(optedOut.revision).not.toBe(legacy.revision);
+    expect(new Memberships(store).get(legacy.discord_user_id, settings)).toEqual(optedOut);
+    expect(memberships.save({ ...optedOut }, settings, optedOut.revision)).toEqual(optedOut);
+    const optedIn = memberships.save(
+      { ...optedOut, provision_jellyfin: true },
+      settings,
+      optedOut.revision,
+    );
+    expect(optedIn.revision).not.toBe(optedOut.revision);
+  });
+
+  it.each([null, 0, 1, 'false', {}])('rejects malformed provisioning decisions: %j', (value) => {
+    const { memberships, store } = fixture();
+    expect(() =>
+      memberships.save({ ...input(), provision_jellyfin: value } as MembershipInput, settings),
+    ).toThrow('invalid identity');
+    expect(store.membershipRecords()).toEqual([]);
+  });
+});
+
 describe('encrypted scoped memberships', () => {
   it('preserves revisions for idempotent saves and revises changed limits, names, and active state', () => {
     const { memberships } = fixture();

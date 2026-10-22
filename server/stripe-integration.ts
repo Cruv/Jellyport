@@ -538,6 +538,63 @@ export class StripeIntegration {
     this.persist();
     return this.status();
   }
+  /** Internal identity-review commit. The caller has just obtained a complete,
+   * fresh Discord roster and preflighted exact media IDs. One SQLite transaction
+   * persists all reviewed associations; no billing or media API write occurs. */
+  commitReviewedIdentities(
+    input: {
+      expected_revision: string;
+      links: Array<{ customer_id: string; discord_user_id: string; username: string }>;
+    },
+    writeLocal: () => void,
+  ): void {
+    this.checkRevision(input.expected_revision);
+    if (this.task)
+      throw new ServiceError('Wait for Stripe synchronization, then refresh the identity review.');
+    if (input.links.length > 2500)
+      throw new ServiceError('Review fewer customer identities at once.');
+    if (input.links.length) {
+      const last = Date.parse(this.state.last_sync ?? '');
+      if (!this.state.api_key || !Number.isFinite(last) || this.now() - last > checkoutTtl)
+        throw new ServiceError('Refresh Stripe billing data before linking a customer.');
+    }
+    const next = structuredClone(this.state);
+    const seen = new Set<string>();
+    for (const link of input.links) {
+      if (
+        !stripeCustomer.test(link.customer_id) ||
+        !validSnowflake(link.discord_user_id) ||
+        !cleanText(link.username, 64) ||
+        seen.has(link.customer_id) ||
+        !next.snapshot?.subscriptions.some((item) => item.customer_id === link.customer_id)
+      )
+        throw new ServiceError(
+          'Select each saved Stripe customer once and verify its Discord owner.',
+        );
+      seen.add(link.customer_id);
+      const existing = next.links.find((item) => item.customer_id === link.customer_id);
+      if (existing && existing.discord_user_id !== link.discord_user_id)
+        throw new ServiceError(
+          'Unlink the existing Stripe customer owner before changing ownership.',
+        );
+      if (existing) Object.assign(existing, link);
+      else next.links.push({ ...link });
+    }
+    if (input.links.length) next.revision = randomUUID();
+    this.store.db.exec('BEGIN IMMEDIATE');
+    try {
+      writeLocal();
+      if (input.links.length)
+        this.store.db
+          .prepare('INSERT OR REPLACE INTO stripe_integration_state (id,encrypted) VALUES (1,?)')
+          .run(this.store.encrypt(next));
+      this.store.db.exec('COMMIT');
+      this.state = next;
+    } catch (error) {
+      this.store.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
   unlinkCustomer(input: {
     customer_id: string;
     expected_revision: string;

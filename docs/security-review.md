@@ -62,6 +62,40 @@ remain sensitive and must not be mounted in the web container. Validation used
 private copies and fake destination clients; no production API writes or
 deployments were performed, and no real backup data enters fixtures or commits.
 
+## Reviewed member associations — 0.27.0
+
+The combined Memberships review inventories human Discord members, existing
+media accounts and cached Stripe observations without enumerating media catalogs
+or reading playback history. Automatic suggestions require exact current
+usernames or approved identities. Accounts with conflicting ownership cannot be
+claimed. The administrator explicitly confirms existing account IDs and slots;
+Jellyfin creation remains a separate opt-in action.
+
+Approvals require current administrator authorization, same-origin/CSRF checks
+and an unexpired inventory revision. Fresh source checks precede one SQLite
+transaction that saves encrypted Stripe links, media ownership, review notes and
+a durable informational-role task. Source failure, changed review or changed
+ownership rejects the approval. Legacy migration, mapping and access paths also
+check approved ownership before acting. Gap annotations do not grant access or
+change subscription/Family exemptions, and missing observations never justify
+an automatic disable.
+
+Role tasks return within a four-second delivery budget, continue with bounded
+single-worker processing and survive restart. They change only the configured
+safe organization roles, recheck current configuration and ownership, and expose
+aggregate authenticated status without member IDs or credentials. A Discord
+failure retains the approved identities and reports an explicit retry outcome;
+it cannot create a media account or send credentials. Queue and completed-task
+history are bounded, encrypted and scoped to the linked servers and guild.
+
+Synthetic regression coverage includes 227-member bulk review, existing
+Emby-only Stripe links, atomic rollback, ownership conflicts, source failures,
+stale/revoked authorization, annotations, opt-in provisioning, role time budgets,
+restart/retry safety and desktop/iPhone browser workflows. This is a code and
+behavior review, not a production penetration test or a guarantee against all
+vulnerabilities. Stripe observations still do not prove invoice payment or
+authorize billing enforcement.
+
 ## Stripe billing observations — 0.26.0
 
 The Stripe connector uses restricted keys and GET requests to a fixed HTTPS

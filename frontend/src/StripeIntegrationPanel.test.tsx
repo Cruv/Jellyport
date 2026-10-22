@@ -6,6 +6,7 @@ import StripeIntegrationPanel, {
   type StripeSubscriptionReview,
 } from './StripeIntegrationPanel';
 import type { Api, ApiOptions } from './types';
+import type { IdentityReviewSnapshot } from '../../server/identity-review-types';
 
 const initial: StripeIntegrationStatus = {
   configured: false,
@@ -53,6 +54,61 @@ const discordMember = {
   membership_active: false,
 };
 const tiers = [{ id: 'sloop', name: 'Sloop', plan_name: 'Sloop Plan', account_limit: 1 }];
+const mediaAccount = {
+  kind: 'emby' as const,
+  id: 'emby_synthetic',
+  name: 'synthetic.member',
+  disabled: false,
+  family: false,
+  administrator: false,
+  owner_discord_id: null,
+  slot: null,
+};
+const identityDirectory: IdentityReviewSnapshot = {
+  revision: 'identity-revision',
+  generated_at: '2026-10-22T01:00:00Z',
+  expires_at: '2026-10-22T01:05:00Z',
+  sources: Object.fromEntries(
+    ['discord', 'emby', 'jellyfin', 'stripe'].map((name) => [
+      name,
+      { available: true, complete: true, updated_at: null },
+    ]),
+  ) as IdentityReviewSnapshot['sources'],
+  accounts: [mediaAccount],
+  summary: { members: 1, unlinked_accounts: 1, suggestions: 1, gaps: 1, acknowledged: 0 },
+  rows: [
+    {
+      id: 'member:synthetic',
+      member: { id: discordMember.id, username: discordMember.username, roles: [] },
+      member_candidates: [],
+      customers: [
+        {
+          id: row.customer_id,
+          name: row.customer_name,
+          email: row.customer_email,
+          linked_discord_id: null,
+          proposed_discord_id: row.proposed_discord_id,
+          statuses: ['active'],
+          tier_id: null,
+          active_subscription: true,
+        },
+      ],
+      confirmed_accounts: [],
+      suggestions: [
+        { account: mediaAccount, reason: 'Unique exact Discord username', reliable: true },
+      ],
+      gaps: ['active_subscription_no_media'],
+      exception: null,
+      reliable: true,
+      conflict: null,
+    },
+  ],
+};
+const identityResult = {
+  approved: 1,
+  roles: { status: 'updated', updated: 1, failed: 0 },
+  warnings: [],
+};
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
@@ -70,6 +126,8 @@ function page(
       return { revision: status.revision, subscriptions: rows } as T;
     if (path.startsWith('/api/discord/members?'))
       return { members: [discordMember], truncated: false } as T;
+    if (path === '/api/identity-review') return identityDirectory as T;
+    if (path === '/api/identity-review/apply') return identityResult as T;
     return status as T;
   }) as Api;
   const notify = vi.fn();
@@ -300,7 +358,7 @@ describe('Stripe integration settings', () => {
         'Stripe record identifiers',
       ),
     ).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Approve customer link' })).toHaveProperty(
+    expect(screen.getByRole('button', { name: 'Review media accounts' })).toHaveProperty(
       'disabled',
       true,
     );
@@ -309,20 +367,41 @@ describe('Stripe integration settings', () => {
     });
     fireEvent.click(await screen.findByRole('button', { name: 'Select @synthetic.member' }));
     expect(screen.getByText('Membership is not currently active.')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Approve customer link' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Review media accounts' }));
+    const mediaDialog = screen.getByRole('dialog', { name: 'Confirm Stripe & media accounts' });
+    await within(mediaDialog).findByText('Link existing accounts; Jellyfin is optional');
+    expect(within(mediaDialog).getByLabelText('Emby · synthetic.member')).toHaveProperty(
+      'checked',
+      true,
+    );
+    expect(
+      (p.api as ReturnType<typeof vi.fn>).mock.calls.some(
+        ([path]) => path === '/api/stripe/links' || path === '/api/identity-review/apply',
+      ),
+    ).toBe(false);
+    fireEvent.click(
+      within(mediaDialog).getByRole('button', { name: 'Approve identity & update roles' }),
+    );
     await waitFor(() =>
       expect(p.notify).toHaveBeenCalledWith(
-        'Stripe customer linked to the selected Discord member.',
+        '1 identity approved. Discord organization roles updated.',
+        false,
       ),
     );
     expect(p.api).toHaveBeenCalledWith(
-      '/api/stripe/links',
+      '/api/identity-review/apply',
       expect.objectContaining({
         method: 'POST',
         body: {
-          customer_id: row.customer_id,
-          discord_user_id: discordMember.id,
-          expected_revision: 'revision-1',
+          revision: 'identity-revision',
+          selections: [
+            {
+              row_id: 'member:synthetic',
+              discord_user_id: discordMember.id,
+              stripe_customer_ids: [row.customer_id],
+              accounts: [{ kind: 'emby', id: 'emby_synthetic', slot: 1 }],
+            },
+          ],
         },
       }),
     );
@@ -335,7 +414,8 @@ describe('Stripe integration settings', () => {
         return { revision: connected.revision, subscriptions: [row] } as T;
       if (path.startsWith('/api/discord/members?'))
         return { members: [discordMember], truncated: false } as T;
-      if (path === '/api/stripe/links') throw new Error('PRIVATE_LINK_RESPONSE');
+      if (path === '/api/identity-review') return identityDirectory as T;
+      if (path === '/api/identity-review/apply') throw new Error('PRIVATE_LINK_RESPONSE');
       return connected as T;
     });
     await screen.findByText('Test restricted key saved');
@@ -349,9 +429,14 @@ describe('Stripe integration settings', () => {
     fireEvent.click(
       await within(dialog).findByRole('button', { name: 'Select @synthetic.member' }),
     );
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Approve customer link' }));
-    const alert = await within(dialog).findByRole('alert');
-    expect(alert.textContent).toContain('The Stripe action could not be completed.');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Review media accounts' }));
+    const mediaDialog = screen.getByRole('dialog', { name: 'Confirm Stripe & media accounts' });
+    await within(mediaDialog).findByText('Link existing accounts; Jellyfin is optional');
+    fireEvent.click(
+      within(mediaDialog).getByRole('button', { name: 'Approve identity & update roles' }),
+    );
+    const alert = await within(mediaDialog).findByRole('alert');
+    expect(alert.textContent).toContain('Approval could not be confirmed.');
     expect(document.body.textContent).not.toContain('PRIVATE_LINK_RESPONSE');
     expect(screen.getAllByRole('alert')).toHaveLength(1);
     p.rerender(<StripeIntegrationPanel {...p.props} active={false} />);
@@ -381,7 +466,7 @@ describe('Stripe integration settings', () => {
         signal: expect.any(AbortSignal),
       }),
     );
-    expect(within(dialog).getByRole('button', { name: 'Approve customer link' })).toHaveProperty(
+    expect(within(dialog).getByRole('button', { name: 'Review media accounts' })).toHaveProperty(
       'disabled',
       false,
     );
@@ -419,7 +504,7 @@ describe('Stripe integration settings', () => {
         'The suggested Discord member could not be resolved.',
       );
       expect(within(dialog).queryByText('@synthetic.member')).toBeNull();
-      expect(within(dialog).getByRole('button', { name: 'Approve customer link' })).toHaveProperty(
+      expect(within(dialog).getByRole('button', { name: 'Review media accounts' })).toHaveProperty(
         'disabled',
         true,
       );
@@ -463,7 +548,7 @@ describe('Stripe integration settings', () => {
     );
     const dialog = screen.getByRole('dialog', { name: 'Approve Discord identity' });
     expect(within(dialog).queryByText('@synthetic.member')).toBeNull();
-    expect(within(dialog).getByRole('button', { name: 'Approve customer link' })).toHaveProperty(
+    expect(within(dialog).getByRole('button', { name: 'Review media accounts' })).toHaveProperty(
       'disabled',
       true,
     );
@@ -487,7 +572,7 @@ describe('Stripe integration settings', () => {
     revision = 'revision-2';
     fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
     await screen.findByText(/Billing data changed during this review/);
-    expect(screen.getByRole('button', { name: 'Approve customer link' })).toHaveProperty(
+    expect(screen.getByRole('button', { name: 'Review media accounts' })).toHaveProperty(
       'disabled',
       true,
     );
@@ -518,7 +603,7 @@ describe('Stripe integration settings', () => {
     expect(screen.getByText(/Payment collection paused/)).toBeTruthy();
     expect(screen.getByText(/Invoice billing/)).toBeTruthy();
     expect(screen.getByText(/Billing data changed during this review/)).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Approve customer link' })).toHaveProperty(
+    expect(screen.getByRole('button', { name: 'Review media accounts' })).toHaveProperty(
       'disabled',
       true,
     );
@@ -574,5 +659,68 @@ describe('Stripe integration settings', () => {
     expect(screen.getByText('JELLYPORT_IDENTITY_V1 discord={user.id}')).toBeTruthy();
     expect(screen.getByText(/A role announcement cannot identify a Stripe customer/)).toBeTruthy();
     expect(screen.getByText(/actual announcing bot’s ID/)).toBeTruthy();
+  });
+
+  it('continues read-only role polling after the Stripe approval dialog closes without replaying the link', async () => {
+    let rolePolls = 0;
+    const taskId = '11111111-2222-4333-8444-555555555555';
+    const p = page(connected, [row], async <T,>(path: string) => {
+      if (path === '/api/stripe/subscriptions')
+        return { revision: connected.revision, subscriptions: [row] } as T;
+      if (path === '/api/stripe/resolve-candidate') return { member: discordMember } as T;
+      if (path === '/api/identity-review') return identityDirectory as T;
+      if (path === '/api/identity-review/apply')
+        return {
+          ...identityResult,
+          roles: { status: 'queued', task_id: taskId, updated: 0, failed: 0 },
+        } as T;
+      if (path === `/api/identity-review/roles/${taskId}`) {
+        rolePolls++;
+        return { status: 'updated', task_id: taskId, updated: 1, failed: 0 } as T;
+      }
+      return connected as T;
+    });
+    await screen.findByText('Test restricted key saved');
+    tab('Review links');
+    fireEvent.click(await screen.findByRole('button', { name: 'Review Discord link' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Find suggested Discord member' }));
+    await screen.findByText('@synthetic.member');
+    fireEvent.click(screen.getByRole('button', { name: 'Review media accounts' }));
+    const dialog = screen.getByRole('dialog', { name: 'Confirm Stripe & media accounts' });
+    await within(dialog).findByText('Link existing accounts; Jellyfin is optional');
+    vi.useFakeTimers();
+    await act(async () =>
+      fireEvent.click(
+        within(dialog).getByRole('button', { name: 'Approve identity & update roles' }),
+      ),
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(
+      screen.getByText(
+        '1 identity approved. Discord organization roles are updating in the background.',
+      ),
+    ).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(rolePolls).toBe(1);
+    expect(
+      screen.getByText('1 identity approved. Discord organization roles updated.'),
+    ).toBeTruthy();
+    expect(
+      (p.api as ReturnType<typeof vi.fn>).mock.calls.filter(
+        ([path]) => path === '/api/identity-review/apply',
+      ),
+    ).toHaveLength(1);
+    expect(
+      (p.api as ReturnType<typeof vi.fn>).mock.calls.filter(
+        ([path]) => path === '/api/stripe/links',
+      ),
+    ).toHaveLength(0);
+    p.unmount();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(rolePolls).toBe(1);
   });
 });

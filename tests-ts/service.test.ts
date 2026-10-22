@@ -1441,6 +1441,12 @@ describe('account migration and subscription safety', () => {
     const bot = new FakeBot();
     bot.username = 'river';
     service.bot = bot;
+    await service.setMembershipAccess({
+      discord_user_id: '123456789',
+      access_mode: 'subscription',
+      tier_id: 'sloop',
+      provision_jellyfin: true,
+    });
     const before = structuredClone(servers.users.jellyfin);
     await service.recordSubscription({
       id: 'unlinked',
@@ -1567,6 +1573,12 @@ describe('account migration and subscription safety', () => {
     bot.active = true;
     bot.members = [{ id: '123456789', username: 'alex' }];
     service.bot = bot;
+    await service.setMembershipAccess({
+      discord_user_id: '123456789',
+      access_mode: 'subscription',
+      tier_id: 'sloop',
+      provision_jellyfin: true,
+    });
     store.saveSettings({
       ...store.settings(),
       discord_role_events: true,
@@ -1922,6 +1934,12 @@ describe('account migration and subscription safety', () => {
     bot.username = 'different.discord';
     service.bot = bot;
     approveMapping('e-sam', 'river', 'j-river', '123456789');
+    await service.setMembershipAccess({
+      discord_user_id: '123456789',
+      access_mode: 'subscription',
+      tier_id: 'sloop',
+      provision_jellyfin: true,
+    });
     await service.recordSubscription({
       id: 'mapped-subscribe',
       action: 'subscribe',

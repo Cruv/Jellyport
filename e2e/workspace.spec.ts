@@ -9,7 +9,6 @@ const pages = [
   'User mappings',
   'Account roles',
   'Memberships',
-  'Subscriptions',
   'Activity',
   'Settings',
 ];

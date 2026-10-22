@@ -22,6 +22,7 @@ interface MembershipReview {
   tier: MembershipTier;
   accessMode: 'subscription' | 'complimentary';
   usernames: string[];
+  provisionJellyfin: boolean;
 }
 const message = (reason: unknown) =>
   reason instanceof Error ? reason.message : 'The membership could not be updated.';
@@ -32,14 +33,18 @@ export default function MembershipsPage({
   api,
   notify,
   created,
+  embedded = false,
+  refreshKey = 0,
 }: {
   settings: Settings;
   api: Api;
   notify: Notify;
   created: (job: Job) => void;
+  embedded?: boolean;
+  refreshKey?: number;
 }) {
   const tiers = settings.membership_tiers || defaultMembershipTiers;
-  const [view, setView] = useRouteTab('memberships');
+  const [view, setView] = useRouteTab('memberships', 'accounts');
   const [query, setQuery] = useState('');
   const [accessFilter, setAccessFilter] = useState('all');
   const [memberships, setMemberships] = useState<Membership[]>([]);
@@ -55,6 +60,10 @@ export default function MembershipsPage({
   const [complimentaryLimit, setComplimentaryLimit] = useWorkspaceDraftState(
     'memberships.complimentaryLimit',
     1,
+  );
+  const [provisionJellyfin, setProvisionJellyfin] = useWorkspaceDraftState(
+    'memberships.provisionJellyfin',
+    false,
   );
   const [tierId, setTierId] = useWorkspaceDraftState('memberships.tierId', tiers[0]?.id || '');
   const [loading, setLoading] = useState(true);
@@ -111,7 +120,7 @@ export default function MembershipsPage({
       loadController.current?.abort();
       controllers.current.forEach((controller) => controller.abort());
     };
-  }, [reload]);
+  }, [reload, refreshKey]);
 
   const filteredMemberships = memberships.filter(
     (item) =>
@@ -151,6 +160,7 @@ export default function MembershipsPage({
     setMember(value);
     setError('');
     const saved = memberships.find((item) => item.discord_user_id === value?.id);
+    setProvisionJellyfin(saved ? saved.provision_jellyfin !== false : false);
     setTierId(saved?.tier_id || tiers[0]?.id || '');
     if (saved) {
       setAccessMode(saved.access_mode || 'subscription');
@@ -159,12 +169,21 @@ export default function MembershipsPage({
   }
   function showReview(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!member || !tier || !loaded || loading || busyRef.current) return;
+    if (
+      !member ||
+      !tier ||
+      !loaded ||
+      loading ||
+      busyRef.current ||
+      (!provisionJellyfin && !existing?.links.length)
+    )
+      return;
     setError('');
-    setReview({ member, existing, tier: { ...tier }, accessMode, usernames });
+    setReview({ member, existing, tier: { ...tier }, accessMode, usernames, provisionJellyfin });
   }
   async function provision() {
-    if (!review || busyRef.current) return;
+    if (!review || (!review.provisionJellyfin && !review.existing?.links.length) || busyRef.current)
+      return;
     busyRef.current = true;
     setBusy(true);
     setError('');
@@ -181,6 +200,7 @@ export default function MembershipsPage({
           body: {
             discord_user_id: review.member.id,
             access_mode: review.accessMode,
+            provision_jellyfin: review.provisionJellyfin,
             ...(review.accessMode === 'complimentary'
               ? { account_limit: review.tier.account_limit }
               : { tier_id: review.tier.id }),
@@ -205,7 +225,13 @@ export default function MembershipsPage({
           discord_user_id: review.member.id,
           tier_id: review.tier.id,
           expected_account_limit: review.tier.account_limit,
-          expected_usernames: review.usernames,
+          expected_usernames: review.provisionJellyfin
+            ? review.usernames
+            : [...(review.existing?.links || [])]
+                .filter((link) => link.membership_slot <= review.tier.account_limit)
+                .sort((left, right) => left.membership_slot - right.membership_slot)
+                .map((link) => link.username),
+          provision_jellyfin: review.provisionJellyfin,
           ...(current?.revision ? { expected_revision: current.revision } : {}),
         },
         signal: controller.signal,
@@ -240,6 +266,7 @@ export default function MembershipsPage({
         body: {
           discord_user_id: member.id,
           access_mode: accessMode,
+          provision_jellyfin: provisionJellyfin,
           ...(accessMode === 'complimentary'
             ? { account_limit: tier.account_limit }
             : { tier_id: tier.id }),
@@ -264,20 +291,22 @@ export default function MembershipsPage({
 
   return (
     <>
-      <Heading
-        title="Memberships"
-        description="Manage paid and complimentary access, account allowances, and each Discord owner’s linked accounts."
-        actions={
-          <button
-            className="btn btn-quiet"
-            aria-busy={loading}
-            onClick={() => void reload(true)}
-            disabled={busy || loading}
-          >
-            <Icon name="refresh" /> Refresh
-          </button>
-        }
-      />
+      {!embedded && (
+        <Heading
+          title="Memberships"
+          description="Manage paid and complimentary access, account allowances, and each Discord owner’s linked accounts."
+          actions={
+            <button
+              className="btn btn-quiet"
+              aria-busy={loading}
+              onClick={() => void reload(true)}
+              disabled={busy || loading}
+            >
+              <Icon name="refresh" /> Refresh
+            </button>
+          }
+        />
+      )}
 
       {error && !review && (
         <div className="error-block" role="alert">
@@ -285,6 +314,18 @@ export default function MembershipsPage({
         </div>
       )}
       <div className="page-stack">
+        {embedded && (
+          <div className="form-actions">
+            <button
+              className="btn btn-quiet"
+              aria-busy={loading}
+              onClick={() => void reload(true)}
+              disabled={busy || loading}
+            >
+              <Icon name="refresh" /> Refresh access
+            </button>
+          </div>
+        )}
         <Tabs
           id="membership-views"
           label="Membership tasks"
@@ -311,6 +352,7 @@ export default function MembershipsPage({
                   setAccessMode('subscription');
                   setTierId(tiers[0]?.id || '');
                   setComplimentaryLimit(1);
+                  setProvisionJellyfin(false);
                   setView('editor');
                 }}
               >
@@ -403,7 +445,7 @@ export default function MembershipsPage({
                     ? 'No matching memberships'
                     : 'Give each member their account allowance.'
                 }
-                text="Add a Discord member to create or migrate the accounts included in their tier."
+                text="Add a Discord member to manage access. Jellyfin accounts are optional and require a separate review."
               />
             )}
             <Pagination
@@ -420,7 +462,7 @@ export default function MembershipsPage({
           <section className="panel task-panel">
             <div className="panel-header">
               <div>
-                <h2>Manage a member’s accounts</h2>
+                <h2>Manage a member’s access</h2>
                 <p>Select the owner and review their account allowance.</p>
               </div>
               <span className="server-icon discord">
@@ -512,7 +554,23 @@ export default function MembershipsPage({
                     </div>
                   )}
                 </div>
-                {member && tier && (
+                <label className="check-card">
+                  <input
+                    type="checkbox"
+                    aria-label="Enable Jellyfin account provisioning"
+                    checked={provisionJellyfin}
+                    disabled={busy || loading}
+                    onChange={(event) => setProvisionJellyfin(event.target.checked)}
+                  />
+                  <span>
+                    <strong>Enable Jellyfin account provisioning</strong>
+                    <small>
+                      Optional. Leave off for Emby-only and non-media members. Saving access never
+                      creates accounts or migrates history.
+                    </small>
+                  </span>
+                </label>
+                {member && tier && provisionJellyfin && (
                   <div className="support-note">
                     <strong>
                       {existing ? 'Saved account names are preserved.' : 'Expected account names'}
@@ -536,7 +594,14 @@ export default function MembershipsPage({
                   <button
                     className="btn btn-primary"
                     type="submit"
-                    disabled={!member || !tier || !loaded || loading || busy}
+                    disabled={
+                      !member ||
+                      !tier ||
+                      !loaded ||
+                      loading ||
+                      busy ||
+                      (!provisionJellyfin && !existing?.links.length)
+                    }
                   >
                     <Icon name="check" /> Review membership update
                   </button>
@@ -547,7 +612,8 @@ export default function MembershipsPage({
                 <p>
                   Save access policy changes how membership events are handled without changing
                   media accounts. Review membership update checks account slots before queuing
-                  creation, migration, or access changes.
+                  access changes to existing linked accounts. Creating missing accounts or migrating
+                  history requires Jellyfin provisioning to be enabled.
                 </p>
                 <p>
                   New accounts receive the default role and separate passwords delivered privately
@@ -588,7 +654,11 @@ export default function MembershipsPage({
             </>
           }
         >
-          <p>Ensure these account slots are available to this member:</p>
+          <p>
+            {review.provisionJellyfin
+              ? 'Ensure these account slots are available to this member:'
+              : 'Update existing linked Jellyfin accounts only. Missing slots will not create or migrate accounts:'}
+          </p>
           {review.existing?.active === false && (
             <p>This update marks the membership active again and restores eligible accounts.</p>
           )}
@@ -603,7 +673,9 @@ export default function MembershipsPage({
                     ? link.disabled_by_jellyport
                       ? 'Re-enable the preserved account if Jellyport disabled it'
                       : 'Preserve the linked account and its data'
-                    : 'Migrate a matching Emby account or create a fresh account'}
+                    : review.provisionJellyfin
+                      ? 'Migrate a matching Emby account or create a fresh account'
+                      : 'Not provisioned · Jellyfin opt-in is off'}
                 </li>
               );
             })}

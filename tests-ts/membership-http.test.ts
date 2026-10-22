@@ -520,6 +520,7 @@ describe('administrator membership HTTP endpoints', () => {
         'base_username',
         'tier_id',
         'access_mode',
+        'provision_jellyfin',
         'account_limit',
         'active',
         'server_url',

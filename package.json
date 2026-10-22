@@ -1,6 +1,6 @@
 {
   "name": "jellyport",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "private": true,
   "type": "module",
   "description": "Self-hosted Emby to Jellyfin migration and Discord account management",
@@ -26,7 +26,7 @@
     "@fastify/static": "10.1.5",
     "discord.js": "14.27.0",
     "dotenv": "18.0.6",
-    "fastify": "5.12.5",
+    "fastify": "5.12.7",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "stream-json": "3.7.0",

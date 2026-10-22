@@ -172,6 +172,8 @@ beforeEach(() => {
     '/api/settings': settings,
     '/api/users': { emby: [], jellyfin: [] },
     '/api/user-mappings': { mappings: [] },
+    '/api/memberships': { memberships: [] },
+    '/api/subscriptions': { events: [] },
     '/api/account-roles': { roles: [], assignments: [] },
     '/api/jobs/retention': {
       retention_days: 0,
@@ -841,8 +843,9 @@ describe('React account safeguards', () => {
     responses['/api/subscriptions/processing-event/apply'] = { ...event, status: 'processing' };
     render(<App />);
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
-    fireEvent.click(screen.getByRole('button', { name: 'Subscriptions' }));
-    await screen.findByRole('heading', { name: 'Subscriptions', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Memberships' }));
+    await screen.findByRole('heading', { name: 'Memberships', level: 1 });
+    fireEvent.click(screen.getByRole('tab', { name: /^Events/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Review' }));
     const dialog = await screen.findByRole('dialog');
     fireEvent.click(within(dialog).getByRole('button', { name: /Apply/ }));
@@ -989,7 +992,7 @@ describe('React account safeguards', () => {
     ['roles', 'Account roles'],
     ['accounts', 'Create account'],
     ['memberships', 'Memberships'],
-    ['subscriptions', 'Subscriptions'],
+    ['subscriptions', 'Memberships'],
     ['activity', 'Activity'],
     ['settings', 'Settings'],
   ])(
@@ -1002,7 +1005,11 @@ describe('React account safeguards', () => {
       const view = render(<App />);
       await screen.findByRole('heading', { name: title, level: 1 });
       expect(window.location.hash).toBe(
-        target === 'settings' ? '#/settings/media/emby' : `#/${target}`,
+        target === 'settings'
+          ? '#/settings/media/emby'
+          : target === 'subscriptions'
+            ? '#/memberships/events/review'
+            : `#/${target}`,
       );
       view.unmount();
       render(<App />);
@@ -1379,6 +1386,7 @@ describe('React account safeguards', () => {
     responses['/api/logout'] = { ...session, authenticated: false, user: undefined };
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Memberships' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Accounts & access' }));
     await screen.findByText('private-family-account');
     fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
     await screen.findByLabelText('Jellyfin username');
@@ -1738,8 +1746,9 @@ describe('React account safeguards', () => {
     responses['/api/subscriptions/event-1/apply'] = { ...event, status: 'applied' };
     render(<App />);
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
-    fireEvent.click(screen.getByRole('button', { name: 'Subscriptions' }));
-    await screen.findByRole('heading', { name: 'Subscriptions', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Memberships' }));
+    await screen.findByRole('heading', { name: 'Memberships', level: 1 });
+    fireEvent.click(screen.getByRole('tab', { name: /^Events/ }));
     fireEvent.click(screen.getByRole('button', { name: 'Review' }));
     const dialog = await screen.findByRole('dialog');
     expect(

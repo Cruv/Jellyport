@@ -111,13 +111,16 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
                   quantity: 1,
                 },
               ],
-              identity_candidates: [
-                {
-                  discord_user_id: paidOwner,
-                  source: 'subscription_metadata' as const,
-                  field: 'discord_user_id',
-                },
-              ],
+              identity_candidates:
+                index === 0
+                  ? [
+                      {
+                        discord_user_id: paidOwner,
+                        source: 'subscription_metadata' as const,
+                        field: 'discord_user_id',
+                      },
+                    ]
+                  : [],
             })),
           }),
           checkoutIdentityCandidates: async () => [],
@@ -210,6 +213,11 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
         sendCredentials: async () => {},
         membershipActive: async () => true,
         activeMembers: async () => members,
+        listIdentityMembers: async () => ({
+          members: members.map((member) => ({ ...member, roles: [] })),
+          complete: true,
+          fetched_at: new Date().toISOString(),
+        }),
         searchMembers: async (query) => ({
           members: members
             .filter((member) => member.username.includes(query.toLowerCase()))

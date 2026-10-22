@@ -22,6 +22,8 @@ import { CloneReviews, type CloneAccountsInput } from './account-cloning.js';
 import type { MigrationScope } from './migration.js';
 import { BotManager, BotError } from './bot.js';
 import { UserOrganization } from './user-organization.js';
+import { IdentityReview } from './identity-review.js';
+import { registerIdentityReviewRoutes } from './identity-review-routes.js';
 import { DemoServers } from './demo.js';
 import { ServiceError, MediaError } from './errors.js';
 import { DEMO_SETTINGS } from './types.js';
@@ -90,7 +92,13 @@ export interface CreateAppOptions {
   stripeClientFactory?: StripeIntegrationOptions['clientFactory'];
 }
 export type JellyportApp = FastifyInstance & {
-  jellyport: { store: Store; service: Service; bot: BotManager; stripe: StripeIntegration };
+  jellyport: {
+    store: Store;
+    service: Service;
+    bot: BotManager;
+    stripe: StripeIntegration;
+    identities: IdentityReview;
+  };
 };
 
 const equal = (left: string, right: string): boolean => {
@@ -194,6 +202,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     },
   });
   bot.onIdentityHint = (hint) => stripe.recordDiscordHint(hint);
+  const organization = new UserOrganization(service);
+  const identities = new IdentityReview(service, stripe, organization);
   const app = Fastify({
     logger: false,
     bodyLimit: 65536,
@@ -205,7 +215,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     ajv: { customOptions: { coerceTypes: false, removeAdditional: false, useDefaults: false } },
   }) as unknown as JellyportApp;
   app.server.headersTimeout = 15_000;
-  app.decorate('jellyport', { store, service, bot, stripe });
+  app.decorate('jellyport', { store, service, bot, stripe, identities });
   const sessions = new Map<string, Session>();
   const anonymousSessions = new Map<string, Session>();
   const authenticatedSessions = new Map<string, Session>();
@@ -1359,7 +1369,6 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   });
   app.get('/api/subscriptions', async () => ({ events: store.subscriptions() }));
   app.get('/api/memberships', async () => ({ memberships: service.listMemberships() }));
-  const organization = new UserOrganization(service);
   app.post<{ Body: Parameters<Service['saveAccountProfile']>[0] }>(
     '/api/account-profiles',
     {
@@ -1460,6 +1469,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           properties: {
             discord_user_id: { type: 'string', pattern: '^[0-9]{5,22}$' },
             access_mode: { type: 'string', enum: ['subscription', 'complimentary'] },
+            provision_jellyfin: { type: 'boolean' },
             account_limit: { type: 'integer', minimum: 1, maximum: 3 },
             tier_id: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' },
             expected_revision: id,
@@ -1476,6 +1486,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       expected_revision?: string;
       expected_account_limit?: number;
       expected_usernames?: string[];
+      provision_jellyfin?: boolean;
     };
   }>(
     '/api/memberships/provision',
@@ -1490,9 +1501,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             tier_id: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' },
             expected_revision: id,
             expected_account_limit: { type: 'integer', minimum: 1, maximum: 3 },
+            provision_jellyfin: { type: 'boolean' },
             expected_usernames: {
               type: 'array',
-              minItems: 1,
+              minItems: 0,
               maxItems: 3,
               items: { type: 'string', minLength: 1, maxLength: 64 },
             },
@@ -1506,6 +1518,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         throw new ServiceError(
           'Review both the account allowance and account names before applying.',
         );
+      if (input.provision_jellyfin !== undefined && input.expected_account_limit === undefined)
+        throw new ServiceError(
+          'Review the account allowance and names before changing Jellyfin provisioning.',
+        );
       return reply.code(202).send(
         await service.provisionMembership(
           input.discord_user_id,
@@ -1516,6 +1532,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             : {
                 account_limit: input.expected_account_limit,
                 usernames: input.expected_usernames!,
+                provision_jellyfin: input.provision_jellyfin,
               },
         ),
       );
@@ -1533,6 +1550,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   registerDiscordMemberRoutes(app);
   registerAccountRoleRoutes(app);
   registerStripeRoutes(app, stripe, demo);
+  registerIdentityReviewRoutes(app, identities, (request) => {
+    const original = session(request);
+    return () => {
+      if (!original?.authenticated || session(request) !== original)
+        throw new JellyfinAuthError('Sign in again before approving identity links.', 401);
+    };
+  });
   app.post<{
     Body: {
       role_id: string;
@@ -1630,7 +1654,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     clearInterval(stripePolling);
     previews.close();
     cloneReviews.close();
-    await Promise.all([stripe.stop(), bot.stop(), service.stop()]);
+    const identitiesClosed = identities.close();
+    await Promise.all([stripe.stop(), bot.stop(), service.stop(), identitiesClosed]);
     await upkeep;
     await Promise.all([...sessions.values()].map((value) => revoke(value)));
     sessions.clear();
@@ -1644,6 +1669,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   try {
     if (!demo && store.authState()?.kind === 'configured') await bot.restart(store.settings());
     if (demo || store.authState()?.kind === 'configured') await service.start();
+    if (!demo && store.authState()?.kind === 'configured')
+      void identities.roleSync.start().catch(() => {});
     await app.ready();
     return app;
   } catch (error) {

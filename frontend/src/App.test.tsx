@@ -1733,6 +1733,49 @@ describe('React account safeguards', () => {
       vi.useRealTimers();
     }
   });
+  it('reviews subscription entitlement without promising a mandatory Jellyfin account', async () => {
+    const event = {
+      id: 'entitlement-only-event',
+      username: 'synthetic-emby-owner',
+      discord_user_id: '123456789012345678',
+      action: 'subscribe',
+      status: 'pending',
+      source: 'mee6_message',
+      detail: 'Sloop Crewman Plan',
+      account_limit: 1,
+      created_at: '2026-10-22T12:00:00Z',
+    };
+    responses['/api/subscriptions'] = { events: [event] };
+    responses['/api/subscriptions/entitlement-only-event/apply'] = { ...event, status: 'applied' };
+    window.history.replaceState(null, '', '#/memberships/events/review');
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: /^Review$/ }));
+    const dialog = await screen.findByRole('dialog', { name: 'Process subscription' });
+    expect(within(dialog).getByText('Apply this member’s subscription allowance.')).toBeTruthy();
+    expect(
+      within(dialog).getByText(/Emby-only and Discord-only members do not need a Jellyfin account/),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /Jellyfin accounts are created or migrated only when the member has enabled Jellyfin provisioning/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /Manually flagged Family accounts and complimentary memberships remain protected/,
+      ),
+    ).toBeTruthy();
+    expect(within(dialog).queryByText('Provision this member’s Jellyfin accounts.')).toBeNull();
+    expect(requests.some((request) => request.options?.method === 'POST')).toBe(false);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Apply subscription' }));
+    await screen.findByText('Subscription event applied.');
+    expect(
+      requests
+        .filter((request) => request.options?.method === 'POST')
+        .map((request) => request.path),
+    ).toEqual(['/api/subscriptions/entitlement-only-event/apply']);
+  });
+
   it('states that manual cancellation approval disables access immediately before sending the request', async () => {
     const event = {
       id: 'event-1',
@@ -1753,7 +1796,17 @@ describe('React account safeguards', () => {
     const dialog = await screen.findByRole('dialog');
     expect(
       within(dialog).getByText(
-        /Approving this event manually disables all linked account slots immediately/,
+        /Approving this event manually disables eligible linked Jellyfin account slots immediately/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /Manually flagged Family accounts and complimentary memberships are spared/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /When no Jellyfin accounts are linked.*without creating or requiring an account/,
       ),
     ).toBeTruthy();
     expect(requests.some((request) => request.path.endsWith('/apply'))).toBe(false);

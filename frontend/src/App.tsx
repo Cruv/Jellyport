@@ -2300,13 +2300,39 @@ function DialogContent({
         warning={!subscribe}
         title={
           subscribe
-            ? 'Provision this member’s Jellyfin accounts.'
-            : 'Disable all linked Jellyfin accounts now.'
+            ? 'Apply this member’s subscription allowance.'
+            : 'Update this member’s access now.'
         }
       >
-        {subscribe
-          ? 'Jellyport uses the member’s subscription tier to provision account slots, preserves linked usernames, and disables extras after a downgrade. Accounts and their data are kept for future upgrades.'
-          : 'Approving this event manually disables all linked account slots immediately, even when automatic disabling is off. Accounts, passwords, and watch history are preserved.'}
+        {subscribe ? (
+          <>
+            <p>
+              Jellyport records the member’s subscription tier and account allowance. Emby-only and
+              Discord-only members do not need a Jellyfin account.
+            </p>
+            <p>
+              Jellyfin accounts are created or migrated only when the member has enabled Jellyfin
+              provisioning. Existing linked accounts follow the allowance; eligible extra accounts
+              are disabled after a downgrade with their data preserved.
+            </p>
+            <p>Manually flagged Family accounts and complimentary memberships remain protected.</p>
+          </>
+        ) : (
+          <>
+            <p>
+              Approving this event manually disables eligible linked Jellyfin account slots
+              immediately, even when automatic disabling is off.
+            </p>
+            <p>
+              Manually flagged Family accounts and complimentary memberships are spared. Accounts,
+              passwords, and watch history are preserved.
+            </p>
+            <p>
+              When no Jellyfin accounts are linked, Jellyport updates the membership status without
+              creating or requiring an account.
+            </p>
+          </>
+        )}
       </Callout>
       {subscribe && event.source === 'mee6_message' && event.detail && (
         <p className="muted text-small">

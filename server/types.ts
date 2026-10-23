@@ -33,6 +33,8 @@ export interface Settings {
   discord_message_events: boolean;
   discord_role_events: boolean;
   auto_provision: boolean;
+  /** Future verified subscribers only; existing membership choices stay unchanged. */
+  auto_create_new_subscribers?: boolean;
   auto_disable: boolean;
   disable_on_cancel: boolean;
   membership_tiers?: MembershipTier[];
@@ -64,6 +66,7 @@ export const DEFAULT_SETTINGS: Settings = {
   discord_message_events: false,
   discord_role_events: false,
   auto_provision: false,
+  auto_create_new_subscribers: false,
   auto_disable: false,
   disable_on_cancel: false,
   membership_tiers: structuredClone(DEFAULT_MEMBERSHIP_TIERS),

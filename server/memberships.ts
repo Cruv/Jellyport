@@ -25,6 +25,9 @@ export interface MembershipInput {
   access_mode?: MembershipAccessMode;
   /** Legacy decisions default to true. New reviewed members explicitly opt in. */
   provision_jellyfin?: boolean;
+  /** Server-only enrollment guard. Only explicit admin opt-in or verified
+   * completion may clear it; a report deletion/restart supplies no authority. */
+  new_subscriber_pending?: true;
   active?: boolean;
   inactive_reason?: 'cancel' | 'expire';
 }
@@ -117,6 +120,7 @@ function validateInput(value: MembershipInput): void {
       !['subscription', 'complimentary'].includes(value.access_mode)) ||
     (value.active !== undefined && typeof value.active !== 'boolean') ||
     (value.provision_jellyfin !== undefined && typeof value.provision_jellyfin !== 'boolean') ||
+    (value.new_subscriber_pending !== undefined && value.new_subscriber_pending !== true) ||
     (value.inactive_reason !== undefined && !['cancel', 'expire'].includes(value.inactive_reason))
   )
     throw new ServiceError('The membership contains invalid identity fields.');
@@ -163,6 +167,7 @@ export class Memberships {
       account_limit: value.account_limit,
       access_mode: value.access_mode ?? 'subscription',
       provision_jellyfin: value.provision_jellyfin ?? true,
+      ...(value.new_subscriber_pending ? { new_subscriber_pending: true as const } : {}),
       active: value.active ?? true,
       ...(value.active === false && value.inactive_reason
         ? { inactive_reason: value.inactive_reason }
@@ -206,6 +211,42 @@ export class Memberships {
       (member) => member.discord_user_id === discordId && (!server || !sameScope(member, server)),
     );
   }
+  /** Revoke only the exact automatic enrollment that a failed job created.
+   * Configuration may have changed while its upstream request was pending; do
+   * not resolve current pairing state or rewrite a different/newer decision. */
+  holdProvisioning(original: Membership): boolean {
+    return this.finishEnrollment(original, false);
+  }
+  completeProvisioning(original: Membership): boolean {
+    return this.finishEnrollment(original, true);
+  }
+  private finishEnrollment(original: Membership, successful: boolean): boolean {
+    const id = recordId(original);
+    const expected = this.record(id, original);
+    if (!expected.new_subscriber_pending) return false;
+    this.store.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.store.db.prepare('SELECT encrypted FROM memberships WHERE id=?').get(id);
+      const current = row
+        ? this.record(id, this.store.decrypt<Membership>(row.encrypted as Uint8Array))
+        : null;
+      if (!current || current.revision !== expected.revision || !current.new_subscriber_pending) {
+        this.store.db.exec('COMMIT');
+        return false;
+      }
+      const { new_subscriber_pending: _pending, ...settled } = current;
+      this.store.saveMembershipRecord(id, {
+        ...settled,
+        provision_jellyfin: successful && current.provision_jellyfin,
+        revision: randomUUID(),
+      });
+      this.store.db.exec('COMMIT');
+      return true;
+    } catch (error) {
+      this.store.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
   save(input: MembershipInput, settings: Settings, expectedRevision?: string): Membership {
     validateInput(input);
     const server = scope(this.store, settings);
@@ -226,6 +267,7 @@ export class Memberships {
         existing.account_limit === input.account_limit &&
         existing.access_mode === (input.access_mode ?? 'subscription') &&
         existing.provision_jellyfin === (input.provision_jellyfin ?? true) &&
+        existing.new_subscriber_pending === input.new_subscriber_pending &&
         existing.active === (input.active ?? true) &&
         existing.inactive_reason === (input.active === false ? input.inactive_reason : undefined)
       ) {
@@ -239,6 +281,7 @@ export class Memberships {
         account_limit: input.account_limit,
         access_mode: input.access_mode ?? 'subscription',
         provision_jellyfin: input.provision_jellyfin ?? true,
+        ...(input.new_subscriber_pending ? { new_subscriber_pending: true as const } : {}),
         active: input.active ?? true,
         ...(input.active === false && input.inactive_reason
           ? { inactive_reason: input.inactive_reason }

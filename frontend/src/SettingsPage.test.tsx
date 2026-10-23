@@ -823,6 +823,80 @@ describe('New account password and message settings', () => {
 });
 
 describe('Settings draft and submission safeguards', () => {
+  it('defaults the new-subscriber policy off and explains the automatic provisioning prerequisite', () => {
+    window.history.replaceState(null, '', '#/settings/automation/rules');
+    const p = page();
+    expect(
+      screen.getByRole('checkbox', { name: 'Create Jellyfin accounts for new subscribers' }),
+    ).toHaveProperty('checked', false);
+    expect(screen.getByRole('status').textContent).toContain('Automatic provisioning is paused.');
+    expect(
+      screen.getByText(
+        /Existing Discord members, Emby users, and membership provisioning choices stay opt-in/,
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/never creates Emby access or enrolls existing subscribers/),
+    ).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole('checkbox', { name: 'Automatically provision subscribed members' }),
+    );
+    expect(screen.getByRole('status').textContent).toContain('Automatic provisioning is enabled.');
+    expect(
+      screen.getByRole('checkbox', { name: 'Create Jellyfin accounts for new subscribers' }),
+    ).toHaveProperty('checked', false);
+    expect(p.requests.filter((request) => request.options?.method)).toEqual([]);
+  });
+
+  it('saves the new-subscriber policy independently without silently enabling automatic provisioning', async () => {
+    window.history.replaceState(null, '', '#/settings/automation/rules');
+    const p = page();
+    fireEvent.click(
+      screen.getByRole('checkbox', { name: 'Create Jellyfin accounts for new subscribers' }),
+    );
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(
+      p.requests.find((request) => request.path === '/api/settings')?.options?.body,
+    ).toMatchObject({
+      auto_create_new_subscribers: true,
+      auto_provision: false,
+    });
+  });
+
+  it('retains an edited new-subscriber policy and its prerequisite across tabs and settings refreshes', async () => {
+    window.history.replaceState(null, '', '#/settings/automation/rules');
+    const p = page();
+    for (const name of [
+      'Automatically provision subscribed members',
+      'Create Jellyfin accounts for new subscribers',
+    ]) {
+      fireEvent.click(screen.getByRole('checkbox', { name }));
+    }
+    settingsTab('Servers');
+    p.rerender(
+      <SettingsPage
+        {...p.props}
+        settings={{ ...oldSettings, auto_create_new_subscribers: false }}
+      />,
+    );
+    settingsTab('Automation');
+    for (const name of [
+      'Automatically provision subscribed members',
+      'Create Jellyfin accounts for new subscribers',
+    ]) {
+      expect(screen.getByRole('checkbox', { name })).toHaveProperty('checked', true);
+    }
+    expect(screen.getByRole('status').textContent).toContain('Automatic provisioning is enabled.');
+    expect(p.requests.filter((request) => request.options?.method)).toEqual([]);
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(
+      p.requests.find((request) => request.path === '/api/settings')?.options?.body,
+    ).toMatchObject({ auto_create_new_subscribers: true, auto_provision: true });
+  });
+
   it('keeps Stripe credentials outside the general settings form and preserves its route', async () => {
     const stripe = {
       configured: false,

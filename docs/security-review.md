@@ -98,6 +98,30 @@ behavior review, not a production penetration test or a guarantee against all
 vulnerabilities. Stripe observations still do not prove invoice payment or
 authorize billing enforcement.
 
+## Future subscriber onboarding — 0.28.0
+
+The optional new-subscriber policy is disabled by default and requires the
+separate automatic-provisioning switch and a trusted, exact-tier MEE6 signup.
+Its private activation generation is encrypted and saved atomically with
+settings, scoped to the configured guild and media-server identities. Clients
+cannot supply or backdate the cutoff. Restarts preserve it; disabling or changing
+scope invalidates queued automatic authority.
+
+Only fresh announcements for human members who joined the guild after activation
+can establish automatic Jellyfin provisioning. Existing membership opt-outs,
+legacy account links, approved ownership, mappings and matching Emby account
+names cannot be converted into automatic history migrations. Identity failures
+remain for administrator review. Generic role events, reconciliation, Stripe
+observations and old messages cannot authorize first-time creation. Existing
+ownership, current-recipient, server-binding, job-revision and uncertain-creation
+protections remain in effect; new credentials use the ordinary private delivery
+and expiring administrator recovery path. An encrypted pending-enrollment guard
+survives process failure, report deletion and changes to the active configuration;
+only verified completion or an explicit administrator decision clears it. Failure
+holds update the exact original membership revision without overwriting newer
+decisions or another server's record. Verification uses synthetic adapters
+and local demo pages rather than real signups or live media accounts.
+
 ## Stripe billing observations — 0.26.0
 
 The Stripe connector uses restricted keys and GET requests to a fixed HTTPS

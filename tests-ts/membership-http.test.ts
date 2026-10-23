@@ -124,6 +124,67 @@ afterEach(async () => {
 });
 
 describe('administrator membership HTTP endpoints', () => {
+  it('saves the new-subscriber switch only with current admin, CSRF and origin authority and keeps its cutoff private', async () => {
+    const { app, headers, revoke } = await fixture();
+    const { store, service, bot } = app.jellyport;
+    vi.spyOn(bot, 'restart').mockResolvedValue(undefined);
+    const payload = {
+      discord_enabled: true,
+      discord_guild_id: '123456789',
+      discord_bot_token: 'synthetic-onboarding-bot-key',
+      discord_message_events: true,
+      discord_subscription_channel_id: '234567890',
+      discord_subscription_bot_id: '345678901',
+      auto_provision: true,
+      auto_create_new_subscribers: true,
+    };
+    for (const rejected of [
+      { headers: {}, status: 401 },
+      { headers: { cookie: headers.cookie }, status: 403 },
+      { headers: { ...headers, origin: 'https://untrusted.example' }, status: 403 },
+    ]) {
+      const response = await app.inject({
+        method: 'PUT',
+        url: '/api/settings',
+        payload,
+        headers: rejected.headers,
+      });
+      expect(response.statusCode).toBe(rejected.status);
+      expect(service.newSubscriberPolicy.activation(store.settings())).toBeNull();
+    }
+    const backdated = await app.inject({
+      method: 'PUT',
+      url: '/api/settings',
+      headers,
+      payload: { ...payload, new_subscriber_enabled_at: '2000-01-01T00:00:00.000Z' },
+    });
+    expect(backdated.statusCode).toBe(400);
+    expect(service.newSubscriberPolicy.activation(store.settings())).toBeNull();
+    const saved = await app.inject({ method: 'PUT', url: '/api/settings', headers, payload });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.headers['cache-control']).toBe('no-store');
+    expect(saved.json()).toMatchObject({ auto_create_new_subscribers: true });
+    const activation = service.newSubscriberPolicy.activation(store.settings())!;
+    expect(Number.isFinite(Date.parse(activation.enabled_at))).toBe(true);
+    const publicRead = await app.inject({ url: '/api/settings', headers });
+    for (const response of [saved, publicRead]) {
+      expect(response.body).not.toContain(activation.revision);
+      expect(response.body).not.toContain('enabled_at');
+      expect(response.body).not.toContain(payload.discord_bot_token);
+    }
+    expect(store.jobs()).toEqual([]);
+    expect(store.links()).toEqual([]);
+    revoke();
+    const denied = await app.inject({
+      method: 'PUT',
+      url: '/api/settings',
+      headers,
+      payload: { auto_create_new_subscribers: false },
+    });
+    expect(denied.statusCode).toBe(401);
+    expect(service.newSubscriberPolicy.activation(store.settings())).toEqual(activation);
+  });
+
   it('shows private alert status only to admins and rejects a stale recipient stop review', async () => {
     const { app, headers } = await fixture();
     const { store, service } = app.jellyport;

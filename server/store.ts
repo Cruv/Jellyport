@@ -8,6 +8,7 @@ import { nameKey } from './identity.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { DEFAULT_SETTINGS, DEMO_SETTINGS, type Settings } from './types.js';
 import { jobRetentionTimestamp, type JobRetentionCursor } from './job-retention.js';
+import { NewSubscriberPolicy } from './new-subscriber-policy.js';
 import type {
   Job,
   JobRequest,
@@ -116,6 +117,7 @@ export class Store {
       PRAGMA journal_mode=WAL;
       PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS new_subscriber_policy (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS auth_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS job_retention (job_id TEXT PRIMARY KEY,age_ms REAL);
@@ -183,6 +185,7 @@ export class Store {
       UNION ALL SELECT 1 FROM stripe_integration_state
       UNION ALL SELECT 1 FROM media_ownership UNION ALL SELECT 1 FROM identity_review_exceptions
       UNION ALL SELECT 1 FROM identity_role_sync_tasks
+      UNION ALL SELECT 1 FROM new_subscriber_policy
       UNION ALL SELECT 1 FROM job_retention_config UNION ALL SELECT 1 FROM job_retention LIMIT 1`,
         )
         .get();
@@ -256,7 +259,16 @@ export class Store {
     };
   }
   saveSettings(settings: Settings): void {
-    this.db.prepare('INSERT OR REPLACE INTO settings VALUES (1,?)').run(this.encrypt(settings));
+    const previous = this.settings();
+    this.db.exec('SAVEPOINT new_subscriber_settings');
+    try {
+      this.db.prepare('INSERT OR REPLACE INTO settings VALUES (1,?)').run(this.encrypt(settings));
+      new NewSubscriberPolicy(this).capture(previous, settings);
+      this.db.exec('RELEASE new_subscriber_settings');
+    } catch (error) {
+      this.db.exec('ROLLBACK TO new_subscriber_settings; RELEASE new_subscriber_settings');
+      throw error;
+    }
   }
   adminAlertConfig<T>(): T | null {
     const row = this.db.prepare('SELECT encrypted FROM admin_alert_config WHERE id=1').get();

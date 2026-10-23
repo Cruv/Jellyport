@@ -49,7 +49,7 @@ export interface BotService {
 }
 
 type Settings = Partial<AppSettings>;
-type Identity = { id: string; username: string };
+type Identity = { id: string; username: string; joined_at?: string };
 type Authorization = { administrator: boolean; roleIds: Iterable<unknown>; adminRoleId?: unknown };
 type Eligibility = { bot: boolean; roleIds: Iterable<unknown>; memberRoleId?: unknown };
 
@@ -646,7 +646,11 @@ export class BotManager {
       throw new BotError(
         'The recipient must be a human server member with the configured membership role.',
       );
-    return { id: member.id, username: member.user.username };
+    return {
+      id: member.id,
+      username: member.user.username,
+      ...(member.joinedAt ? { joined_at: member.joinedAt.toISOString() } : {}),
+    };
   }
 
   async resolveUsername(userId: string): Promise<string> {

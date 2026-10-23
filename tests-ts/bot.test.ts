@@ -423,6 +423,32 @@ describe('Discord authorization and identity', () => {
     );
   });
 
+  it.each([undefined, new Date('2026-10-22T20:00:00.000Z')])(
+    'returns only a fresh verified guild join date when available: %s',
+    async (joinedAt) => {
+      const { manager, recipient, guild } = await fixture();
+      Object.assign(recipient, {
+        joinedAt,
+        username: 'unverified-caller-label',
+        displayName: 'Friendly display name',
+        nickname: 'Friendly server alias',
+      });
+      Object.assign(recipient.user, { createdAt: new Date('2020-01-01T00:00:00.000Z') });
+      guild.members.fetch.mockClear();
+
+      expect(await manager.recipientIdentity('22')).toEqual({
+        id: '22',
+        username: 'jlogan35',
+        ...(joinedAt ? { joined_at: '2026-10-22T20:00:00.000Z' } : {}),
+      });
+      expect(guild.members.fetch).toHaveBeenCalledExactlyOnceWith({
+        user: '22',
+        force: true,
+        cache: false,
+      });
+    },
+  );
+
   it('preserves large Discord IDs and rejects unsafe number conversions', () => {
     expect(snowflake('18446744073709551615')).toBe('18446744073709551615');
     expect(snowflake('18446744073709551616')).toBeNull();

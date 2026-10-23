@@ -131,6 +131,8 @@ export interface JobRequest {
   new_subscriber_policy_revision?: string;
   new_subscriber_event_id?: string;
   new_subscriber_emitted_at?: string;
+  /** Server-owned authority pin for automatic subscription work after queueing. */
+  automatic_subscription_source?: string;
   access_disabled?: boolean;
 }
 /** Server-owned preview proof. A numbered name is a suggestion until the
@@ -420,6 +422,7 @@ class CanceledError extends StoppedError {}
 class SourcePreparationError extends ServiceError {}
 class DestinationPreparationError extends ServiceError {}
 class NewSubscriberOptInRequired extends ServiceError {}
+class SubscriptionSourceChanged extends ServiceError {}
 interface NewSubscriberGuard {
   stripe_entitlement?: StripeEntitlementFact;
   revision: string;
@@ -1834,6 +1837,8 @@ export class Service {
     );
   }
   private assertMembershipRequest(request: JobRequest, settings: Settings): Membership | null {
+    if (request.automatic_subscription_source !== undefined)
+      this.assertAutomaticSubscriptionSource(request.automatic_subscription_source);
     if (request.stripe_entitlement) {
       this.assertStripeEntitlement(request.stripe_entitlement);
       if (request.discord_user_id !== request.stripe_entitlement.discord_user_id)
@@ -1977,10 +1982,12 @@ export class Service {
     review?: { account_limit: number; usernames: string[]; provision_jellyfin?: boolean },
     newSubscriber?: NewSubscriberGuard,
     stripeEntitlement?: StripeEntitlementFact,
+    automaticSource?: string,
   ): Promise<Job> {
     if (this.demo) throw new ServiceError('Demo memberships are read-only.');
     return this.membershipMutex.run(() =>
       this.mutationMutex.run(async () => {
+        if (automaticSource !== undefined) this.assertAutomaticSubscriptionSource(automaticSource);
         await this.validateRecipients([discordId]);
         const identity = await this.recipientIdentity(discordId);
         if (identity.id && identity.id !== discordId)
@@ -1997,6 +2004,8 @@ export class Service {
             'A previous automatic signup requires an explicit Jellyfin opt-in in Memberships before provisioning can continue.',
           );
         const assertNewPolicy = () => {
+          if (automaticSource !== undefined)
+            this.assertAutomaticSubscriptionSource(automaticSource);
           if (stripeEntitlement) this.assertStripeEntitlement(stripeEntitlement);
           if (!newSubscriber) return;
           this.newSubscriberPolicy.assertActive(settings, newSubscriber.revision);
@@ -2265,6 +2274,9 @@ export class Service {
           'membership',
           requests.map((request) => ({
             ...request,
+            ...(automaticSource !== undefined
+              ? { automatic_subscription_source: automaticSource }
+              : {}),
             ...(stripeEntitlement
               ? { stripe_entitlement: structuredClone(stripeEntitlement) }
               : {}),
@@ -4920,6 +4932,12 @@ export class Service {
       );
     this.verifyStripeEntitlement(fact);
   }
+  private assertAutomaticSubscriptionSource(source: string | null | undefined): void {
+    if (this.store.settings().new_subscriber_source === 'stripe' && source !== 'stripe')
+      throw new SubscriptionSourceChanged(
+        'Stripe is the selected membership authority. Review this non-Stripe event explicitly; no further automatic account changes are authorized.',
+      );
+  }
   async recordStripeEntitlement(fact: StripeEntitlementFact): Promise<void> {
     this.assertStripeEntitlement(fact);
     const event = await this.recordSubscription({
@@ -5071,6 +5089,23 @@ export class Service {
       const event = this.store.subscription(id);
       if (!event) throw new ServiceError('Subscription event not found.');
       if (['applied', 'ignored', 'processing'].includes(event.status)) return event;
+      const assertSource = () => {
+        if (automatic) this.assertAutomaticSubscriptionSource(event.source);
+      };
+      const holdForSourceReview = () => {
+        event.status = 'pending';
+        event.error = null;
+        event.result =
+          'Stripe is the selected membership authority. This non-Stripe event requires explicit administrator review. Any completed account work is preserved; no further automatic changes were made.';
+        this.store.saveSubscription(event);
+        return event;
+      };
+      try {
+        assertSource();
+      } catch (error) {
+        if (error instanceof SubscriptionSourceChanged) return holdForSourceReview();
+        throw error;
+      }
       if (event.source === 'stripe') {
         if (!event.stripe_entitlement)
           throw new ServiceError('Verified Stripe entitlement evidence is required.');
@@ -5141,6 +5176,7 @@ export class Service {
       event.error = null;
       this.store.saveSubscription(event);
       try {
+        assertSource();
         const memberId = event.discord_user_id;
         const settings = this.store.settings();
         if (
@@ -5194,6 +5230,7 @@ export class Service {
                 undefined,
                 newSubscriber,
                 event.stripe_entitlement,
+                automatic ? (event.source ?? '') : undefined,
               );
             } catch (error) {
               if (newSubscriber.enrolled_membership)
@@ -5212,6 +5249,7 @@ export class Service {
             delete event.report_cleared;
             this.store.saveSubscription(event);
             await this.jobTasks.get(newSubscriberJob.id);
+            assertSource();
             const outcome = this.getJob(newSubscriberJob.id);
             if (
               !['completed', 'partial'].includes(outcome.status) ||
@@ -5285,6 +5323,7 @@ export class Service {
                     'Configuration or membership changed. Review and try again.',
                   );
                 this.checkStopped();
+                assertSource();
                 if (event.stripe_entitlement)
                   this.assertStripeEntitlement(event.stripe_entitlement);
                 this.memberships.save(
@@ -5312,11 +5351,13 @@ export class Service {
               undefined,
               undefined,
               event.stripe_entitlement,
+              automatic ? (event.source ?? '') : undefined,
             );
             event.job_id = job.id;
             delete event.report_cleared;
             this.store.saveSubscription(event);
             await this.jobTasks.get(job.id);
+            assertSource();
             const outcome = this.getJob(job.id);
             if (
               ['failed', 'interrupted'].includes(outcome.status) ||
@@ -5338,6 +5379,7 @@ export class Service {
           await this.membershipMutex.run(() =>
             this.mutationMutex.run(async () => {
               this.checkStopped();
+              assertSource();
               const previous = this.memberships.get(memberId, this.store.settings());
               if (previous?.access_mode === 'complimentary') {
                 event.status = 'ignored';
@@ -5356,6 +5398,7 @@ export class Service {
                 );
               const primary = this.store.link(memberId) ?? links[0];
               const saveInactive = () => (
+                assertSource(),
                 event.stripe_entitlement && this.assertStripeEntitlement(event.stripe_entitlement),
                 this.memberships.save(
                   {
@@ -5387,6 +5430,7 @@ export class Service {
                   this.assertLinkedTarget(await jellyfin.user(link.remote_id), link, settings);
                 const member = saveInactive();
                 const guard = () => {
+                  assertSource();
                   if (event.stripe_entitlement)
                     this.assertStripeEntitlement(event.stripe_entitlement);
                   this.checkStopped();
@@ -5419,6 +5463,7 @@ export class Service {
         }
         if (event.status !== 'ignored') event.status = 'applied';
       } catch (error) {
+        if (error instanceof SubscriptionSourceChanged) return holdForSourceReview();
         if (!this.recipientRequiresSubscription(event.discord_user_id)) {
           event.status = 'ignored';
           event.error = null;

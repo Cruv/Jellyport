@@ -193,6 +193,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   const bot = new BotManager(service);
   service.bot = bot;
   const stripe = new StripeIntegration(store, {
+    onEntitlement: (fact) => service.recordStripeEntitlement(fact),
     clientFactory: options.stripeClientFactory,
     resolveDiscordMember: async (id) => {
       const identity = await service.bot!.recipientIdentity(id, false);
@@ -201,6 +202,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       return { id, username: identity.username };
     },
   });
+  service.verifyStripeEntitlement = (fact) => stripe.assertEntitlement(fact);
   bot.onIdentityHint = (hint) => stripe.recordDiscordHint(hint);
   const organization = new UserOrganization(service);
   const identities = new IdentityReview(service, stripe, organization);
@@ -1147,6 +1149,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           request.body.source_snapshot_ids,
           previewTiming,
           reviewed?.preview?.history_only_targets,
+          reviewed?.preview?.household_targets,
         );
         // The duration is now copied into the durable job; release session-owned review data.
         if (reviewed) previews.cancel(request.cookies[COOKIE]!, reviewed.id);
@@ -1367,7 +1370,18 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       throw new ServiceError('Wait for the job to finish before revealing its credentials.');
     return { credentials: store.takeCredentials(job.id) };
   });
-  app.get('/api/subscriptions', async () => ({ events: store.subscriptions() }));
+  app.get<{ Params: { job_id: string } }>('/api/jobs/:job_id/messages', async (request, reply) => {
+    const job = service.getJob(request.params.job_id);
+    reply.header('Cache-Control', 'no-store');
+    return { messages: store.botMessages(job.id) };
+  });
+  const publicSubscription = (event: Awaited<ReturnType<Service['applySubscription']>>) => {
+    const { stripe_entitlement: _privateEvidence, ...summary } = event;
+    return summary;
+  };
+  app.get('/api/subscriptions', async () => ({
+    events: store.subscriptions().map(publicSubscription),
+  }));
   app.get('/api/memberships', async () => ({ memberships: service.listMemberships() }));
   app.post<{ Body: Parameters<Service['saveAccountProfile']>[0] }>(
     '/api/account-profiles',
@@ -1540,11 +1554,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   );
   app.post<{ Params: { event_id: string } }>(
     '/api/subscriptions/:event_id/apply',
-    async (request) => service.applySubscription(request.params.event_id),
+    async (request) => publicSubscription(await service.applySubscription(request.params.event_id)),
   );
   app.post<{ Params: { event_id: string } }>(
     '/api/subscriptions/:event_id/ignore',
-    async (request) => service.ignoreSubscription(request.params.event_id),
+    async (request) =>
+      publicSubscription(await service.ignoreSubscription(request.params.event_id)),
   );
   registerUserMappingRoutes(app);
   registerDiscordMemberRoutes(app);
@@ -1642,6 +1657,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       // The worker is synchronous and bounded, so ticks cannot overlap. It reports
       // aggregate failures through its status without logging private report data.
       service.runJobRetention();
+      store.pruneBotMessages();
     } catch {
       app.log.warn('Activity retention could not run; it will retry on the next scheduled tick.');
     }

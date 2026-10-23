@@ -71,21 +71,15 @@ describe('complete episode identity precedes stray episode-provider hits', () =>
     expect(matcher([from]).matches[0]?.target).toBe(right);
   });
 
-  it('preserves own episode-ID conflicts inside the selected context despite an agreeing provider and exact path', () => {
+  it('resolves stale own episode IDs using the verified show, full range, exact title and unique mapped file', () => {
     const from = source();
     const right = correct();
     right.ProviderIds = { Imdb: 'conflicting-imdb', Tvdb: 'episode-tvdb' };
     const plan = matchItems([from], [wrong(), right], mappings);
-    expect(plan.matches).toEqual([]);
-    expect(plan.ambiguous).toEqual([
-      expect.objectContaining({
-        source: from,
-        candidates: [right],
-        method: 'series_episode',
-        reason_codes: ['provider_conflict'],
-        path_resolution: 'conflict_prevents_path_resolution',
-      }),
+    expect(plan.matches).toEqual([
+      { source: from, target: right, method: 'series_episode+title+path' },
     ]);
+    expect(plan.ambiguous).toEqual([]);
   });
 
   it.each(['source', 'target'])(
@@ -197,7 +191,7 @@ describe('complete episode identity precedes stray episode-provider hits', () =>
     );
   });
 
-  it('does not silently discard same-context contradictions to choose a convenient edition', () => {
+  it('does not let another physical edition with stale episode IDs veto the verified exact file', () => {
     const from = source();
     const right = correct();
     const conflictingEdition = {
@@ -206,14 +200,59 @@ describe('complete episode identity precedes stray episode-provider hits', () =>
       Path: '/media/other-edition.mkv',
       ProviderIds: { Imdb: 'other-episode' },
     };
-    expect(matchItems([from], [wrong(), right, conflictingEdition], mappings)).toMatchObject({
+    expect(matchItems([from], [wrong(), right, conflictingEdition], mappings).matches).toEqual([
+      { source: from, target: right, method: 'series_episode+provider_id+path' },
+    ]);
+  });
+
+  it.each(['', '  ', undefined, 'A different chapter'])(
+    'does not override episode IDs without an exact nonempty title (%s)',
+    (Name) => {
+      const from = source();
+      const right = { ...correct(), Name, ProviderIds: { Tvdb: 'stale-tvdb' } };
+      expect(matchItems([from], [right], mappings)).toMatchObject({
+        matches: [],
+        ambiguous: [expect.objectContaining({ reason_codes: ['provider_conflict'] })],
+      });
+    },
+  );
+
+  it('normalizes only Unicode, case and whitespace for the exact episode title evidence', () => {
+    const from = { ...source(), Name: '  SYNTHETIC\tCAFÉ ' };
+    const right = {
+      ...correct(),
+      Name: 'synthetic cafe\u0301',
+      ProviderIds: { Tvdb: 'stale-tvdb' },
+    };
+    expect(matchItems([from], [right], mappings).matches).toEqual([
+      { source: from, target: right, method: 'series_episode+title+path' },
+    ]);
+  });
+
+  it.each([undefined, '/media/another-file.mkv'])(
+    'keeps a same-title episode-ID conflict unresolved without the exact mapped file (%s)',
+    (Path) => {
+      const from = source();
+      const right = { ...correct(), Path, ProviderIds: { Tvdb: 'stale-tvdb' } };
+      expect(matchItems([from], [right], mappings)).toMatchObject({
+        matches: [],
+        ambiguous: [expect.objectContaining({ reason_codes: ['provider_conflict'] })],
+      });
+    },
+  );
+
+  it('does not manufacture unique path evidence by filtering a differently labelled duplicate row', () => {
+    const from = source();
+    const right = correct();
+    const duplicate = {
+      ...right,
+      Id: 'duplicate-file',
+      Name: 'Different metadata on the same path',
+      ProviderIds: { Tvdb: 'stale-tvdb' },
+    };
+    expect(matchItems([from], [right, duplicate], mappings)).toMatchObject({
       matches: [],
-      ambiguous: [
-        expect.objectContaining({
-          candidates: [right, conflictingEdition],
-          reason_codes: ['provider_conflict'],
-        }),
-      ],
+      ambiguous: [expect.objectContaining({ candidates: [right, duplicate] })],
     });
   });
 
@@ -221,6 +260,7 @@ describe('complete episode identity precedes stray episode-provider hits', () =>
     const from = source();
     const sameNumberDifferentOrder = {
       ...correct(),
+      Name: 'A different episode ordering caption',
       ProviderIds: { Imdb: 'different-order-episode', Tvdb: 'different-order-tvdb' },
     };
     expect(matchItems([from], [wrong(), sameNumberDifferentOrder], mappings)).toMatchObject({

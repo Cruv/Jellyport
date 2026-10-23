@@ -6,6 +6,7 @@ import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import { UserWarnings } from './SettingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import type { Api, DiscordMember, Notify, UserMapping, Users } from './types';
+import { parseAccountUsername, type AccountNaming } from '../../server/account-naming';
 
 const errorMessage = (error: unknown) =>
   error instanceof Error ? error.message : 'The mapping could not be saved.';
@@ -17,6 +18,7 @@ export default function UserMappingsPage({
   notify,
   refresh,
   templateUserId,
+  accountNaming = {},
 }: {
   mappings: UserMapping[];
   users: Users;
@@ -24,6 +26,7 @@ export default function UserMappingsPage({
   notify: Notify;
   refresh: (manual?: boolean) => Promise<void>;
   templateUserId?: string;
+  accountNaming?: AccountNaming;
 }) {
   const [view, setView] = useRouteTab('mappings');
   const [query, setQuery] = useState('');
@@ -348,7 +351,12 @@ export default function UserMappingsPage({
                       setSourceId(id);
                       setDiscordMember(null);
                       setDiscordId('');
-                      setMembershipSlot(1);
+                      setMembershipSlot(
+                        parseAccountUsername(
+                          users.emby.find((user) => user.Id === id)?.Name ?? '',
+                          accountNaming,
+                        )?.slot ?? 1,
+                      );
                       setDiscordName('');
                       if (!targetName || targetName === previousName)
                         setTargetName(users.emby.find((user) => user.Id === id)?.Name || '');
@@ -444,8 +452,11 @@ export default function UserMappingsPage({
                 suggestedQuery={
                   discordName ||
                   users.jellyfin.find((user) => user.Id === targetId)?.Name ||
+                  parseAccountUsername(
+                    targetName || users.emby.find((user) => user.Id === sourceId)?.Name || '',
+                    accountNaming,
+                  )?.base ||
                   targetName ||
-                  users.emby.find((user) => user.Id === sourceId)?.Name ||
                   ''
                 }
                 allowInactive

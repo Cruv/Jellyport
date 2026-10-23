@@ -823,6 +823,123 @@ describe('New account password and message settings', () => {
 });
 
 describe('Settings draft and submission safeguards', () => {
+  it('saves configurable bot messages, retention and optional trusted formats without sending a message', async () => {
+    const p = page();
+    settingsTab('Discord');
+    fireEvent.click(screen.getByRole('tab', { name: 'Messages' }));
+    expect(screen.getByLabelText('Bot message history retention (days)')).toHaveProperty(
+      'value',
+      '30',
+    );
+    fireEvent.change(screen.getByLabelText('Message to customize'), {
+      target: { value: 'job_status' },
+    });
+    expect(screen.queryByText('Unsaved changes · save all settings together.')).toBeNull();
+    fireEvent.change(screen.getByLabelText('Operation status text'), {
+      target: { value: 'Community progress: {job_id} · {status}{progress_summary}' },
+    });
+    expect(screen.getByLabelText('Bot message preview').textContent).toContain(
+      'Community progress: example_job · running',
+    );
+    fireEvent.change(screen.getByLabelText('Bot message history retention (days)'), {
+      target: { value: '0' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Add message format' }));
+    fireEvent.change(screen.getByLabelText('Text for message format 1'), {
+      target: { value: 'Plan active: {user} / {plan}' },
+    });
+    fireEvent.click(screen.getByText('Test a fictional subscription message'));
+    fireEvent.change(screen.getByLabelText('Fictional announcement'), {
+      target: { value: 'Plan active: @example.member / Example Plan' },
+    });
+    expect(screen.getByLabelText('Subscription format preview').textContent).toBe(
+      'subscribe · @example.member · Example Plan',
+    );
+    expect(p.requests.filter((request) => request.options?.method)).toEqual([]);
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(
+      p.requests.find((request) => request.path === '/api/settings')?.options?.body,
+    ).toMatchObject({
+      bot_message_templates: {
+        job_status: 'Community progress: {job_id} · {status}{progress_summary}',
+      },
+      bot_message_retention_days: 0,
+      subscription_message_patterns: [
+        { action: 'subscribe', template: 'Plan active: {user} / {plan}' },
+      ],
+    });
+    expect(
+      p.requests.some(
+        (request) => request.path.includes('/messages') || request.path.includes('/credentials'),
+      ),
+    ).toBe(false);
+  });
+
+  it('keeps edited bot templates and retention across other settings refreshes and resets only the selected template', async () => {
+    const p = page();
+    settingsTab('Discord');
+    fireEvent.click(screen.getByRole('tab', { name: 'Messages' }));
+    fireEvent.change(screen.getByLabelText('Account or migration queued text'), {
+      target: { value: 'Draft {job_id}: {status}' },
+    });
+    fireEvent.change(screen.getByLabelText('Bot message history retention (days)'), {
+      target: { value: '45' },
+    });
+    fireEvent.change(screen.getByLabelText('Message to customize'), {
+      target: { value: 'command_error' },
+    });
+    fireEvent.change(screen.getByLabelText('Command error text'), {
+      target: { value: 'Help: {message}' },
+    });
+    p.rerender(
+      <SettingsPage
+        {...p.props}
+        settings={{
+          ...oldSettings,
+          bot_message_templates: { job_queued: 'Newer {job_id} {status}' },
+          bot_message_retention_days: 90,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Reset selected bot message' }));
+    expect(screen.getByLabelText('Command error text')).toHaveProperty('value', '{message}');
+    fireEvent.change(screen.getByLabelText('Message to customize'), {
+      target: { value: 'job_queued' },
+    });
+    expect(screen.getByLabelText('Account or migration queued text')).toHaveProperty(
+      'value',
+      'Draft {job_id}: {status}',
+    );
+    expect(screen.getByLabelText('Bot message history retention (days)')).toHaveProperty(
+      'value',
+      '45',
+    );
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(
+      p.requests.find((request) => request.path === '/api/settings')?.options?.body,
+    ).toMatchObject({
+      bot_message_templates: { job_queued: 'Draft {job_id}: {status}' },
+      bot_message_retention_days: 45,
+    });
+  });
+
+  it('rejects unsupported bot placeholders and reveals the invalid message before saving', async () => {
+    const p = page();
+    settingsTab('Discord');
+    fireEvent.click(screen.getByRole('tab', { name: 'Messages' }));
+    fireEvent.change(screen.getByLabelText('Account or migration queued text'), {
+      target: { value: 'Unsafe {password}' },
+    });
+    expect(within(screen.getByLabelText('Bot message preview')).getByRole('alert')).toBeTruthy();
+    settingsTab('Servers');
+    submit();
+    await waitFor(() => expect(document.activeElement?.id).toBe('setting-bot_message_templates'));
+    expect(screen.getByRole('tab', { name: 'Messages', selected: true })).toBeTruthy();
+    expect(p.requests.some((request) => request.options?.method === 'PUT')).toBe(false);
+  });
+
   it('defaults the new-subscriber policy off and explains the automatic provisioning prerequisite', () => {
     window.history.replaceState(null, '', '#/settings/automation/rules');
     const p = page();
@@ -831,13 +948,9 @@ describe('Settings draft and submission safeguards', () => {
     ).toHaveProperty('checked', false);
     expect(screen.getByRole('status').textContent).toContain('Automatic provisioning is paused.');
     expect(
-      screen.getByText(
-        /Existing Discord members, Emby users, and membership provisioning choices stay opt-in/,
-      ),
+      screen.getByText(/Existing Emby accounts and membership choices remain opt-in/),
     ).toBeTruthy();
-    expect(
-      screen.getByText(/never creates Emby access or enrolls existing subscribers/),
-    ).toBeTruthy();
+    expect(screen.getByText(/No Emby access is created/)).toBeTruthy();
 
     fireEvent.click(
       screen.getByRole('checkbox', { name: 'Automatically provision subscribed members' }),

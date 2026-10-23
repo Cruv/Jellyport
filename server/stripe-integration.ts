@@ -8,6 +8,12 @@ import {
   type StripeIdentityCandidate,
 } from './stripe-client.js';
 import type { Store } from './store.js';
+import {
+  StripeEntitlements,
+  stripeAuthority,
+  type StripeEntitlementFact,
+} from './stripe-entitlements.js';
+export type { StripeEntitlementFact } from './stripe-entitlements.js';
 
 export interface StripePriceTier {
   price_id: string;
@@ -51,7 +57,11 @@ interface StripeState {
 export interface StripeIntegrationStatus {
   configured: boolean;
   mode: 'live' | 'test' | null;
-  review_only: true;
+  review_only: boolean;
+  automation_enabled: boolean;
+  automation_enabled_at: string | null;
+  automation_error: string | null;
+  automation_review_count: number;
   revision: string;
   running: boolean;
   sync_enabled: boolean;
@@ -84,12 +94,15 @@ export interface StripeIntegrationConfiguration {
   sync_enabled: boolean;
   expected_revision: string;
   price_tiers?: StripePriceTier[];
+  automation_enabled?: boolean;
 }
-type BillingClient = Pick<StripeClient, 'mode' | 'snapshot' | 'checkoutIdentityCandidates'>;
+type BillingClient = Pick<StripeClient, 'mode' | 'snapshot' | 'checkoutIdentityCandidates'> &
+  Partial<Pick<StripeClient, 'paidPeriod'>>;
 export interface StripeIntegrationOptions {
   clientFactory?: (key: string) => BillingClient;
   resolveDiscordMember?: (id: string) => Promise<{ id?: string; username: string }>;
   now?: () => number;
+  onEntitlement?: (fact: StripeEntitlementFact) => Promise<void>;
 }
 
 function validSnowflake(value: unknown): value is string {
@@ -132,6 +145,7 @@ function blankState(guild: string, key = ''): StripeState {
 /** Read-only billing observations and explicitly reviewed identity links. This
  * connector deliberately has no media-server or membership mutation capability. */
 export class StripeIntegration {
+  private readonly entitlements: StripeEntitlements;
   private state: StripeState;
   private task: Promise<StripeIntegrationStatus> | null = null;
   private controller: AbortController | null = null;
@@ -144,6 +158,7 @@ export class StripeIntegration {
   ) {
     this.clientFactory = options.clientFactory ?? ((key) => new StripeClient(key));
     this.now = options.now ?? Date.now;
+    this.entitlements = new StripeEntitlements(store, this.now);
     store.db.exec(
       'CREATE TABLE IF NOT EXISTS stripe_integration_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL)',
     );
@@ -191,7 +206,8 @@ export class StripeIntegration {
     return {
       configured: Boolean(s.api_key),
       mode: s.api_key ? (s.api_key.startsWith('rk_live_') ? 'live' : 'test') : null,
-      review_only: true,
+      review_only: !this.entitlements.enabled(s.generation),
+      ...this.entitlements.status(s.generation),
       revision: s.revision,
       running: this.task !== null,
       sync_enabled: s.sync_enabled,
@@ -209,6 +225,7 @@ export class StripeIntegration {
   async disconnect(input: { expected_revision: string }): Promise<StripeIntegrationStatus> {
     this.checkRevision(input.expected_revision);
     this.controller?.abort();
+    this.entitlements.configure(false, this.state.generation, null, null);
     this.state = blankState(this.guild());
     this.persist();
     await this.task?.catch(() => {});
@@ -218,6 +235,8 @@ export class StripeIntegration {
     this.checkRevision(input.expected_revision);
     if (typeof input.sync_enabled !== 'boolean')
       throw new ServiceError('Choose whether automatic Stripe syncing is enabled.');
+    if (input.automation_enabled !== undefined && typeof input.automation_enabled !== 'boolean')
+      throw new ServiceError('Choose whether verified Stripe membership automation is enabled.');
     if (
       input.api_key !== undefined &&
       (typeof input.api_key !== 'string' ||
@@ -244,8 +263,20 @@ export class StripeIntegration {
       throw new ServiceError(
         'Map each Stripe price once to a configured Jellyport membership tier.',
       );
-    this.controller?.abort();
     const keyChanged = key !== this.state.api_key;
+    if (keyChanged && input.automation_enabled)
+      throw new ServiceError(
+        'Save and sync the replacement key before enabling billing automation.',
+      );
+    this.entitlements.configure(
+      keyChanged
+        ? false
+        : (input.automation_enabled ?? this.entitlements.enabled(this.state.generation)),
+      this.state.generation,
+      this.state.snapshot,
+      this.state.last_sync,
+    );
+    this.controller?.abort();
     if (keyChanged) this.state = blankState(this.guild(), key);
     this.state.sync_enabled = input.sync_enabled;
     // Existing mappings never silently cross a replacement key/account boundary.
@@ -399,6 +430,67 @@ export class StripeIntegration {
         this.state.last_error = null;
         this.state.revision = randomUUID();
         this.persist();
+        const automationRevision = this.state.revision;
+        if (this.entitlements.enabled(generation)) {
+          try {
+            if (!client.paidPeriod)
+              throw new ServiceError(
+                'Stripe automation requires Invoices Read permission and paid-period support.',
+              );
+            const periods = new Map();
+            const approved = new Set(this.state.links.map((link) => link.customer_id));
+            const linked = snapshot.subscriptions.filter((subscription) =>
+              approved.has(subscription.customer_id),
+            );
+            // At most one invoice GET per approved subscription, serially, sharing
+            // the existing timeout/rate/backoff boundary and cancellation signal.
+            for (const subscription of linked) {
+              if (
+                this.state.revision !== automationRevision ||
+                this.state.generation !== generation
+              )
+                throw new ServiceError('Stripe automation connection changed.');
+              if (controller.signal.aborted)
+                throw new ServiceError('Stripe automation read timed out.');
+              periods.set(
+                subscription.id,
+                await client.paidPeriod(subscription.id, controller.signal),
+              );
+            }
+            if (
+              this.state.revision !== automationRevision ||
+              this.state.generation !== generation ||
+              controller.signal.aborted
+            )
+              throw new ServiceError('Stripe automation connection changed.');
+            const facts = this.entitlements.prepare(
+              generation,
+              snapshot,
+              this.state.links,
+              this.state.price_tiers,
+              periods,
+            );
+            for (const fact of facts) {
+              if (controller.signal.aborted || this.state.generation !== generation)
+                throw new ServiceError(
+                  'Stripe automation stopped before additional access actions.',
+                );
+              if (!this.options.onEntitlement || !this.entitlements.claim(fact)) continue;
+              try {
+                await this.options.onEntitlement(fact);
+                this.entitlements.finish(fact, true);
+              } catch {
+                this.entitlements.finish(fact, false);
+              }
+            }
+          } catch (error) {
+            this.entitlements.fail(
+              error instanceof StripeClientError && error.code === 'forbidden'
+                ? 'Stripe automation requires Invoices Read permission. Billing observations were saved; no uncertain access decision was applied.'
+                : 'Stripe paid-period verification could not complete. Existing access was preserved; review billing before retrying.',
+            );
+          }
+        }
         return this.status();
       } catch (error) {
         this.scope();
@@ -414,6 +506,9 @@ export class StripeIntegration {
                 ? 'Stripe sync reached its time limit. The previous saved billing data was preserved.'
                 : 'Stripe sync failed. The previous saved billing data was preserved.';
           this.persist();
+          this.entitlements.fail(
+            'Stripe synchronization failed. Existing access is preserved until billing can be verified.',
+          );
         }
         throw new ServiceError(
           error instanceof StripeClientError
@@ -430,6 +525,29 @@ export class StripeIntegration {
       })
       .then(() => this.status());
     return this.task;
+  }
+  assertEntitlement(fact: StripeEntitlementFact): void {
+    this.scope();
+    if (
+      this.stopped ||
+      this.controller?.signal.aborted ||
+      this.state.generation !== fact.generation ||
+      this.state.last_error ||
+      !this.state.links.some(
+        (link) =>
+          link.customer_id === fact.customer_id && link.discord_user_id === fact.discord_user_id,
+      ) ||
+      !this.state.price_tiers.some(
+        (entry) => entry.price_id === fact.price_id && entry.tier_id === fact.tier_id,
+      )
+    )
+      throw new ServiceError(
+        'Stripe identity, tier or connection changed. Review billing before retrying.',
+      );
+    this.entitlements.assert(
+      fact,
+      stripeAuthority(this.state.links, this.state.price_tiers, this.store),
+    );
   }
   private requireCurrentReview(revision: string): void {
     this.checkRevision(revision);

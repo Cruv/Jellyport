@@ -429,6 +429,9 @@ export interface Overview {
   pending_subscriptions?: number;
 }
 export interface PreviewUser {
+  membership_slot?: number;
+  owner_basis?: 'mapping' | 'approved' | 'numbered_suggestion';
+  owner_search?: string;
   history_only?: boolean;
   target_user_id?: string | null;
   source_snapshot?: SourceSnapshotMetadata;
@@ -532,6 +535,12 @@ export interface Settings {
   password_length?: number;
   password_exclude_ambiguous?: boolean;
   credential_message_template?: string;
+  bot_message_templates?: import('../../server/bot-messages').BotMessageTemplates;
+  bot_message_retention_days?: number;
+  subscription_message_patterns?: import('../../server/subscription-messages').SubscriptionMessagePattern[];
+  account_name_primary?: string;
+  account_name_additional?: string;
+  account_name_aliases?: string[];
   path_mappings: { source: string; target: string }[];
   discord_enabled: boolean;
   discord_bot_token_set: boolean;
@@ -549,6 +558,7 @@ export interface Settings {
   discord_emby_only_role?: boolean;
   auto_provision: boolean;
   auto_create_new_subscribers?: boolean;
+  new_subscriber_source?: 'trusted_messages' | 'stripe';
   auto_disable: boolean;
   disable_on_cancel: boolean;
   membership_tiers?: MembershipTier[];

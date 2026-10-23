@@ -461,6 +461,8 @@ const matchingMethods: Record<string, string> = {
   path: 'Exact mapped file path',
   'provider_id+path': 'Provider ID + exact mapped file path',
   'series_episode+path': 'Show ID + season and episode + exact mapped file path',
+  'series_episode+title+path':
+    'Show ID + season and episode + episode title + exact mapped file path',
   'series_episode+provider_id': 'Show ID + season and episode + episode provider ID',
   'series_episode+provider_id+path':
     'Show ID + season and episode + episode provider ID + exact mapped file path',

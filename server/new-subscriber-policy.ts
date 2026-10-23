@@ -25,6 +25,7 @@ export class NewSubscriberPolicy {
           settings.emby_url ? normalizeJellyfinUrl(settings.emby_url) : '',
           settings.jellyfin_url ? normalizeJellyfinUrl(settings.jellyfin_url) : '',
           auth?.kind === 'configured' ? auth.serverId : null,
+          settings.new_subscriber_source ?? 'trusted_messages',
         ]),
       )
       .digest('hex');

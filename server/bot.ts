@@ -28,7 +28,16 @@ import {
 } from './credential-message.js';
 import { discordCredentialContent } from './credentials.js';
 import { parseMee6Identity } from './mee6-identity.js';
+import {
+  parseConfiguredSubscriptionMessage,
+  type SubscriptionMessagePattern,
+} from './subscription-messages.js';
 import type { IdentityRoster } from './identity-review-types.js';
+import {
+  renderConfiguredBotMessage,
+  type BotMessageReceipt,
+  type BotMessageTemplateId,
+} from './bot-messages.js';
 
 export class BotError extends Error {}
 class MissingMember extends BotError {}
@@ -42,6 +51,7 @@ export interface BotService {
   resolveDiscordMapping?(discordId: string): UserMapping | null;
   resolveDiscordMappings?(discordId: string): UserMapping[];
   recipientRequiresSubscription?(discordId: string): boolean;
+  recipientRequiresMembershipRole?(discordId: string): boolean;
   getJob(id: string): Job | null | undefined;
   recordSubscription(event: SubscriptionInput & { guild_id?: string }): Promise<unknown>;
   reconcileMemberships?(): Promise<unknown>;
@@ -111,12 +121,32 @@ const cancelled = new RegExp(
   'i',
 );
 
-export function parseSubscriptionMessage(content: unknown): {
-  action: 'subscribe' | 'cancel';
+export function parseSubscriptionMessage(
+  content: unknown,
+  patterns?: SubscriptionMessagePattern[],
+): {
+  action: 'subscribe' | 'cancel' | 'expire';
   discord_user_id: string | null;
   username: string | null;
   detail: string;
 } | null {
+  if (patterns?.length) {
+    const parsed = parseConfiguredSubscriptionMessage(content, patterns);
+    if (!parsed) return null;
+    const mention = /^<@!?([0-9]{1,20})>$/.exec(parsed.user);
+    const id = mention ? snowflake(mention[1]) : null;
+    if (mention && !id) return null;
+    return {
+      action: parsed.action,
+      discord_user_id: id,
+      username: mention ? null : parsed.user.replace(/^@/, ''),
+      detail:
+        parsed.plan ||
+        (parsed.action === 'expire'
+          ? 'Expiration announcement.'
+          : 'Cancellation announcement; paid access may remain active.'),
+    };
+  }
   if (typeof content !== 'string' || content.length > 300 || /[\r\n]/.test(content)) return null;
   let match = subscribed.exec(content.trim());
   let action: 'subscribe' | 'cancel' = 'subscribe';
@@ -208,6 +238,22 @@ export function jobStatusMessage(value: object): string {
   return message;
 }
 
+function configuredJobMessage(
+  settings: Settings,
+  kind: 'job_queued' | 'job_status',
+  job: object,
+): string {
+  // Reuse the existing allowlisted projection; never interpolate whole jobs or upstream errors.
+  const summary = jobStatusMessage(job);
+  const parts = /^Job `([A-Za-z0-9_-]{1,80})`: ([a-z]+)\.(.*)$/.exec(summary);
+  if (!parts) return summary;
+  return renderConfiguredBotMessage(kind, settings.bot_message_templates, {
+    job_id: parts[1]!,
+    status: parts[2]!,
+    progress_summary: parts[3]!,
+  });
+}
+
 export function botIntents(settings: Settings): GatewayIntentBits[] {
   const intents = [GatewayIntentBits.Guilds];
   if (settings.discord_message_events) {
@@ -216,7 +262,12 @@ export function botIntents(settings: Settings): GatewayIntentBits[] {
       GatewayIntentBits.MessageContent,
       GatewayIntentBits.GuildMembers,
     );
-  } else if (settings.discord_role_events) intents.push(GatewayIntentBits.GuildMembers);
+  } else if (
+    settings.discord_role_events ||
+    settings.new_subscriber_source === 'stripe' ||
+    settings.discord_auto_role_sync
+  )
+    intents.push(GatewayIntentBits.GuildMembers);
   return intents;
 }
 
@@ -922,7 +973,7 @@ export class BotManager {
   private async readIdentityMembers(): Promise<DiscordIdentityRoster> {
     if (!botIntents(this.settings).includes(GatewayIntentBits.GuildMembers))
       throw new BotError(
-        'A full Discord roster requires Server Members Intent. Enable it in the Discord Developer Portal and enable trusted subscription messages or membership role events in Jellyport before refreshing.',
+        'A full Discord roster requires Server Members Intent. Enable it in the Discord Developer Portal and configure Stripe membership, organization role synchronization, trusted messages, or membership role events in Jellyport before refreshing.',
       );
     const guild = this.guild();
     const client = this.client;
@@ -1070,7 +1121,7 @@ export class BotManager {
     serverUrl: string,
     requireMembership = true,
     message?: string,
-  ): Promise<void> {
+  ): Promise<BotMessageReceipt> {
     const member = await this.fetchMember(userId);
     if (
       !recipientEligible(member.guild.id, this.settings.discord_guild_id, {
@@ -1088,11 +1139,12 @@ export class BotManager {
             username,
             password,
             serverUrl || String(this.settings.jellyfin_public_url ?? ''),
+            this.settings.credential_message_template ?? DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
           )
         : discordCredentialContent(message);
     this.checkActive();
     try {
-      await this.wait(
+      const delivered = await this.wait(
         member.send({
           content,
           allowedMentions: { parse: [], repliedUser: false },
@@ -1100,6 +1152,15 @@ export class BotManager {
         }),
         20_000,
       );
+      return {
+        content,
+        ...(snowflake(delivered.id) ? { message_id: delivered.id } : {}),
+        ...(snowflake(delivered.channelId) ? { channel_id: delivered.channelId } : {}),
+        sent_at:
+          delivered.createdAt instanceof Date && Number.isFinite(delivered.createdAt.getTime())
+            ? delivered.createdAt.toISOString()
+            : new Date().toISOString(),
+      };
     } catch (error) {
       if (error instanceof Stopped) throw error;
       throw new BotError(
@@ -1115,7 +1176,7 @@ export class BotManager {
     serverUrl: string,
     requireMembership = true,
     message?: string,
-  ): Promise<void> {
+  ): Promise<BotMessageReceipt> {
     return this.sendCredentials(userId, username, password, serverUrl, requireMembership, message);
   }
 
@@ -1248,6 +1309,10 @@ export class BotManager {
     }
   }
 
+  private message(kind: BotMessageTemplateId, values: Record<string, string>): string {
+    return renderConfiguredBotMessage(kind, this.settings.bot_message_templates, values);
+  }
+
   async handleCreate(
     interaction: ChatInputCommandInteraction,
     user: { id: string },
@@ -1259,7 +1324,9 @@ export class BotManager {
       await this.prepare(interaction);
       const identity = await this.recipientIdentity(
         user.id,
-        this.service.recipientRequiresSubscription?.(user.id) ?? true,
+        this.service.recipientRequiresMembershipRole?.(user.id) ??
+          this.service.recipientRequiresSubscription?.(user.id) ??
+          true,
       );
       const mapping = !this.service.provisionMembership
         ? this.service.resolveDiscordMapping?.(identity.id)
@@ -1279,13 +1346,14 @@ export class BotManager {
         ? await this.service.provisionMembership(identity.id, tierId ?? undefined)
         : await this.service.createAccount(identity.username, identity.id);
       this.checkActive();
-      message = jobStatusMessage(job) + ' Use /jellyport status to check progress.';
+      message = configuredJobMessage(this.settings, 'job_queued', job);
     } catch (error) {
       if (error instanceof Stopped) throw error;
       message =
         error instanceof BotError
           ? error.message
           : 'Account creation could not be queued. Check the Jellyport web page.';
+      message = this.message('command_error', { message });
     }
     await this.reply(interaction, message);
   }
@@ -1300,7 +1368,9 @@ export class BotManager {
       await this.prepare(interaction);
       const identity = await this.recipientIdentity(
         user.id,
-        this.service.recipientRequiresSubscription?.(user.id) ?? true,
+        this.service.recipientRequiresMembershipRole?.(user.id) ??
+          this.service.recipientRequiresSubscription?.(user.id) ??
+          true,
       );
       const proposedMappings = this.service.resolveDiscordMappings
         ? this.service.resolveDiscordMappings(identity.id)
@@ -1334,13 +1404,14 @@ export class BotManager {
         );
       const job = await this.service.migrateUsers([id], { [id]: identity.id });
       this.checkActive();
-      message = jobStatusMessage(job) + ' Use /jellyport status to check progress.';
+      message = configuredJobMessage(this.settings, 'job_queued', job);
     } catch (error) {
       if (error instanceof Stopped) throw error;
       message =
         error instanceof BotError
           ? error.message
           : 'Migration could not be queued. Check the Jellyport web page.';
+      message = this.message('command_error', { message });
     }
     await this.reply(interaction, message);
   }
@@ -1353,13 +1424,14 @@ export class BotManager {
         throw new BotError('Enter a valid Jellyport job ID.');
       const job = this.service.getJob(jobId);
       if (!job) throw new BotError('That Jellyport job could not be found.');
-      message = jobStatusMessage(job);
+      message = configuredJobMessage(this.settings, 'job_status', job);
     } catch (error) {
       if (error instanceof Stopped) throw error;
       message =
         error instanceof BotError
           ? error.message
           : 'Job status could not be read. Check the Jellyport web page.';
+      message = this.message('command_error', { message });
     }
     await this.reply(interaction, message);
   }
@@ -1379,7 +1451,10 @@ export class BotManager {
       if (action === 'enable' || action === 'test') {
         await this.sendAdminPrivate(
           identity.id,
-          'Jellyport private admin notification test. Only you receive this direct message. Admin alerts contain brief status summaries; account credentials and private owner notes are never included.',
+          this.message('admin_test', {
+            username: identity.username,
+            server_url: settings.jellyfin_public_url || settings.jellyfin_url || '',
+          }),
           current,
         );
         if (action === 'enable') {
@@ -1424,6 +1499,7 @@ export class BotManager {
           'Choose enable, disable, test, or status for private admin notifications.',
         );
       }
+      message = this.message('admin_settings', { message });
     } catch (error) {
       if (error instanceof Stopped) throw error;
       // Storage, Discord, and notification state exceptions can contain private
@@ -1432,6 +1508,7 @@ export class BotManager {
         error instanceof BotError
           ? error.message
           : 'Private admin notification settings could not be changed. Check the Jellyport web page.';
+      message = this.message('command_error', { message });
     }
     await this.reply(interaction, message);
   }
@@ -1460,7 +1537,10 @@ export class BotManager {
       }
       return;
     }
-    const parsed = parseSubscriptionMessage(message.content);
+    const parsed = parseSubscriptionMessage(
+      message.content,
+      settings.subscription_message_patterns,
+    );
     if (!parsed) return;
     let identity: Identity | null = null;
     try {

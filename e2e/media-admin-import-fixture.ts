@@ -24,7 +24,7 @@ const destinationServer = 'ffeeddccbbaa99887766554433221111';
 const templateUser = '2233445566778899aabbccddeeff0011';
 const username = 'synthetic_member';
 type Kind = 'emby' | 'jellyfin';
-type BackupState = 'valid' | 'missing' | 'incomplete' | 'expired';
+type BackupState = 'valid' | 'missing' | 'missing_file' | 'incomplete' | 'expired';
 
 // Small independently generated ZIPs exercise the actual archive validator.
 function archive(entries: Array<{ name: string; text: string }>): Buffer {
@@ -171,6 +171,8 @@ export const test = base.extend<{ imports: ImportFixture }>({
       const schema = await readFile(resolve('tests-ts/fixtures/emby-4.10.1.0-schema.sql'), 'utf8');
       async function backup(kind: Kind, state: BackupState) {
         if (kind === 'emby') {
+          if (state === 'missing_file')
+            throw new Error('Missing listed archives are specific to the native Jellyfin API.');
           const full = join(sourceBackups, 'embyserver-backup-full'),
             data = join(full, 'data');
           await rm(full, { recursive: true, force: true });
@@ -229,10 +231,18 @@ export const test = base.extend<{ imports: ImportFixture }>({
             await utimes(join(full, path), settled, settled);
           return;
         }
-        if (state === 'valid' || state === 'missing')
+        // In-progress ZIPs do not appear in the native completed-backup list.
+        // Other states replace the completed set; missing_file intentionally
+        // leaves that API listing intact while the mounted archive disappears.
+        if (state === 'missing_file') {
+          for (const name of nativeManifests.keys())
+            await rm(join(destinationBackups, name), { force: true });
+          return;
+        }
+        if (state !== 'incomplete')
           for (const name of await readdir(destinationBackups))
             await rm(join(destinationBackups, name));
-        if (state === 'valid' || state === 'missing') nativeManifests.clear();
+        if (state !== 'incomplete') nativeManifests.clear();
         if (state === 'missing') return;
         const stamp = new Date(Date.now() - (state === 'valid' ? 60 : 30) * 60_000)
           .toISOString()

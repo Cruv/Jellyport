@@ -28,6 +28,7 @@ export function registerStripeRoutes(
           properties: {
             api_key: { type: 'string', maxLength: 512 },
             sync_enabled: { type: 'boolean' },
+            automation_enabled: { type: 'boolean' },
             expected_revision: revision,
             price_tiers: {
               type: 'array',

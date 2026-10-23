@@ -397,6 +397,7 @@ it.each([
       undefined,
       undefined,
       undefined,
+      undefined,
     );
   },
 );
@@ -488,10 +489,61 @@ it('passes protected-account pins only from the session-owned review and rejects
     undefined,
     expect.objectContaining({ preview_id: review.id }),
     { 'e-alex': pin },
+    undefined,
   );
   expect(
     (await app.inject({ url: `/api/migrations/preview/${review.id}`, headers })).statusCode,
   ).toBe(404);
+});
+
+it('passes household ownership only from its session-owned review and rejects client-supplied household proofs', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const preview = await app.jellyport.service.preview(['e-alex']);
+  const proof = {
+    source_username: 'alex_2',
+    discord_user_id: '123456789012345678',
+    discord_username: 'alex',
+    slot: 2,
+    server_id: 'synthetic-emby',
+  };
+  vi.spyOn(app.jellyport.service, 'preview').mockResolvedValue({
+    ...preview,
+    household_targets: { 'e-alex': proof },
+  });
+  const stamp = new Date().toISOString();
+  const migrate = vi.spyOn(app.jellyport.service, 'migrateUsers').mockResolvedValue({
+    id: 'synthetic-household-job',
+    kind: 'migrate',
+    status: 'queued',
+    created_at: stamp,
+    updated_at: stamp,
+    progress: { processed: 0, total: 1 },
+    results: [],
+  });
+  const review = await readyPreview(app, headers);
+  const payload = { source_user_ids: ['e-alex'], preview_id: review.id };
+  const forged = await app.inject({
+    method: 'POST',
+    url: '/api/migrations',
+    headers,
+    payload: { ...payload, household_targets: { 'e-alex': { ...proof, slot: 3 } } },
+  });
+  expect(forged.statusCode).toBe(422);
+  expect(migrate).not.toHaveBeenCalled();
+  review.preview.household_targets['e-alex'].discord_user_id = '223456789012345678';
+  const accepted = await app.inject({ method: 'POST', url: '/api/migrations', headers, payload });
+  expect(accepted.statusCode).toBe(202);
+  expect(migrate).toHaveBeenCalledExactlyOnceWith(
+    ['e-alex'],
+    undefined,
+    { 'e-alex': null },
+    'watched_only',
+    undefined,
+    expect.objectContaining({ preview_id: review.id }),
+    undefined,
+    { 'e-alex': proof },
+  );
 });
 
 it('persists trusted whole-review preparation plus accepted job duration without dividing bulk review time', async () => {

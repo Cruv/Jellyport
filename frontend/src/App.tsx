@@ -22,6 +22,7 @@ import {
   UserCell,
 } from './components';
 import SettingsPage from './SettingsPage';
+import BotMessageHistoryPanel from './BotMessageHistoryPanel';
 import AuthScreen from './AuthScreen';
 import UserMappingsPage from './UserMappingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
@@ -1075,6 +1076,7 @@ export default function App() {
         mappings={mappings}
         users={users}
         templateUserId={settings?.template_user_id}
+        accountNaming={settings ?? {}}
         api={api}
         notify={notify}
         refresh={(manual) => load('mappings', manual)}
@@ -1361,22 +1363,30 @@ function MigrationRecipient({ user, api }: { user: PreviewUser; api: Api }) {
         }
       : null,
   );
-  const mapped = !!user.mapping_id && !!user.discord_user_id;
+  const mapped = !!user.discord_user_id && (!!user.mapping_id || !!user.owner_basis);
   return (
     <>
       <DiscordMemberPicker
         api={api}
         value={member}
         onChange={setMember}
-        suggestedQuery={user.discord_username || user.source_username || user.username}
+        suggestedQuery={
+          user.discord_username || user.owner_search || user.source_username || user.username
+        }
         disabled={mapped}
-        label="Discord recipient (optional)"
+        label={
+          user.membership_slot
+            ? `Discord owner · account ${user.membership_slot}`
+            : 'Discord recipient (optional)'
+        }
         id={`recipient-${user.source_user_id}`}
         inputName={user.source_user_id}
       />
       <p className="subtle text-tiny">
         {mapped
-          ? 'This member is linked by your saved user mapping. Edit that mapping to change the recipient.'
+          ? user.owner_basis === 'numbered_suggestion'
+            ? 'Starting confirms this suggested owner and account slot. Every new household account sends its own credentials to this same owner. Save a user mapping to choose a different owner.'
+            : 'This member and account slot are confirmed by your saved mapping or ownership review. Edit the mapping to change them.'
           : user.target_exists
             ? 'Select a member to link membership management. Existing credentials are preserved.'
             : 'Select a member for private credential delivery. For different usernames, save a user mapping first.'}
@@ -2144,6 +2154,7 @@ function DialogContent({
         {!job.results?.length && !activeJob(job) && !job.error && (
           <p className="muted text-small mt-18">This operation has no per-user results.</p>
         )}
+        <BotMessageHistoryPanel key={job.id} jobId={job.id} api={api} notify={notify} />
         {!activeJob(job) &&
           job.kind !== 'role_update' &&
           !job.results?.every((result) => result.history_only) && (

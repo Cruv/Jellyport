@@ -3,6 +3,7 @@ import { ServiceError } from './errors.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import type { Store } from './store.js';
 import type { Settings } from './types.js';
+import { renderAccountUsername, type AccountNaming } from './account-naming.js';
 
 export interface MembershipTier {
   id: string;
@@ -97,18 +98,16 @@ export function resolveMembershipTier(
   const tier = validateMembershipTiers(tiers).find((item) => item.plan_name.toLowerCase() === key);
   return tier ? structuredClone(tier) : null;
 }
-export function membershipUsername(baseUsername: string, slot: number): string {
-  validateMembershipSlot(slot);
-  if (!text(baseUsername, 64) || /[\\/<>]/.test(baseUsername))
-    throw new ServiceError(
-      'Use a membership base username of 1–64 printable characters without slashes or angle brackets.',
-    );
-  const username = slot === 1 ? baseUsername : `${baseUsername}_${slot}`;
-  if ([...username].length > 64)
-    throw new ServiceError(
-      'The membership base username is too long for numbered accounts. Choose a shorter approved username.',
-    );
-  return username;
+export function membershipUsername(
+  baseUsername: string,
+  slot: number,
+  policy: AccountNaming = {},
+): string {
+  try {
+    return renderAccountUsername(baseUsername, slot, policy);
+  } catch (error) {
+    throw new ServiceError((error as Error).message);
+  }
 }
 function validateInput(value: MembershipInput): void {
   if (

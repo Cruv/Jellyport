@@ -36,6 +36,20 @@ The Discord member picker is available in **User mappings**, **Memberships**, **
 
 Selection fills the Discord ID automatically. Fresh account creation also fills the current Discord username. Saving a user mapping retains the verified identity for future migrations and membership actions. A saved mapping's recipient is fixed in the migration preview; change it on **User mappings** instead of overriding it for one job. The bot rechecks the selected member before sensitive actions, so a search result does not bypass membership checks.
 
+From 0.29.1, an approved normal migration with a verified Discord owner saves both
+the exact Emby account and Jellyfin account under that owner and account slot when
+it establishes the destination link. The **Users** directory then shows both
+servers together, including after a restart. Older ownerless mappings do not add
+duplicate rows for accounts whose ownership is already confirmed. History-only
+and migrations without a Discord owner do not establish Discord ownership.
+
+Earlier migrations may have saved only the Jellyfin link. To repair an existing
+split identity, open **Memberships → Identity & gaps**, review that Discord member,
+select the actual existing Emby/Jellyfin accounts and their slots, and approve the
+associations. This does not repeat history migration or reset passwords. Old
+reports and matching usernames alone do not authorize an automatic ownership
+backfill.
+
 One verified Discord member can own three separate account slots. Choose slot 1, 2, or 3 in **User mappings** when the account names differ. Each slot can have one approved source and destination mapping. Account history remains separate; sharing the Discord owner does not merge the accounts or their data.
 
 An advanced manual ID fallback remains available when you already know the member's ID. User mappings also allow a manual username label; a label alone is not a verified identity. Searching starts on interaction with the picker, so a bulk migration preview does not perform a Discord lookup for every user on opening. The slash command's `user:@member` selector also supplies the ID without manual entry.

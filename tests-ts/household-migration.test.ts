@@ -259,6 +259,13 @@ describe('reviewed household source accounts', () => {
       expect(
         service.mediaOwnerships.get('emby', 'demo-emby', sources[index]!, store.settings()),
       ).toMatchObject({ discord_user_id: owner, slot: index + 1 });
+      expect(
+        service.mediaOwnerships.get('jellyfin', 'demo-jellyfin', link.remote_id, store.settings()),
+      ).toMatchObject({
+        username: link.username,
+        discord_user_id: owner,
+        slot: index + 1,
+      });
       expect(bot.sendCredentials.mock.calls[index]?.slice(0, 2)).toEqual([owner, link.username]);
     }
     expect(create).toHaveBeenCalledTimes(3);
@@ -285,6 +292,17 @@ describe('reviewed household source accounts', () => {
     expect(create).not.toHaveBeenCalled();
     expect(reset).not.toHaveBeenCalled();
     expect(bot.sendCredentials).not.toHaveBeenCalled();
+    expect(
+      service.mediaOwnerships.get('emby', 'demo-emby', 'e-second', store.settings()),
+    ).toMatchObject({ discord_user_id: owner, slot: 2 });
+    expect(
+      service.mediaOwnerships.get(
+        'jellyfin',
+        'demo-jellyfin',
+        'existing-secondary',
+        store.settings(),
+      ),
+    ).toMatchObject({ discord_user_id: owner, slot: 2, username: 'Jim_2' });
   });
 
   it.each(['quota', 'source-name', 'owner', 'mapping', 'occupied-slot'])(

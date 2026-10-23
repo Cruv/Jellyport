@@ -221,6 +221,35 @@ describe('approved media ownership in existing migration workflows', () => {
     expect(bot.delivered).not.toHaveBeenCalled();
   });
 
+  it('pins the Emby server at explicit owner admission and rejects a replacement before reading history or creating an account', async () => {
+    servers.users.emby.find((user) => user.Id === 'e-alex')!.Name = 'discord.user';
+    const factory = service.clientFactory;
+    let sourceIdentityReads = 0;
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      if (args[2] === 'emby') {
+        const systemInfo = client.systemInfo.bind(client);
+        client.systemInfo = async () => {
+          const info = await systemInfo();
+          return ++sourceIdentityReads === 1 ? info : { ...info, Id: 'replacement-emby' };
+        };
+      }
+      return client;
+    };
+    const job = await finish(await service.migrateUsers(['e-alex'], { 'e-alex': owner }));
+    expect(job.status).toBe('failed');
+    expect(sourceIdentityReads).toBe(2);
+    expect(service.mediaOwnerships.list(store.settings())).toEqual([]);
+    expect(store.links()).toEqual([]);
+    expect(mediaWrites()).toEqual([]);
+    expect(
+      calls.some((call) =>
+        ['catalogItems', 'migrationState', 'migrationItems', 'items'].includes(call.method),
+      ),
+    ).toBe(false);
+    expect(bot.delivered).not.toHaveBeenCalled();
+  });
+
   it('permits an explicitly approved migration and credential delivery for a verified source username exception', async () => {
     registered('emby', 'e-alex');
     const result = await finish(await service.migrateUsers(['e-alex'], { 'e-alex': owner }));

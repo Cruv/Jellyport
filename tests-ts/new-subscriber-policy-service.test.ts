@@ -141,6 +141,9 @@ describe('future new-subscriber automatic Jellyfin onboarding', () => {
       account_limit: Number(limit),
     });
     expect(
+      service.memberships.get(owner, store.settings())?.new_subscriber_pending,
+    ).toBeUndefined();
+    expect(
       calls
         .filter((call) => call.kind === 'emby')
         .every((call) => ['users', 'close'].includes(call.method)),
@@ -462,6 +465,9 @@ describe('future new-subscriber automatic Jellyfin onboarding', () => {
     const event = await signup();
     expect(event.status).toBe('applied');
     expect(service.memberships.get(owner, store.settings())?.provision_jellyfin).toBe(true);
+    expect(
+      service.memberships.get(owner, store.settings())?.new_subscriber_pending,
+    ).toBeUndefined();
     expect(event.result).toContain('credential delivery failed');
     const password = bot.sendCredentials.mock.calls[0]![2];
     expect(JSON.stringify(event)).not.toContain(password);
@@ -514,7 +520,12 @@ describe('future new-subscriber automatic Jellyfin onboarding', () => {
       if (++reads !== 3) return;
       const member = service.memberships.get(owner, store.settings())!;
       manualRevision = service.memberships.save(
-        { ...member, provision_jellyfin: true, account_limit: 2 },
+        {
+          ...member,
+          provision_jellyfin: true,
+          new_subscriber_pending: undefined,
+          account_limit: 2,
+        },
         store.settings(),
         member.revision,
       ).revision;
@@ -528,7 +539,7 @@ describe('future new-subscriber automatic Jellyfin onboarding', () => {
     noAccounts();
   });
 
-  it('does not rewrite an old scope after the configured guild changes', async () => {
+  it('holds the original automatic enrollment even if the guild changes, including after restoring it', async () => {
     let reads = 0;
     let originalRevision: string | undefined;
     const original = store.settings();
@@ -539,10 +550,130 @@ describe('future new-subscriber automatic Jellyfin onboarding', () => {
       }
     };
     expect((await signup()).status).toBe('failed');
-    expect(service.memberships.get(owner, original)).toMatchObject({
-      revision: originalRevision,
-      provision_jellyfin: true,
-    });
+    expect(service.memberships.get(owner, original)?.revision).not.toBe(originalRevision);
+    expect(service.memberships.get(owner, original)?.provision_jellyfin).toBe(false);
+    expect(service.memberships.get(owner, original)?.new_subscriber_pending).toBeUndefined();
+    store.saveSettings(original);
+    embyRead = undefined;
+    expect((await signup()).status).toBe('applied');
+    expect(store.jobs()).toHaveLength(1);
     noAccounts();
+  });
+
+  it.each(['url', 'server-id'])(
+    'holds only the original enrollment after paired %s changes and restoration',
+    async (change) => {
+      const original = store.settings();
+      const originalAuth = {
+        kind: 'configured' as const,
+        serverUrl: original.jellyfin_url,
+        serverId: 'demo-jellyfin',
+        apiKeyName: 'synthetic',
+      };
+      store.db
+        .prepare('INSERT OR REPLACE INTO auth_state VALUES (1,?)')
+        .run(store.encrypt(originalAuth));
+      store.saveSettings(original);
+      let reads = 0;
+      let replacementRevision: string | undefined;
+      let changedSettings = original;
+      embyRead = async () => {
+        if (++reads !== 3) return;
+        changedSettings =
+          change === 'url'
+            ? { ...original, jellyfin_url: 'http://replacement.example.test' }
+            : original;
+        const changedAuth = {
+          ...originalAuth,
+          serverUrl: changedSettings.jellyfin_url,
+          serverId: 'replacement-server',
+        };
+        store.db
+          .prepare('UPDATE auth_state SET encrypted=? WHERE id=1')
+          .run(store.encrypt(changedAuth));
+        store.saveSettings(changedSettings);
+        replacementRevision = service.memberships.save(
+          {
+            discord_user_id: owner,
+            base_username: 'explicit.replacement',
+            tier_id: 'brigantine',
+            access_mode: 'subscription',
+            provision_jellyfin: true,
+            account_limit: 2,
+            active: true,
+          },
+          changedSettings,
+        ).revision;
+      };
+      expect((await signup()).status).toBe('failed');
+      expect(service.memberships.get(owner, changedSettings)).toMatchObject({
+        revision: replacementRevision,
+        provision_jellyfin: true,
+        base_username: 'explicit.replacement',
+      });
+      store.db
+        .prepare('UPDATE auth_state SET encrypted=? WHERE id=1')
+        .run(store.encrypt(originalAuth));
+      store.saveSettings(original);
+      expect(service.memberships.get(owner, original)?.provision_jellyfin).toBe(false);
+      expect(service.memberships.get(owner, original)?.new_subscriber_pending).toBeUndefined();
+      embyRead = undefined;
+      expect((await signup()).status).toBe('applied');
+      expect(store.jobs()).toHaveLength(1);
+      noAccounts();
+    },
+  );
+
+  it('keeps enrollment authority pending across a crash window, report deletion and restart', async () => {
+    let reads = 0;
+    embyRead = async () => {
+      if (++reads === 3)
+        servers.users.emby.push({
+          Id: 'existing-after-enrollment',
+          Name: bot.username,
+          Policy: {},
+        });
+    };
+    // Model the durable state if a process exits before the completion CAS.
+    vi.spyOn(service.memberships, 'holdProvisioning').mockReturnValue(false);
+    const failed = await signup();
+    expect(failed.status).toBe('failed');
+    expect(service.memberships.get(owner, store.settings())).toMatchObject({
+      provision_jellyfin: true,
+      new_subscriber_pending: true,
+    });
+    expect(service.clearJobHistory([failed.job_id!]).removed_ids).toEqual([failed.job_id]);
+    const factory = service.clientFactory;
+    await service.stop();
+    store.close();
+    store = new Store(directory);
+    service = new Service(store, { clientFactory: factory });
+    service.bot = bot;
+    embyRead = undefined;
+    servers.users.emby = [];
+    const before = calls.length;
+    const later = await signup();
+    expect(later.status).toBe('pending');
+    expect(later.result).toContain('previous automatic signup remains unresolved');
+    expect(store.jobs()).toEqual([]);
+    expect(calls).toHaveLength(before);
+    await expect(service.provisionMembership(owner)).rejects.toThrow('previous automatic signup');
+    noAccounts();
+    const pending = service.memberships.get(owner, store.settings())!;
+    const edited = await service.setMembershipAccess({
+      discord_user_id: owner,
+      access_mode: 'subscription',
+      tier_id: 'brigantine',
+      expected_revision: pending.revision,
+    });
+    expect(edited.new_subscriber_pending).toBe(true);
+    const approved = await service.setMembershipAccess({
+      discord_user_id: owner,
+      access_mode: 'subscription',
+      tier_id: 'sloop',
+      provision_jellyfin: true,
+      expected_revision: edited.revision,
+    });
+    expect(approved.new_subscriber_pending).toBeUndefined();
   });
 });

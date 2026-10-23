@@ -115,7 +115,11 @@ remain for administrator review. Generic role events, reconciliation, Stripe
 observations and old messages cannot authorize first-time creation. Existing
 ownership, current-recipient, server-binding, job-revision and uncertain-creation
 protections remain in effect; new credentials use the ordinary private delivery
-and expiring administrator recovery path. Verification uses synthetic adapters
+and expiring administrator recovery path. An encrypted pending-enrollment guard
+survives process failure, report deletion and changes to the active configuration;
+only verified completion or an explicit administrator decision clears it. Failure
+holds update the exact original membership revision without overwriting newer
+decisions or another server's record. Verification uses synthetic adapters
 and local demo pages rather than real signups or live media accounts.
 
 ## Stripe billing observations — 0.26.0

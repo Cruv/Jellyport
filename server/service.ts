@@ -403,6 +403,7 @@ interface NewSubscriberGuard {
   revision: string;
   emitted_at: string;
   event_id: string;
+  enrolled_membership?: Membership;
 }
 export function now(): string {
   return new Date().toISOString();
@@ -1626,6 +1627,9 @@ export class Service {
               identity!.username,
             access_mode: input.access_mode,
             provision_jellyfin: input.provision_jellyfin ?? previous?.provision_jellyfin ?? false,
+            ...(previous?.new_subscriber_pending && input.provision_jellyfin === undefined
+              ? { new_subscriber_pending: true as const }
+              : {}),
             tier_id: tier.id,
             account_limit: tier.account_limit,
             active: input.access_mode === 'complimentary' ? true : (previous?.active ?? true),
@@ -1832,6 +1836,14 @@ export class Service {
           throw new ServiceError('Discord returned a different member. Reload and try again.');
         const settings = this.store.settings();
         const existing = this.memberships.get(discordId, settings);
+        if (
+          existing?.new_subscriber_pending &&
+          !newSubscriber &&
+          review?.provision_jellyfin !== true
+        )
+          throw new ServiceError(
+            'A previous automatic signup requires an explicit Jellyfin opt-in in Memberships before provisioning can continue.',
+          );
         const assertNewPolicy = () => {
           if (!newSubscriber) return;
           this.newSubscriberPolicy.assertActive(settings, newSubscriber.revision);
@@ -2066,12 +2078,14 @@ export class Service {
             tier_id: tier.id,
             access_mode: existing?.access_mode ?? 'subscription',
             provision_jellyfin: allowNewAccounts,
+            ...(newSubscriber ? { new_subscriber_pending: true as const } : {}),
             account_limit: tier.account_limit,
             active: true,
           },
           settings,
           existing?.revision,
         );
+        if (newSubscriber) newSubscriber.enrolled_membership = structuredClone(member);
         return this.queue(
           'membership',
           requests.map((request) => ({
@@ -4754,9 +4768,15 @@ export class Service {
           event.tier_id = tier.id;
           event.account_limit = tier.account_limit;
           const existing = this.memberships.get(memberId, settings);
+          if (existing?.new_subscriber_pending) {
+            event.status = 'pending';
+            event.error = null;
+            event.result =
+              'A previous automatic signup remains unresolved. Review the account results and explicitly choose Jellyfin provisioning in Memberships; no account was created or migrated.';
+            this.store.saveSubscription(event);
+            return event;
+          }
           let newSubscriberJob: Job | undefined;
-          let newSubscriberRevision: string | undefined;
-          const newSubscriberScope = this.mediaOwnerships.scope(settings);
           const newSubscriber =
             automatic && !existing && !this.store.linksForMember(memberId).length
               ? this.newSubscriberGuard(event, settings)
@@ -4770,8 +4790,13 @@ export class Service {
                 undefined,
                 newSubscriber,
               );
-              newSubscriberRevision = this.memberships.get(memberId, settings)?.revision;
             } catch (error) {
+              if (newSubscriber.enrolled_membership)
+                await this.membershipMutex.run(() =>
+                  this.mutationMutex.run(async () => {
+                    this.memberships.holdProvisioning(newSubscriber.enrolled_membership!);
+                  }),
+                );
               // An established identity is a normal opt-in hold. Connectivity,
               // configuration races and unverifiable reads remain visible failures.
               if (!(error instanceof NewSubscriberOptInRequired)) throw error;
@@ -4805,19 +4830,8 @@ export class Service {
               // opt-in before filling additional slots after this failure.
               await this.membershipMutex.run(() =>
                 this.mutationMutex.run(async () => {
-                  const currentSettings = this.store.settings();
-                  const current = this.memberships.get(memberId, currentSettings);
-                  if (
-                    current &&
-                    current.revision === newSubscriberRevision &&
-                    current.provision_jellyfin &&
-                    this.mediaOwnerships.scope(currentSettings) === newSubscriberScope
-                  )
-                    this.memberships.save(
-                      { ...current, provision_jellyfin: false },
-                      currentSettings,
-                      current.revision,
-                    );
+                  if (newSubscriber?.enrolled_membership)
+                    this.memberships.holdProvisioning(newSubscriber.enrolled_membership);
                 }),
               );
               throw new ServiceError(
@@ -4827,6 +4841,12 @@ export class Service {
             event.result = outcome.results.some((result) => result.discord_delivery === 'failed')
               ? 'Jellyfin accounts created, but private credential delivery failed. Reveal credentials in the linked job; creation will not be retried.'
               : 'New-subscriber Jellyfin accounts created and credentials sent privately. No Emby history was read or migrated.';
+            if (newSubscriber?.enrolled_membership)
+              await this.membershipMutex.run(() =>
+                this.mutationMutex.run(async () => {
+                  this.memberships.completeProvisioning(newSubscriber.enrolled_membership!);
+                }),
+              );
           } else if (
             (!existing || existing.provision_jellyfin === false) &&
             !this.store.linksForMember(memberId).length
@@ -4929,6 +4949,9 @@ export class Service {
                     tier_id: previous?.tier_id ?? 'sloop',
                     access_mode: previous?.access_mode ?? 'subscription',
                     provision_jellyfin: previous?.provision_jellyfin ?? true,
+                    ...(previous?.new_subscriber_pending
+                      ? { new_subscriber_pending: true as const }
+                      : {}),
                     account_limit: previous?.account_limit ?? 1,
                     active: false,
                     inactive_reason: event.action as 'cancel' | 'expire',

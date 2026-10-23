@@ -260,6 +260,135 @@ describe('user directory and informational Discord organization', () => {
     expect(row.jellyfin[0]?.name).toBe('simple.family');
   });
 
+  it('shows confirmed accounts once when an older ownerless mapping still pairs them', async () => {
+    mapping('e-river', 'j-river', null);
+    service.mediaOwnerships.save(
+      [
+        {
+          kind: 'emby',
+          server_id: 'demo-emby',
+          account_id: 'e-river',
+          username: 'river',
+          discord_user_id: owner,
+          slot: 1,
+        },
+      ],
+      store.settings(),
+    );
+    store.saveLink(owner, 'river', 'j-river');
+    const rows = (await organization.directory()).users;
+    const selected = rows.filter(
+      (row) =>
+        row.emby.some((account) => account.id === 'e-river') ||
+        row.jellyfin.some((account) => account.id === 'j-river'),
+    );
+    expect(selected).toHaveLength(1);
+    expect(selected[0]).toMatchObject({
+      discord_user_id: owner,
+      emby: [{ id: 'e-river' }],
+      jellyfin: [{ id: 'j-river' }],
+      requires_review: false,
+    });
+    expect(mediaWrites).toEqual([]);
+  });
+
+  it.each(['emby', 'jellyfin'] as const)(
+    'keeps an ownerless mapping’s unowned side separate when only its %s account is confirmed',
+    async (kind) => {
+      mapping('e-river', 'j-river', null);
+      if (kind === 'jellyfin') store.saveLink(owner, 'river', 'j-river');
+      else
+        service.mediaOwnerships.save(
+          [
+            {
+              kind,
+              server_id: 'demo-emby',
+              account_id: 'e-river',
+              username: 'river',
+              discord_user_id: owner,
+              slot: 1,
+            },
+          ],
+          store.settings(),
+        );
+      const rows = (await organization.directory()).users;
+      const owned = rows.find((row) => row.discord_user_id === owner)!;
+      const otherKind = kind === 'emby' ? 'jellyfin' : 'emby';
+      const ownedId = kind === 'emby' ? 'e-river' : 'j-river';
+      const otherId = kind === 'emby' ? 'j-river' : 'e-river';
+      expect(owned[kind].map((account) => account.id)).toEqual([ownedId]);
+      expect(owned[otherKind]).toEqual([]);
+      const unowned = rows.filter((row) =>
+        row[otherKind].some((account) => account.id === otherId),
+      );
+      expect(unowned).toHaveLength(1);
+      expect(unowned[0]).toMatchObject({ discord_user_id: null, requires_review: true });
+      expect(unowned[0]![kind]).toEqual([]);
+      expect(
+        rows.filter((row) => row[kind].some((account) => account.id === ownedId)),
+      ).toHaveLength(1);
+      expect(mediaWrites).toEqual([]);
+    },
+  );
+
+  it('still rejects distinct confirmed owners instead of hiding an account conflict', async () => {
+    mapping('e-river', 'j-river', owner);
+    service.mediaOwnerships.save(
+      [
+        {
+          kind: 'emby',
+          server_id: 'demo-emby',
+          account_id: 'e-river',
+          username: 'river',
+          discord_user_id: other,
+          slot: 1,
+        },
+      ],
+      store.settings(),
+    );
+    await expect(organization.directory()).rejects.toThrow('Conflicting media account owners');
+    expect(bot.updateTagRoles).not.toHaveBeenCalled();
+    expect(mediaWrites).toEqual([]);
+  });
+
+  it('keeps a directly confirmed migration owner with both accounts after a service restart', async () => {
+    updateSettings({ discord_guild_id: '123456789012345678' });
+    bindServer();
+    bot.members.set(owner, { username: 'river', roles: ['subscriber'] });
+    const readOnlyFactory = service.clientFactory;
+    service.clientFactory = servers.factory;
+    const job = await service.migrateUsers(['e-river'], { 'e-river': owner });
+    await service.jobTasks.get(job.id);
+    const result = service.getJob(job.id);
+    expect(result.status, JSON.stringify(result)).toBe('completed');
+    service.clientFactory = readOnlyFactory;
+    const assertLinkedDirectory = async () => {
+      const rows = (await organization.directory()).users;
+      const selected = rows.filter(
+        (row) =>
+          row.emby.some((account) => account.id === 'e-river') ||
+          row.jellyfin.some((account) => account.id === 'j-river'),
+      );
+      expect(selected).toHaveLength(1);
+      expect(selected[0]).toMatchObject({
+        discord_user_id: owner,
+        emby: [{ id: 'e-river', name: 'river' }],
+        jellyfin: [{ id: 'j-river', name: 'river' }],
+        requires_review: false,
+      });
+    };
+    await assertLinkedDirectory();
+    await service.stop();
+    store.close();
+    store = new Store(directory);
+    service = new Service(store, { clientFactory: readOnlyFactory });
+    service.bot = bot;
+    organization = new UserOrganization(service);
+    await assertLinkedDirectory();
+    expect(bot.sendCredentials).not.toHaveBeenCalled();
+    expect(mediaWrites).toEqual([]);
+  });
+
   it('does not pair duplicate usernames and marks admin, unknown-policy and template accounts protected', async () => {
     servers.users.jellyfin.push({
       Id: 'j-river-duplicate',

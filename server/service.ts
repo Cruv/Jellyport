@@ -936,6 +936,88 @@ export class Service {
       );
     return current;
   }
+  /** A migration's verified IDs may add ownership, never replace an existing
+   * owner or consume another account's reserved slot. Call inside the binding
+   * SAVEPOINT too, after all remote reads have completed. */
+  private migrationIdentityAdditions(
+    records: Array<Omit<MediaOwnership, 'scope' | 'approved_at'>>,
+    settings: Settings,
+  ): Array<Omit<MediaOwnership, 'scope' | 'approved_at'>> {
+    const owners = this.mediaOwnerships.list(settings);
+    const mappings = this.mappings.list(settings);
+    const source = records.find((record) => record.kind === 'emby');
+    const additions: typeof records = [];
+    for (const record of records) {
+      const existing = owners.find(
+        (owner) =>
+          owner.kind === record.kind &&
+          owner.server_id === record.server_id &&
+          owner.account_id === record.account_id,
+      );
+      if (
+        existing &&
+        (existing.discord_user_id !== record.discord_user_id ||
+          existing.slot !== record.slot ||
+          existing.username !== record.username)
+      )
+        throw new ServiceError(
+          'This media account has a conflicting approved owner, label, or slot. Review its identity before migrating.',
+        );
+      if (
+        owners.some(
+          (owner) =>
+            owner.kind === record.kind &&
+            owner.server_id === record.server_id &&
+            owner.discord_user_id === record.discord_user_id &&
+            owner.slot === record.slot &&
+            owner.account_id !== record.account_id,
+        )
+      )
+        throw new ServiceError(
+          'This owner already has a different approved account in the selected media-server slot. Review its identity before migrating.',
+        );
+      for (const mapping of mappings) {
+        const selectedSource = mapping.source_user_id === source?.account_id;
+        const selectedAccount =
+          record.kind === 'emby'
+            ? mapping.source_user_id === record.account_id
+            : mapping.target_user_id === record.account_id ||
+              (!mapping.target_user_id &&
+                caseFold(mapping.target_username) === caseFold(record.username));
+        const sameOwnerSlot =
+          mapping.discord_user_id === record.discord_user_id &&
+          (mapping.membership_slot ?? 1) === record.slot;
+        if (
+          (selectedAccount &&
+            mapping.discord_user_id &&
+            (mapping.discord_user_id !== record.discord_user_id ||
+              (mapping.membership_slot ?? 1) !== record.slot)) ||
+          (sameOwnerSlot && !selectedSource) ||
+          (record.kind === 'jellyfin' && selectedAccount && !selectedSource)
+        )
+          throw new ServiceError(
+            'An approved user mapping conflicts with this migration owner or account slot. Review the mapping before migrating.',
+          );
+      }
+      if (record.kind === 'jellyfin') {
+        const targetLink = this.store.linkForRemote(record.account_id);
+        const slotLink = this.store.link(record.discord_user_id, record.slot);
+        if (
+          (targetLink &&
+            (targetLink.discord_user_id !== record.discord_user_id ||
+              targetLink.membership_slot !== record.slot ||
+              targetLink.username !== record.username)) ||
+          (slotLink &&
+            (slotLink.remote_id !== record.account_id || slotLink.username !== record.username))
+        )
+          throw new ServiceError(
+            'The Jellyfin account link conflicts with this migration owner or slot. Review its identity before migrating.',
+          );
+      }
+      if (!existing) additions.push(record);
+    }
+    return additions;
+  }
   async preview(sourceUserIds: string[], options: MigrationPreviewOptions = {}) {
     return this.previewRead(sourceUserIds, options);
   }
@@ -2542,16 +2624,21 @@ export class Service {
     const registeredSources = this.mediaOwnerships
       .list(settings)
       .filter((owner) => owner.kind === 'emby' && sourceUserIds.includes(owner.account_id));
+    const confirmsMigrationOwner = sourceUserIds.some(
+      (id) => discordRecipients[id] || this.mappings.getForSource(id, settings)?.discord_user_id,
+    );
     let ownershipServerId: string | undefined;
-    if (registeredSources.length || Object.keys(reviewedHouseholds).length)
-      await this.withClient(settings, 'emby', async (client) => {
+    const readOwnershipServerId = () =>
+      this.withClient(settings, 'emby', async (client) => {
         const info = await client.systemInfo();
         if (typeof info.Id !== 'string' || !info.Id)
           throw new ServiceError(
             'The Emby server identity could not be verified for approved ownership.',
           );
-        ownershipServerId = info.Id;
+        return info.Id;
       });
+    if (registeredSources.length || Object.keys(reviewedHouseholds).length)
+      ownershipServerId = await readOwnershipServerId();
     if (sourceSnapshotIds) {
       if (
         Object.keys(sourceSnapshotIds).length !== sourceUserIds.length ||
@@ -2662,6 +2749,19 @@ export class Service {
       throw new ServiceError(
         'Configuration changed during migration preparation. Prepare a new review.',
       );
+    if (!ownershipServerId && confirmsMigrationOwner) {
+      ownershipServerId = await readOwnershipServerId();
+      if (JSON.stringify(settings) !== JSON.stringify(this.store.settings()))
+        throw new ServiceError(
+          'Configuration changed during migration preparation. Prepare a new review.',
+        );
+      for (const request of requests)
+        request.source_ownership = {
+          ...request.source_ownership,
+          server_id: ownershipServerId,
+          identity_hash: request.source_ownership?.identity_hash ?? null,
+        };
+    }
     for (const request of requests)
       if (ownershipServerId) this.sourceOwnership(request, settings, ownershipServerId);
     const allOwners = this.mediaOwnerships.list(settings);
@@ -3802,6 +3902,10 @@ export class Service {
     const registeredSource: { value: MediaOwnership | null } = { value: null };
     const registeredAccounts = this.mediaOwnerships.list(settings);
     const auth = this.store.authState();
+    const bindsMigrationIdentity = Boolean(
+      request.source_user_id && request.discord_user_id && !request.history_only_target,
+    );
+    const migrationIdentityScope = this.mediaOwnerships.scope(settings);
     let targetOwnershipServerId = auth?.kind === 'configured' ? auth.serverId : undefined;
     let targetOwnershipPin: { id: string; identity_hash: string | null } | undefined;
     let username: string;
@@ -3815,6 +3919,13 @@ export class Service {
     const guard = () => {
       this.checkJobStopped(job);
       this.assertConnections(settings);
+      if (
+        bindsMigrationIdentity &&
+        this.mediaOwnerships.scope(this.store.settings()) !== migrationIdentityScope
+      )
+        throw new ServiceError(
+          'The identity server configuration changed. Review a new migration before linking its accounts.',
+        );
       this.assertMembershipRequest(request, settings);
       if (!request.history_only_target) this.assertDefaultRole(template, request, settings);
       this.assertMapping(mapping, request.source_user_id, settings);
@@ -3834,7 +3945,11 @@ export class Service {
           );
       }
     };
-    if (registeredAccounts.length || request.source_ownership?.identity_hash) {
+    if (
+      registeredAccounts.length ||
+      request.source_ownership?.identity_hash ||
+      bindsMigrationIdentity
+    ) {
       const info = await jellyfin.systemInfo();
       if (
         typeof info.Id !== 'string' ||
@@ -4162,6 +4277,20 @@ export class Service {
       const existing = currentTarget ? this.store.linkForRemote(currentTarget.Id) : null;
       if (existing && (existing.discord_user_id !== recipient || existing.membership_slot !== slot))
         throw new ServiceError('This Jellyfin account is already linked to another Discord user.');
+      if (source && sourceOwnershipServerId && !historyOnly)
+        this.migrationIdentityAdditions(
+          [
+            {
+              kind: 'emby',
+              server_id: sourceOwnershipServerId,
+              account_id: source.user.Id,
+              username: source.user.Name,
+              discord_user_id: recipient,
+              slot,
+            },
+          ],
+          settings,
+        );
     }
     const result: JobResult = {
       timing,
@@ -4326,13 +4455,114 @@ export class Service {
           throw new ServiceError(
             'This Discord user is already linked to a different Jellyfin account. Existing identity link was preserved.',
           );
-        this.store.saveLink(
-          recipient,
-          username,
-          target.Id,
-          Boolean(previous?.disabled_by_jellyport),
-          slot,
-        );
+        if (source && !historyOnly) {
+          if (!sourceOwnershipServerId || !targetOwnershipServerId)
+            throw new ServiceError(
+              'Verify both media-server identities before linking migrated accounts.',
+            );
+          await this.withClient(settings, 'emby', async (emby) => {
+            const info = await emby.systemInfo();
+            guard();
+            if (info.Id !== sourceOwnershipServerId)
+              throw new ServiceError(
+                'The Emby server changed before migration identity confirmation. Review its accounts.',
+              );
+            const confirmed = await emby.user(source!.user.Id);
+            guard();
+            if (confirmed.Id !== source!.user.Id || confirmed.Name !== source!.user.Name)
+              throw new ServiceError(
+                'The Emby source identity changed before linking migrated accounts. Review its account.',
+              );
+          });
+          const info = await jellyfin.systemInfo();
+          guard();
+          const confirmed = await jellyfin.user(target.Id);
+          guard();
+          if (
+            info.Id !== targetOwnershipServerId ||
+            confirmed.Id !== target.Id ||
+            confirmed.Name !== username ||
+            confirmed.Policy?.IsAdministrator !== false ||
+            confirmed.Policy.IsDisabled !== false ||
+            confirmed.Id === settings.template_user_id
+          )
+            throw new ServiceError(
+              'The Jellyfin destination identity changed before linking migrated accounts. Review its account.',
+            );
+          const sourceRecord = {
+            kind: 'emby' as const,
+            server_id: sourceOwnershipServerId,
+            account_id: source.user.Id,
+            username: source.user.Name,
+            discord_user_id: recipient,
+            slot,
+          };
+          const targetRecord = {
+            kind: 'jellyfin' as const,
+            server_id: targetOwnershipServerId,
+            account_id: target.Id,
+            username,
+            discord_user_id: recipient,
+            slot,
+          };
+          this.store.db.exec('SAVEPOINT jellyport_migration_identity');
+          let boundSource: MediaOwnership, boundTarget: MediaOwnership;
+          try {
+            guard();
+            const additions = this.migrationIdentityAdditions(
+              [sourceRecord, targetRecord],
+              settings,
+            );
+            const currentLink = this.store.link(recipient, slot);
+            this.mediaOwnerships.save(additions, settings);
+            this.store.saveLink(
+              recipient,
+              username,
+              target.Id,
+              Boolean(currentLink?.disabled_by_jellyport),
+              slot,
+            );
+            const savedSource = this.mediaOwnerships.get(
+              'emby',
+              sourceOwnershipServerId,
+              source.user.Id,
+              settings,
+            );
+            const savedTarget = this.mediaOwnerships.get(
+              'jellyfin',
+              targetOwnershipServerId,
+              target.Id,
+              settings,
+            );
+            if (!savedSource || !savedTarget)
+              throw new ServiceError(
+                'The migrated account ownership could not be persisted. Review the account identities before retrying.',
+              );
+            boundSource = savedSource;
+            boundTarget = savedTarget;
+            this.store.db.exec('RELEASE jellyport_migration_identity');
+          } catch (error) {
+            this.store.db.exec('ROLLBACK TO jellyport_migration_identity');
+            this.store.db.exec('RELEASE jellyport_migration_identity');
+            throw error;
+          }
+          // Rebase only the records authenticated inside our own successful
+          // transaction. A later conflicting write must still trip the guards.
+          request.source_ownership = {
+            server_id: sourceOwnershipServerId,
+            identity_hash: this.ownershipHash(boundSource),
+          };
+          registeredSource.value = boundSource;
+          targetOwnershipPin = { id: target.Id, identity_hash: this.ownershipHash(boundTarget) };
+          guard();
+        } else
+          this.store.saveLink(
+            recipient,
+            username,
+            target.Id,
+            Boolean(previous?.disabled_by_jellyport),
+            slot,
+          );
       }
       if (source && result.data) {
         guard();

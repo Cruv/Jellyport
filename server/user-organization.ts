@@ -141,19 +141,26 @@ export class UserOrganization {
       const account = users[ownership.kind].find((user) => user.Id === ownership.account_id);
       if (account) add(getRow(ownership.discord_user_id, ''), ownership.kind, account);
     }
-    for (const mapping of mappings) {
+    const addMapping = (mapping: (typeof mappings)[number], unassignedOnly = false) => {
       const source = users.emby.find(
-        (user) => user.Id === mapping.source_user_id && user.Name === mapping.source_username,
+        (user) =>
+          user.Id === mapping.source_user_id &&
+          user.Name === mapping.source_username &&
+          (!unassignedOnly || !usedEmby.has(user.Id)),
       );
       const target = users.jellyfin.find(
-        (user) => user.Id === mapping.target_user_id && user.Name === mapping.target_username,
+        (user) =>
+          user.Id === mapping.target_user_id &&
+          user.Name === mapping.target_username &&
+          (!unassignedOnly || !usedJellyfin.has(user.Id)),
       );
-      if (!source && !target) continue;
+      if (!source && !target) return;
       const row = getRow(mapping.discord_user_id, `mapping:${mapping.id}`);
       if (mapping.discord_username) row.discord_username = mapping.discord_username;
       if (source) add(row, 'emby', source);
       if (target) add(row, 'jellyfin', target);
-    }
+    };
+    for (const mapping of mappings) if (mapping.discord_user_id) addMapping(mapping);
     for (const link of this.service.store.links()) {
       if (
         this.service.memberships.hasOtherScope(link.discord_user_id, settings) &&
@@ -165,6 +172,9 @@ export class UserOrganization {
       );
       if (target) add(getRow(link.discord_user_id, ''), 'jellyfin', target);
     }
+    // Standalone mappings may predate confirmed ownership. Keep only their
+    // unassigned sides, without borrowing the other account's Discord owner.
+    for (const mapping of mappings) if (!mapping.discord_user_id) addMapping(mapping, true);
     // A matching name is a display aid only. It never establishes Discord ownership.
     for (const source of users.emby) {
       if (usedEmby.has(source.Id)) continue;

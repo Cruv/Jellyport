@@ -548,6 +548,7 @@ export interface Settings {
   discord_auto_role_sync?: boolean;
   discord_emby_only_role?: boolean;
   auto_provision: boolean;
+  auto_create_new_subscribers?: boolean;
   auto_disable: boolean;
   disable_on_cancel: boolean;
   membership_tiers?: MembershipTier[];

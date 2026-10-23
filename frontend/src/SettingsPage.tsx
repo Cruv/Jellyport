@@ -50,6 +50,7 @@ const toggleNames = [
   'discord_role_events',
   'discord_message_events',
   'auto_provision',
+  'auto_create_new_subscribers',
   'auto_disable',
   'disable_on_cancel',
 ] as const;
@@ -112,17 +113,22 @@ function Toggle({
   label,
   description,
   checked,
+  onDraftChange,
 }: {
   name: string;
   label: string;
   description: string;
   checked: boolean;
+  onDraftChange?: (checked: boolean) => void;
 }) {
   const { dirty, latest } = useContext(SettingsDraftDirty);
   const [draft, setDraft] = useWorkspaceDraftState(`settings.toggle.${name}`, checked);
   useLayoutEffect(() => {
     if (!latest.current) setDraft(checked);
   }, [dirty, latest, checked, setDraft]);
+  useEffect(() => {
+    onDraftChange?.(draft);
+  }, [draft, onDraftChange]);
   return (
     <div className="toggle-row">
       <div>
@@ -282,6 +288,7 @@ export default function SettingsPage({
   const [accountTab, setAccountTab] = useRouteTab('settings', 'accounts');
   const [discordTab, setDiscordTab] = useRouteTab('settings', 'discord');
   const [automationTab, setAutomationTab] = useRouteTab('settings', 'automation');
+  const [automaticProvisioning, setAutomaticProvisioning] = useState(s.auto_provision);
   const [selectedTier, setSelectedTier] = useState(0);
   const [historyTab, setHistoryTab] = useRouteTab('settings', 'history');
   const [dirty, setDirtyDraft] = useWorkspaceDraftState('settings.dirty', false);
@@ -1477,9 +1484,21 @@ export default function SettingsPage({
                         <Toggle
                           name="auto_provision"
                           label="Automatically provision subscribed members"
-                          description="Provision accounts for the member’s tier and deliver new credentials automatically. Automatic downgrades also require automatic disabling. With role events enabled, active members are scanned on startup and every five minutes."
+                          description="Apply membership changes automatically. Create Jellyfin accounts only when the member or new-subscriber policy allows it, then deliver new credentials. Automatic downgrades also require automatic disabling. With role events enabled, active members are scanned on startup and every five minutes."
                           checked={s.auto_provision}
+                          onDraftChange={setAutomaticProvisioning}
                         />
+                        <Toggle
+                          name="auto_create_new_subscribers"
+                          label="Create Jellyfin accounts for new subscribers"
+                          description="For new Discord members who subscribe after this policy is enabled, a fresh trusted subscription message with a recognized tier can create 1–3 Jellyfin accounts and DM their login details. Existing Discord members, Emby users, and membership provisioning choices stay opt-in. This never creates Emby access or enrolls existing subscribers."
+                          checked={s.auto_create_new_subscribers ?? false}
+                        />
+                        <p className="support-note" role="status">
+                          {automaticProvisioning
+                            ? 'Automatic provisioning is enabled. The new-subscriber policy applies only to future Discord joins and verified signups after it is saved.'
+                            : 'Automatic provisioning is paused. Enable “Automatically provision subscribed members” as well as the new-subscriber policy for unattended account creation and DMs.'}
+                        </p>
                         <Toggle
                           name="auto_disable"
                           label="Automatically disable expired memberships"

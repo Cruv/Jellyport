@@ -124,6 +124,13 @@ export function validateSettings(input: unknown): asserts input is Settings {
   if (settings.discord_role_events && !settings.discord_member_role_id)
     throw new ServiceError('Membership role events require an active subscriber role ID.');
   if (
+    settings.auto_create_new_subscribers &&
+    (!settings.discord_enabled || !settings.discord_message_events)
+  )
+    throw new ServiceError(
+      'New-subscriber Jellyfin accounts require Discord and trusted MEE6 subscription messages with a configured tier.',
+    );
+  if (
     (settings.auto_provision || settings.auto_disable) &&
     (!settings.discord_enabled ||
       !(settings.discord_message_events || settings.discord_role_events))

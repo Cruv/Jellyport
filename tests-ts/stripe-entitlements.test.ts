@@ -122,6 +122,133 @@ describe('verified Stripe entitlement policy', () => {
       )[0]?.action,
     ).toBe('expire');
   });
+  it('does not renew a canceled subscription when an old past-due invoice is paid after cancellation', () => {
+    const day = 86_400;
+    const original = subscription();
+    const originalPeriod = { ...paid(), end: base + 30 * day };
+    const active = prepare(snapshot([original]), new Map([[original.id, originalPeriod]]))[0]!;
+    expect(active.action).toBe('subscribe');
+    expect(policy.claim(active)).toBe(true);
+    policy.finish(active, true);
+
+    clock = (base + 45 * day) * 1000;
+    expect(
+      prepare(
+        snapshot([{ ...original, status: 'past_due' }]),
+        new Map([[original.id, originalPeriod]]),
+      ),
+    ).toEqual([]);
+    expect(() => policy.assert(active)).toThrow('changed or expired');
+
+    clock = (base + 61 * day) * 1000;
+    const canceled = { ...original, status: 'canceled', ended_at: base + 60 * day };
+    const expiry = prepare(snapshot([canceled]), new Map([[original.id, originalPeriod]]))[0]!;
+    expect(expiry.action).toBe('expire');
+    expect(policy.claim(expiry)).toBe(true);
+    policy.finish(expiry, true);
+
+    clock = (base + 62 * day) * 1000;
+    const latePaidPeriod = {
+      ...paid(),
+      invoice_id: 'in_overdue',
+      created: base + 30 * day,
+      start: base + 30 * day,
+      end: base + 60 * day,
+      paid_at: base + 62 * day,
+    };
+    const late = prepare(snapshot([canceled]), new Map([[original.id, latePaidPeriod]]));
+    expect(late).toHaveLength(1);
+    expect(late[0]).toMatchObject({
+      action: 'expire',
+      is_new: false,
+      paid_through: new Date((base + 60 * day) * 1000).toISOString(),
+    });
+    expect(policy.claim(late[0]!)).toBe(true);
+    policy.finish(late[0]!, true);
+    clock += day * 1000;
+    const refreshed = prepare(snapshot([canceled]), new Map([[original.id, latePaidPeriod]]))[0]!;
+    expect(refreshed.action).toBe('expire');
+    expect(policy.claim(refreshed)).toBe(false);
+  });
+  it('restores entitlement only for a genuinely active paid replacement after an old canceled invoice is paid late', () => {
+    const day = 86_400;
+    clock = (base + 62 * day) * 1000;
+    const canceled = { ...subscription(), status: 'canceled', ended_at: base + 60 * day };
+    const oldPeriod = {
+      ...paid(),
+      start: base + 30 * day,
+      end: base + 60 * day,
+      paid_at: base + 62 * day,
+    };
+    const replacement = {
+      ...subscription('replacement'),
+      customer_id: 'cus_new',
+      created: base + 62 * day - 10,
+    };
+    const replacementPeriod = {
+      ...paid('replacement'),
+      customer_id: 'cus_new',
+      created: replacement.created,
+      paid_at: base + 62 * day - 5,
+      start: replacement.created,
+      end: base + 92 * day,
+    };
+    const facts = prepare(
+      snapshot([canceled, replacement]),
+      new Map([
+        [canceled.id, oldPeriod],
+        [replacement.id, replacementPeriod],
+      ]),
+    );
+    expect(facts).toHaveLength(1);
+    expect(facts[0]).toMatchObject({
+      action: 'subscribe',
+      subscription_id: replacement.id,
+      invoice_id: replacementPeriod.invoice_id,
+      paid_through: new Date(replacementPeriod.end * 1000).toISOString(),
+      is_new: true,
+    });
+  });
+  it('protects another approved customer’s current payment when a canceled subscription’s old invoice is paid late', () => {
+    const day = 86_400;
+    clock = (base + 62 * day) * 1000;
+    const canceled = { ...subscription(), status: 'canceled', ended_at: base + 60 * day };
+    const current = { ...subscription('other'), created: base + 61 * day };
+    const oldPeriod = { ...paid(), end: base + 60 * day, paid_at: base + 62 * day };
+    const currentPeriod = {
+      ...paid('other'),
+      created: current.created,
+      paid_at: current.created + 1,
+      start: current.created,
+      end: base + 91 * day,
+    };
+    const both = [...links, { customer_id: 'cus_other', discord_user_id: owner }];
+    const facts = policy.prepare(
+      generation,
+      snapshot([canceled, current]),
+      both,
+      prices,
+      new Map([
+        [canceled.id, oldPeriod],
+        [current.id, currentPeriod],
+      ]),
+    );
+    expect(facts).toHaveLength(1);
+    expect(facts[0]).toMatchObject({
+      action: 'subscribe',
+      customer_id: 'cus_other',
+      subscription_id: current.id,
+    });
+    expect(
+      policy.prepare(
+        generation,
+        snapshot([canceled, current]),
+        both,
+        prices,
+        new Map([[canceled.id, oldPeriod]]),
+      ),
+    ).toEqual([]);
+  });
   it.each(['active', 'trialing', 'past_due', 'unpaid', 'paused', 'unknown'])(
     'does not expire an owner when another approved customer has %s access',
     (status) => {
@@ -238,6 +365,22 @@ describe('Stripe paid-invoice API projection', () => {
       price_id: 'price_member',
     });
     expect(JSON.stringify(result)).not.toContain('never-retain');
+  });
+  it('keeps an overdue invoice’s original service period when it is paid much later', async () => {
+    const day = 86_400;
+    const value = {
+      ...invoice(),
+      created: base - 90 * day,
+      period_end: base + 30 * day,
+      status_transitions: { paid_at: base + 1 },
+    };
+    value.lines.data[0]!.period = { start: base - 90 * day, end: base - 60 * day };
+    expect(await api(value).paidPeriod('sub_new')).toMatchObject({
+      created: base - 90 * day,
+      paid_at: base + 1,
+      start: base - 90 * day,
+      end: base - 60 * day,
+    });
   });
   it('rejects a paid invoice for a different subscription', async () => {
     const value = invoice();

@@ -38,6 +38,7 @@ describe('Stripe-first membership automation without MEE6', () => {
     stripe: StripeIntegration,
     bot: BillingBot;
   let data: StripeSnapshot, period: StripePaidPeriod | null, reads: string[], writes: string[];
+  let periodsBySubscription: Map<string, StripePaidPeriod | null> | undefined;
   beforeEach(async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(base * 1000));
@@ -53,6 +54,7 @@ describe('Stripe-first membership automation without MEE6', () => {
       products: [],
     };
     period = null;
+    periodsBySubscription = undefined;
     store.saveSettings({
       ...store.settings(),
       emby_url: 'http://emby.example.test',
@@ -100,7 +102,8 @@ describe('Stripe-first membership automation without MEE6', () => {
         mode: 'live',
         snapshot: async () => structuredClone(data),
         checkoutIdentityCandidates: async () => [],
-        paidPeriod: async () => period,
+        paidPeriod: async (id) =>
+          periodsBySubscription ? (periodsBySubscription.get(id) ?? null) : period,
       }),
       resolveDiscordMember: async (id) => ({ id, username: 'new.member' }),
       onEntitlement: (fact) => service.recordStripeEntitlement(fact),
@@ -305,6 +308,126 @@ describe('Stripe-first membership automation without MEE6', () => {
     data.subscriptions[0]!.status = 'past_due';
     await stripe.sync();
     expect(target.Policy?.IsDisabled).toBe(false);
+  });
+  it.each([false, true])(
+    'keeps a canceled delinquent member inactive when old debt is paid late (expiry previously observed: %s)',
+    async (observedExpiry) => {
+      await newSubscription();
+      await stripe.sync();
+      const target = servers.users.jellyfin.find((account) => account.Name === 'new.member')!;
+      const targetId = target.Id;
+      const originalPeriod = structuredClone(period!);
+      vi.setSystemTime(new Date((base + 45 * 86_400) * 1000));
+      data.subscriptions[0]!.status = 'past_due';
+      await stripe.sync();
+      expect(target.Policy?.IsDisabled).toBe(false);
+      data.subscriptions[0]!.status = 'canceled';
+      data.subscriptions[0]!.ended_at = base + 50 * 86_400;
+      if (observedExpiry) {
+        vi.setSystemTime(new Date((base + 51 * 86_400) * 1000));
+        await stripe.sync();
+        expect(target.Policy?.IsDisabled).toBe(true);
+      }
+      vi.setSystemTime(new Date((base + 62 * 86_400) * 1000));
+      period = {
+        ...originalPeriod,
+        invoice_id: 'in_old_debt_paid_late',
+        created: base + 2 * 86_400,
+        paid_at: base + 62 * 86_400,
+        start: base + 2 * 86_400,
+        end: base + 32 * 86_400,
+      };
+      await stripe.sync();
+      expect(target.Policy?.IsDisabled).toBe(true);
+      expect(service.memberships.get(owner, store.settings())?.active).toBe(false);
+      expect(store.linksForMember(owner).map((link) => link.remote_id)).toEqual([targetId]);
+      expect(store.jobs()).toHaveLength(1);
+      expect(bot.sendCredentials).toHaveBeenCalledTimes(1);
+      const lateEvent = store
+        .subscriptions()
+        .find((event) => event.stripe_entitlement?.invoice_id === 'in_old_debt_paid_late');
+      expect(lateEvent).toMatchObject({ action: 'expire', status: 'applied' });
+      expect(lateEvent!.stripe_entitlement!.paid_through).toBe(
+        new Date((base + 32 * 86_400) * 1000).toISOString(),
+      );
+      const writeCount = writes.length;
+      await stripe.sync();
+      expect(writes).toHaveLength(writeCount);
+      expect(bot.sendCredentials).toHaveBeenCalledTimes(1);
+    },
+  );
+  it('reactivates the same existing account only after a genuinely new paid subscription follows late old-debt payment', async () => {
+    await newSubscription();
+    await stripe.sync();
+    const target = servers.users.jellyfin.find((account) => account.Name === 'new.member')!;
+    const targetId = target.Id;
+    vi.setSystemTime(new Date((base + 45 * 86_400) * 1000));
+    data.subscriptions[0]!.status = 'past_due';
+    await stripe.sync();
+    data.subscriptions[0]!.status = 'canceled';
+    data.subscriptions[0]!.ended_at = base + 50 * 86_400;
+    vi.setSystemTime(new Date((base + 62 * 86_400) * 1000));
+    period = {
+      ...period!,
+      invoice_id: 'in_old_debt_paid_late',
+      created: base + 2 * 86_400,
+      paid_at: base + 62 * 86_400,
+      start: base + 2 * 86_400,
+      end: base + 32 * 86_400,
+    };
+    await stripe.sync();
+    expect(target.Policy?.IsDisabled).toBe(true);
+    expect(service.memberships.get(owner, store.settings())?.active).toBe(false);
+    expect(bot.sendCredentials).toHaveBeenCalledTimes(1);
+
+    const restoredAt = base + 62 * 86_400 + 10;
+    vi.setSystemTime(new Date(restoredAt * 1000));
+    data.subscriptions.push({
+      ...data.subscriptions[0]!,
+      id: 'sub_replacement',
+      created: restoredAt - 2,
+      status: 'active',
+      ended_at: undefined,
+      items: [
+        { id: 'si_replacement', price_id: 'price_member', product_id: 'prod_member', quantity: 1 },
+      ],
+    });
+    periodsBySubscription = new Map([
+      ['sub_new', period],
+      [
+        'sub_replacement',
+        {
+          ...period,
+          invoice_id: 'in_replacement',
+          subscription_id: 'sub_replacement',
+          created: restoredAt - 2,
+          paid_at: restoredAt - 1,
+          start: restoredAt - 2,
+          end: restoredAt + 30 * 86_400,
+        },
+      ],
+    ]);
+    const beforeRestore = writes.length;
+    await stripe.sync();
+    expect(service.memberships.get(owner, store.settings())?.active).toBe(true);
+    expect(store.linksForMember(owner).map((link) => link.remote_id)).toEqual([targetId]);
+    expect(
+      servers.users.jellyfin.find((account) => account.Id === targetId)?.Policy?.IsDisabled,
+    ).toBe(false);
+    expect(store.link(owner, 1)?.disabled_by_jellyport).toBe(0);
+    expect(writes.slice(beforeRestore)).toEqual(['setPolicy']);
+    expect(bot.sendCredentials).toHaveBeenCalledTimes(1);
+    const event = store
+      .subscriptions()
+      .find((entry) => entry.stripe_entitlement?.subscription_id === 'sub_replacement');
+    expect(event).toMatchObject({ action: 'subscribe', status: 'applied' });
+    expect(service.getJob(event!.job_id!).results).toMatchObject([
+      { target_user_id: targetId, created: false },
+    ]);
+    const afterRestore = writes.length;
+    await stripe.sync();
+    expect(writes).toHaveLength(afterRestore);
+    expect(bot.sendCredentials).toHaveBeenCalledTimes(1);
   });
   it('requires the original approved customer and matching owner for access decisions', async () => {
     await newSubscription();

@@ -104,11 +104,24 @@ function useRouteSnapshot(): WorkspaceRoute {
   useEffect(() => {
     const update = () => {
       // A legacy skip link is an in-page anchor, not a request to leave the workspace.
-      if (window.location.hash !== skipAnchor) setRoute(parseWorkspaceRoute(window.location.hash));
+      const hash = window.location.hash;
+      if (hash !== skipAnchor) {
+        const next = parseWorkspaceRoute(hash);
+        setRoute((current) =>
+          current.page === next.page &&
+          current.tab === next.tab &&
+          current.subtab === next.subtab &&
+          hash === workspaceRouteHash(next)
+            ? current
+            : next,
+        );
+      }
     };
     window.addEventListener('popstate', update);
     window.addEventListener('hashchange', update);
     window.addEventListener(routeEvent, update);
+    // Navigation may have changed between rendering and attaching these listeners.
+    update();
     return () => {
       window.removeEventListener('popstate', update);
       window.removeEventListener('hashchange', update);
@@ -120,7 +133,12 @@ function useRouteSnapshot(): WorkspaceRoute {
 export function useWorkspaceRoute(): WorkspaceRoute {
   const route = useRouteSnapshot();
   useEffect(() => {
-    if (window.location.hash !== skipAnchor) navigateWorkspace(route, { replace: true });
+    const hash = window.location.hash;
+    if (
+      hash !== skipAnchor &&
+      workspaceRouteHash(parseWorkspaceRoute(hash)) === workspaceRouteHash(route)
+    )
+      navigateWorkspace(route, { replace: true });
   }, [route]);
   return route;
 }

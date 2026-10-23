@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { StrictMode } from 'react';
+import { StrictMode, useLayoutEffect } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import {
@@ -141,6 +141,28 @@ describe('allowlisted structural workspace routes', () => {
 });
 
 describe('browser route ownership and lifecycle', () => {
+  it.each([false, true])('preserves early navigation with StrictMode=%s', (strict) => {
+    window.history.replaceState(null, '', '#/accounts');
+    function AccountTab() {
+      const [tab] = useRouteTab('accounts');
+      return <output aria-label="Account tab">{tab}</output>;
+    }
+    function EarlyNavigation() {
+      useLayoutEffect(() => navigateWorkspace({ page: 'accounts', tab: 'recover' }), []);
+      return null;
+    }
+    const content = (
+      <>
+        <Route />
+        <AccountTab />
+        <EarlyNavigation />
+      </>
+    );
+    render(strict ? <StrictMode>{content}</StrictMode> : content);
+    expect(window.location.hash).toBe('#/accounts/recover');
+    expect(screen.getByLabelText('Route').textContent).toBe('#/accounts/recover');
+    expect(screen.getByLabelText('Account tab').textContent).toBe('recover');
+  });
   it('canonicalizes legacy bookmarks with replacement and adds no extra Back entry', () => {
     window.history.replaceState(null, '', '#settings-history');
     const push = vi.spyOn(window.history, 'pushState');
@@ -150,6 +172,13 @@ describe('browser route ownership and lifecycle', () => {
     expect(replace).toHaveBeenCalledWith(null, '', '#/settings/history/emby');
     expect(push).not.toHaveBeenCalled();
     expect(window.history.state).toBeNull();
+  });
+  it('sanitizes noncanonical hash changes even when the selected route is unchanged', () => {
+    render(<Route />);
+    window.history.replaceState(null, '', '#/overview/private-record');
+    fireEvent(window, new HashChangeEvent('hashchange'));
+    expect(window.location.hash).toBe('#/overview');
+    expect(screen.getByLabelText('Route').textContent).toBe('#/overview');
   });
   it('restores tab selections through Back and Forward while keeping drafts only in the current mounted form', async () => {
     window.history.replaceState(null, '', '#/users');

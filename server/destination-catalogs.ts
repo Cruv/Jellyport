@@ -40,6 +40,7 @@ import {
   DESTINATION_CATALOG_MAX_AGE,
   DESTINATION_BACKUP_SERVER_VERSION,
   DESTINATION_CATALOG_RECOVERY_DEADLINE,
+  DESTINATION_CATALOG_REQUEST_MAX_AGE,
   destinationCatalogMetadata,
   destinationCatalogPrefix,
   normalizedServerVersion,
@@ -61,6 +62,8 @@ const CLEANUP_ERROR =
 const IDLE_MS = 60_000;
 export const JELLYFIN_BACKUP_WAIT_MS = 30 * 60_000;
 const BACKUP_POLL_MS = 15_000;
+const BACKUP_PREFLIGHT_RETRY_MS = 60_000;
+class BackupPreflightBusy extends ServiceError {}
 type CatalogConfig = DailyImportConfig & { create_backup?: boolean };
 interface BackupCreation {
   id: string;
@@ -83,6 +86,8 @@ interface State {
   configured: boolean;
   generations: DestinationCatalogResult[];
   active?: DestinationCatalogRequest;
+  active_publication_pending?: boolean;
+  backup_preflight_retry_at?: string;
   backup_creation?: BackupCreation;
   last_attempt_at: string | null;
   last_error: string | null;
@@ -210,6 +215,8 @@ export class DestinationCatalogs {
   private backupClient?: MediaAPI;
   private readonly backupReadClients = new Set<MediaAPI>();
   private backupPollAt = 0;
+  private backupRetryAt = 0;
+  private handoffRetryAt = 0;
   private readonly imports: ImportCoordinator;
   private revision = 0;
   private readonly reads = new AbortController();
@@ -245,6 +252,9 @@ export class DestinationCatalogs {
           last_error: null,
         };
     this.imports = options.imports ?? new ImportCoordinator();
+    const retryAt = Date.parse(this.state.backup_preflight_retry_at ?? '');
+    if (Number.isFinite(retryAt) && retryAt <= Date.now() + BACKUP_PREFLIGHT_RETRY_MS)
+      this.backupRetryAt = retryAt;
     this.state.backup_retention ??= { enabled: false, keep: 7, revision: randomUUID() };
     this.state.owned_backups ??= [];
     this.state.backup_cleanup ??= {
@@ -392,8 +402,11 @@ export class DestinationCatalogs {
             deadline_at: this.state.backup_creation.deadline_at,
           }
         : null,
-      next_run_at: dailyImportSchedule(this.state.config, this.state.last_scheduled_date)
-        .next_run_at,
+      next_run_at:
+        this.backupRetryAt > Date.now() &&
+        dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due
+          ? new Date(this.backupRetryAt).toISOString()
+          : dailyImportSchedule(this.state.config, this.state.last_scheduled_date).next_run_at,
       configured: this.state.configured,
       available,
       usable,
@@ -445,6 +458,8 @@ export class DestinationCatalogs {
       revision: randomUUID(),
       create_backup: input.create_backup ?? this.state.config.create_backup ?? false,
     };
+    this.backupRetryAt = 0;
+    delete this.state.backup_preflight_retry_at;
     this.save();
     return this.status();
   }
@@ -661,7 +676,7 @@ export class DestinationCatalogs {
       );
     return latest.id;
   }
-  async refresh(createBackup = false) {
+  async refresh(createBackup = false, scheduledDate?: string) {
     const revision = this.revision;
     if (this.stopping || this.clearing)
       throw new ServiceError('The Jellyfin import is changing or stopping. Retry shortly.');
@@ -686,7 +701,9 @@ export class DestinationCatalogs {
     delete this.state.last_diagnostic;
     try {
       const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
-      if (due) this.state.last_scheduled_date = due.date;
+      // Importing an old archive is not evidence that a create-before-import
+      // occurrence has run. Preserve the legacy import-only deduplication rule.
+      if (due && !this.state.config.create_backup) this.state.last_scheduled_date = due.date;
       this.save();
       if (
         this.stopping ||
@@ -753,8 +770,10 @@ export class DestinationCatalogs {
             );
           const tasks = await client.jellyfinBackupTasks();
           if (tasks.some((task) => task.key === 'RefreshLibrary' && task.state !== 'Idle'))
-            throw new ServiceError(
-              'Jellyfin is scanning its library. No backup was requested; schedule the import outside the library scan window.',
+            throw new BackupPreflightBusy(
+              scheduledDate
+                ? 'Jellyfin is scanning its library. No backup was requested; Jellyport will retry preflight once per minute within this scheduled hour.'
+                : 'Jellyfin is scanning its library. No backup was requested; retry after the scan finishes.',
             );
           const baseline = await client.jellyfinBackups();
           if (
@@ -777,6 +796,9 @@ export class DestinationCatalogs {
             baseline: baseline.map((entry) => entry.name),
           };
           this.state.backup_creation = backup;
+          if (scheduledDate) this.state.last_scheduled_date = scheduledDate;
+          this.backupRetryAt = 0;
+          delete this.state.backup_preflight_retry_at;
           // Commit the intent BEFORE issuing this non-idempotent mutation.
           this.save();
           keepClient = true;
@@ -788,6 +810,19 @@ export class DestinationCatalogs {
             } catch {}
           });
           return this.status();
+        }
+        if (this.backupSelectionSupported && client.jellyfinBackups) {
+          // The native API lists completed archives. A filename on disk may still
+          // be an unfinished ZIP, and its local-time name is not a UTC ordering.
+          const completed = await client.jellyfinBackups();
+          const latest = [...completed].sort(
+            (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at),
+          )[0];
+          if (!latest)
+            throw new ServiceError(
+              'No completed Jellyfin backup was found. Create a database backup or enable scheduled backup creation.',
+            );
+          request.expected_backup = { name: latest.name, created_at: latest.created_at };
         }
       } finally {
         this.backupReadClients.delete(client);
@@ -824,11 +859,17 @@ export class DestinationCatalogs {
       return this.status();
     } catch (error) {
       if (this.state.backup_creation) throw error;
+      if (scheduledDate) {
+        if (error instanceof BackupPreflightBusy) {
+          this.backupRetryAt = Date.now() + BACKUP_PREFLIGHT_RETRY_MS;
+          this.state.backup_preflight_retry_at = new Date(this.backupRetryAt).toISOString();
+        } else this.state.last_scheduled_date = scheduledDate;
+      }
       delete this.state.active;
       this.state.last_finished_at = new Date().toISOString();
       this.state.last_outcome = 'failed';
       this.state.last_error =
-        createBackup && error instanceof ServiceError
+        error instanceof ServiceError
           ? error.message
           : 'Jellyfin catalog import could not start. Check the helper and configured Jellyfin connection. Any previously saved catalog is preserved.';
       this.save();
@@ -983,21 +1024,20 @@ export class DestinationCatalogs {
       // Persist the transition before publishing. Restarts resume checking this
       // request, not the native mutation. Offline import has its own worker watchdog.
       this.state.active = request;
+      this.state.active_publication_pending = true;
       delete this.state.backup_creation;
       this.state.last_error = null;
       this.state.last_outcome = 'running';
       this.state.last_finished_at = null;
       this.save();
       try {
-        await writeEnvelope(
-          join(this.directory, `${destinationCatalogPrefix(request.id)}.request`),
-          request,
-          this.key!,
-        );
+        await this.publishPendingImport(request, readConnection);
+        delete this.state.active_publication_pending;
+        this.save();
       } catch {
         // Keep the durable active attempt; IPC failure never replays the POST.
         this.state.last_error =
-          'The completed Jellyfin backup could not be handed to the helper. Check shared-folder permissions and refresh status; no additional backup will be requested for this attempt.';
+          'The completed Jellyfin backup could not be handed to the helper. Jellyport will retry this same import request within its admission window; no additional backup will be requested. Check shared-folder permissions.';
         this.save();
       }
       return 'queued';
@@ -1005,6 +1045,67 @@ export class DestinationCatalogs {
       this.backupReadClients.delete(client);
       await client.close();
     }
+  }
+  private async publishPendingImport(
+    request: DestinationCatalogRequest,
+    verifiedConnection?: string,
+  ): Promise<void> {
+    if (this.stopping || !this.key || this.state.active?.id !== request.id)
+      throw new ServiceError('The Jellyfin import is stopping or changed.');
+    const prefix = destinationCatalogPrefix(request.id);
+    // The helper atomically renames request -> working and publishes result
+    // before removing working. Observing any state means it must not be replayed.
+    for (const suffix of ['request', 'working', 'result']) {
+      try {
+        const value = await lstat(join(this.directory, `${prefix}.${suffix}`));
+        if (!value.isFile() || value.isSymbolicLink())
+          throw new ServiceError('The Jellyfin import handoff could not be validated.');
+        return;
+      } catch (error) {
+        if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT')
+          throw error;
+      }
+    }
+    if (Date.now() - Date.parse(request.requested_at) > DESTINATION_CATALOG_REQUEST_MAX_AGE)
+      throw new ServiceError('The Jellyfin import admission window expired.');
+    const settings = this.store.settings();
+    const connection = connectionHash(settings);
+    if (new URL(settings.jellyfin_url).toString() !== new URL(request.binding.url).toString())
+      throw new ServiceError('The Jellyfin import connection changed.');
+    if (verifiedConnection !== connection) {
+      const client = this.options.clientFactory()(
+        settings.jellyfin_url,
+        settings.jellyfin_api_key,
+        'jellyfin',
+      );
+      this.backupReadClients.add(client);
+      try {
+        const info = await client.systemInfo();
+        if (
+          !sameBinding(request.binding, {
+            url: settings.jellyfin_url,
+            server_id: String(info.Id),
+            version: String(info.Version),
+          })
+        )
+          throw new ServiceError('The Jellyfin import server identity changed.');
+      } finally {
+        this.backupReadClients.delete(client);
+        await client.close();
+      }
+    }
+    if (
+      this.stopping ||
+      this.state.active?.id !== request.id ||
+      connectionHash(this.store.settings()) !== connection
+    )
+      throw new ServiceError('The Jellyfin import connection changed or stopped.');
+    await writeEnvelope(
+      join(this.directory, `${prefix}.request`),
+      request,
+      this.key,
+      this.reads.signal,
+    );
   }
   async acknowledgeBackup(expectedAttemptId: string) {
     const backup = this.state.backup_creation;
@@ -1218,9 +1319,21 @@ export class DestinationCatalogs {
       }
       const active = this.state.active;
       if (active) {
+        if (this.state.active_publication_pending && Date.now() >= this.handoffRetryAt) {
+          this.handoffRetryAt = Date.now() + BACKUP_POLL_MS;
+          try {
+            await this.publishPendingImport(active);
+            delete this.state.active_publication_pending;
+            this.state.last_error = null;
+            this.save();
+          } catch {
+            // Retain the exact durable request and mutation intent. In particular,
+            // a restart or expired admission never authorizes a new native POST.
+          }
+        }
         await this.readProgress(active);
         const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
-        if (due) {
+        if (due && !this.state.config.create_backup) {
           this.state.last_scheduled_date = due.date;
           this.save();
         }
@@ -1309,6 +1422,7 @@ export class DestinationCatalogs {
             if (owned) owned.fingerprint = value.backup_fingerprint;
           }
           delete this.state.active;
+          delete this.state.active_publication_pending;
           this.imports.release(`jellyfin:${active.id}`);
           this.save();
           await rm(join(this.directory, `${destinationCatalogPrefix(active.id)}.progress`), {
@@ -1321,6 +1435,7 @@ export class DestinationCatalogs {
           DESTINATION_CATALOG_RECOVERY_DEADLINE
         ) {
           delete this.state.active;
+          delete this.state.active_publication_pending;
           this.imports.release(`jellyfin:${active.id}`);
           this.state.last_error_code = 'timeout';
           this.state.last_error = destinationCatalogFailureMessage('timeout');
@@ -1331,14 +1446,12 @@ export class DestinationCatalogs {
         }
       }
       const due = dailyImportSchedule(this.state.config, this.state.last_scheduled_date).due;
-      if (due && this.state.active) {
+      if (due && this.state.active && !this.state.config.create_backup) {
         this.state.last_scheduled_date = due.date;
         this.save();
-      } else if (due && !this.imports.busy) {
-        this.state.last_scheduled_date = due.date;
-        this.save();
+      } else if (due && !this.imports.busy && Date.now() >= this.backupRetryAt) {
         try {
-          await this.refresh(this.state.config.create_backup === true);
+          await this.refresh(this.state.config.create_backup === true, due.date);
         } catch {
           /* refresh records a sanitized failed attempt. */
         }

@@ -36,8 +36,8 @@ const pageTabs: Partial<Record<Page, readonly string[]>> = {
 };
 const settingsSubtabs: Record<string, readonly string[]> = {
   media: ['emby', 'jellyfin', 'paths'],
-  accounts: ['permissions', 'passwords'],
-  discord: ['connection', 'alerts'],
+  accounts: ['permissions', 'passwords', 'naming'],
+  discord: ['connection', 'alerts', 'messages'],
   automation: ['tiers', 'rules'],
   history: ['emby', 'jellyfin'],
 };

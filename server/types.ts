@@ -1,6 +1,8 @@
 import { DEFAULT_MEMBERSHIP_TIERS, type MembershipTier } from './memberships.js';
 import { DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE } from './credential-message.js';
 import { DEFAULT_PASSWORD_LENGTH, DEFAULT_PASSWORD_EXCLUDE_AMBIGUOUS } from './credentials.js';
+import { DEFAULT_PRIMARY_NAME, DEFAULT_ADDITIONAL_NAME } from './account-naming.js';
+import type { BotMessageTemplateId } from './bot-messages.js';
 
 export interface PathMapping {
   source: string;
@@ -15,6 +17,12 @@ export interface Settings {
   password_length?: number;
   password_exclude_ambiguous?: boolean;
   credential_message_template?: string;
+  bot_message_templates?: Partial<Record<BotMessageTemplateId, string>>;
+  bot_message_retention_days?: number;
+  subscription_message_patterns?: import('./subscription-messages.js').SubscriptionMessagePattern[];
+  account_name_primary?: string;
+  account_name_additional?: string;
+  account_name_aliases?: string[];
   template_user_id: string;
   default_role_id?: string;
   path_mappings: PathMapping[];
@@ -35,6 +43,7 @@ export interface Settings {
   auto_provision: boolean;
   /** Future verified subscribers only; existing membership choices stay unchanged. */
   auto_create_new_subscribers?: boolean;
+  new_subscriber_source?: 'trusted_messages' | 'stripe';
   auto_disable: boolean;
   disable_on_cancel: boolean;
   membership_tiers?: MembershipTier[];
@@ -48,6 +57,12 @@ export const DEFAULT_SETTINGS: Settings = {
   password_length: DEFAULT_PASSWORD_LENGTH,
   password_exclude_ambiguous: DEFAULT_PASSWORD_EXCLUDE_AMBIGUOUS,
   credential_message_template: DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
+  bot_message_templates: {},
+  bot_message_retention_days: 30,
+  subscription_message_patterns: [],
+  account_name_primary: DEFAULT_PRIMARY_NAME,
+  account_name_additional: DEFAULT_ADDITIONAL_NAME,
+  account_name_aliases: [],
   template_user_id: '',
   default_role_id: '',
   path_mappings: [],
@@ -67,6 +82,7 @@ export const DEFAULT_SETTINGS: Settings = {
   discord_role_events: false,
   auto_provision: false,
   auto_create_new_subscribers: false,
+  new_subscriber_source: 'trusted_messages',
   auto_disable: false,
   disable_on_cancel: false,
   membership_tiers: structuredClone(DEFAULT_MEMBERSHIP_TIERS),

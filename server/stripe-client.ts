@@ -60,6 +60,7 @@ export interface StripeSubscriptionItem {
 
 export interface StripeSubscription {
   id: string;
+  created?: number;
   customer_id: string;
   customer_name?: string;
   /** Private correlation hint only; never proves Discord ownership. */
@@ -76,6 +77,16 @@ export interface StripeSubscription {
   items: StripeSubscriptionItem[];
   /** Untrusted hints requiring a verified guild member and administrator approval. */
   identity_candidates: StripeIdentityCandidate[];
+}
+export interface StripePaidPeriod {
+  invoice_id: string;
+  customer_id: string;
+  subscription_id: string;
+  paid_at: number;
+  created: number;
+  price_id: string;
+  start: number;
+  end: number;
 }
 
 export interface StripeProduct {
@@ -393,6 +404,7 @@ export class StripeClient {
         if (!status || !/^[a-z_]+$/.test(status)) throw new StripeClientError('invalid_response');
         return {
           id: id(row.id, 'sub'),
+          created: timestamp(row.created),
           customer_id: id(customer?.id ?? row.customer, 'cus'),
           customer_name: optionalLabel(customer?.name, 200),
           customer_email: optionalLabel(customer?.email, 320),
@@ -559,5 +571,72 @@ export class StripeClient {
     const products = await this.products(signal, budget);
     await this.checkPrices(signal, budget);
     return { mode: this.mode, subscriptions, products, completed_at: new Date().toISOString() };
+  }
+
+  /** One bounded read of the most recently created paid invoice. Never infer
+   * access from the subscription period, an unpaid invoice or invoice.period_end. */
+  async paidPeriod(subscriptionId: string, signal?: AbortSignal): Promise<StripePaidPeriod | null> {
+    id(subscriptionId, 'sub');
+    const result = await this.request(
+      '/v1/invoices',
+      new URLSearchParams({
+        subscription: subscriptionId,
+        status: 'paid',
+        limit: '1',
+      }),
+      { bytes: 0 },
+      this.signal(signal),
+    );
+    if (
+      result.object !== 'list' ||
+      !Array.isArray(result.data) ||
+      result.data.length > 1 ||
+      typeof result.has_more !== 'boolean'
+    )
+      throw new StripeClientError('invalid_response');
+    if (!result.data.length) return null;
+    const invoice = object(result.data[0]);
+    this.checkMode(invoice);
+    if (invoice.object !== 'invoice' || invoice.status !== 'paid' || invoice.amount_remaining !== 0)
+      throw new StripeClientError('invalid_response');
+    const parent = invoice.parent == null ? null : object(invoice.parent);
+    const subscription =
+      parent?.type === 'subscription_details'
+        ? object(parent.subscription_details).subscription
+        : null;
+    if (subscription !== subscriptionId) throw new StripeClientError('invalid_response');
+    const created = timestamp(invoice.created),
+      paid_at = timestamp(object(invoice.status_transitions).paid_at);
+    if (created === undefined || paid_at === undefined || paid_at < created) return null;
+    const lines = object(invoice.lines);
+    if (!Array.isArray(lines.data) || lines.has_more !== false || lines.data.length !== 1)
+      return null;
+    const line = object(lines.data[0]);
+    this.checkMode(line);
+    const lineParent = object(line.parent);
+    if (lineParent.type !== 'subscription_item_details') return null;
+    const details = object(lineParent.subscription_item_details);
+    if (
+      details.subscription !== subscriptionId ||
+      details.proration !== false ||
+      line.quantity !== 1
+    )
+      return null;
+    const pricing = object(line.pricing),
+      period = object(line.period);
+    if (pricing.type !== 'price_details') return null;
+    const start = timestamp(period.start),
+      end = timestamp(period.end);
+    if (start === undefined || end === undefined || end <= start) return null;
+    return {
+      invoice_id: id(invoice.id, 'in'),
+      customer_id: id(invoice.customer, 'cus'),
+      subscription_id: subscriptionId,
+      paid_at,
+      created,
+      price_id: id(object(pricing.price_details).price, 'price|plan'),
+      start,
+      end,
+    };
   }
 }

@@ -62,13 +62,21 @@ Jellyfin also includes configuration and supporting files in this native archive
 The helper receives only the completed archive's safe filename and original
 timestamp, never the API key. Its backup mount stays read-only unless the separate
 cleanup feature below is enabled. Manual **Import latest Jellyfin backup** remains
-import-only.
+import-only. With a compatible helper, imports select a completed backup from the
+native Jellyfin API by its original creation timestamp and pin that exact archive.
+A newer ZIP still being written in the mounted folder cannot displace a completed
+archive. Filename ordering does not establish freshness. Older helper adapters
+without exact-selection support retain their legacy directory-selection behavior;
+update both containers together.
 
 Jellyfin does the live database work, including database optimization. Its native
 backup is supported while the server is running, but can consume CPU, I/O and
 hold database transactions; this is not a guarantee of uninterrupted playback.
-Jellyport checks for an active library scan before requesting a backup and skips
-that occurrence if one is running. Choose a time outside the library-scan window,
+Jellyport checks for an active library scan before requesting a backup. If one is
+running, it retries this read-only preflight at most once per minute within the
+scheduled occurrence's one-hour catch-up window, including after an app restart.
+The occurrence is claimed before the native creation request, so a timeout or
+uncertain result never causes another creation request. Choose a time outside the library-scan window,
 and avoid starting another backup manually while Jellyport is preparing one.
 Changing or disabling the schedule does not cancel already accepted server work.
 
@@ -89,6 +97,11 @@ read-only completed-backup observations. A unique new archive matching the bound
 server/version and request time can continue the import; an ambiguous result or
 unconfirmed completion retains the last good catalog and blocks new imports.
 Late completion can still be recovered without another creation request.
+If a completed backup cannot initially be handed to the helper, Jellyport can
+republish the same authenticated import intent within its original five-minute
+admission window. It rechecks the server binding and never republishes an intent
+already visible as queued, running or finished. This recovery does not request
+another native backup or renew an import deadline.
 
 If completion remains uncertain, inspect **Jellyfin → Dashboard → Backups** first.
 Use **Confirm backup stopped…** only after confirming the backup finished or
@@ -163,8 +176,11 @@ Timing rules are the same for both import schedules:
 - Automatic claims only move forward by civil date. Moving the clock/time zone or
   editing the time backwards cannot reopen an already attempted date. The next
   run waits for a date later than the last claimed date in the selected zone.
-- A manual attempt within, or spanning, the due window satisfies that automatic
-  occurrence. Administrators can still explicitly import manually more than once.
+- For import-only schedules, a manual attempt within, or spanning, the due window
+  satisfies that automatic occurrence. For create-before-import schedules, an
+  import-only manual attempt does not satisfy the fresh-creation occurrence;
+  the scheduled workflow waits for the shared slot and then creates its backup.
+  Administrators can still explicitly import manually more than once.
   Failed automatic attempts remain visible and wait for the next date; inspect
   status and fix the reported problem before manually retrying.
 

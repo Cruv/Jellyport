@@ -1661,6 +1661,44 @@ describe('React account safeguards', () => {
       discord_user_id: '123456789012345678',
     });
   });
+  it('shows the exact archived bot message including its password again after reopening Activity details', async () => {
+    const content =
+      'Account: family_2\nPassword: SyntheticArchive42\nhttps://jellyfin.example.test';
+    responses['/api/jobs/job-1/messages'] = {
+      messages: [
+        {
+          id: 'archive-1',
+          kind: 'credentials',
+          recipient_id: '123456789012345678',
+          recipient_username: 'family.owner',
+          account_username: 'family_2',
+          membership_slot: 2,
+          content,
+          status: 'sent',
+          created_at: '2026-10-23T12:00:00.000Z',
+        },
+      ],
+    };
+    const dialog = await openJob();
+    expect(requests.some((request) => request.path.endsWith('/messages'))).toBe(false);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'View bot messages' }));
+    const article = await within(dialog).findByRole('article', { name: 'Message for family_2' });
+    expect(article.querySelector('pre')?.textContent).toBe(content);
+    fireEvent.click(within(dialog).getByRole('button', { name: /^Close$/ }));
+    expect(screen.queryByText(/SyntheticArchive42/)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'View operation details' }));
+    const reopened = await screen.findByRole('dialog');
+    fireEvent.click(within(reopened).getByRole('button', { name: 'View bot messages' }));
+    expect(
+      (
+        await within(reopened).findByRole('article', { name: 'Message for family_2' })
+      ).querySelector('pre')?.textContent,
+    ).toBe(content);
+    expect(requests.filter((request) => request.path === '/api/jobs/job-1/messages')).toHaveLength(
+      2,
+    );
+    expect(requests.some((request) => request.path === '/api/jobs/job-1/credentials')).toBe(false);
+  });
   it('invalidates recovery approval when a searched Discord recipient is selected', async () => {
     responses['/api/accounts/recovery?username=alex'] = {
       username: 'alex',

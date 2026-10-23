@@ -257,10 +257,20 @@ function episodeContext(item: MediaItem): {
   if (!series.size || [...series.values()].some((ids) => ids.size > 1)) return null;
   return { numbers, series };
 }
-function compatibilityReasons(source: MediaItem, target: MediaItem): AmbiguityReasonCode[] {
+function matchingEpisodeTitle(source: MediaItem, target: MediaItem): boolean {
+  const normalized = (value: unknown) =>
+    typeof value === 'string' ? caseFold(value.normalize('NFC').trim().replace(/\s+/gu, ' ')) : '';
+  const title = normalized(source.Name);
+  return !!title && title === normalized(target.Name);
+}
+function compatibilityReasons(
+  source: MediaItem,
+  target: MediaItem,
+  verifiedEpisodePath = false,
+): AmbiguityReasonCode[] {
   if (kind(source) !== kind(target)) return ['media_type_conflict'];
   const reasons: AmbiguityReasonCode[] = [];
-  const fields = ['ProviderIds'];
+  const fields = verifiedEpisodePath ? [] : ['ProviderIds'];
   if (['episode', 'season'].includes(kind(source))) {
     fields.push('SeriesProviderIds');
     const a = seriesNumbers(source),
@@ -411,9 +421,36 @@ export function createMatcher(
         retainedCandidates += candidates.size;
         return [...candidates].sort((a, b) => a - b).map((index) => target[index]!);
       };
+      // Within a verified show and complete episode range, the same physical file
+      // and exact nonempty title outweigh stale episode IDs. Count every contextual
+      // row at the path before checking its title: duplicate editions must not gain
+      // artificial uniqueness by discarding a differently labelled candidate.
+      let verifiedEpisodePath = false;
+      if (
+        preferredEpisodeContext &&
+        ![...providers(item, 'ProviderIds').values()].some((ids) => ids.size > 1)
+      ) {
+        const atPath = [...candidates].filter((index) => pathCandidates.has(index));
+        if (atPath.length === 1) {
+          const selected = target[atPath[0]!]!;
+          if (
+            matchingEpisodeTitle(item, selected) &&
+            ![...providers(selected, 'ProviderIds').values()].some((ids) => ids.size > 1)
+          ) {
+            if (
+              candidates.size > 1 ||
+              providerConflict(providers(item, 'ProviderIds'), providers(selected, 'ProviderIds'))
+            )
+              method += '+path';
+            candidates = new Set(atPath);
+            verifiedEpisodePath = true;
+          }
+        }
+      }
       const conflictCodes = new Set<AmbiguityReasonCode>();
       for (const index of candidates) {
-        for (const code of compatibilityReasons(item, target[index]!)) conflictCodes.add(code);
+        for (const code of compatibilityReasons(item, target[index]!, verifiedEpisodePath))
+          conflictCodes.add(code);
         // The first incompatible candidate already makes the decision ambiguous.
         // Report that pair's conflicts without rescanning a large collision bucket.
         if (conflictCodes.size) break;
@@ -455,6 +492,11 @@ export function createMatcher(
       if (candidates.size === 1) {
         const selected = target[[...candidates][0]!]!;
         if (
+          verifiedEpisodePath &&
+          providerConflict(providers(item, 'ProviderIds'), providers(selected, 'ProviderIds'))
+        )
+          method = 'series_episode+title+path';
+        else if (
           preferredEpisodeContext &&
           providersAgree(providers(item, 'ProviderIds'), providers(selected, 'ProviderIds'))
         )

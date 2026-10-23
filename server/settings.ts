@@ -3,6 +3,9 @@ import { DEFAULT_SETTINGS, type Settings } from './types.js';
 import { validateMembershipTiers } from './memberships.js';
 import { validateCredentialMessageTemplate } from './credential-message.js';
 import { validatePasswordOptions, validateCredentialMessageOptions } from './credentials.js';
+import { validateAccountNaming } from './account-naming.js';
+import { validateBotMessageTemplates } from './bot-messages.js';
+import { validateSubscriptionMessagePatterns } from './subscription-messages.js';
 export const SECRET_FIELDS = ['emby_api_key', 'jellyfin_api_key', 'discord_bot_token'] as const;
 const snowflake = /^[0-9]{5,22}$/;
 const control = /[\x00-\x1f]/;
@@ -30,6 +33,10 @@ export function validateSettings(input: unknown): asserts input is Settings {
   validatePasswordOptions(settings);
   try {
     validateCredentialMessageTemplate(settings.credential_message_template);
+    validateAccountNaming(settings as unknown as Settings);
+    validateBotMessageTemplates(settings.bot_message_templates ?? {});
+    validateSubscriptionMessagePatterns(settings.subscription_message_patterns ?? []);
+    validateActivityRetentionDays(settings.bot_message_retention_days ?? 30);
   } catch (error) {
     throw new ServiceError((error as Error).message);
   }
@@ -125,17 +132,30 @@ export function validateSettings(input: unknown): asserts input is Settings {
     throw new ServiceError('Membership role events require an active subscriber role ID.');
   if (
     settings.auto_create_new_subscribers &&
-    (!settings.discord_enabled || !settings.discord_message_events)
+    (!settings.discord_enabled ||
+      (settings.new_subscriber_source !== 'stripe' && !settings.discord_message_events))
   )
     throw new ServiceError(
-      'New-subscriber Jellyfin accounts require Discord and trusted MEE6 subscription messages with a configured tier.',
+      'New-subscriber Jellyfin accounts require Discord and a configured Stripe or trusted subscription message source.',
     );
   if (
     (settings.auto_provision || settings.auto_disable) &&
     (!settings.discord_enabled ||
-      !(settings.discord_message_events || settings.discord_role_events))
+      !(
+        settings.discord_message_events ||
+        settings.discord_role_events ||
+        settings.new_subscriber_source === 'stripe'
+      ))
   )
     throw new ServiceError(
       'Automation requires a connected Discord configuration and a message or role event source.',
+    );
+  if (
+    !['trusted_messages', 'stripe'].includes(
+      String(settings.new_subscriber_source ?? 'trusted_messages'),
+    )
+  )
+    throw new ServiceError(
+      'Choose trusted subscription messages or Stripe as the subscriber source.',
     );
 }

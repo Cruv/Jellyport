@@ -13,7 +13,11 @@ import { date, num, type Api, type DiscordMember, type MembershipTier, type Noti
 export interface StripeIntegrationStatus {
   configured: boolean;
   mode: 'live' | 'test' | null;
-  review_only: true;
+  review_only: boolean;
+  automation_enabled?: boolean;
+  automation_enabled_at?: string | null;
+  automation_error?: string | null;
+  automation_review_count?: number;
   revision: string;
   running: boolean;
   sync_enabled: boolean;
@@ -61,6 +65,7 @@ export default function StripeIntegrationPanel({
   const [loadedRows, setLoadedRows] = useState(false);
   const [rowsRevision, setRowsRevision] = useState('');
   const [syncEnabled, setSyncEnabled] = useState(false);
+  const [automationEnabled, setAutomationEnabled] = useState(false);
   const [priceTiers, setPriceTiers] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
@@ -106,6 +111,7 @@ export default function StripeIntegrationPanel({
       initialized.current = true;
       draftRevision.current = value.revision;
       setSyncEnabled(value.sync_enabled);
+      setAutomationEnabled(value.automation_enabled === true);
       setPriceTiers(
         Object.fromEntries(value.price_tiers.map((item) => [item.price_id, item.tier_id])),
       );
@@ -314,12 +320,15 @@ export default function StripeIntegrationPanel({
       {
         ...(apiKey ? { api_key: apiKey } : {}),
         sync_enabled: syncEnabled,
+        automation_enabled: automationEnabled,
         expected_revision: draftRevision.current,
         price_tiers: Object.entries(priceTiers)
           .filter(([, tier]) => tier)
           .map(([price_id, tier_id]) => ({ price_id, tier_id })),
       },
-      'Stripe settings saved. Account changes remain under review.',
+      automationEnabled
+        ? 'Stripe membership automation settings saved. Existing subscribers remain protected by the activation baseline.'
+        : 'Stripe settings saved. Account changes remain under review.',
     );
   }
 
@@ -348,9 +357,13 @@ export default function StripeIntegrationPanel({
 
   return (
     <div className="settings-group" aria-label="Stripe billing integration">
-      <Callout title="Billing review only" icon="info">
-        Stripe reads subscription status. Syncing and approving identity links do not create,
-        disable, or change media accounts. Family and complimentary access remain admin-managed.
+      <Callout
+        title={status?.automation_enabled ? 'Verified billing management' : 'Billing review only'}
+        icon="info"
+      >
+        {status?.automation_enabled
+          ? 'Stripe access remains read-only. Verified paid periods can drive the Jellyport account actions you enabled; uncertain billing preserves existing access. Family and complimentary access remain admin-managed.'
+          : 'Stripe reads subscription status. Syncing and approving identity links do not create, disable, or change media accounts. Family and complimentary access remain admin-managed.'}
       </Callout>
       {demo && <p className="section-note">Stripe connections are unavailable in the demo.</p>}
       <IdentityReviewResult result={identityResult} />
@@ -417,6 +430,27 @@ export default function StripeIntegrationPanel({
                   retry.
                 </p>
               )}
+              {status.automation_enabled && (
+                <Callout title="Verified Stripe membership automation enabled">
+                  Only approved Discord identities and mapped prices can drive access actions. New
+                  account creation and disabling also require the corresponding Jellyport automation
+                  switches. Existing Emby users remain opt-in.
+                  {status.automation_enabled_at && (
+                    <p>Activation baseline: {date(status.automation_enabled_at)}</p>
+                  )}
+                </Callout>
+              )}
+              {status.automation_error && (
+                <p className="error-block" role="alert">
+                  {status.automation_error}
+                </p>
+              )}
+              {!!status.automation_review_count && (
+                <p className="section-note">
+                  {num(status.automation_review_count)} billing actions require review under
+                  Memberships → Events. Uncertain account creation is never retried automatically.
+                </p>
+              )}
               <button
                 className="btn btn-primary"
                 type="button"
@@ -426,7 +460,9 @@ export default function StripeIntegrationPanel({
                     'sync',
                     '/api/stripe/sync',
                     {},
-                    'Stripe sync started. No media accounts will be changed.',
+                    status.automation_enabled
+                      ? 'Stripe sync started. Verified billing actions follow your saved automation policy.'
+                      : 'Stripe sync started. No media accounts will be changed.',
                   )
                 }
               >
@@ -451,11 +487,13 @@ export default function StripeIntegrationPanel({
                 <p>
                   Create a restricted key in Stripe → Developers → API keys. Choose Read for
                   Customers, Products, Prices, Subscriptions, and Checkout Sessions. Leave every
-                  other permission at None. No write permissions are needed.
+                  other permission at None. For membership automation, also enable Read for
+                  Invoices. No write permissions are needed.
                 </p>
                 <p>
-                  Use a live key to inspect live MEE6 subscriptions. Enter it only in the field
-                  below; Jellyport never returns the saved key. A blank field keeps the saved key.
+                  Use a live key to inspect live subscriptions, including MEE6 subscriptions. Enter
+                  it only in the field below; Jellyport never returns the saved key. A blank field
+                  keeps the saved key.
                 </p>
               </div>
             </details>
@@ -499,7 +537,8 @@ export default function StripeIntegrationPanel({
                     Refresh billing every 15 minutes
                   </label>
                   <p className="muted text-tiny mt-4">
-                    Reads billing data for review. Account creation and disabling stay off.
+                    Reads billing data. Access changes require verified membership automation and
+                    the separate account-action switches.
                   </p>
                 </div>
                 <label className="toggle">
@@ -512,6 +551,40 @@ export default function StripeIntegrationPanel({
                       setSyncEnabled(event.target.checked);
                     }}
                     disabled={demo || !!busy || status?.running || !status}
+                  />
+                  <span className="toggle-track" aria-hidden="true" />
+                </label>
+              </div>
+              <div className="toggle-row">
+                <div>
+                  <label htmlFor="stripe-automation-enabled" className="switch-label">
+                    Use verified Stripe billing for membership automation
+                  </label>
+                  <p className="muted text-tiny mt-4">
+                    First select Stripe as the subscription source in Settings → Automation →
+                    Membership automation, save and sync a live key, map prices, and approve
+                    customer identities. Enabling captures the existing subscriber baseline; it
+                    never bulk creates accounts. MEE6 messages and roles are optional.
+                  </p>
+                </div>
+                <label className="toggle">
+                  <input
+                    id="stripe-automation-enabled"
+                    type="checkbox"
+                    checked={automationEnabled}
+                    onChange={(event) => {
+                      configDirty.current = true;
+                      setAutomationEnabled(event.target.checked);
+                    }}
+                    disabled={
+                      demo ||
+                      !!busy ||
+                      status?.running ||
+                      !status ||
+                      !status.configured ||
+                      status.mode !== 'live' ||
+                      !status.last_sync
+                    }
                   />
                   <span className="toggle-track" aria-hidden="true" />
                 </label>

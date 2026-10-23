@@ -138,6 +138,37 @@ const tab = (name: string) => fireEvent.click(screen.getByRole('tab', { name }))
 const save = () => fireEvent.submit(screen.getByRole('form', { name: 'Stripe connection' }));
 
 describe('Stripe integration settings', () => {
+  it('makes live verified billing automation an explicit saved choice and explains the activation baseline', async () => {
+    const p = page({ ...connected, mode: 'live', automation_enabled: false });
+    await screen.findByText('Live restricted key saved');
+    const toggle = screen.getByLabelText('Use verified Stripe billing for membership automation');
+    expect(toggle).toHaveProperty('checked', false);
+    expect(toggle).toHaveProperty('disabled', false);
+    fireEvent.click(toggle);
+    save();
+    await waitFor(() => expect(p.notify).toHaveBeenCalled());
+    expect(p.api).toHaveBeenCalledWith(
+      '/api/stripe/config',
+      expect.objectContaining({
+        method: 'POST',
+        body: expect.objectContaining({ automation_enabled: true }),
+      }),
+    );
+    expect(screen.getByText(/Enabling captures the existing subscriber baseline/)).toBeTruthy();
+  });
+  it('shows verification failures and uncertain receipt reviews without enabling billing on a test key', async () => {
+    page({
+      ...connected,
+      automation_error: 'Synthetic invoice verification unavailable',
+      automation_review_count: 2,
+    });
+    await screen.findByText('Test restricted key saved');
+    expect(
+      screen.getByLabelText('Use verified Stripe billing for membership automation'),
+    ).toHaveProperty('disabled', true);
+    expect(screen.getByText('Synthetic invoice verification unavailable')).toBeTruthy();
+    expect(screen.getByText(/2 billing actions require review/)).toBeTruthy();
+  });
   it('loads only when active, explains exact read permissions, and keeps account automation off', async () => {
     const p = page(initial, [], undefined, { active: false });
     expect(p.api).not.toHaveBeenCalled();
@@ -183,6 +214,7 @@ describe('Stripe integration settings', () => {
         body: {
           api_key: 'rk_test_synthetic_only',
           sync_enabled: false,
+          automation_enabled: false,
           expected_revision: 'revision-1',
           price_tiers: [],
         },
@@ -193,7 +225,12 @@ describe('Stripe integration settings', () => {
     expect(p.api).toHaveBeenLastCalledWith(
       '/api/stripe/config',
       expect.objectContaining({
-        body: { sync_enabled: false, expected_revision: 'revision-2', price_tiers: [] },
+        body: {
+          sync_enabled: false,
+          automation_enabled: false,
+          expected_revision: 'revision-2',
+          price_tiers: [],
+        },
       }),
     );
     expect(document.body.textContent).not.toContain('rk_test_synthetic_only');

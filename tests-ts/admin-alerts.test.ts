@@ -79,6 +79,21 @@ function subscription(id: string, status = 'pending'): SubscriptionEvent {
   };
 }
 describe('private administrator notification outbox', () => {
+  it('uses the configured digest text with only the safe status summary', async () => {
+    const { alerts, store, settings, recipient } = fixture();
+    settings.bot_message_templates = { admin_digest: 'Community update:\n{summary}' };
+    store.saveSettings(settings);
+    alerts.enable(recipient, settings);
+    store.saveJob(job('custom-digest'));
+    const send = vi.fn(async (_id: string, _content: string) => {});
+    await alerts.flush(settings, send);
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      recipient.user_id,
+      expect.stringMatching(/^Community update:\nJellyport private admin update/),
+      expect.any(Function),
+    );
+    expect(send.mock.calls[0]![1]).not.toMatch(/PASSWORD|SECRET|PRIVATE_USERNAME/);
+  });
   it('defaults to disabled and has a narrowly projected status', () => {
     const { alerts, settings } = fixture();
     expect(alerts.status(settings)).toEqual({
@@ -281,16 +296,14 @@ describe('private administrator notification outbox', () => {
         store.saveSettings({ ...settings, jellyfin_url: 'https://other.example' });
       if (change === 'disabled') store.saveSettings({ ...settings, discord_enabled: false });
       if (change === 'identity')
-        store.db
-          .prepare('UPDATE auth_state SET encrypted=? WHERE id=1')
-          .run(
-            store.encrypt({
-              kind: 'configured',
-              serverUrl: settings.jellyfin_url,
-              serverId: 'replacement',
-              apiKeyName: 'fixture',
-            }),
-          );
+        store.db.prepare('UPDATE auth_state SET encrypted=? WHERE id=1').run(
+          store.encrypt({
+            kind: 'configured',
+            serverUrl: settings.jellyfin_url,
+            serverId: 'replacement',
+            apiKeyName: 'fixture',
+          }),
+        );
       const send = vi.fn(async () => {});
       await alerts.flush(settings, send);
       expect(send).not.toHaveBeenCalled();

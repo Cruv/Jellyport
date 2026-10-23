@@ -19,6 +19,7 @@ import {
   snapshotKey,
   writeEnvelope,
 } from '../server/snapshot-files.js';
+import * as snapshotFiles from '../server/snapshot-files.js';
 import { DEFAULT_SETTINGS, Store } from '../server/store.js';
 import {
   backupCleanupPrefix,
@@ -266,9 +267,12 @@ describe('scheduled native Jellyfin backup creation', () => {
     const saved = await f.enable();
     await f.heartbeat();
     await f.manager.refresh();
-    expect((await f.requests())[0]!.expected_backup).toBeUndefined();
+    expect((await f.requests())[0]!.expected_backup).toEqual({
+      name: f.old.name,
+      created_at: f.old.created_at,
+    });
     expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
-    expect(f.client.jellyfinBackups).not.toHaveBeenCalled();
+    expect(f.client.jellyfinBackups).toHaveBeenCalledOnce();
     expect((await f.manager.status()).config).toEqual(saved.config);
   });
 
@@ -337,7 +341,7 @@ describe('scheduled native Jellyfin backup creation', () => {
     expect(f.imports.busy).toBe(true);
   });
 
-  it('does not request a backup during a library scan and does not replay the failed daily claim', async () => {
+  it('defers a busy library scan before POST and retries once per minute within the scheduled hour', async () => {
     const f = await fixture();
     f.client.jellyfinBackupTasks.mockResolvedValue([{ key: 'RefreshLibrary', state: 'Running' }]);
     await f.enable();
@@ -349,13 +353,161 @@ describe('scheduled native Jellyfin backup creation', () => {
     expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
     expect(f.imports.busy).toBe(false);
     f.client.jellyfinBackupTasks.mockResolvedValue([{ key: 'RefreshLibrary', state: 'Idle' }]);
+    await f.restart();
     await f.tick();
     expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
+    vi.setSystemTime(dueTime + 60_000);
+    await f.tick();
+    expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
+    await f.tick();
+    expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
+  });
+
+  it('does not start a deferred native backup after the catch-up hour expires', async () => {
+    const f = await fixture();
+    f.client.jellyfinBackupTasks.mockResolvedValue([{ key: 'RefreshLibrary', state: 'Running' }]);
+    await f.enable();
+    await f.due();
+    vi.setSystemTime(dueTime + 59 * 60_000);
+    await f.tick();
+    expect(f.client.jellyfinBackupTasks).toHaveBeenCalledTimes(2);
+    vi.setSystemTime(dueTime + 60 * 60_000);
+    f.client.jellyfinBackupTasks.mockResolvedValue([{ key: 'RefreshLibrary', state: 'Idle' }]);
+    await f.tick();
+    expect(f.client.jellyfinBackupTasks).toHaveBeenCalledTimes(2);
+    expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
+  });
+
+  it.each([dueTime - 60_000, dueTime + 60_000])(
+    'does not let an import-only manual action suppress scheduled fresh creation (manual=%s)',
+    async (time) => {
+      const f = await fixture();
+      await f.enable();
+      vi.setSystemTime(time);
+      await f.heartbeat();
+      await f.manager.refresh();
+      expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
+      const [manual] = await f.requests();
+      vi.setSystemTime(dueTime + 2 * 60_000);
+      await f.finish(manual!);
+      expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
+      expect((await f.manager.status()).backup_creation?.phase).toBe('creating');
+    },
+  );
+
+  it('pins the latest completed API manifest by original time rather than local filename order', async () => {
+    const f = await fixture();
+    const newest = { ...manifest(initialTime - 1000), name: 'jellyfin-backup-20261018003000.zip' };
+    const older = { ...manifest(initialTime - 60_000), name: 'jellyfin-backup-20261018014500.zip' };
+    f.client.jellyfinBackups.mockResolvedValue([older, newest]);
+    await f.heartbeat();
+    await f.manager.refresh();
+    expect((await f.requests())[0]!.expected_backup).toEqual({
+      name: newest.name,
+      created_at: newest.created_at,
+    });
+    expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
+  });
+
+  it('reports an empty completed archive list without requesting native creation or an unpinned import', async () => {
+    const f = await fixture();
+    f.client.jellyfinBackups.mockResolvedValue([]);
+    await f.heartbeat();
+    await expect(f.manager.refresh()).rejects.toThrow('No completed Jellyfin backup');
+    expect(await f.requests()).toEqual([]);
+    expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
+  });
+
+  async function failedHandoff(f: Awaited<ReturnType<typeof fixture>>) {
+    await f.enable();
+    await f.due();
+    f.creation.resolve(manifest());
+    await vi.waitFor(async () => {
+      expect((await f.manager.status()).backup_creation?.phase).toBe('waiting');
+    });
+    const write = snapshotFiles.writeEnvelope;
+    const publication = vi
+      .spyOn(snapshotFiles, 'writeEnvelope')
+      .mockImplementation(async (...args) => {
+        if (String(args[0]).endsWith('.request')) throw new Error('synthetic unavailable IPC');
+        return write(...args);
+      });
+    await f.tick();
+    publication.mockRestore();
+    expect(await f.requests()).toEqual([]);
+    expect(f.savedState().active_publication_pending).toBe(true);
+    return f.savedState().active as DestinationCatalogRequest;
+  }
+
+  it('recovers the same durable helper handoff across restart without another native POST', async () => {
+    const f = await fixture();
+    const active = await failedHandoff(f);
+    await f.restart();
+    expect(await f.requests()).toEqual([active]);
+    expect(f.savedState().active_publication_pending).toBeUndefined();
+    expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
+    await f.finish(active);
+    expect((await f.manager.status()).last_outcome).toBe('succeeded');
+  });
+
+  it.each(['request', 'working'])(
+    'does not replay a handoff already observed in the helper %s state',
+    async (suffix) => {
+      const f = await fixture();
+      const active = await failedHandoff(f);
+      await writeEnvelope(
+        join(f.shared, `${destinationCatalogPrefix(active.id)}.${suffix}`),
+        active,
+        f.key,
+      );
+      await f.restart();
+      expect((await f.requests()).length).toBe(suffix === 'request' ? 1 : 0);
+      expect(f.savedState().active_publication_pending).toBeUndefined();
+      expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
+      expect(f.imports.busy).toBe(true);
+    },
+  );
+
+  it('does not renew an expired handoff admission window or repeat native creation', async () => {
+    const f = await fixture();
+    const active = await failedHandoff(f);
+    vi.setSystemTime(Date.parse(active.requested_at) + 5 * 60_000 + 1);
+    await f.restart();
+    expect(await f.requests()).toEqual([]);
+    expect(f.savedState().active).toEqual(active);
+    expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
+  });
+
+  it.each(['url', 'server'])(
+    'does not republish a pending handoff after the linked %s changes',
+    async (change) => {
+      const f = await fixture();
+      await failedHandoff(f);
+      if (change === 'url')
+        f.store.saveSettings({ ...f.store.settings(), jellyfin_url: 'http://different.test/' });
+      else f.client.systemInfo.mockResolvedValue({ Id: 'b'.repeat(32), Version: '12.2.0.0' });
+      await f.restart();
+      expect(await f.requests()).toEqual([]);
+      expect(f.savedState().active_publication_pending).toBe(true);
+      expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('allows a rotated key to recover a pending handoff only after rechecking server identity', async () => {
+    const f = await fixture();
+    const active = await failedHandoff(f);
+    f.store.saveSettings({ ...f.store.settings(), jellyfin_api_key: 'synthetic-rotated-key' });
+    f.client.systemInfo.mockClear();
+    await f.restart();
+    expect(f.client.systemInfo).toHaveBeenCalledOnce();
+    expect(await f.requests()).toEqual([active]);
+    expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
   });
 
   it('rejects an unsupported future server version before native backup work and retains the last valid catalog', async () => {
     const f = await fixture();
     const good = await f.seedGood();
+    f.client.jellyfinBackups.mockClear();
     f.client.systemInfo.mockResolvedValue({ Id: serverId, Version: '13.0.0' });
     await f.enable();
     await f.due();
@@ -878,7 +1030,8 @@ describe('owned Jellyfin backup retention', () => {
       ),
     ).toBe(false);
     expect((await f.manager.status()).backup_cleanup.owned_backups).toBe(8);
-    expect(f.client.jellyfinBackups).toHaveBeenCalledTimes(1);
+    // One completed-manifest selection, then an independent cleanup presence check.
+    expect(f.client.jellyfinBackups).toHaveBeenCalledTimes(2);
   });
   it('preserves changed archives and does not count them toward the seven matching owned files', async () => {
     const { f, owned } = await ownedFixture(9);
@@ -898,9 +1051,9 @@ describe('owned Jellyfin backup retention', () => {
     async (failure) => {
       const { f } = await ownedFixture(9);
       if (failure === 'unavailable')
-        f.client.jellyfinBackups.mockRejectedValue(
-          new MediaError('Synthetic backup listing unavailable.'),
-        );
+        f.client.jellyfinBackups
+          .mockResolvedValueOnce([f.old])
+          .mockRejectedValue(new MediaError('Synthetic backup listing unavailable.'));
       else
         f.client.systemInfo
           .mockResolvedValueOnce({ Id: serverId, Version: '12.2.0.0' })
@@ -922,7 +1075,8 @@ describe('owned Jellyfin backup retention', () => {
         false,
       );
       expect(f.imports.busy).toBe(false);
-      if (failure === 'changed-server') expect(f.client.jellyfinBackups).not.toHaveBeenCalled();
+      // The first list selected the import; changed identity prevents a cleanup list.
+      if (failure === 'changed-server') expect(f.client.jellyfinBackups).toHaveBeenCalledOnce();
     },
   );
   it('does not queue cleanup after a failed import or with an uncertain native creation', async () => {

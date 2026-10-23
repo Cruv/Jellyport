@@ -16,6 +16,21 @@ import SourceSnapshotsPanel from './SourceSnapshotsPanel';
 import DestinationCatalogPanel from './DestinationCatalogPanel';
 import ActivityRetentionPanel from './ActivityRetentionPanel';
 import StripeIntegrationPanel from './StripeIntegrationPanel';
+import AccountNamingPanel from './AccountNamingPanel';
+import { validateAccountNaming, type AccountNaming } from '../../server/account-naming';
+import BotMessagesSettings from './BotMessagesSettings';
+import SubscriptionMessageFormats from './SubscriptionMessageFormats';
+import {
+  validateSubscriptionMessagePatterns,
+  type SubscriptionMessagePattern,
+} from '../../server/subscription-messages';
+import {
+  BOT_MESSAGE_CATALOG,
+  validateBotMessageTemplate,
+  validateBotMessageTemplates,
+  type BotMessageTemplates,
+  type BotMessageTemplateId,
+} from '../../server/bot-messages';
 import { navigateWorkspace, useRouteTab } from './routing';
 import { useWorkspaceDraftState } from './workspace-drafts';
 import {
@@ -375,6 +390,36 @@ export default function SettingsPage({
     'settings.credential-template',
     s.credential_message_template ?? DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
   );
+  const namingSettings = (value: Settings): AccountNaming => ({
+    account_name_primary: value.account_name_primary ?? '{username}',
+    account_name_additional: value.account_name_additional ?? '{username}_{slot}',
+    account_name_aliases: value.account_name_aliases ?? [],
+  });
+  const [accountNaming, setAccountNaming] = useWorkspaceDraftState<AccountNaming>(
+    'settings.account-naming',
+    namingSettings(s),
+  );
+  useLayoutEffect(() => {
+    if (!latestDirty.current) setAccountNaming(namingSettings(s));
+  }, [
+    dirty,
+    s.account_name_primary,
+    s.account_name_additional,
+    s.account_name_aliases,
+    setAccountNaming,
+  ]);
+  const [botTemplates, setBotTemplates] = useWorkspaceDraftState<BotMessageTemplates>(
+    'settings.bot-message-templates',
+    s.bot_message_templates ?? {},
+  );
+  const [botMessageKind, setBotMessageKind] = useState<BotMessageTemplateId>('job_queued');
+  const [subscriptionFormats, setSubscriptionFormats] = useWorkspaceDraftState<
+    SubscriptionMessagePattern[]
+  >('settings.subscription-message-patterns', s.subscription_message_patterns ?? []);
+  const [botMessageRetention, setBotMessageRetention] = useWorkspaceDraftState(
+    'settings.bot-message-retention',
+    String(s.bot_message_retention_days ?? 30),
+  );
   const replacementKey = useRef<HTMLInputElement | null>(null);
   const serviceKeyRequest = useRef<AbortController | null>(null);
   useEffect(() => {
@@ -402,6 +447,21 @@ export default function SettingsPage({
     if (!latestDirty.current)
       setCredentialTemplate(s.credential_message_template ?? DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE);
   }, [dirty, s.credential_message_template, setCredentialTemplate]);
+  useLayoutEffect(() => {
+    if (!latestDirty.current) {
+      setBotTemplates(s.bot_message_templates ?? {});
+      setBotMessageRetention(String(s.bot_message_retention_days ?? 30));
+      setSubscriptionFormats(s.subscription_message_patterns ?? []);
+    }
+  }, [
+    dirty,
+    s.bot_message_templates,
+    s.bot_message_retention_days,
+    setBotTemplates,
+    setBotMessageRetention,
+    s.subscription_message_patterns,
+    setSubscriptionFormats,
+  ]);
   useLayoutEffect(() => {
     if (latestDirty.current) return;
     setMappings(s.path_mappings || []);
@@ -468,6 +528,57 @@ export default function SettingsPage({
         throw error;
       }
       data.credential_message_template = credentialTemplate;
+      const cleanNaming = {
+        ...accountNaming,
+        account_name_aliases: (accountNaming.account_name_aliases ?? [])
+          .map((line) => line.trim())
+          .filter(Boolean),
+      };
+      try {
+        validateAccountNaming(cleanNaming);
+      } catch (error) {
+        selectTab('accounts', 'naming');
+        throw error;
+      }
+      Object.assign(data, cleanNaming);
+      try {
+        validateBotMessageTemplates(botTemplates);
+      } catch (error) {
+        for (const [id, value] of Object.entries(botTemplates)) {
+          if (!Object.hasOwn(BOT_MESSAGE_CATALOG, id)) continue;
+          try {
+            validateBotMessageTemplate(id as BotMessageTemplateId, value);
+          } catch {
+            setBotMessageKind(id as BotMessageTemplateId);
+            break;
+          }
+        }
+        selectTab('discord', 'messages');
+        revealField(form.querySelector('#setting-bot_message_templates'));
+        throw error;
+      }
+      data.bot_message_templates = botTemplates;
+      try {
+        validateSubscriptionMessagePatterns(subscriptionFormats);
+      } catch (error) {
+        selectTab('discord', 'messages');
+        const invalid = subscriptionFormats.findIndex((row) => {
+          try {
+            validateSubscriptionMessagePatterns([row]);
+            return false;
+          } catch {
+            return true;
+          }
+        });
+        revealField(form.querySelector(`#subscription-format-text-${Math.max(0, invalid)}`));
+        throw error;
+      }
+      data.subscription_message_patterns = subscriptionFormats;
+      if (!/^\d+$/.test(botMessageRetention) || Number(botMessageRetention) > 3650) {
+        revealField(form.querySelector('#setting-bot_message_retention_days'));
+        throw new Error('Bot message retention must be a whole number from 0 to 3650 days.');
+      }
+      data.bot_message_retention_days = Number(botMessageRetention);
       data.path_mappings = mappings
         .map((row) => ({ source: row.source.trim(), target: row.target.trim() }))
         .filter((row) => row.source || row.target);
@@ -625,7 +736,12 @@ export default function SettingsPage({
           onSubmit={save}
           onChangeCapture={(event) => {
             if (
-              !['replacement-jellyfin-api-key', 'membership-tier-editor'].includes(event.target.id)
+              ![
+                'replacement-jellyfin-api-key',
+                'membership-tier-editor',
+                'bot-message-kind',
+                'subscription-format-example',
+              ].includes(event.target.id)
             )
               setDirty(true);
           }}
@@ -891,10 +1007,26 @@ export default function SettingsPage({
                   tabs={[
                     { id: 'permissions', label: 'Permissions' },
                     { id: 'passwords', label: 'Passwords & messages' },
+                    { id: 'naming', label: 'Account naming' },
                   ]}
                   value={accountTab}
                   onChange={setAccountTab}
                 />
+                <TabPanel
+                  id="settings-account-defaults"
+                  tabId="naming"
+                  active={accountTab === 'naming'}
+                >
+                  <section data-settings-main="accounts" data-settings-sub="naming">
+                    <AccountNamingPanel
+                      value={accountNaming}
+                      onChange={(value) => {
+                        setDirty(true);
+                        setAccountNaming(value);
+                      }}
+                    />
+                  </section>
+                </TabPanel>
                 <TabPanel
                   id="settings-account-defaults"
                   tabId="permissions"
@@ -1117,6 +1249,7 @@ export default function SettingsPage({
                   tabs={[
                     { id: 'connection', label: 'Bot connection' },
                     { id: 'alerts', label: 'Private alerts & commands' },
+                    { id: 'messages', label: 'Messages' },
                   ]}
                   value={discordTab}
                   onChange={setDiscordTab}
@@ -1212,8 +1345,9 @@ export default function SettingsPage({
                             >
                               Discord Developer Portal
                             </a>
-                            . Enable the Server Members intent for role events, and Message Content
-                            intent for message events.
+                            . Enable Server Members intent for role events, Stripe membership, or
+                            automatic organization roles. Message Content intent is needed only for
+                            optional trusted message events.
                           </div>
                         </details>
                       </div>
@@ -1252,6 +1386,37 @@ export default function SettingsPage({
                         </div>
                       </div>
                     </details>
+                  </section>
+                </TabPanel>
+                <TabPanel id="settings-bot" tabId="messages" active={discordTab === 'messages'}>
+                  <section
+                    className="settings-group"
+                    data-settings-main="discord"
+                    data-settings-sub="messages"
+                  >
+                    <BotMessagesSettings
+                      templates={botTemplates}
+                      change={setBotTemplates}
+                      selected={botMessageKind}
+                      select={setBotMessageKind}
+                      retention={botMessageRetention}
+                      changeRetention={setBotMessageRetention}
+                      reset={() => {
+                        setDirty(true);
+                        setBotTemplates((current) => {
+                          const next = { ...current };
+                          delete next[botMessageKind];
+                          return next;
+                        });
+                      }}
+                    />
+                    <SubscriptionMessageFormats
+                      formats={subscriptionFormats}
+                      change={(value) => {
+                        setDirty(true);
+                        setSubscriptionFormats(value);
+                      }}
+                    />
                   </section>
                 </TabPanel>
               </section>
@@ -1450,6 +1615,26 @@ export default function SettingsPage({
                       description="Opt in to automatic changes, or keep membership events in your review queue."
                     >
                       <div className="form-stack">
+                        <div className="field">
+                          <label htmlFor="setting-new_subscriber_source">
+                            Subscription authority
+                          </label>
+                          <select
+                            id="setting-new_subscriber_source"
+                            name="new_subscriber_source"
+                            defaultValue={s.new_subscriber_source ?? 'trusted_messages'}
+                          >
+                            <option value="trusted_messages">
+                              Trusted Discord subscription messages
+                            </option>
+                            <option value="stripe">Stripe billing</option>
+                          </select>
+                          <small>
+                            Stripe requires an approved customer-to-Discord link, mapped prices and
+                            billing automation enabled in Settings → Stripe. Discord messages are
+                            optional when Stripe is selected.
+                          </small>
+                        </div>
                         <Toggle
                           name="discord_role_events"
                           label="Watch membership role changes"
@@ -1491,12 +1676,12 @@ export default function SettingsPage({
                         <Toggle
                           name="auto_create_new_subscribers"
                           label="Create Jellyfin accounts for new subscribers"
-                          description="For new Discord members who subscribe after this policy is enabled, a fresh trusted subscription message with a recognized tier can create 1–3 Jellyfin accounts and DM their login details. Existing Discord members, Emby users, and membership provisioning choices stay opt-in. This never creates Emby access or enrolls existing subscribers."
+                          description="Verified future signups can create the tier’s 1–3 Jellyfin accounts and privately deliver login details. Stripe uses approved customer links and verified payments; trusted messages require a fresh recognized plan and new Discord join. Existing Emby accounts and membership choices remain opt-in. No Emby access is created."
                           checked={s.auto_create_new_subscribers ?? false}
                         />
                         <p className="support-note" role="status">
                           {automaticProvisioning
-                            ? 'Automatic provisioning is enabled. The new-subscriber policy applies only to future Discord joins and verified signups after it is saved.'
+                            ? 'Automatic provisioning is enabled. Only verified future signups under the selected authority can use the new-subscriber policy; enabling it does not enroll an existing population.'
                             : 'Automatic provisioning is paused. Enable “Automatically provision subscribed members” as well as the new-subscriber policy for unattended account creation and DMs.'}
                         </p>
                         <Toggle

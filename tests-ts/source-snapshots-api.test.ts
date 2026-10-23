@@ -343,6 +343,7 @@ it.each([undefined, 'complete', 'watched_only'] as const)(
       source_snapshot_ids,
       undefined,
       undefined,
+      undefined,
     );
   },
 );

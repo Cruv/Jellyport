@@ -9,6 +9,7 @@ import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { DEFAULT_SETTINGS, DEMO_SETTINGS, type Settings } from './types.js';
 import { jobRetentionTimestamp, type JobRetentionCursor } from './job-retention.js';
 import { NewSubscriberPolicy } from './new-subscriber-policy.js';
+import type { BotMessageHistory } from './bot-messages.js';
 import type {
   Job,
   JobRequest,
@@ -118,6 +119,7 @@ export class Store {
       PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS new_subscriber_policy (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS stripe_entitlement_policy (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS auth_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS job_retention (job_id TEXT PRIMARY KEY,age_ms REAL);
@@ -128,6 +130,10 @@ export class Store {
       CREATE TABLE IF NOT EXISTS job_retention_config (id INTEGER PRIMARY KEY CHECK(id=1),days INTEGER NOT NULL CHECK(typeof(days)='integer' AND days BETWEEN 0 AND 3650));
       CREATE TABLE IF NOT EXISTS accounts (name_key TEXT PRIMARY KEY, username TEXT NOT NULL, remote_id TEXT, status TEXT NOT NULL, password BLOB, expires REAL);
       CREATE TABLE IF NOT EXISTS credentials (job_id TEXT NOT NULL, username TEXT NOT NULL, encrypted BLOB NOT NULL, expires REAL NOT NULL, PRIMARY KEY (job_id,username));
+      CREATE TABLE IF NOT EXISTS bot_message_history (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, created_ms REAL NOT NULL, status TEXT NOT NULL, encrypted BLOB NOT NULL);
+      CREATE INDEX IF NOT EXISTS bot_message_history_job ON bot_message_history(job_id,created_ms);
+      CREATE INDEX IF NOT EXISTS bot_message_history_age ON bot_message_history(created_ms);
+      CREATE TRIGGER IF NOT EXISTS bot_message_history_delete AFTER DELETE ON jobs BEGIN DELETE FROM bot_message_history WHERE job_id=OLD.id; END;
       CREATE TABLE IF NOT EXISTS links (discord_user_id TEXT NOT NULL, membership_slot INTEGER NOT NULL DEFAULT 1 CHECK(membership_slot BETWEEN 1 AND 3), username TEXT NOT NULL, remote_id TEXT NOT NULL UNIQUE, disabled_by_jellyport INTEGER NOT NULL DEFAULT 0, pending_disabled INTEGER, PRIMARY KEY(discord_user_id,membership_slot));
       CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS job_queue (job_id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
@@ -186,6 +192,8 @@ export class Store {
       UNION ALL SELECT 1 FROM media_ownership UNION ALL SELECT 1 FROM identity_review_exceptions
       UNION ALL SELECT 1 FROM identity_role_sync_tasks
       UNION ALL SELECT 1 FROM new_subscriber_policy
+      UNION ALL SELECT 1 FROM stripe_entitlement_policy
+      UNION ALL SELECT 1 FROM bot_message_history
       UNION ALL SELECT 1 FROM job_retention_config UNION ALL SELECT 1 FROM job_retention LIMIT 1`,
         )
         .get();
@@ -233,6 +241,15 @@ export class Store {
       }
     }
     this.purgeExpired();
+    // A process interruption cannot prove whether Discord accepted a DM.
+    for (const row of this.db
+      .prepare("SELECT id,encrypted FROM bot_message_history WHERE status='pending'")
+      .iterate()) {
+      const value = this.decrypt<BotMessageHistory>(row.encrypted as Uint8Array);
+      this.db
+        .prepare('UPDATE bot_message_history SET status=?,encrypted=? WHERE id=?')
+        .run('uncertain', this.encrypt({ ...value, status: 'uncertain' }), row.id);
+    }
   }
   encrypt(value: unknown): Buffer {
     return this.cipher.encrypt(value);
@@ -745,6 +762,51 @@ export class Store {
       Date.now() / 1000 + 86400,
     );
   }
+  saveBotMessage(jobId: string, message: BotMessageHistory): void {
+    if (!this.db.prepare('SELECT 1 FROM jobs WHERE id=?').get(jobId))
+      throw new Error('Message history requires an existing activity.');
+    const timestamp = Date.parse(message.created_at);
+    if (!message.id || !Number.isFinite(timestamp) || message.content.length > 2000)
+      throw new Error('Invalid bot message history.');
+    const existing = this.db
+      .prepare('SELECT job_id,encrypted FROM bot_message_history WHERE id=?')
+      .get(message.id);
+    if (existing) {
+      const previous = this.decrypt<BotMessageHistory>(existing.encrypted as Uint8Array);
+      if (
+        existing.job_id !== jobId ||
+        previous.created_at !== message.created_at ||
+        previous.content !== message.content ||
+        previous.recipient_id !== message.recipient_id ||
+        previous.account_username !== message.account_username ||
+        previous.membership_slot !== message.membership_slot ||
+        previous.status !== 'pending'
+      )
+        throw new Error('Bot message history is immutable after delivery.');
+    }
+    this.db
+      .prepare('INSERT OR REPLACE INTO bot_message_history VALUES (?,?,?,?,?)')
+      .run(message.id, jobId, timestamp, message.status, this.encrypt(message));
+  }
+  botMessages(jobId: string): BotMessageHistory[] {
+    const days = this.settings().bot_message_retention_days ?? 30;
+    const cutoff = days > 0 ? Date.now() - days * 86400_000 : -Number.MAX_VALUE;
+    return this.db
+      .prepare(
+        'SELECT encrypted FROM bot_message_history WHERE job_id=? AND created_ms>? ORDER BY created_ms,id LIMIT 1000',
+      )
+      .all(jobId, cutoff)
+      .map((row) => this.decrypt<BotMessageHistory>(row.encrypted as Uint8Array));
+  }
+  pruneBotMessages(): void {
+    const days = this.settings().bot_message_retention_days ?? 30;
+    if (days > 0)
+      this.db
+        .prepare(
+          'DELETE FROM bot_message_history WHERE id IN (SELECT id FROM bot_message_history WHERE created_ms<=? LIMIT 500)',
+        )
+        .run(Date.now() - days * 86400_000);
+  }
   deleteCredentials(jobId: string, username: string): void {
     this.db.prepare('DELETE FROM credentials WHERE job_id=? AND username=?').run(jobId, username);
   }
@@ -814,7 +876,23 @@ export class Store {
   }
   subscription(id: string): SubscriptionEvent | null {
     const row = this.db.prepare('SELECT payload FROM subscriptions WHERE id=?').get(id);
-    return row ? (JSON.parse(row.payload as string) as SubscriptionEvent) : null;
+    if (!row) return null;
+    const event = JSON.parse(row.payload as string) as SubscriptionEvent & {
+      _stripe_entitlement_encrypted?: string;
+    };
+    if (event._stripe_entitlement_encrypted !== undefined) {
+      if (typeof event._stripe_entitlement_encrypted !== 'string')
+        throw new Error('The saved Stripe entitlement could not be verified.');
+      const saved = this.decrypt<{
+        event_id: string;
+        fact: NonNullable<SubscriptionEvent['stripe_entitlement']>;
+      }>(Buffer.from(event._stripe_entitlement_encrypted, 'base64'));
+      if (saved.event_id !== event.id || saved.fact?.event_id !== event.id)
+        throw new Error('The saved Stripe entitlement belongs to a different subscription event.');
+      event.stripe_entitlement = saved.fact;
+      delete event._stripe_entitlement_encrypted;
+    }
+    return event;
   }
   subscriptions(): SubscriptionEvent[] {
     return this.db
@@ -822,12 +900,40 @@ export class Store {
         "SELECT payload FROM subscriptions ORDER BY json_extract(payload,'$.created_at') DESC",
       )
       .all()
-      .map((row) => JSON.parse(row.payload as string) as SubscriptionEvent);
+      .map((row) => {
+        const event = JSON.parse(row.payload as string) as SubscriptionEvent & {
+          _stripe_entitlement_encrypted?: string;
+        };
+        if (event._stripe_entitlement_encrypted !== undefined) {
+          if (typeof event._stripe_entitlement_encrypted !== 'string')
+            throw new Error('The saved Stripe entitlement could not be verified.');
+          const saved = this.decrypt<{
+            event_id: string;
+            fact: NonNullable<SubscriptionEvent['stripe_entitlement']>;
+          }>(Buffer.from(event._stripe_entitlement_encrypted, 'base64'));
+          if (saved.event_id !== event.id || saved.fact?.event_id !== event.id)
+            throw new Error(
+              'The saved Stripe entitlement belongs to a different subscription event.',
+            );
+          event.stripe_entitlement = saved.fact;
+          delete event._stripe_entitlement_encrypted;
+        }
+        return event;
+      });
   }
   saveSubscription(event: SubscriptionEvent): void {
+    const { stripe_entitlement, ...payload } = event as SubscriptionEvent & {
+      _stripe_entitlement_encrypted?: string;
+    };
+    delete payload._stripe_entitlement_encrypted;
+    if (stripe_entitlement)
+      payload._stripe_entitlement_encrypted = this.encrypt({
+        event_id: event.id,
+        fact: stripe_entitlement,
+      }).toString('base64');
     this.db
       .prepare('INSERT OR REPLACE INTO subscriptions VALUES (?,?)')
-      .run(event.id, JSON.stringify(event));
+      .run(event.id, JSON.stringify(payload));
   }
   purgeExpired(): void {
     const time = Date.now() / 1000;
@@ -835,6 +941,7 @@ export class Store {
       this.db.prepare('DELETE FROM credentials WHERE expires<=?').run(time);
       this.db.prepare('UPDATE accounts SET password=NULL,expires=NULL WHERE expires<=?').run(time);
     });
+    this.pruneBotMessages();
   }
   close(): void {
     this.db.close();

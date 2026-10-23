@@ -1,5 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { generatePassword, accountCredentialMessage } from './credentials.js';
+import {
+  generatePassword,
+  accountCredentialMessage,
+  discordCredentialContent,
+} from './credentials.js';
+import type { BotMessageHistory, BotMessageReceipt } from './bot-messages.js';
 import { MediaError, ServiceError } from './errors.js';
 import {
   caseFold,
@@ -80,6 +85,8 @@ import {
 import { AccountRenames } from './account-rename.js';
 import { MediaOwnerships, type MediaOwnership } from './media-ownership.js';
 import { NewSubscriberPolicy } from './new-subscriber-policy.js';
+import type { StripeEntitlementFact } from './stripe-entitlements.js';
+import { parseAccountUsername } from './account-naming.js';
 import type { IdentityRoster } from './identity-review-types.js';
 import {
   JOB_RETENTION_INTERVAL_SECONDS,
@@ -99,6 +106,7 @@ export interface ReviewedHistoryTarget {
   template_user_id: string;
 }
 export interface JobRequest {
+  stripe_entitlement?: StripeEntitlementFact;
   clone_source?: ReviewedCloneSource;
   clone_profile?: { family: boolean; owner_name: string; notes: string };
   history_only_target?: ReviewedHistoryTarget;
@@ -124,6 +132,15 @@ export interface JobRequest {
   new_subscriber_event_id?: string;
   new_subscriber_emitted_at?: string;
   access_disabled?: boolean;
+}
+/** Server-owned preview proof. A numbered name is a suggestion until the
+ * administrator accepts this exact owner, source identity and account slot. */
+export interface ReviewedHouseholdAccount {
+  source_username: string;
+  discord_user_id: string;
+  discord_username: string;
+  slot: number;
+  server_id: string;
 }
 export interface JobStats {
   source_played: number;
@@ -248,6 +265,7 @@ export interface Job {
   migration_scope?: MigrationScope;
 }
 export interface SubscriptionEvent {
+  stripe_entitlement?: StripeEntitlementFact;
   id: string;
   action: 'subscribe' | 'cancel' | 'expire';
   status: string;
@@ -278,6 +296,7 @@ export interface JobHistoryCleanupResult {
   skipped: Array<{ id: string; reason: JobHistoryCleanupSkipReason }>;
 }
 export interface SubscriptionInput {
+  stripe_entitlement?: StripeEntitlementFact;
   id: string;
   action: 'subscribe' | 'cancel' | 'expire';
   username?: string | null;
@@ -300,7 +319,7 @@ export interface BotAdapter {
     url: string,
     requireMembership?: boolean,
     message?: string,
-  ): Promise<void>;
+  ): Promise<BotMessageReceipt | void>;
   listTagRoles?(): Promise<{
     roles: Array<{ id: string; name: string; manageable: boolean }>;
     can_manage_roles: boolean;
@@ -344,6 +363,8 @@ interface MigrationPreviewOptions {
 }
 interface PreviewUser {
   membership_slot?: number;
+  owner_basis?: 'mapping' | 'approved' | 'numbered_suggestion';
+  owner_search?: string;
   history_only?: true;
   source_snapshot?: SnapshotMetadata;
   source_user_id: string;
@@ -400,6 +421,7 @@ class SourcePreparationError extends ServiceError {}
 class DestinationPreparationError extends ServiceError {}
 class NewSubscriberOptInRequired extends ServiceError {}
 interface NewSubscriberGuard {
+  stripe_entitlement?: StripeEntitlementFact;
   revision: string;
   emitted_at: string;
   event_id: string;
@@ -480,6 +502,7 @@ function previewItemSummary(item: MediaItem): MigrationItemSummary {
 
 /** Account jobs and subscription actions share a mutation lock released between users. */
 export class Service {
+  verifyStripeEntitlement?: (fact: StripeEntitlementFact) => void;
   bot: BotAdapter | null = null;
   clientFactory: ClientFactory;
   readonly jobTasks = new Map<string, Promise<void>>();
@@ -913,6 +936,67 @@ export class Service {
   async preview(sourceUserIds: string[], options: MigrationPreviewOptions = {}) {
     return this.previewRead(sourceUserIds, options);
   }
+  private async householdSuggestions(
+    users: Pick<
+      PreviewUser,
+      'source_user_id' | 'source_username' | 'history_only' | 'discord_user_id'
+    >[],
+    settings: Settings,
+  ): Promise<Record<string, Omit<ReviewedHouseholdAccount, 'server_id'>>> {
+    const numbered = users.filter(
+      (user) =>
+        !user.history_only &&
+        !user.discord_user_id &&
+        (parseAccountUsername(user.source_username, settings)?.slot ?? 1) > 1,
+    );
+    if (!numbered.length || !settings.discord_enabled || !this.bot?.listIdentityMembers) return {};
+    let roster: IdentityRoster;
+    try {
+      roster = await this.bot.listIdentityMembers();
+    } catch {
+      return {};
+    }
+    if (!roster.complete) return {};
+    const result: Record<string, Omit<ReviewedHouseholdAccount, 'server_id'>> = {};
+    const members = new Map(roster.members.map((member) => [member.id, member]));
+    const fullNames = new Set(roster.members.map((member) => caseFold(member.username)));
+    const byBase = new Map<string, Map<string, IdentityRoster['members'][number]>>();
+    const addBase = (base: string, id: string) => {
+      const member = members.get(id);
+      if (!member) return;
+      const key = caseFold(base),
+        group = byBase.get(key) ?? new Map();
+      group.set(id, member);
+      byBase.set(key, group);
+    };
+    for (const member of roster.members) addBase(member.username, member.id);
+    for (const member of this.memberships.list(settings))
+      addBase(member.base_username, member.discord_user_id);
+    for (const mapping of this.mappings.list(settings))
+      if (mapping.discord_user_id && (mapping.membership_slot ?? 1) === 1) {
+        const parsed = parseAccountUsername(mapping.source_username, settings);
+        addBase(
+          parsed?.slot === 1 ? parsed.base : mapping.source_username,
+          mapping.discord_user_id,
+        );
+      }
+    for (const user of numbered) {
+      // A real Discord username containing a numeric suffix belongs to that
+      // identity. Never silently strip it and assign their account to a namesake.
+      if (fullNames.has(caseFold(user.source_username))) continue;
+      const parsed = parseAccountUsername(user.source_username, settings)!;
+      const candidates = [...(byBase.get(caseFold(parsed.base))?.values() ?? [])];
+      if (candidates.length !== 1) continue;
+      const owner = candidates[0]!;
+      result[user.source_user_id] = {
+        source_username: user.source_username,
+        discord_user_id: owner.id,
+        discord_username: owner.username,
+        slot: parsed.slot,
+      };
+    }
+    return result;
+  }
   private async previewRead(
     sourceUserIds: string[],
     options: MigrationPreviewOptions = {},
@@ -922,6 +1006,7 @@ export class Service {
     migration_scope: MigrationScope;
     source_snapshot_ids?: Record<string, string>;
     history_only_targets?: Record<string, ReviewedHistoryTarget>;
+    household_targets?: Record<string, ReviewedHouseholdAccount>;
   }> {
     const scope = migrationScope(options.migration_scope);
     const checkCanceled = () => {
@@ -1081,7 +1166,12 @@ export class Service {
               discord_username: historyOnly
                 ? null
                 : (mapping?.discord_username ?? registeredIdentity?.username ?? null),
-              ...(!mapping && registeredIdentity ? { membership_slot: registeredOwner!.slot } : {}),
+              ...(mapping?.discord_user_id
+                ? { membership_slot: mapping.membership_slot ?? 1, owner_basis: 'mapping' as const }
+                : registeredIdentity
+                  ? { membership_slot: registeredOwner!.slot, owner_basis: 'approved' as const }
+                  : {}),
+              owner_search: sourceUser.Name,
               warnings: [
                 snapshot
                   ? 'Saved history is available. Preview checks account identity and backup freshness only. Exact watched-status counts and matching details are deferred until approval; results report unmatched and ambiguous items. Approval uses this backup generation and a shared Jellyfin matching catalog.'
@@ -1102,10 +1192,36 @@ export class Service {
             options.progress?.(users.length, sourceUserIds.length);
             checkCanceled();
           }
+          const suggestions = await this.householdSuggestions(users, settings);
+          checkCanceled();
+          const householdTargets: Record<string, ReviewedHouseholdAccount> = {};
+          if (Object.keys(suggestions).length) {
+            const info = snapshotInfo ?? (await emby.systemInfo());
+            checkCanceled();
+            if (typeof info.Id !== 'string' || !info.Id)
+              throw new ServiceError(
+                'The Emby server identity could not be verified for numbered account review.',
+              );
+            for (const user of users) {
+              const suggested = suggestions[user.source_user_id];
+              if (!suggested) continue;
+              householdTargets[user.source_user_id] = { ...suggested, server_id: info.Id };
+              user.discord_user_id = suggested.discord_user_id;
+              user.discord_username = suggested.discord_username;
+              user.membership_slot = suggested.slot;
+              user.owner_basis = 'numbered_suggestion';
+              user.warnings.push(
+                'Starting this migration confirms the suggested household owner and account slot. All new account credentials go privately to that owner. Existing passwords are preserved.',
+              );
+            }
+          }
           return {
             users,
             mode: 'merge',
             migration_scope: scope,
+            ...(Object.keys(householdTargets).length
+              ? { household_targets: householdTargets }
+              : {}),
             ...(Object.keys(historyOnlyTargets).length
               ? { history_only_targets: historyOnlyTargets }
               : {}),
@@ -1128,10 +1244,16 @@ export class Service {
   recipientRequiresSubscription(discordId: string): boolean {
     return this.memberships.get(discordId, this.store.settings())?.access_mode !== 'complimentary';
   }
+  recipientRequiresMembershipRole(discordId: string): boolean {
+    return (
+      this.store.settings().new_subscriber_source !== 'stripe' &&
+      this.recipientRequiresSubscription(discordId)
+    );
+  }
   private async recipientIdentity(discordId: string) {
     return this.requireBot().recipientIdentity(
       discordId,
-      this.recipientRequiresSubscription(discordId),
+      this.recipientRequiresMembershipRole(discordId),
     );
   }
   private async validateRecipients(recipients: Iterable<string>): Promise<void> {
@@ -1140,7 +1262,7 @@ export class Service {
       try {
         await bot.validateRecipient(
           String(recipient),
-          this.recipientRequiresSubscription(String(recipient)),
+          this.recipientRequiresMembershipRole(String(recipient)),
         );
       } catch {
         throw new ServiceError(
@@ -1712,6 +1834,13 @@ export class Service {
     );
   }
   private assertMembershipRequest(request: JobRequest, settings: Settings): Membership | null {
+    if (request.stripe_entitlement) {
+      this.assertStripeEntitlement(request.stripe_entitlement);
+      if (request.discord_user_id !== request.stripe_entitlement.discord_user_id)
+        throw new ServiceError(
+          'The Stripe account owner changed. Review the queued membership action.',
+        );
+    }
     if (request.new_subscriber_policy_revision) {
       this.newSubscriberPolicy.assertActive(settings, request.new_subscriber_policy_revision);
       const emitted = Date.parse(request.new_subscriber_emitted_at ?? '');
@@ -1721,7 +1850,7 @@ export class Service {
       const activation = this.newSubscriberPolicy.activation(settings)!;
       if (
         !event ||
-        event.source !== 'mee6_message' ||
+        !['mee6_message', 'stripe'].includes(event.source ?? '') ||
         event.action !== 'subscribe' ||
         event.discord_user_id !== request.discord_user_id ||
         !event.detail?.trim() ||
@@ -1731,7 +1860,7 @@ export class Service {
         emitted < Date.parse(activation.enabled_at) ||
         Date.parse(event.created_at) < Date.parse(activation.enabled_at) ||
         emitted > Date.now() + 30_000 ||
-        Date.now() - emitted > 10 * 60_000
+        (event.source !== 'stripe' && Date.now() - emitted > 10 * 60_000)
       )
         throw new ServiceError('The new-subscriber review expired. Review account provisioning.');
       if (!this.store.settings().auto_provision || request.source_user_id || request.mapping_id)
@@ -1780,8 +1909,29 @@ export class Service {
     const activation = this.newSubscriberPolicy.activation(settings);
     const emitted = Date.parse(event.emitted_at ?? '');
     const time = Date.now();
+    if (event.source === 'stripe') {
+      if (
+        settings.new_subscriber_source !== 'stripe' ||
+        !activation ||
+        !event.stripe_entitlement?.is_new
+      )
+        return null;
+      this.assertStripeEntitlement(event.stripe_entitlement);
+      if (
+        Date.parse(event.stripe_entitlement.created_at) < Date.parse(activation.enabled_at) ||
+        Date.parse(event.created_at) < Date.parse(activation.enabled_at)
+      )
+        return null;
+      return {
+        revision: activation.revision,
+        emitted_at: event.emitted_at!,
+        event_id: event.id,
+        stripe_entitlement: event.stripe_entitlement,
+      };
+    }
     if (
       !activation ||
+      settings.new_subscriber_source === 'stripe' ||
       event.source !== 'mee6_message' ||
       !event.detail?.trim() ||
       !Number.isFinite(Date.parse(event.created_at)) ||
@@ -1826,6 +1976,7 @@ export class Service {
     expectedRevision?: string,
     review?: { account_limit: number; usernames: string[]; provision_jellyfin?: boolean },
     newSubscriber?: NewSubscriberGuard,
+    stripeEntitlement?: StripeEntitlementFact,
   ): Promise<Job> {
     if (this.demo) throw new ServiceError('Demo memberships are read-only.');
     return this.membershipMutex.run(() =>
@@ -1835,6 +1986,7 @@ export class Service {
         if (identity.id && identity.id !== discordId)
           throw new ServiceError('Discord returned a different member. Reload and try again.');
         const settings = this.store.settings();
+        if (stripeEntitlement) this.assertStripeEntitlement(stripeEntitlement);
         const existing = this.memberships.get(discordId, settings);
         if (
           existing?.new_subscriber_pending &&
@@ -1845,6 +1997,7 @@ export class Service {
             'A previous automatic signup requires an explicit Jellyfin opt-in in Memberships before provisioning can continue.',
           );
         const assertNewPolicy = () => {
+          if (stripeEntitlement) this.assertStripeEntitlement(stripeEntitlement);
           if (!newSubscriber) return;
           this.newSubscriberPolicy.assertActive(settings, newSubscriber.revision);
           if (
@@ -1863,13 +2016,15 @@ export class Service {
           const emitted = Date.parse(newSubscriber.emitted_at);
           const time = Date.now();
           if (
-            !Number.isFinite(joined) ||
-            joined < Date.parse(activation.enabled_at) ||
-            joined > time ||
+            (!newSubscriber.stripe_entitlement &&
+              (!Number.isFinite(joined) ||
+                joined < Date.parse(activation.enabled_at) ||
+                joined > time)) ||
+            (newSubscriber.stripe_entitlement && identity.id !== discordId) ||
             !Number.isFinite(emitted) ||
             emitted < Date.parse(activation.enabled_at) ||
             emitted > time + 30_000 ||
-            time - emitted > 10 * 60_000
+            (!newSubscriber.stripe_entitlement && time - emitted > 10 * 60_000)
           )
             throw new NewSubscriberOptInRequired(
               'Existing Discord members and older subscription events require an explicit Jellyfin opt-in.',
@@ -1924,8 +2079,16 @@ export class Service {
         const primaryLink = this.store.link(discordId);
         const baseUsername =
           existing?.base_username ??
-          primaryLink?.username ??
-          primaryMapping?.target_username ??
+          (primaryLink
+            ? parseAccountUsername(primaryLink.username, settings)?.slot === 1
+              ? parseAccountUsername(primaryLink.username, settings)!.base
+              : primaryLink.username
+            : undefined) ??
+          (primaryMapping
+            ? parseAccountUsername(primaryMapping.target_username, settings)?.slot === 1
+              ? parseAccountUsername(primaryMapping.target_username, settings)!.base
+              : primaryMapping.target_username
+            : undefined) ??
           identity.username;
         const links = this.store.linksForMember(discordId);
         const allowNewAccounts = review?.provision_jellyfin ?? existing?.provision_jellyfin ?? true;
@@ -1949,7 +2112,7 @@ export class Service {
               'Verify the configured Emby connection before automatic onboarding.',
             );
           const names = new Set(
-            [1, 2, 3].map((slot) => caseFold(membershipUsername(baseUsername, slot))),
+            [1, 2, 3].map((slot) => caseFold(membershipUsername(baseUsername, slot, settings))),
           );
           if (sourceUsers.some((source) => names.has(caseFold(source.Name))))
             throw new NewSubscriberOptInRequired(
@@ -1993,7 +2156,8 @@ export class Service {
               continue;
             }
             if (slot > tier.account_limit || !allowNewAccounts) continue;
-            const username = mapping?.target_username ?? membershipUsername(baseUsername, slot);
+            const username =
+              mapping?.target_username ?? membershipUsername(baseUsername, slot, settings);
             if (mapping?.target_user_id) validateExistingMappingUsername(username);
             else validateUsername(username);
             const target = this.mappedTarget(targets, mapping ?? null, username, settings);
@@ -2090,6 +2254,9 @@ export class Service {
           'membership',
           requests.map((request) => ({
             ...request,
+            ...(stripeEntitlement
+              ? { stripe_entitlement: structuredClone(stripeEntitlement) }
+              : {}),
             membership_revision: member.revision,
             ...(newSubscriber
               ? {
@@ -2224,6 +2391,7 @@ export class Service {
     targetUserId: string,
     discordUserId?: string | null,
   ): Promise<Job> {
+    const settings = this.store.settings();
     const info = await this.recoveryInfo(username);
     if (
       ['clone_uncertain', 'clone_incomplete'].includes(this.store.account(username)?.status ?? '')
@@ -2245,14 +2413,15 @@ export class Service {
       if (link) slot = link.membership_slot;
       else if (mapping?.discord_user_id !== discordUserId && member) {
         const derivedSlot = [1, 2, 3].find(
-          (candidate) => username === membershipUsername(member!.base_username, candidate),
+          (candidate) =>
+            username === membershipUsername(member!.base_username, candidate, settings),
         );
         if (derivedSlot) slot = derivedSlot;
       }
       const householdName =
         member?.active &&
         slot <= member.account_limit &&
-        username === membershipUsername(member.base_username, slot);
+        username === membershipUsername(member.base_username, slot, settings);
       if (
         (await this.recipientIdentity(discordUserId)).username !== username &&
         mapping?.discord_user_id !== discordUserId &&
@@ -2290,6 +2459,7 @@ export class Service {
     sourceSnapshotIds?: Record<string, string>,
     previewTiming?: Job['preview_timing'],
     historyOnlyTargets?: Record<string, ReviewedHistoryTarget>,
+    householdTargets?: Record<string, ReviewedHouseholdAccount>,
   ): Promise<Job> {
     const requestedAt = now();
     const scope = migrationScope(requestedScope);
@@ -2311,11 +2481,46 @@ export class Service {
     const settings = this.store.settings();
     this.requireServer(settings, 'emby');
     this.requireServer(settings, 'jellyfin');
+    const reviewedHouseholds = householdTargets ?? {};
+    if (
+      Object.keys(reviewedHouseholds).some(
+        (id) => !sourceUserIds.includes(id) || historyOnlyTargets?.[id],
+      )
+    )
+      throw new ServiceError(
+        'Household owners must belong to selected, unprotected source accounts.',
+      );
+    if (Object.keys(reviewedHouseholds).length) {
+      const sourceUsers = await this.withClient(settings, 'emby', async (client) => {
+        const info = await client.systemInfo();
+        const result = [];
+        for (const [id, proof] of Object.entries(reviewedHouseholds)) {
+          const user = await client.user(id);
+          if (info.Id !== proof.server_id || user.Id !== id || user.Name !== proof.source_username)
+            throw new ServiceError('The reviewed household source changed. Prepare a new review.');
+          result.push({ source_user_id: id, source_username: user.Name, discord_user_id: null });
+        }
+        return result;
+      });
+      const current = await this.householdSuggestions(sourceUsers, settings);
+      for (const [id, proof] of Object.entries(reviewedHouseholds)) {
+        const actual = current[id];
+        if (
+          !actual ||
+          actual.discord_user_id !== proof.discord_user_id ||
+          actual.discord_username !== proof.discord_username ||
+          actual.slot !== proof.slot
+        )
+          throw new ServiceError(
+            'The suggested household owner changed. Prepare a new review or save an explicit user mapping.',
+          );
+      }
+    }
     const registeredSources = this.mediaOwnerships
       .list(settings)
       .filter((owner) => owner.kind === 'emby' && sourceUserIds.includes(owner.account_id));
     let ownershipServerId: string | undefined;
-    if (registeredSources.length)
+    if (registeredSources.length || Object.keys(reviewedHouseholds).length)
       await this.withClient(settings, 'emby', async (client) => {
         const info = await client.systemInfo();
         if (typeof info.Id !== 'string' || !info.Id)
@@ -2350,7 +2555,18 @@ export class Service {
         throw new ServiceError(
           'The user mapping changed after preview. Review a new preview before migrating.',
         );
-      const recipient = Object.hasOwn(discordRecipients, id) ? discordRecipients[id] : undefined;
+      const household = reviewedHouseholds[id];
+      const recipient = Object.hasOwn(discordRecipients, id)
+        ? discordRecipients[id]
+        : household?.discord_user_id;
+      if (
+        household &&
+        (recipient !== household.discord_user_id ||
+          (mapping && (mapping.membership_slot ?? 1) !== household.slot))
+      )
+        throw new ServiceError(
+          'The household recipient or slot differs from the approved review. Save a user mapping for exceptions.',
+        );
       const historyOnly = historyOnlyTargets?.[id];
       if (historyOnly && recipient)
         throw new ServiceError(
@@ -2359,7 +2575,7 @@ export class Service {
       const registeredOwner = registeredSources.find(
         (owner) => owner.account_id === id && owner.server_id === ownershipServerId,
       );
-      const slot = mapping?.membership_slot ?? registeredOwner?.slot ?? 1;
+      const slot = mapping?.membership_slot ?? registeredOwner?.slot ?? household?.slot ?? 1;
       if (
         !historyOnly &&
         registeredOwner &&
@@ -2412,7 +2628,11 @@ export class Service {
           : {}),
       };
     });
-    await this.validateRecipients(Object.values(discordRecipients));
+    await this.validateRecipients([
+      ...new Set(
+        requests.flatMap((request) => (request.discord_user_id ? [request.discord_user_id] : [])),
+      ),
+    ]);
     // Preflight may await media or Discord reads. Queueing must use the same
     // configuration that was reviewed, rather than adopting a concurrent edit.
     if (JSON.stringify(settings) !== JSON.stringify(this.store.settings()))
@@ -2421,6 +2641,51 @@ export class Service {
       );
     for (const request of requests)
       if (ownershipServerId) this.sourceOwnership(request, settings, ownershipServerId);
+    const allOwners = this.mediaOwnerships.list(settings);
+    const approved: Omit<MediaOwnership, 'scope' | 'approved_at'>[] = [];
+    for (const [id, proof] of Object.entries(reviewedHouseholds)) {
+      if (proof.server_id !== ownershipServerId || this.mappings.getForSource(id, settings))
+        throw new ServiceError(
+          'The household identity changed. Review a new preview or its explicit mapping.',
+        );
+      if (
+        allOwners.some(
+          (owner) =>
+            owner.kind === 'emby' &&
+            owner.server_id === proof.server_id &&
+            ((owner.account_id === id &&
+              (owner.discord_user_id !== proof.discord_user_id || owner.slot !== proof.slot)) ||
+              (owner.discord_user_id === proof.discord_user_id &&
+                owner.slot === proof.slot &&
+                owner.account_id !== id)),
+        )
+      )
+        throw new ServiceError(
+          'This household account slot already has another approved source. Review its mapping.',
+        );
+      approved.push({
+        kind: 'emby',
+        server_id: proof.server_id,
+        account_id: id,
+        username: proof.source_username,
+        discord_user_id: proof.discord_user_id,
+        slot: proof.slot,
+      });
+    }
+    // Acceptance approves identity independently of history transfer. Keep the
+    // association even if a later media operation fails, without moving history
+    // between the family's distinct accounts.
+    this.mediaOwnerships.save(approved, settings);
+    for (const request of requests) {
+      const proof = reviewedHouseholds[request.source_user_id ?? ''];
+      if (proof)
+        request.source_ownership = {
+          server_id: proof.server_id,
+          identity_hash: this.ownershipHash(
+            this.mediaOwnerships.get('emby', proof.server_id, request.source_user_id!, settings),
+          ),
+        };
+    }
     return this.queue('migrate', requests, requestedAt, previewTiming);
   }
   private async requireRoleServer(client: MediaAPI, role: AccountRole): Promise<void> {
@@ -3691,7 +3956,7 @@ export class Service {
           'Verify the configured Emby connection before automatic onboarding.',
         );
       const names = new Set(
-        [1, 2, 3].map((slot) => caseFold(membershipUsername(member.base_username, slot))),
+        [1, 2, 3].map((slot) => caseFold(membershipUsername(member.base_username, slot, settings))),
       );
       const sources = await this.withClient(settings, 'emby', (client) => client.users());
       guard();
@@ -3806,7 +4071,7 @@ export class Service {
       const approvedHouseholdName = Boolean(
         request.membership_revision &&
         member &&
-        username === membershipUsername(member.base_username, slot),
+        username === membershipUsername(member.base_username, slot, settings),
       );
       const registeredIdentity =
         registeredSource.value?.discord_user_id === recipient &&
@@ -4240,6 +4505,9 @@ export class Service {
         this.save(job);
         guard();
       }
+      let archivedMessage: BotMessageHistory | undefined;
+      let archiveSent = false;
+      let deliveryAcknowledged = false;
       if (recipient && password)
         try {
           phase('delivering_credentials');
@@ -4254,20 +4522,49 @@ export class Service {
               'The Discord recipient identity changed. Credentials were preserved for administrator review.',
             );
           guard();
-          await this.requireBot().sendCredentials(
+          archivedMessage = {
+            id: randomUUID(),
+            kind: 'credentials',
+            recipient_id: recipient,
+            recipient_username: identity.username,
+            account_username: username,
+            membership_slot: request.membership_slot ?? mapping?.membership_slot ?? 1,
+            content: discordCredentialContent(message!),
+            status: 'pending',
+            created_at: now(),
+          };
+          this.store.saveBotMessage(job.id, archivedMessage);
+          const receipt = await this.requireBot().sendCredentials(
             recipient,
             username,
             password,
             publicUrl,
-            this.recipientRequiresSubscription(recipient),
+            this.recipientRequiresMembershipRole(recipient),
             message,
           );
+          deliveryAcknowledged = true;
+          result.discord_delivery = 'sent';
+          this.store.saveBotMessage(job.id, {
+            ...archivedMessage,
+            ...receipt,
+            status: 'sent',
+            sent_at: receipt?.sent_at ?? now(),
+          });
+          archiveSent = true;
           result.discord_delivery = 'sent';
           this.store.deleteCredentials(job.id, username);
         } catch {
-          result.discord_delivery = 'failed';
-          result.delivery_error =
-            'Discord delivery failed. Credentials remain available for one-time reveal for 24 hours.';
+          if (archivedMessage && !archiveSent) {
+            try {
+              this.store.saveBotMessage(job.id, { ...archivedMessage, status: 'uncertain' });
+            } catch {
+              /* The durable pending attempt remains uncertain; never resend automatically. */
+            }
+          }
+          result.discord_delivery = deliveryAcknowledged ? 'sent' : 'failed';
+          result.delivery_error = deliveryAcknowledged
+            ? 'Discord confirmed delivery, but local message archival or temporary credential cleanup could not finish. Any retained recovery credentials remain available until expiration.'
+            : 'Discord delivery was not confirmed. Credentials remain available for one-time reveal for 24 hours.';
         }
       else if (recipient) result.discord_delivery = 'skipped_existing_account';
       if (source && result.data) {
@@ -4565,7 +4862,43 @@ export class Service {
     await Promise.allSettled([...this.clients].map((client) => client.close()));
     await Promise.allSettled([...this.jobTasks.values()]);
   }
+  private assertStripeEntitlement(fact: StripeEntitlementFact): void {
+    if (this.store.settings().new_subscriber_source !== 'stripe' || !this.verifyStripeEntitlement)
+      throw new ServiceError(
+        'Select and connect the verified Stripe subscription source before applying billing access.',
+      );
+    this.verifyStripeEntitlement(fact);
+  }
+  async recordStripeEntitlement(fact: StripeEntitlementFact): Promise<void> {
+    this.assertStripeEntitlement(fact);
+    const event = await this.recordSubscription({
+      id: fact.event_id,
+      action: fact.action,
+      source: 'stripe',
+      discord_user_id: fact.discord_user_id,
+      emitted_at: fact.observed_at,
+      detail: (this.store.settings().membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).find(
+        (tier) => tier.id === fact.tier_id,
+      )?.plan_name,
+      stripe_entitlement: fact,
+    });
+    if (!['applied', 'ignored'].includes(event.status))
+      throw new ServiceError('Stripe membership action requires administrator review.');
+  }
   async recordSubscription(incoming: SubscriptionInput): Promise<SubscriptionEvent> {
+    if (incoming.source === 'stripe') {
+      if (!incoming.stripe_entitlement)
+        throw new ServiceError('Verified Stripe entitlement evidence is required.');
+      this.assertStripeEntitlement(incoming.stripe_entitlement);
+      if (
+        incoming.id !== incoming.stripe_entitlement.event_id ||
+        incoming.action !== incoming.stripe_entitlement.action ||
+        incoming.discord_user_id !== incoming.stripe_entitlement.discord_user_id
+      )
+        throw new ServiceError(
+          'The Stripe event does not match its verified account owner or action.',
+        );
+    }
     const existing = this.store.subscription(String(incoming.id));
     if (existing) return existing;
     if (!['subscribe', 'cancel', 'expire'].includes(incoming.action))
@@ -4578,6 +4911,9 @@ export class Service {
       source: incoming.source,
       detail: incoming.detail,
       emitted_at: incoming.emitted_at,
+      ...(incoming.stripe_entitlement
+        ? { stripe_entitlement: structuredClone(incoming.stripe_entitlement) }
+        : {}),
       status: 'pending',
       created_at: now(),
     };
@@ -4594,6 +4930,7 @@ export class Service {
       event.action === 'subscribe'
         ? settings.auto_provision
         : settings.auto_disable && (event.action === 'expire' || settings.disable_on_cancel);
+    if (settings.new_subscriber_source === 'stripe' && event.source !== 'stripe') automatic = false;
     if (event.action === 'subscribe') {
       try {
         const tier = this.subscriptionTier(event, settings);
@@ -4601,6 +4938,7 @@ export class Service {
         event.account_limit = tier.account_limit;
         if (
           settings.auto_create_new_subscribers &&
+          settings.new_subscriber_source !== 'stripe' &&
           settings.auto_provision &&
           event.source !== 'mee6_message' &&
           event.discord_user_id &&
@@ -4628,6 +4966,7 @@ export class Service {
       !automatic &&
       settings.auto_provision &&
       settings.auto_create_new_subscribers &&
+      settings.new_subscriber_source !== 'stripe' &&
       event.action === 'subscribe' &&
       event.discord_user_id &&
       ['discord_role', 'role_reconciliation'].includes(event.source ?? '') &&
@@ -4681,6 +5020,19 @@ export class Service {
       const event = this.store.subscription(id);
       if (!event) throw new ServiceError('Subscription event not found.');
       if (['applied', 'ignored', 'processing'].includes(event.status)) return event;
+      if (event.source === 'stripe') {
+        if (!event.stripe_entitlement)
+          throw new ServiceError('Verified Stripe entitlement evidence is required.');
+        this.assertStripeEntitlement(event.stripe_entitlement);
+        if (
+          event.id !== event.stripe_entitlement.event_id ||
+          event.action !== event.stripe_entitlement.action ||
+          event.discord_user_id !== event.stripe_entitlement.discord_user_id
+        )
+          throw new ServiceError(
+            'The Stripe event does not match its verified account owner or action.',
+          );
+      }
       if (!event.discord_user_id)
         throw new ServiceError(
           'This message could not be resolved to one Discord user ID. Use a manual account action after verifying the member.',
@@ -4698,6 +5050,7 @@ export class Service {
         event.action === 'subscribe' &&
         this.newSubscriberGuard(event, waitingSettings) &&
         waitingSettings.discord_member_role_id &&
+        event.source !== 'stripe' &&
         !this.memberships.get(event.discord_user_id, waitingSettings) &&
         !this.store.linksForMember(event.discord_user_id).length
       ) {
@@ -4789,6 +5142,7 @@ export class Service {
                 undefined,
                 undefined,
                 newSubscriber,
+                event.stripe_entitlement,
               );
             } catch (error) {
               if (newSubscriber.enrolled_membership)
@@ -4880,6 +5234,8 @@ export class Service {
                     'Configuration or membership changed. Review and try again.',
                   );
                 this.checkStopped();
+                if (event.stripe_entitlement)
+                  this.assertStripeEntitlement(event.stripe_entitlement);
                 this.memberships.save(
                   {
                     discord_user_id: memberId,
@@ -4898,7 +5254,14 @@ export class Service {
             event.result =
               'Membership entitlement updated. Jellyfin provisioning remains opt-in for existing members, established identities and unverified signups; no media account was created or migrated.';
           } else {
-            const job = await this.provisionMembership(memberId, tier.id);
+            const job = await this.provisionMembership(
+              memberId,
+              tier.id,
+              undefined,
+              undefined,
+              undefined,
+              event.stripe_entitlement,
+            );
             event.job_id = job.id;
             delete event.report_cleared;
             this.store.saveSubscription(event);
@@ -4941,7 +5304,8 @@ export class Service {
                   'This Discord member has no Jellyport identity link. No account was disabled.',
                 );
               const primary = this.store.link(memberId) ?? links[0];
-              const saveInactive = () =>
+              const saveInactive = () => (
+                event.stripe_entitlement && this.assertStripeEntitlement(event.stripe_entitlement),
                 this.memberships.save(
                   {
                     discord_user_id: memberId,
@@ -4958,7 +5322,8 @@ export class Service {
                   },
                   settings,
                   previous?.revision,
-                );
+                )
+              );
               if (!links.length) {
                 if (JSON.stringify(settings) !== JSON.stringify(this.store.settings()))
                   throw new ServiceError('Configuration changed. Review and try again.');
@@ -4971,6 +5336,8 @@ export class Service {
                   this.assertLinkedTarget(await jellyfin.user(link.remote_id), link, settings);
                 const member = saveInactive();
                 const guard = () => {
+                  if (event.stripe_entitlement)
+                    this.assertStripeEntitlement(event.stripe_entitlement);
                   this.checkStopped();
                   if (
                     this.memberships.get(memberId, this.store.settings())?.revision !==
@@ -5023,6 +5390,15 @@ export class Service {
   }
   private subscriptionTier(event: SubscriptionEvent, settings: Settings) {
     const tiers = settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS;
+    if (event.source === 'stripe') {
+      if (!event.stripe_entitlement)
+        throw new ServiceError('Verified Stripe entitlement evidence is required.');
+      this.assertStripeEntitlement(event.stripe_entitlement);
+      const tier = tiers.find((entry) => entry.id === event.stripe_entitlement!.tier_id);
+      if (!tier)
+        throw new ServiceError('Map the verified Stripe price to a current membership tier.');
+      return tier;
+    }
     if (event.source !== 'mee6_message' || !event.detail?.trim()) {
       const previous = event.discord_user_id
         ? this.memberships.get(event.discord_user_id, settings)

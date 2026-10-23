@@ -95,24 +95,30 @@ Emby-only Stripe links, atomic rollback, ownership conflicts, source failures,
 stale/revoked authorization, annotations, opt-in provisioning, role time budgets,
 restart/retry safety and desktop/iPhone browser workflows. This is a code and
 behavior review, not a production penetration test or a guarantee against all
-vulnerabilities. Stripe observations still do not prove invoice payment or
-authorize billing enforcement.
+vulnerabilities. Cached Stripe observations alone do not prove invoice payment;
+the separately enabled invoice-backed authority described below is required for
+billing enforcement.
 
-## Future subscriber onboarding — 0.28.0
+## Future subscriber onboarding
 
 The optional new-subscriber policy is disabled by default and requires the
-separate automatic-provisioning switch and a trusted, exact-tier MEE6 signup.
+separate automatic-provisioning switch and a selected subscription authority.
+Trusted Discord messages require an exact configured plan; Stripe requires an
+approved customer-to-Discord link, mapped price and verified paid invoice period.
 Its private activation generation is encrypted and saved atomically with
 settings, scoped to the configured guild and media-server identities. Clients
 cannot supply or backdate the cutoff. Restarts preserve it; disabling or changing
 scope invalidates queued automatic authority.
 
-Only fresh announcements for human members who joined the guild after activation
-can establish automatic Jellyfin provisioning. Existing membership opt-outs,
+For the trusted-message authority, only fresh announcements for human members
+who joined the guild after activation establish automatic Jellyfin provisioning.
+Stripe records a private subscription baseline when billing automation is enabled;
+only verified paid signups created after activation can enroll new accounts.
+Existing membership opt-outs,
 legacy account links, approved ownership, mappings and matching Emby account
 names cannot be converted into automatic history migrations. Identity failures
-remain for administrator review. Generic role events, reconciliation, Stripe
-observations and old messages cannot authorize first-time creation. Existing
+remain for administrator review. Generic role events, reconciliation, unverified
+Stripe observations and old messages cannot authorize first-time creation. Existing
 ownership, current-recipient, server-binding, job-revision and uncertain-creation
 protections remain in effect; new credentials use the ordinary private delivery
 and expiring administrator recovery path. An encrypted pending-enrollment guard
@@ -122,20 +128,23 @@ holds update the exact original membership revision without overwriting newer
 decisions or another server's record. Verification uses synthetic adapters
 and local demo pages rather than real signups or live media accounts.
 
-## Stripe billing observations — 0.26.0
+## Stripe billing observations and optional access automation
 
 The Stripe connector uses restricted keys and GET requests to a fixed HTTPS
 Stripe origin. It pins the API version, forbids redirects, bounds response bytes,
 pagination, request concurrency, retries and total sync time, and checks each of
 the five documented Read permissions. Upstream bodies and errors are not logged
 or echoed. Keys, minimized customer/subscription observations, Checkout identity
-hints and approved Discord links use the existing authenticated encryption.
+hints, approved Discord links and persisted invoice-backed authority proofs use
+the existing authenticated encryption. Normal subscription-event responses omit
+the private invoice authority proof.
 Normal settings/status responses never return the key or customer contact data.
 Customer review routes require the central current-administrator, same-origin,
 CSRF and no-store protections. There is no public Stripe webhook endpoint.
 
-Sync and link approval cannot call media-server or membership mutations. A
-billing period is not reported as a paid-through date. Candidate identity fields
+With billing automation disabled, sync and link approval cannot call media-server
+or membership mutations. An observed billing period alone is not a paid-through
+date. Candidate identity fields
 remain unverified until an administrator selects a freshly verified human guild
 member. Reviews carry the catalog's own revision; key/guild changes and disconnect
 invalidate saved links and stale asynchronous work. Failed or incomplete reads
@@ -145,8 +154,28 @@ record bounded hints and do not infer payment or customer ownership.
 Verification uses synthetic Stripe, Discord and media adapters, including
 desktop and iPhone browser workflows. Live MEE6 subscription visibility and
 the actual source of Discord identity require verification after an operator
-supplies a restricted key. Invoice-backed access enforcement and signed billing
-webhooks are outside this connector's current scope.
+supplies a restricted key. Optional billing automation additionally requires
+Invoices Read permission and confirmed paid invoice line periods for the exact
+subscription, customer and mapped price. Reads are bounded and serial. Multiple
+active subscriptions, unknown payment state, paused billing or incomplete reads
+do not authorize automatic expiration. A cancellation cannot end access before its
+verified paid period ends. Persisted event claims prevent replay after an uncertain
+process interruption; unresolved actions require administrator review. Signed
+billing webhooks are not implemented.
+
+## Administrator bot message history
+
+Enabled administrators can reopen the exact captured credential DM, including its
+password, through the authenticated Activity message endpoint. Content is encrypted
+at rest and excluded from normal job, status, alert and logging payloads. The UI
+loads it only on request and discards it when closed or the session changes.
+The default archive retention is 30 days, configurable independently of temporary
+24-hour recovery credentials; zero retains messages until their activity is deleted.
+Deleting an activity also deletes its message archive. A pending send after restart
+is marked uncertain, never reported as acknowledged or automatically resent. Old
+delivered credentials already removed by earlier versions cannot be reconstructed.
+Encryption does not prevent an authorized administrator, host operator, or someone
+holding both the database and secret key from reading the retained passwords.
 
 ## Reviewed account cloning and rename — 0.25.0
 

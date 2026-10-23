@@ -3,6 +3,7 @@ import { ServiceError } from './errors.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { adminAlertReceiptId, type AdminAlertSource, type Store } from './store.js';
 import type { Settings } from './types.js';
+import { renderConfiguredBotMessage } from './bot-messages.js';
 
 const DELIVERY_ERROR =
   'Private admin notifications could not be delivered. Check the bot connection, administrator access, and Discord privacy settings.';
@@ -221,7 +222,14 @@ export class AdminAlerts {
       const sources = this.store.pendingAdminAlertSources(value.generation);
       if (!sources.length) return;
       try {
-        await send(value.user_id, summary(sources), stillCurrent);
+        await send(
+          value.user_id,
+          renderConfiguredBotMessage('admin_digest', settings.bot_message_templates, {
+            summary: summary(sources),
+            server_url: settings.jellyfin_public_url || settings.jellyfin_url,
+          }),
+          stillCurrent,
+        );
       } catch {
         if (!stillCurrent()) return;
         const current = this.configuration()!;

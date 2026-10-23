@@ -133,7 +133,7 @@ describe('persisted new-subscriber activation boundary', () => {
   it('requires trusted message events and rejects browser-supplied activation timestamps', () => {
     expect(() => validateSettings(enabled())).not.toThrow();
     expect(() => validateSettings({ ...enabled(), discord_message_events: false })).toThrow(
-      'trusted MEE6 subscription messages',
+      'configured Stripe or trusted subscription message source',
     );
     expect(() => validateSettings({ ...enabled(), auto_create_new_subscribers: 'yes' })).toThrow(
       'must be a boolean',

@@ -584,6 +584,17 @@ describe('Bot lifecycle and commands', () => {
       'alerts',
     ]);
   });
+  it.each([{ new_subscriber_source: 'stripe' as const }, { discord_auto_role_sync: true }])(
+    'requests member inventory without message access for %j',
+    (settings) => {
+      expect(botIntents(settings)).toEqual([
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+      ]);
+      expect(botIntents(settings)).not.toContain(GatewayIntentBits.GuildMessages);
+      expect(botIntents(settings)).not.toContain(GatewayIntentBits.MessageContent);
+    },
+  );
 
   it.each([
     ['create', null],
@@ -1139,6 +1150,74 @@ describe('Explicit complete Discord identity roster', () => {
 });
 
 describe('Private credential delivery and membership', () => {
+  it('customizes command summaries without exposing credentials and honors provider-specific role requirements', async () => {
+    const { manager, service, recipient } = await fixture({
+      bot_message_templates: {
+        job_queued: 'Community job {job_id}: {status}{progress_summary}',
+        job_status: 'Progress for {job_id}: {status}{progress_summary}',
+      },
+    });
+    Object.assign(service, {
+      recipientRequiresSubscription: () => true,
+      recipientRequiresMembershipRole: () => false,
+    });
+    recipient.roles.cache.clear();
+    const created = interaction();
+    await manager.handleCreate(asInteraction(created), { id: '22' });
+    expect(created.followUp.mock.calls[0]![0]).toMatchObject({
+      content: 'Community job job_1: queued',
+    });
+    const status = interaction();
+    await manager.handleStatus(asInteraction(status), 'job_1');
+    expect(status.followUp.mock.calls[0]![0]).toMatchObject({
+      content: 'Progress for job_1: running 1/2 users processed.',
+    });
+    expect(JSON.stringify([created.followUp.mock.calls, status.followUp.mock.calls])).not.toMatch(
+      /SECRET|NEVER-IN-CHANNEL/,
+    );
+  });
+  it('returns the exact wire content and Discord acknowledgement for administrator history', async () => {
+    const { manager, recipient } = await fixture();
+    recipient.send.mockResolvedValue({
+      id: '234567890123456789',
+      channelId: '345678901234567890',
+      createdAt: new Date('2026-10-23T12:00:00.000Z'),
+    });
+    const message = accountCredentialMessage(
+      { jellyfin_public_url: 'https://jellyfin.example.test' },
+      'family_2',
+      'A7bC8dE9fG2h',
+    );
+    expect(
+      await manager.sendCredentials(
+        '22',
+        'family_2',
+        'A7bC8dE9fG2h',
+        'https://jellyfin.example.test',
+        true,
+        message,
+      ),
+    ).toEqual({
+      content: discordCredentialContent(message),
+      message_id: '234567890123456789',
+      channel_id: '345678901234567890',
+      sent_at: '2026-10-23T12:00:00.000Z',
+    });
+  });
+  it('uses the configured account-holder template for direct credential delivery too', async () => {
+    const { manager, recipient } = await fixture({
+      credential_message_template: 'Welcome {username}\n{server_url}\nCode: {password}',
+    });
+    await manager.sendCredentials(
+      '22',
+      'jlogan35',
+      'A7bC8dE9fG2h',
+      'https://jellyfin.example.test',
+    );
+    expect(recipient.send.mock.calls[0]![0]).toMatchObject({
+      content: 'Welcome jlogan35\nhttps://jellyfin.example.test\nCode: A7bC8dE9fG2h',
+    });
+  });
   it('delivers the captured plain account message without using changed settings or interpreting Markdown', async () => {
     const { manager, recipient } = await fixture({
       credential_message_template: 'Changed {username}: {password} at {server_url}',
@@ -1355,6 +1434,30 @@ describe('Trusted subscription sources', () => {
     discord_subscription_channel_id: '700',
     discord_subscription_bot_id: '800',
   };
+  it('uses a configured literal format while retaining the trusted channel and sender boundary', async () => {
+    const { manager, service } = await fixture({
+      ...sourceSettings,
+      subscription_message_patterns: [{ action: 'subscribe', template: 'Joined: {user} / {plan}' }],
+    });
+    await manager.handleSubscriptionMessage(
+      subscriptionMessage({ content: 'Joined: <@22> / Example Tier' }),
+    );
+    expect(service.recordSubscription).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        discord_user_id: '22',
+        detail: 'Example Tier',
+        action: 'subscribe',
+      }),
+    );
+    await manager.handleSubscriptionMessage(
+      subscriptionMessage({
+        id: '1001',
+        channelId: '701',
+        content: 'Joined: <@22> / Example Tier',
+      }),
+    );
+    expect(service.recordSubscription).toHaveBeenCalledTimes(1);
+  });
 
   it.each([
     { guild: null },

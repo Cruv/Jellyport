@@ -6,6 +6,8 @@ import type { StripeIntegration, StripeSubscriptionReview } from './stripe-integ
 import type { UserOrganization } from './user-organization.js';
 import type { MediaOwnership } from './media-ownership.js';
 import { IdentityRoleSync } from './identity-role-sync.js';
+import { membershipUsername } from './memberships.js';
+import { parseAccountUsername } from './account-naming.js';
 import type {
   IdentityAccount,
   IdentityBillingCustomer,
@@ -330,11 +332,19 @@ export class IdentityReview {
     }
     const proposedAccounts = new Set<string>();
     const accountNames = new Map<string, IdentityAccount[]>();
+    const legacyNames = new Map<string, IdentityAccount[]>();
     for (const account of accounts) {
       const identity = key(account.kind, nameKey(account.name));
       const group = accountNames.get(identity) ?? [];
       group.push(account);
       accountNames.set(identity, group);
+      const parsed = parseAccountUsername(account.name, settings);
+      if (parsed && parsed.slot > 1) {
+        const alias = `${account.kind}:${nameKey(parsed.base)}:${parsed.slot}`;
+        const values = legacyNames.get(alias) ?? [];
+        values.push(account);
+        legacyNames.set(alias, values);
+      }
     }
     for (const member of roster.members) {
       const row = getRow(`discord:${member.id}`, member);
@@ -345,9 +355,27 @@ export class IdentityReview {
       }
       for (const kind of kinds)
         for (let slot = 1; slot <= 3; slot++) {
-          const expectedName = nameKey(slot === 1 ? member.username : `${member.username}_${slot}`);
-          const matching = accountNames.get(key(kind, expectedName)) ?? [];
+          let expectedName: string;
+          try {
+            expectedName = nameKey(membershipUsername(member.username, slot, settings));
+          } catch {
+            continue;
+          }
+          const matching = [...(accountNames.get(key(kind, expectedName)) ?? [])];
+          // Legacy literal formats are suggestions too. They cannot claim a real
+          // Discord member's full username as another member's secondary account.
+          if (slot > 1)
+            for (const account of legacyNames.get(`${kind}:${nameKey(member.username)}:${slot}`) ??
+              [])
+              if (!matching.some((item) => item.id === account.id)) matching.push(account);
           for (const account of matching) {
+            if (
+              (slot > 1 || nameKey(account.name) !== nameKey(member.username)) &&
+              (nameMembers.get(nameKey(account.name)) ?? []).some(
+                (identity) => identity.id !== member.id,
+              )
+            )
+              continue;
             if (account.owner_discord_id === member.id) continue;
             if (account.owner_discord_id || ownerByAccount.get(key(kind, account.id))?.conflict) {
               row.conflict = 'A matching account already has a different confirmed owner.';

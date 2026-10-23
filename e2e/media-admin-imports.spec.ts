@@ -22,6 +22,7 @@ async function importBackup(
   imports: ImportFixture,
   kind: 'emby' | 'jellyfin',
   outcome: 'succeeded' | 'failed' = 'succeeded',
+  start: 'accepted' | 'rejected' = 'accepted',
 ) {
   const view = await panel(page, kind);
   const path =
@@ -37,14 +38,29 @@ async function importBackup(
     })
     .click();
   const response = await accepted;
-  expect(response.status()).toBe(202);
-  expect((await response.json()).running).toBe(true);
   const progress = view.getByRole('progressbar', {
     name: kind === 'emby' ? 'Backup import progress' : 'Jellyfin catalog import progress',
     exact: true,
   });
-  await expect(progress).toBeVisible();
-  await expect(progress).not.toHaveAttribute('value');
+  if (start === 'accepted') {
+    expect(response.status()).toBe(202);
+    expect((await response.json()).running).toBe(true);
+    await expect(progress).toBeVisible();
+    await expect(progress).not.toHaveAttribute('value');
+  } else {
+    expect(kind).toBe('jellyfin');
+    expect(outcome).toBe('failed');
+    expect(response.status()).toBe(400);
+    expect(await response.json()).toEqual({
+      detail:
+        'No completed Jellyfin backup was found. Create a database backup or enable scheduled backup creation.',
+    });
+    await expect(
+      view.getByRole('alert').filter({ hasText: 'Jellyfin backup import could not start.' }),
+    ).toBeVisible();
+    await expect(progress).toHaveCount(0);
+    await view.getByRole('button', { name: 'Refresh status', exact: true }).click();
+  }
   const read = kind === 'emby' ? imports.sourceStatus : imports.destinationStatus;
   await expect.poll(async () => (await read()).last_outcome, { timeout: 15_000 }).toBe(outcome);
   await expect(
@@ -222,7 +238,16 @@ test('first failed backup imports show no retained data and recover through the 
   test.setTimeout(60_000);
   for (const kind of ['emby', 'jellyfin'] as const) {
     await imports.backup(kind, 'missing');
-    const view = await importBackup(page, imports, kind, 'failed');
+    const beforeRequests = (await readdir(imports.exchange)).filter((name) =>
+      /\.(?:request|working)$/.test(name),
+    );
+    const view = await importBackup(
+      page,
+      imports,
+      kind,
+      'failed',
+      kind === 'jellyfin' ? 'rejected' : 'accepted',
+    );
     await expect(view.getByRole('alert')).not.toHaveCount(0);
     await expect(view.getByText(/Previous.*saved data.*retained/i)).toHaveCount(0);
     await expect(
@@ -237,6 +262,14 @@ test('first failed backup imports show no retained data and recover through the 
       const status = await imports.destinationStatus();
       expect(status.record).toBeNull();
       expect(status.last_error).not.toMatch(/The last good .* is preserved/i);
+      expect(status.last_error).toBe(
+        'No completed Jellyfin backup was found. Create a database backup or enable scheduled backup creation.',
+      );
+      expect(
+        (await readdir(imports.exchange)).filter((name) => /\.(?:request|working)$/.test(name)),
+      ).toEqual(beforeRequests);
+      expect(imports.nativeBackupCalls()).toBe(0);
+      expect(imports.helperImports()).toBe(0);
       await expect(
         view.getByText('No saved Jellyfin matching catalog', { exact: true }),
       ).toBeVisible();
@@ -278,9 +311,23 @@ test('missing and invalid backups fail visibly, retain original valid history, a
   await imports.backup('emby', 'valid');
   await importBackup(page, imports, 'emby');
 
-  // A newer incomplete native archive must fail; the older valid archive is not a fallback.
+  // The native API lists only completed archives. Ignore the newer unfinished
+  // ZIP and import the exact completed archive without renewing its age.
   await imports.backup('jellyfin', 'incomplete');
+  const completedImports = imports.helperImports();
+  view = await importBackup(page, imports, 'jellyfin');
+  expect(imports.helperImports()).toBe(completedImports + 1);
+  expect((await imports.destinationStatus()).record).toMatchObject({
+    id: first.destination.id,
+    backup_created_at: imports.backupAt,
+    expires_at: first.destination.expires_at,
+  });
+  // A completed API entry whose exact mounted ZIP is missing must fail rather
+  // than selecting an arbitrary archive or falling back to a live catalog.
+  await imports.backup('jellyfin', 'missing_file');
   view = await importBackup(page, imports, 'jellyfin', 'failed');
+  expect((await imports.destinationStatus()).error_code).toBe('backup_missing');
+  expect(imports.helperImports()).toBe(completedImports + 1);
   await expect(view.getByText('Previous saved data is retained.', { exact: true })).toBeVisible();
   expect((await imports.destinationStatus()).record).toMatchObject({
     id: first.destination.id,

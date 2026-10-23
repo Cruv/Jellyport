@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  automaticAccountNameCandidates,
   parseAccountUsername,
   renderAccountUsername,
   validateAccountNaming,
@@ -8,6 +9,30 @@ import { validateSettings } from '../server/settings.js';
 import { DEFAULT_SETTINGS } from '../server/types.js';
 
 describe('shared literal account naming', () => {
+  it('keeps current, original and configured legacy names as bounded automatic-enrollment exclusions', () => {
+    expect(
+      automaticAccountNameCandidates('river', {
+        account_name_primary: 'media-{username}',
+        account_name_additional: 'media-{username}-profile{slot}',
+        account_name_aliases: ['legacy-{username}-profile{slot}', '{username}_{slot}'],
+      }),
+    ).toEqual([
+      'river',
+      'media-river',
+      'river_2',
+      'river_3',
+      'media-river-profile2',
+      'media-river-profile3',
+      'legacy-river-profile2',
+      'legacy-river-profile3',
+    ]);
+    expect(automaticAccountNameCandidates('x'.repeat(64))).toEqual(['x'.repeat(64)]);
+    expect(() =>
+      automaticAccountNameCandidates('river', {
+        account_name_aliases: Array.from({ length: 9 }, (_, i) => `{username}-${i}-{slot}`),
+      }),
+    ).toThrow('eight');
+  });
   it('preserves default names and parses only supported terminal slots', () => {
     expect([1, 2, 3].map((slot) => renderAccountUsername('river', slot))).toEqual([
       'river',

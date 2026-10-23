@@ -59,6 +59,28 @@ export function renderAccountUsername(
     );
   return result;
 }
+/** Exclusion hints for automatic enrollment, never proof of account ownership.
+ * Changing formats must not make an existing account look like a new member. */
+export function automaticAccountNameCandidates(base: string, policy: AccountNaming = {}): string[] {
+  if (
+    !Array.isArray(policy.account_name_aliases ?? []) ||
+    (policy.account_name_aliases?.length ?? 0) > 8
+  )
+    throw new Error('Provide at most eight legacy additional account formats.');
+  const names = new Set([renderAccountUsername(base, 1)]);
+  const primary = policy.account_name_primary ?? DEFAULT_PRIMARY_NAME;
+  formatParts(primary, false);
+  names.add(render(primary, base, 1));
+  for (const format of new Set([
+    DEFAULT_ADDITIONAL_NAME,
+    policy.account_name_additional ?? DEFAULT_ADDITIONAL_NAME,
+    ...(policy.account_name_aliases ?? []),
+  ])) {
+    formatParts(format, true);
+    for (const slot of [2, 3]) names.add(render(format, base, slot));
+  }
+  return [...names].filter((name) => [...name].length <= 64);
+}
 function extract(format: string, name: string, slot: number, additional: boolean): string | null {
   const parts = formatParts(format, additional);
   const marker = parts.indexOf('{username}');

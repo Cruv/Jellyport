@@ -86,7 +86,7 @@ import { AccountRenames } from './account-rename.js';
 import { MediaOwnerships, type MediaOwnership } from './media-ownership.js';
 import { NewSubscriberPolicy } from './new-subscriber-policy.js';
 import type { StripeEntitlementFact } from './stripe-entitlements.js';
-import { parseAccountUsername } from './account-naming.js';
+import { automaticAccountNameCandidates, parseAccountUsername } from './account-naming.js';
 import type { IdentityRoster } from './identity-review-types.js';
 import {
   JOB_RETENTION_INTERVAL_SECONDS,
@@ -2104,6 +2104,13 @@ export class Service {
           );
         const sources =
           needsNewSlot && settings.emby_url && settings.emby_api_key ? await this.embyUsers() : [];
+        const newSubscriberNames = new Set(
+          newSubscriber
+            ? [baseUsername, identity.username]
+                .flatMap((base) => automaticAccountNameCandidates(base, settings))
+                .map(caseFold)
+            : [],
+        );
         const assertNewSources = (sourceUsers: MediaUser[]) => {
           if (!newSubscriber) return;
           assertNewPolicy();
@@ -2111,14 +2118,11 @@ export class Service {
             throw new ServiceError(
               'Verify the configured Emby connection before automatic onboarding.',
             );
-          const names = new Set(
-            [1, 2, 3].map((slot) => caseFold(membershipUsername(baseUsername, slot, settings))),
-          );
-          if (sourceUsers.some((source) => names.has(caseFold(source.Name))))
+          if (sourceUsers.some((source) => newSubscriberNames.has(caseFold(source.Name))))
             throw new NewSubscriberOptInRequired(
               'An existing Emby account requires an explicit Jellyfin opt-in.',
             );
-          if ([...names].some((name) => this.store.account(name)))
+          if ([...newSubscriberNames].some((name) => this.store.account(name)))
             throw new NewSubscriberOptInRequired(
               'An existing local account requires administrator review before provisioning.',
             );
@@ -2132,6 +2136,13 @@ export class Service {
               'The paired Jellyfin server changed. No accounts were modified.',
             );
           const targets = await jellyfin.users();
+          if (
+            newSubscriber &&
+            targets.some((target) => newSubscriberNames.has(caseFold(target.Name)))
+          )
+            throw new NewSubscriberOptInRequired(
+              'An existing Jellyfin account requires an explicit identity review.',
+            );
           for (let slot = 1; slot <= 3; slot++) {
             const link = links.find((entry) => entry.membership_slot === slot);
             const mapping = mappings.find((entry) => (entry.membership_slot ?? 1) === slot);
@@ -3945,24 +3956,63 @@ export class Service {
         'The source username changed after membership review. Review its mapping before retrying.',
       );
     guard();
+    let newSubscriberDiscordUsername: string | undefined;
     const assertNewSourceBeforeCreate = async () => {
       if (!request.new_subscriber_policy_revision) return;
       const member = this.assertMembershipRequest(request, settings)!;
-      if (this.store.account(username))
+      const names = new Set(
+        [
+          member.base_username,
+          ...(newSubscriberDiscordUsername ? [newSubscriberDiscordUsername] : []),
+        ]
+          .flatMap((base) => automaticAccountNameCandidates(base, settings))
+          .map(caseFold),
+      );
+      const isCreatedSibling = (id: string | null, name: string) => {
+        const link = id ? this.store.linkForRemote(id) : null;
+        return Boolean(
+          link &&
+          link.discord_user_id === request.discord_user_id &&
+          link.membership_slot !== request.membership_slot &&
+          link.username === name &&
+          membershipUsername(member.base_username, link.membership_slot, settings) === name &&
+          job.results.some(
+            (result) =>
+              result.created === true &&
+              ['completed', 'partial'].includes(result.status) &&
+              result.target_user_id === id &&
+              result.username === name,
+          ),
+        );
+      };
+      if (
+        [...names].some((name) => {
+          const local = this.store.account(name);
+          return local && !isCreatedSibling(local.remote_id, local.username);
+        })
+      )
         throw new ServiceError('An existing local account appeared. Review its identity manually.');
-      if (!settings.emby_url && !settings.emby_api_key) return;
-      if (!settings.emby_url || !settings.emby_api_key)
+      if (Boolean(settings.emby_url) !== Boolean(settings.emby_api_key))
         throw new ServiceError(
           'Verify the configured Emby connection before automatic onboarding.',
         );
-      const names = new Set(
-        [1, 2, 3].map((slot) => caseFold(membershipUsername(member.base_username, slot, settings))),
-      );
-      const sources = await this.withClient(settings, 'emby', (client) => client.users());
+      if (settings.emby_url && settings.emby_api_key) {
+        const sources = await this.withClient(settings, 'emby', (client) => client.users());
+        guard();
+        if (sources.some((source) => names.has(caseFold(source.Name))))
+          throw new ServiceError(
+            'An existing Emby account appeared. Review its Jellyfin opt-in manually.',
+          );
+      }
+      const targets = await jellyfin.users();
       guard();
-      if (sources.some((source) => names.has(caseFold(source.Name))))
+      if (
+        targets.some(
+          (target) => names.has(caseFold(target.Name)) && !isCreatedSibling(target.Id, target.Name),
+        )
+      )
         throw new ServiceError(
-          'An existing Emby account appeared. Review its Jellyfin opt-in manually.',
+          'An existing Jellyfin account appeared. Review its Jellyfin opt-in manually.',
         );
     };
     const currentTarget = this.mappedTarget(
@@ -4054,6 +4104,7 @@ export class Service {
         throw new ServiceError(
           'Discord returned a different recipient identity. Review the mapping.',
         );
+      if (request.new_subscriber_policy_revision) newSubscriberDiscordUsername = identity.username;
       const memberMapping = this.mappings.getForDiscord(recipient, settings, slot);
       if (memberMapping && memberMapping.id !== mapping?.id)
         throw new ServiceError(

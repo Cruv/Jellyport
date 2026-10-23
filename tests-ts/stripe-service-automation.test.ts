@@ -228,6 +228,60 @@ describe('Stripe-first membership automation without MEE6', () => {
     expect(writes).toEqual([]);
     expect(service.memberships.get(owner, store.settings())?.provision_jellyfin).toBe(false);
   });
+  it.each([
+    ['emby', 'new.member'],
+    ['emby', 'NEW.MEMBER_2'],
+    ['emby', 'legacy-new.member-profile3'],
+    ['jellyfin', 'new.member'],
+    ['jellyfin', 'NEW.MEMBER_2'],
+    ['jellyfin', 'legacy-new.member-profile3'],
+  ] as const)(
+    'keeps legacy %s account %s opt-in after the current naming format changes',
+    async (kind, name) => {
+      store.saveSettings({
+        ...store.settings(),
+        account_name_primary: 'media-{username}',
+        account_name_additional: 'media-{username}-profile{slot}',
+        account_name_aliases: ['legacy-{username}-profile{slot}'],
+      });
+      servers.users[kind].push({
+        Id: 'legacy-account',
+        Name: name,
+        Policy: { IsAdministrator: false, IsDisabled: false },
+      });
+      await newSubscription();
+      await stripe.sync();
+      expect(store.jobs()).toEqual([]);
+      expect(store.linksForMember(owner)).toEqual([]);
+      expect(bot.sendCredentials).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
+      expect(service.memberships.get(owner, store.settings())?.provision_jellyfin).toBe(false);
+      expect(reads.every((method) => ['users', 'close'].includes(method))).toBe(true);
+    },
+  );
+  it('allows only this enrollment’s own created siblings when checking custom three-slot names', async () => {
+    store.saveSettings({
+      ...store.settings(),
+      account_name_primary: 'media-{username}',
+      account_name_additional: 'media-{username}-profile{slot}',
+      account_name_aliases: ['legacy-{username}-profile{slot}'],
+    });
+    await stripe.configure({
+      sync_enabled: true,
+      expected_revision: stripe.status().revision,
+      price_tiers: [{ price_id: 'price_member', tier_id: 'galleon' }],
+    });
+    await newSubscription();
+    await stripe.sync();
+    expect(store.linksForMember(owner).map((link) => link.username)).toEqual([
+      'media-new.member',
+      'media-new.member-profile2',
+      'media-new.member-profile3',
+    ]);
+    expect(bot.sendCredentials).toHaveBeenCalledTimes(3);
+    expect(reads.filter((name) => name === 'users')).toHaveLength(5);
+    expect(reads.every((method) => ['users', 'close'].includes(method))).toBe(true);
+  });
   it('disables only after a confirmed ended subscription and expired paid period', async () => {
     await newSubscription();
     await stripe.sync();

@@ -372,6 +372,42 @@ describe('future new-subscriber automatic Jellyfin onboarding', () => {
     noAccounts();
   });
 
+  it.each([
+    ['emby', 'new.member'],
+    ['emby', 'NEW.MEMBER_2'],
+    ['emby', 'legacy-new.member-profile3'],
+    ['jellyfin', 'new.member'],
+    ['jellyfin', 'NEW.MEMBER_2'],
+    ['jellyfin', 'legacy-new.member-profile3'],
+  ] as const)(
+    'holds a legacy %s account %s that appears immediately before custom-name creation',
+    async (kind, name) => {
+      store.saveSettings({
+        ...store.settings(),
+        account_name_primary: 'media-{username}',
+        account_name_additional: 'media-{username}-profile{slot}',
+        account_name_aliases: ['legacy-{username}-profile{slot}'],
+      });
+      let reads = 0;
+      const appearBeforeCreate = async () => {
+        if (++reads !== 3) return;
+        servers.users[kind].push({
+          Id: 'appeared-legacy-account',
+          Name: name,
+          Policy: { IsAdministrator: false, IsDisabled: false },
+        });
+      };
+      if (kind === 'emby') embyRead = appearBeforeCreate;
+      else jellyfinRead = appearBeforeCreate;
+      const event = await signup();
+      expect(event.status).toBe('failed');
+      expect(event.job_id).toBeTruthy();
+      expect(service.memberships.get(owner, store.settings())?.provision_jellyfin).toBe(false);
+      noAccounts();
+      expect(calls.some((call) => ['setPassword', 'setPolicy'].includes(call.method))).toBe(false);
+    },
+  );
+
   it('rejects a policy switch changed during the upstream account check', async () => {
     embyRead = async () => {
       embyRead = undefined;

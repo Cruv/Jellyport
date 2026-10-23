@@ -3387,6 +3387,11 @@ describe('React account safeguards', () => {
       else {
         fireEvent.click(screen.getByRole('button', { name: 'Sign out' }));
         await screen.findByLabelText('Jellyfin username');
+        // The login form can commit before the drawer's passive-effect cleanup.
+        // Wait for the scroll lock itself before checking the released keyboard trap.
+        await waitFor(() =>
+          expect(document.body.classList.contains('navigation-open')).toBe(false),
+        );
       }
       expect(document.body.classList.contains('navigation-open')).toBe(false);
       const event = new KeyboardEvent('keydown', { key: 'Tab', cancelable: true });

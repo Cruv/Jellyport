@@ -635,6 +635,153 @@ describe('reviewed cross-service identity inventory', () => {
     assertNoMediaMutation(f);
   });
 
+  it('exposes canceled access gaps despite a retained subscriber role and late-paid old-invoice reference', async () => {
+    const f = await fixture({ count: 1, roles: false });
+    const member = f.bot.members[0]!;
+    f.store.saveSettings({ ...f.store.settings(), discord_member_role_id: '800001' });
+    f.servers.users.jellyfin.push({
+      Id: 'j-existing',
+      Name: member.username,
+      Policy: { IsAdministrator: false, IsDisabled: false },
+    });
+    f.service.mediaOwnerships.save(
+      [
+        {
+          kind: 'emby',
+          server_id: 'demo-emby',
+          account_id: 'e-0',
+          username: member.username,
+          discord_user_id: member.id,
+          slot: 1,
+        },
+        {
+          kind: 'jellyfin',
+          server_id: 'demo-jellyfin',
+          account_id: 'j-existing',
+          username: member.username,
+          discord_user_id: member.id,
+          slot: 1,
+        },
+      ],
+      f.store.settings(),
+    );
+    f.data.subscriptions[0]!.status = 'canceled';
+    f.data.subscriptions[0]!.ended_at = Math.floor(Date.now() / 1000) - 60 * 86_400;
+    f.data.subscriptions[0]!.latest_invoice_id = 'in_old_debt_paid_late';
+    await f.stripe.sync();
+    await f.stripe.linkCustomer({
+      customer_id: 'cus_0',
+      discord_user_id: member.id,
+      expected_revision: f.stripe.status().revision,
+    });
+    const before = structuredClone(f.servers.users);
+    const snapshot = await f.review.snapshot();
+    const row = snapshot.rows.find((item) => item.member?.id === member.id)!;
+    expect(row.member?.roles).toContain('800001');
+    expect(row.customers).toMatchObject([{ active_subscription: false, statuses: ['canceled'] }]);
+    expect(row.confirmed_accounts).toHaveLength(2);
+    expect(row.gaps).toEqual(
+      expect.arrayContaining([
+        'discord_without_active_subscription',
+        'media_without_active_subscription',
+      ]),
+    );
+    expect(row.gaps).not.toContain('active_subscription_no_media');
+    expect(f.servers.users).toEqual(before);
+    expect(f.bot.updateTagRoles).not.toHaveBeenCalled();
+    expect(f.billingRead).toHaveBeenCalledTimes(2);
+    assertNoMediaMutation(f);
+  });
+
+  it.each(['family', 'complimentary', 'non_media'] as const)(
+    'keeps explicit %s access exempt from canceled-subscription access-gap warnings',
+    async (exception) => {
+      const f = await fixture({ count: 1, roles: false });
+      const member = f.bot.members[0]!;
+      f.store.saveSettings({ ...f.store.settings(), discord_member_role_id: '800001' });
+      f.data.subscriptions[0]!.status = 'canceled';
+      f.data.subscriptions[0]!.latest_invoice_id = 'in_old_debt_paid_late';
+      await f.stripe.sync();
+      await f.stripe.linkCustomer({
+        customer_id: 'cus_0',
+        discord_user_id: member.id,
+        expected_revision: f.stripe.status().revision,
+      });
+      if (exception === 'non_media') {
+        f.servers.users.emby = [];
+        f.service.mediaOwnerships.annotate(
+          `discord:${member.id}`,
+          {
+            kind: 'non_media',
+            note: 'Synthetic community-only approval',
+            approved_at: new Date().toISOString(),
+          },
+          f.store.settings(),
+        );
+      } else {
+        f.service.mediaOwnerships.save(
+          [
+            {
+              kind: 'emby',
+              server_id: 'demo-emby',
+              account_id: 'e-0',
+              username: member.username,
+              discord_user_id: member.id,
+              slot: 1,
+            },
+          ],
+          f.store.settings(),
+        );
+        if (exception === 'family')
+          f.service.profiles.save(
+            {
+              kind: 'emby',
+              user_id: 'e-0',
+              family: true,
+              owner_name: 'Synthetic family member',
+              notes: '',
+            },
+            f.store.settings(),
+          );
+        else
+          f.service.memberships.save(
+            {
+              discord_user_id: member.id,
+              base_username: member.username,
+              tier_id: 'complimentary',
+              account_limit: 1,
+              access_mode: 'complimentary',
+              provision_jellyfin: false,
+              active: true,
+            },
+            f.store.settings(),
+          );
+      }
+      const beforeMedia = structuredClone(f.servers.users);
+      const beforeMemberships = f.store.membershipRecords();
+      const snapshot = await f.review.snapshot();
+      const row = snapshot.rows.find((item) => item.member?.id === member.id)!;
+      expect(row.member?.roles).toContain('800001');
+      expect(row.customers[0]?.active_subscription).toBe(false);
+      expect(row.gaps).not.toContain('discord_without_active_subscription');
+      expect(row.gaps).not.toContain('media_without_active_subscription');
+      if (exception === 'family') expect(row.confirmed_accounts[0]?.family).toBe(true);
+      if (exception === 'non_media') {
+        expect(row.exception?.kind).toBe('non_media');
+        expect(row.gaps).toContain('discord_without_media');
+      }
+      expect(f.servers.users).toEqual(beforeMedia);
+      expect(f.store.membershipRecords()).toEqual(beforeMemberships);
+      expect(f.store.jobs()).toEqual([]);
+      expect(f.store.links()).toEqual([]);
+      expect(f.bot.updateTagRoles).not.toHaveBeenCalled();
+      expect(f.bot.sendCredentials).not.toHaveBeenCalled();
+      expect(
+        f.calls.every((call) => ['users', 'user', 'systemInfo', 'close'].includes(call.method)),
+      ).toBe(true);
+    },
+  );
+
   it.each(['not_configured', 'failed_sync'])(
     'treats %s billing as unknown instead of asserting unpaid or missing paid access',
     async (state) => {

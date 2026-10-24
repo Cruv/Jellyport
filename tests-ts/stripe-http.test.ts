@@ -10,7 +10,7 @@ const directories: string[] = [];
 const apps: JellyportApp[] = [];
 const member = '234567890123456789';
 const key = 'rk_test_syntheticKeyOnly123';
-async function fixture(demo = false) {
+async function fixture(demo = false, live = false) {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-stripe-http-'));
   directories.push(directory);
   const identity = {
@@ -21,7 +21,7 @@ async function fixture(demo = false) {
   };
   const servers = new DemoServers();
   const snapshot = vi.fn(async (): Promise<StripeSnapshot> => ({
-    mode: 'test',
+    mode: live ? 'live' : 'test',
     completed_at: new Date().toISOString(),
     products: [],
     subscriptions: [
@@ -29,11 +29,19 @@ async function fixture(demo = false) {
         id: 'sub_Crew',
         customer_id: 'cus_Crew',
         customer_email: 'synthetic@example.test',
-        status: 'active',
+        status: live ? 'canceled' : 'active',
+        ...(live
+          ? {
+              created: Math.floor(Date.now() / 1000) - 100_000,
+              ended_at: Math.floor(Date.now() / 1000) - 100,
+            }
+          : {}),
         collection_method: 'charge_automatically',
         cancel_at_period_end: false,
         pause_collection: false,
-        items: [],
+        items: live
+          ? [{ id: 'si_Crew', price_id: 'price_Crew', product_id: 'prod_Crew', quantity: 1 }]
+          : [],
         identity_candidates: [
           { discord_user_id: member, source: 'subscription_metadata', field: 'discord_user_id' },
         ],
@@ -51,9 +59,19 @@ async function fixture(demo = false) {
       validateApiKey: async () => ({ serverId: identity.serverId, apiKeyName: 'synthetic' }),
     },
     stripeClientFactory: () => ({
-      mode: 'test',
+      mode: live ? 'live' : 'test',
       snapshot,
       checkoutIdentityCandidates: async () => [],
+      paidPeriod: async () => ({
+        invoice_id: 'in_Crew',
+        customer_id: 'cus_Crew',
+        subscription_id: 'sub_Crew',
+        price_id: 'price_Crew',
+        created: Math.floor(Date.now() / 1000) - 100_000,
+        paid_at: Math.floor(Date.now() / 1000) - 1,
+        start: Math.floor(Date.now() / 1000) - 90_000,
+        end: Math.floor(Date.now() / 1000) - 3600,
+      }),
     }),
   });
   apps.push(app);
@@ -120,7 +138,11 @@ afterEach(async () => {
 describe('private Stripe integration HTTP boundary', () => {
   it('requires an administrator and CSRF for sensitive reads and changes', async () => {
     const { app, headers, revision } = await fixture();
-    for (const url of ['/api/stripe/status', '/api/stripe/subscriptions'])
+    for (const url of [
+      '/api/stripe/status',
+      '/api/stripe/subscriptions',
+      '/api/stripe/cleanup-roles',
+    ])
       expect((await app.inject(url)).statusCode).toBe(401);
     const response = await app.inject({
       method: 'POST',
@@ -139,6 +161,79 @@ describe('private Stripe integration HTTP boundary', () => {
       ).statusCode,
     ).toBe(403);
   });
+  it('protects role selection and accepts only the bounded cleanup configuration schema', async () => {
+    const { app, headers, revision, configure } = await fixture();
+    const listRoles = vi.fn(async () => ({
+      roles: [
+        { id: '555555555555555555', name: 'Subscriber', manageable: true },
+        { id: '999999999999999999', name: 'Administrator', manageable: false },
+      ],
+      can_manage_roles: true,
+    }));
+    Object.assign(app.jellyport.service.bot!, { listSubscriberRoles: listRoles });
+    expect((await configure()).statusCode).toBe(200);
+    const selected = await app.inject({ url: '/api/stripe/cleanup-roles', headers });
+    expect(selected.statusCode).toBe(200);
+    expect(selected.headers['cache-control']).toBe('no-store');
+    expect(selected.json()).toEqual(await listRoles());
+    listRoles.mockClear();
+    expect(
+      (
+        await app.inject({
+          url: '/api/stripe/cleanup-roles',
+          headers: { ...headers, origin: 'https://foreign.example.test' },
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(listRoles).not.toHaveBeenCalled();
+    for (const role_cleanup_role_ids of [
+      ['555555555555555555', '555555555555555555'],
+      ['not-an-id'],
+      Array.from({ length: 21 }, (_, i) => String(555555 + i)),
+    ]) {
+      expect(
+        (
+          await app.inject({
+            method: 'POST',
+            url: '/api/stripe/config',
+            headers,
+            payload: {
+              sync_enabled: false,
+              role_cleanup_enabled: false,
+              role_cleanup_role_ids,
+              expected_revision: revision(),
+            },
+          })
+        ).statusCode,
+      ).toBe(422);
+    }
+    const noCsrf = await app.inject({
+      method: 'POST',
+      url: '/api/stripe/config',
+      headers: { cookie: headers.cookie },
+      payload: {
+        sync_enabled: false,
+        role_cleanup_enabled: false,
+        role_cleanup_role_ids: [],
+        expected_revision: revision(),
+      },
+    });
+    expect(noCsrf.statusCode).toBe(403);
+    const disabled = await app.inject({
+      method: 'POST',
+      url: '/api/stripe/config',
+      headers,
+      payload: {
+        sync_enabled: false,
+        role_cleanup_enabled: false,
+        role_cleanup_role_ids: [],
+        expected_revision: revision(),
+      },
+    });
+    expect(disabled.statusCode).toBe(200);
+    expect(disabled.json().role_cleanup.enabled).toBe(false);
+  });
+
   it('saves encrypted credentials, shares read-only sync, and approves only current member links', async () => {
     const { app, store, headers, revision, configure, snapshot } = await fixture();
     const saved = await configure();
@@ -204,6 +299,93 @@ describe('private Stripe integration HTTP boundary', () => {
     expect(store.links()).toEqual([]);
     expect(store.subscriptions()).toEqual([]);
     expect(store.membershipRecords()).toEqual([]);
+  });
+
+  it('uses the real app cleanup adapter and preserves a standalone customer approval after linking', async () => {
+    const { app, store, headers, revision } = await fixture(false, true);
+    store.saveSettings({ ...store.settings(), new_subscriber_source: 'stripe' });
+    const subscriberRole = '555555555555555555';
+    let present = true;
+    const removeSubscriberRole = vi.fn(
+      async (_id: string, _role: string, _allowed: string[], guard: () => void) => {
+        guard();
+        present = false;
+      },
+    );
+    Object.assign(app.jellyport.service.bot!, {
+      listSubscriberRoles: async () => ({
+        roles: [{ id: subscriberRole, name: 'Subscriber', manageable: true }],
+        can_manage_roles: true,
+      }),
+      memberTagState: async (id: string) => ({
+        id,
+        username: 'synthetic-member',
+        roles: present ? [subscriberRole] : [],
+      }),
+      removeSubscriberRole,
+    });
+    const config = (body: Record<string, unknown>) =>
+      app.inject({
+        method: 'POST',
+        url: '/api/stripe/config',
+        headers,
+        payload: { sync_enabled: true, expected_revision: revision(), ...body },
+      });
+    expect(
+      (
+        await config({
+          api_key: 'rk_live_syntheticKeyOnly123',
+          price_tiers: [{ price_id: 'price_Crew', tier_id: 'sloop' }],
+        })
+      ).statusCode,
+    ).toBe(200);
+    await app.jellyport.stripe.sync();
+    await app.jellyport.stripe.linkCustomer({
+      customer_id: 'cus_Crew',
+      discord_user_id: member,
+      expected_revision: revision(),
+    });
+    const settings = store.settings();
+    app.jellyport.service.mediaOwnerships.annotate(
+      'stripe:cus_Crew',
+      {
+        kind: 'non_media',
+        note: 'Synthetic administrator-approved access.',
+        approved_at: new Date().toISOString(),
+      },
+      settings,
+    );
+    const enabled = await config({
+      role_cleanup_enabled: true,
+      role_cleanup_role_ids: [subscriberRole],
+      price_tiers: [{ price_id: 'price_Crew', tier_id: 'sloop' }],
+    });
+    expect(enabled.statusCode).toBe(200);
+    expect(enabled.json()).toMatchObject({
+      automation_enabled: false,
+      role_cleanup: { enabled: true },
+    });
+    await app.jellyport.stripe.sync();
+    expect(present).toBe(true);
+    expect(removeSubscriberRole).not.toHaveBeenCalled();
+    app.jellyport.service.mediaOwnerships.annotate('stripe:cus_Crew', null, settings);
+    await app.jellyport.stripe.sync();
+    expect(removeSubscriberRole).toHaveBeenCalledExactlyOnceWith(
+      member,
+      subscriberRole,
+      [subscriberRole],
+      expect.any(Function),
+    );
+    expect(present).toBe(false);
+    expect(app.jellyport.stripe.status().role_cleanup.reports[0]).toMatchObject({
+      status: 'removed',
+      discord_user_id: member,
+      removed_role_ids: [subscriberRole],
+    });
+    expect(store.jobs()).toEqual([]);
+    expect(store.links()).toEqual([]);
+    expect(store.membershipRecords()).toEqual([]);
+    expect(store.subscriptions()).toEqual([]);
   });
   it('blocks demo credentials and rejects unknown configuration fields', async () => {
     const { app, headers, configure } = await fixture(true);

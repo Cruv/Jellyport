@@ -120,6 +120,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS new_subscriber_policy (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS stripe_entitlement_policy (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS stripe_role_cleanup_policy (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS auth_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS job_retention (job_id TEXT PRIMARY KEY,age_ms REAL);
@@ -193,6 +194,7 @@ export class Store {
       UNION ALL SELECT 1 FROM identity_role_sync_tasks
       UNION ALL SELECT 1 FROM new_subscriber_policy
       UNION ALL SELECT 1 FROM stripe_entitlement_policy
+      UNION ALL SELECT 1 FROM stripe_role_cleanup_policy
       UNION ALL SELECT 1 FROM bot_message_history
       UNION ALL SELECT 1 FROM job_retention_config UNION ALL SELECT 1 FROM job_retention LIMIT 1`,
         )

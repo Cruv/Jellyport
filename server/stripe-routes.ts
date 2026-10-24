@@ -7,12 +7,22 @@ export function registerStripeRoutes(
   app: JellyportApp,
   stripe: StripeIntegration,
   demo: boolean,
+  listCleanupRoles?: () => Promise<{
+    roles: Array<{ id: string; name: string; manageable: boolean }>;
+    can_manage_roles: boolean;
+  }>,
 ): void {
   const writable = () => {
     if (demo) throw new ServiceError('Stripe connections cannot be changed in demo mode.');
   };
   const revision = { type: 'string', minLength: 1, maxLength: 128 };
   app.get('/api/stripe/status', async () => stripe.status());
+  app.get('/api/stripe/cleanup-roles', async () => {
+    writable();
+    if (!listCleanupRoles)
+      throw new ServiceError('Connect the Discord bot before choosing cleanup roles.');
+    return listCleanupRoles();
+  });
   app.get('/api/stripe/subscriptions', async () => ({
     subscriptions: stripe.subscriptions(),
     revision: stripe.status().revision,
@@ -29,6 +39,13 @@ export function registerStripeRoutes(
             api_key: { type: 'string', maxLength: 512 },
             sync_enabled: { type: 'boolean' },
             automation_enabled: { type: 'boolean' },
+            role_cleanup_enabled: { type: 'boolean' },
+            role_cleanup_role_ids: {
+              type: 'array',
+              maxItems: 20,
+              uniqueItems: true,
+              items: { type: 'string', pattern: '^[1-9][0-9]{0,19}$' },
+            },
             expected_revision: revision,
             price_tiers: {
               type: 'array',

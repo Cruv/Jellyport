@@ -88,43 +88,63 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
         secureCookie: false,
         allowedHosts: ['127.0.0.1'],
         authClient,
-        stripeClientFactory: () => ({
-          mode: 'test',
-          snapshot: async () => ({
-            mode: 'test',
-            completed_at: new Date().toISOString(),
-            products: [{ id: 'prod_Crew', name: 'Synthetic crew plan', active: true }],
-            subscriptions: Array.from({ length: 24 }, (_, index) => ({
-              id: `sub_Crew${index}`,
-              customer_id: `cus_Crew${index}`,
-              customer_name: index === 0 ? 'Synthetic crew owner' : `Synthetic member ${index}`,
-              customer_email: `crew${index}@example.test`,
-              status: 'active',
-              collection_method: 'charge_automatically' as const,
-              pause_collection: index === 0,
-              cancel_at_period_end: false,
-              items: [
-                {
-                  id: `si_Crew${index}`,
-                  price_id: 'price_Crew',
-                  product_id: 'prod_Crew',
-                  quantity: 1,
-                },
-              ],
-              identity_candidates:
-                index === 0
-                  ? [
-                      {
-                        discord_user_id: paidOwner,
-                        source: 'subscription_metadata' as const,
-                        field: 'discord_user_id',
-                      },
-                    ]
-                  : [],
-            })),
-          }),
-          checkoutIdentityCandidates: async () => [],
-        }),
+        stripeClientFactory: (key) => {
+          const mode = key.startsWith('rk_live_') ? ('live' as const) : ('test' as const);
+          const now = Math.floor(Date.now() / 1000);
+          return {
+            mode,
+            snapshot: async () => ({
+              mode,
+              completed_at: new Date().toISOString(),
+              products: [{ id: 'prod_Crew', name: 'Synthetic crew plan', active: true }],
+              subscriptions: Array.from({ length: mode === 'live' ? 1 : 24 }, (_, index) => ({
+                id: `sub_Crew${index}`,
+                customer_id: `cus_Crew${index}`,
+                customer_name: index === 0 ? 'Synthetic crew owner' : `Synthetic member ${index}`,
+                customer_email: `crew${index}@example.test`,
+                status: mode === 'live' ? 'canceled' : 'active',
+                ...(mode === 'live'
+                  ? { created: now - 90 * 86400, ended_at: now - 30 * 86400 }
+                  : {}),
+                collection_method: 'charge_automatically' as const,
+                pause_collection: mode === 'test' && index === 0,
+                cancel_at_period_end: false,
+                items: [
+                  {
+                    id: `si_Crew${index}`,
+                    price_id: 'price_Crew',
+                    product_id: 'prod_Crew',
+                    quantity: 1,
+                  },
+                ],
+                identity_candidates:
+                  index === 0
+                    ? [
+                        {
+                          discord_user_id: paidOwner,
+                          source: 'subscription_metadata' as const,
+                          field: 'discord_user_id',
+                        },
+                      ]
+                    : [],
+              })),
+            }),
+            checkoutIdentityCandidates: async () => [],
+            paidPeriod: async (subscriptionId) =>
+              mode === 'live'
+                ? {
+                    invoice_id: 'in_SyntheticHistorical',
+                    customer_id: 'cus_Crew0',
+                    subscription_id: subscriptionId,
+                    paid_at: now - 29 * 86400,
+                    created: now - 60 * 86400,
+                    price_id: 'price_Crew',
+                    start: now - 60 * 86400,
+                    end: now - 30 * 86400,
+                  }
+                : null,
+          };
+        },
         clientFactory: (url, key, kind) => {
           const client = servers.factory(url, key, kind);
           if (url.includes('offline'))

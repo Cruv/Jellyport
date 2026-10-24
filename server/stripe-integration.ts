@@ -6,6 +6,7 @@ import {
   StripeClientError,
   type StripeSnapshot,
   type StripeIdentityCandidate,
+  type StripePaidPeriod,
 } from './stripe-client.js';
 import type { Store } from './store.js';
 import {
@@ -13,6 +14,12 @@ import {
   stripeAuthority,
   type StripeEntitlementFact,
 } from './stripe-entitlements.js';
+import {
+  StripeRoleCleanup,
+  validCleanupRoles,
+  type StripeRoleCleanupAdapter,
+  type StripeRoleCleanupStatus,
+} from './stripe-role-cleanup.js';
 export type { StripeEntitlementFact } from './stripe-entitlements.js';
 
 export interface StripePriceTier {
@@ -71,6 +78,7 @@ export interface StripeIntegrationStatus {
   linked_customer_count: number;
   price_tiers: StripePriceTier[];
   hints: StripeDiscordHint[];
+  role_cleanup: StripeRoleCleanupStatus;
 }
 export interface StripeSubscriptionReview {
   subscription_id: string;
@@ -95,6 +103,8 @@ export interface StripeIntegrationConfiguration {
   expected_revision: string;
   price_tiers?: StripePriceTier[];
   automation_enabled?: boolean;
+  role_cleanup_enabled?: boolean;
+  role_cleanup_role_ids?: string[];
 }
 type BillingClient = Pick<StripeClient, 'mode' | 'snapshot' | 'checkoutIdentityCandidates'> &
   Partial<Pick<StripeClient, 'paidPeriod'>>;
@@ -103,6 +113,7 @@ export interface StripeIntegrationOptions {
   resolveDiscordMember?: (id: string) => Promise<{ id?: string; username: string }>;
   now?: () => number;
   onEntitlement?: (fact: StripeEntitlementFact) => Promise<void>;
+  roleCleanup?: StripeRoleCleanupAdapter;
 }
 
 function validSnowflake(value: unknown): value is string {
@@ -142,10 +153,11 @@ function blankState(guild: string, key = ''): StripeState {
   };
 }
 
-/** Read-only billing observations and explicitly reviewed identity links. This
- * connector deliberately has no media-server or membership mutation capability. */
+/** Read-only billing observations and explicitly reviewed identity links, with
+ * separately enabled invoice-backed media events and removal-only Discord cleanup. */
 export class StripeIntegration {
   private readonly entitlements: StripeEntitlements;
+  private readonly roleCleanup: StripeRoleCleanup;
   private state: StripeState;
   private task: Promise<StripeIntegrationStatus> | null = null;
   private controller: AbortController | null = null;
@@ -178,6 +190,12 @@ export class StripeIntegration {
       );
     this.scope();
     if (!record) this.persist();
+    this.roleCleanup = new StripeRoleCleanup(
+      store,
+      options.roleCleanup,
+      () => stripeAuthority(this.state.links, this.state.price_tiers, store),
+      this.now,
+    );
   }
   private guild(): string {
     return this.store.settings().discord_guild_id ?? '';
@@ -191,6 +209,7 @@ export class StripeIntegration {
   private scope(): void {
     if (this.state.guild_id === this.guild()) return;
     this.controller?.abort();
+    this.roleCleanup?.configure(false, this.state.generation, []);
     this.state = blankState(this.guild(), this.state.api_key);
     this.persist();
   }
@@ -206,7 +225,8 @@ export class StripeIntegration {
     return {
       configured: Boolean(s.api_key),
       mode: s.api_key ? (s.api_key.startsWith('rk_live_') ? 'live' : 'test') : null,
-      review_only: !this.entitlements.enabled(s.generation),
+      review_only:
+        !this.entitlements.enabled(s.generation) && !this.roleCleanup.enabled(s.generation),
       ...this.entitlements.status(s.generation),
       revision: s.revision,
       running: this.task !== null,
@@ -217,6 +237,7 @@ export class StripeIntegration {
       linked_customer_count: s.links.length,
       price_tiers: structuredClone(s.price_tiers),
       hints: s.hints.map(({ source_event: _source, ...hint }) => ({ ...hint })),
+      role_cleanup: this.roleCleanup.status(s.generation),
     };
   }
   toJSON(): StripeIntegrationStatus {
@@ -226,6 +247,7 @@ export class StripeIntegration {
     this.checkRevision(input.expected_revision);
     this.controller?.abort();
     this.entitlements.configure(false, this.state.generation, null, null);
+    this.roleCleanup.configure(false, this.state.generation, []);
     this.state = blankState(this.guild());
     this.persist();
     await this.task?.catch(() => {});
@@ -237,6 +259,17 @@ export class StripeIntegration {
       throw new ServiceError('Choose whether automatic Stripe syncing is enabled.');
     if (input.automation_enabled !== undefined && typeof input.automation_enabled !== 'boolean')
       throw new ServiceError('Choose whether verified Stripe membership automation is enabled.');
+    if (input.role_cleanup_enabled !== undefined && typeof input.role_cleanup_enabled !== 'boolean')
+      throw new ServiceError('Choose whether Stripe-backed subscriber role cleanup is enabled.');
+    if (
+      input.role_cleanup_role_ids !== undefined &&
+      !validCleanupRoles(input.role_cleanup_role_ids)
+    )
+      throw new ServiceError('Select up to 20 distinct Discord subscriber or tier roles.');
+    if (input.role_cleanup_enabled && !input.sync_enabled)
+      throw new ServiceError(
+        'Enable automatic Stripe sync before enabling subscriber role cleanup.',
+      );
     if (
       input.api_key !== undefined &&
       (typeof input.api_key !== 'string' ||
@@ -268,6 +301,81 @@ export class StripeIntegration {
       throw new ServiceError(
         'Save and sync the replacement key before enabling billing automation.',
       );
+    if (keyChanged && input.role_cleanup_enabled)
+      throw new ServiceError(
+        'Save and sync the replacement key before enabling subscriber role cleanup.',
+      );
+    const previousCleanup = this.roleCleanup.status(this.state.generation);
+    const cleanupEnabled =
+      !keyChanged && input.sync_enabled && (input.role_cleanup_enabled ?? previousCleanup.enabled);
+    const cleanupRoles = input.role_cleanup_role_ids ?? previousCleanup.role_ids;
+    if (cleanupEnabled) {
+      const settings = this.store.settings(),
+        last = Date.parse(this.state.last_sync ?? '');
+      if (
+        !settings.discord_enabled ||
+        settings.new_subscriber_source !== 'stripe' ||
+        !validSnowflake(this.guild())
+      )
+        throw new ServiceError(
+          'Select Stripe as the subscription source and connect Discord before enabling subscriber role cleanup. MEE6 can continue assigning roles.',
+        );
+      if (
+        !this.options.roleCleanup ||
+        !cleanupRoles.length ||
+        !key.startsWith('rk_live_') ||
+        this.state.snapshot?.mode !== 'live' ||
+        !Number.isFinite(last) ||
+        this.now() < last ||
+        this.now() - last > 30 * 60_000 ||
+        this.state.last_error
+      )
+        throw new ServiceError(
+          'Sync a live Stripe connection successfully and select subscriber roles before enabling role cleanup.',
+        );
+      if (
+        !previousCleanup.enabled ||
+        JSON.stringify(previousCleanup.role_ids) !== JSON.stringify(cleanupRoles)
+      ) {
+        const context = this.options.roleCleanup.context();
+        const client = this.clientFactory(key);
+        const probe = this.state.snapshot.subscriptions[0];
+        if (client.mode !== 'live' || !client.paidPeriod || !probe)
+          throw new ServiceError(
+            'Sync a live Stripe subscription with Invoices Read permission before enabling role cleanup.',
+          );
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 30_000);
+        timer.unref();
+        try {
+          const roles = await this.options.roleCleanup.listRoles();
+          this.checkRevision(input.expected_revision);
+          if (
+            context !== this.options.roleCleanup.context() ||
+            !roles.can_manage_roles ||
+            cleanupRoles.some(
+              (id) => !roles.roles.some((role) => role.id === id && role.manageable),
+            )
+          )
+            throw new ServiceError(
+              'The Discord bot must be able to manage every selected cleanup role. Review its permissions and role order.',
+            );
+          await client.paidPeriod(probe.id, controller.signal);
+          this.checkRevision(input.expected_revision);
+          if (controller.signal.aborted || context !== this.options.roleCleanup.context())
+            throw new ServiceError(
+              'Role cleanup configuration changed before invoice access could be verified.',
+            );
+        } catch (error) {
+          if (error instanceof ServiceError) throw error;
+          throw new ServiceError(
+            'Invoice access could not be verified. Grant the restricted Stripe key Invoices Read permission and retry.',
+          );
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+    }
     this.entitlements.configure(
       keyChanged
         ? false
@@ -277,10 +385,14 @@ export class StripeIntegration {
       this.state.last_sync,
     );
     this.controller?.abort();
+    this.roleCleanup.invalidateProof(
+      'Stripe configuration changed. A new verified billing sync is required.',
+    );
     if (keyChanged) this.state = blankState(this.guild(), key);
     this.state.sync_enabled = input.sync_enabled;
     // Existing mappings never silently cross a replacement key/account boundary.
     this.state.price_tiers = keyChanged ? [] : structuredClone(priceTiers);
+    this.roleCleanup.configure(cleanupEnabled, this.state.generation, cleanupRoles);
     this.state.revision = randomUUID();
     this.persist();
     await this.task?.catch(() => {});
@@ -365,6 +477,9 @@ export class StripeIntegration {
     if (this.stopped) return Promise.reject(new ServiceError('The Stripe connection is stopping.'));
     if (!this.state.api_key)
       return Promise.reject(new ServiceError('Save a restricted Stripe key before syncing.'));
+    this.roleCleanup.invalidateProof(
+      'Stripe billing is being refreshed; role cleanup waits for verified invoices.',
+    );
     const generation = this.state.generation,
       revision = this.state.revision;
     const controller = new AbortController();
@@ -431,13 +546,25 @@ export class StripeIntegration {
         this.state.revision = randomUUID();
         this.persist();
         const automationRevision = this.state.revision;
-        if (this.entitlements.enabled(generation)) {
+        if (this.entitlements.enabled(generation) || this.roleCleanup.enabled(generation)) {
           try {
             if (!client.paidPeriod)
               throw new ServiceError(
                 'Stripe automation requires Invoices Read permission and paid-period support.',
               );
-            const periods = new Map();
+            const periods = new Map<string, StripePaidPeriod | null>();
+            const authority = stripeAuthority(this.state.links, this.state.price_tiers, this.store);
+            const verifiedCurrent = () => {
+              this.scope();
+              if (
+                this.stopped ||
+                controller.signal.aborted ||
+                this.state.revision !== automationRevision ||
+                this.state.generation !== generation ||
+                authority !== stripeAuthority(this.state.links, this.state.price_tiers, this.store)
+              )
+                throw new ServiceError('Stripe paid-period authority changed.');
+            };
             const approved = new Set(this.state.links.map((link) => link.customer_id));
             const linked = snapshot.subscriptions.filter((subscription) =>
               approved.has(subscription.customer_id),
@@ -445,24 +572,20 @@ export class StripeIntegration {
             // At most one invoice GET per approved subscription, serially, sharing
             // the existing timeout/rate/backoff boundary and cancellation signal.
             for (const subscription of linked) {
-              if (
-                this.state.revision !== automationRevision ||
-                this.state.generation !== generation
-              )
-                throw new ServiceError('Stripe automation connection changed.');
-              if (controller.signal.aborted)
-                throw new ServiceError('Stripe automation read timed out.');
+              verifiedCurrent();
               periods.set(
                 subscription.id,
                 await client.paidPeriod(subscription.id, controller.signal),
               );
             }
-            if (
-              this.state.revision !== automationRevision ||
-              this.state.generation !== generation ||
-              controller.signal.aborted
-            )
-              throw new ServiceError('Stripe automation connection changed.');
+            verifiedCurrent();
+            this.roleCleanup.recordProof(
+              generation,
+              snapshot,
+              this.state.links,
+              this.state.price_tiers,
+              periods,
+            );
             const facts = this.entitlements.prepare(
               generation,
               snapshot,
@@ -471,6 +594,7 @@ export class StripeIntegration {
               periods,
             );
             for (const fact of facts) {
+              verifiedCurrent();
               if (controller.signal.aborted || this.state.generation !== generation)
                 throw new ServiceError(
                   'Stripe automation stopped before additional access actions.',
@@ -483,7 +607,12 @@ export class StripeIntegration {
                 this.entitlements.finish(fact, false);
               }
             }
+            verifiedCurrent();
+            await this.roleCleanup.reconcile(generation);
           } catch (error) {
+            this.roleCleanup.invalidateProof(
+              'Stripe paid-period verification could not complete. Subscriber roles were preserved; refresh billing before retrying.',
+            );
             this.entitlements.fail(
               error instanceof StripeClientError && error.code === 'forbidden'
                 ? 'Stripe automation requires Invoices Read permission. Billing observations were saved; no uncertain access decision was applied.'
@@ -506,6 +635,9 @@ export class StripeIntegration {
                 ? 'Stripe sync reached its time limit. The previous saved billing data was preserved.'
                 : 'Stripe sync failed. The previous saved billing data was preserved.';
           this.persist();
+          this.roleCleanup.invalidateProof(
+            'Stripe synchronization failed. Subscriber roles are preserved until billing can be verified.',
+          );
           this.entitlements.fail(
             'Stripe synchronization failed. Existing access is preserved until billing can be verified.',
           );
@@ -525,6 +657,21 @@ export class StripeIntegration {
       })
       .then(() => this.status());
     return this.task;
+  }
+  async reconcileRoleCleanup(): Promise<void> {
+    this.scope();
+    if (
+      this.stopped ||
+      !this.state.sync_enabled ||
+      this.state.last_error ||
+      this.state.snapshot?.mode !== 'live'
+    )
+      return;
+    if (this.task) {
+      await this.task.catch(() => {});
+      return;
+    }
+    await this.roleCleanup.reconcile(this.state.generation);
   }
   assertEntitlement(fact: StripeEntitlementFact): void {
     this.scope();
@@ -752,6 +899,6 @@ export class StripeIntegration {
   async stop(): Promise<void> {
     this.stopped = true;
     this.controller?.abort();
-    await this.task?.catch(() => {});
+    await Promise.all([this.task?.catch(() => {}), this.roleCleanup.stop()]);
   }
 }

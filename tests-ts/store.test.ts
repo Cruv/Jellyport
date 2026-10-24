@@ -299,6 +299,7 @@ describe('demo and production data isolation', () => {
     'user_mappings',
     'migration_playlists',
     'memberships',
+    'stripe_role_cleanup_policy',
   ] as const;
   function snapshot(db: DatabaseSync) {
     return Object.fromEntries(
@@ -384,6 +385,7 @@ describe('demo and production data isolation', () => {
     'user_mappings',
     'migration_playlists',
     'memberships',
+    'stripe_role_cleanup_policy',
   ] as const)('rejects blank settings with preexisting %s records', (table) => {
     const path = directory();
     const store = new Store(path);
@@ -430,6 +432,10 @@ describe('demo and production data isolation', () => {
         discord_user_id: '123456789',
         base_username: 'private-member',
       });
+    if (table === 'stripe_role_cleanup_policy')
+      store.db
+        .prepare('INSERT INTO stripe_role_cleanup_policy VALUES (1,?)')
+        .run(store.encrypt({ version: 1, private_cleanup_receipt: 'synthetic-only' }));
     assertRejectedWithoutChanges(path, store);
   });
 

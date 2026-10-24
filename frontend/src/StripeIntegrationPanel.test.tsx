@@ -29,6 +29,32 @@ const connected: StripeIntegrationStatus = {
   last_sync: '2026-10-20T01:00:00Z',
   subscription_count: 1,
 };
+const cleanupStatus: StripeIntegrationStatus = {
+  ...connected,
+  mode: 'live',
+  sync_enabled: true,
+  automation_enabled: false,
+  price_tiers: [{ price_id: 'price_synthetic', tier_id: 'sloop' }],
+  role_cleanup: {
+    enabled: false,
+    role_ids: [],
+    last_run: null,
+    running: false,
+    removed_roles: 0,
+    failed_members: 0,
+    readded_members: 0,
+    last_error: null,
+    reports: [],
+  },
+};
+const cleanupRoles = {
+  can_manage_roles: true,
+  roles: [
+    { id: '111111111111111111', name: 'Synthetic subscriber', manageable: true },
+    { id: '222222222222222222', name: 'Synthetic tier', manageable: true },
+    { id: '333333333333333333', name: 'Synthetic administrator', manageable: false },
+  ],
+};
 const row: StripeSubscriptionReview = {
   subscription_id: 'sub_synthetic',
   customer_id: 'cus_synthetic',
@@ -128,6 +154,7 @@ function page(
       return { members: [discordMember], truncated: false } as T;
     if (path === '/api/identity-review') return identityDirectory as T;
     if (path === '/api/identity-review/apply') return identityResult as T;
+    if (path === '/api/stripe/cleanup-roles') return cleanupRoles as T;
     return status as T;
   }) as Api;
   const notify = vi.fn();
@@ -138,6 +165,339 @@ const tab = (name: string) => fireEvent.click(screen.getByRole('tab', { name }))
 const save = () => fireEvent.submit(screen.getByRole('form', { name: 'Stripe connection' }));
 
 describe('Stripe integration settings', () => {
+  it.each(['Connection', 'Role cleanup'])(
+    'turns cleanup off when periodic billing refresh is disabled from %s',
+    async (section) => {
+      const selected = [cleanupRoles.roles[0]!.id];
+      const p = page({
+        ...cleanupStatus,
+        role_cleanup: { ...cleanupStatus.role_cleanup!, enabled: true, role_ids: selected },
+      });
+      await screen.findByText('Live restricted key saved');
+      if (section === 'Role cleanup') {
+        tab(section);
+        await screen.findByLabelText('Synthetic subscriber');
+        fireEvent.click(screen.getByLabelText('Refresh billing every 15 minutes for cleanup'));
+        expect(
+          screen.getByLabelText('Remove expired subscriber roles automatically'),
+        ).toHaveProperty('checked', false);
+        expect(screen.getByLabelText('Synthetic subscriber')).toHaveProperty('checked', true);
+        fireEvent.submit(screen.getByRole('form', { name: 'Subscriber role cleanup' }));
+      } else {
+        fireEvent.click(screen.getByLabelText('Refresh billing every 15 minutes'));
+        save();
+      }
+      await waitFor(() =>
+        expect(p.api).toHaveBeenCalledWith(
+          '/api/stripe/config',
+          expect.objectContaining({
+            body: expect.objectContaining({
+              sync_enabled: false,
+              role_cleanup_enabled: false,
+              role_cleanup_role_ids: selected,
+              automation_enabled: false,
+              price_tiers: cleanupStatus.price_tiers,
+            }),
+          }),
+        ),
+      );
+    },
+  );
+
+  it('saves selected cleanup roles independently of media automation and preserves price mappings', async () => {
+    let status = cleanupStatus;
+    const p = page(status, [], async <T,>(path: string, options?: ApiOptions) => {
+      if (path === '/api/stripe/cleanup-roles') return cleanupRoles as T;
+      if (path === '/api/stripe/config') {
+        status = {
+          ...status,
+          revision: 'revision-2',
+          role_cleanup: {
+            ...status.role_cleanup!,
+            enabled: true,
+            role_ids: [cleanupRoles.roles[0]!.id],
+          },
+        };
+        expect(options?.body).toEqual({
+          expected_revision: 'revision-1',
+          sync_enabled: true,
+          automation_enabled: false,
+          role_cleanup_enabled: true,
+          role_cleanup_role_ids: [cleanupRoles.roles[0]!.id],
+          price_tiers: cleanupStatus.price_tiers,
+        });
+      }
+      return status as T;
+    });
+    await screen.findByText('Live restricted key saved');
+    expect(p.api).not.toHaveBeenCalledWith('/api/stripe/cleanup-roles', expect.anything());
+    tab('Role cleanup');
+    const role = await screen.findByLabelText('Synthetic subscriber');
+    expect(screen.getByLabelText('Remove expired subscriber roles automatically')).toHaveProperty(
+      'checked',
+      false,
+    );
+    expect(screen.getByText(/Keep MEE6 role assignment enabled/)).toBeTruthy();
+    expect(screen.getByText(/does not require a Jellyfin account/)).toBeTruthy();
+    fireEvent.click(role);
+    fireEvent.click(screen.getByLabelText('Remove expired subscriber roles automatically'));
+    fireEvent.submit(screen.getByRole('form', { name: 'Subscriber role cleanup' }));
+    await waitFor(() =>
+      expect(p.notify).toHaveBeenCalledWith('Subscriber role cleanup settings saved.'),
+    );
+    expect(screen.getByText('Verified subscriber role cleanup')).toBeTruthy();
+    expect(
+      (p.api as ReturnType<typeof vi.fn>).mock.calls.every(([path]) =>
+        path.startsWith('/api/stripe/'),
+      ),
+    ).toBe(true);
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
+
+  it('shares sync and automation drafts across tabs without discarding pending changes', async () => {
+    const p = page({ ...cleanupStatus, sync_enabled: false });
+    await screen.findByText('Live restricted key saved');
+    fireEvent.click(screen.getByLabelText('Use verified Stripe billing for membership automation'));
+    tab('Role cleanup');
+    await screen.findByLabelText('Synthetic subscriber');
+    const enable = screen.getByLabelText('Remove expired subscriber roles automatically');
+    expect(enable).toHaveProperty('disabled', true);
+    fireEvent.click(screen.getByLabelText('Refresh billing every 15 minutes for cleanup'));
+    expect(enable).toHaveProperty('disabled', false);
+    fireEvent.click(screen.getByLabelText('Synthetic tier'));
+    fireEvent.click(enable);
+    fireEvent.submit(screen.getByRole('form', { name: 'Subscriber role cleanup' }));
+    await waitFor(() =>
+      expect(p.notify).toHaveBeenCalledWith('Subscriber role cleanup settings saved.'),
+    );
+    expect(p.api).toHaveBeenCalledWith(
+      '/api/stripe/config',
+      expect.objectContaining({
+        body: expect.objectContaining({
+          sync_enabled: true,
+          automation_enabled: true,
+          role_cleanup_enabled: true,
+          role_cleanup_role_ids: [cleanupRoles.roles[1]!.id],
+          price_tiers: cleanupStatus.price_tiers,
+        }),
+      }),
+    );
+  });
+
+  it('requires a synced live key and selected safe roles before enabling cleanup', async () => {
+    const p = page({ ...cleanupStatus, mode: 'test' });
+    await screen.findByText('Test restricted key saved');
+    tab('Role cleanup');
+    await screen.findByLabelText('Synthetic subscriber');
+    expect(screen.getByLabelText('Remove expired subscriber roles automatically')).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(screen.getByLabelText(/Synthetic administrator/)).toHaveProperty('disabled', true);
+    expect(
+      screen.getByText(/Incomplete or uncertain billing verification preserves roles/),
+    ).toBeTruthy();
+    expect(p.api).not.toHaveBeenCalledWith('/api/stripe/config', expect.anything());
+  });
+
+  it('bounds selected roles, allows unavailable roles to be deselected, and escapes role names', async () => {
+    const selectedIds = Array.from({ length: 20 }, (_, index) =>
+      String(100000000000000000n + BigInt(index)),
+    );
+    const roles = selectedIds
+      .slice(1)
+      .map((id, index) => ({ id, name: `Synthetic role ${index + 2}`, manageable: true }));
+    const p = page(
+      { ...cleanupStatus, role_cleanup: { ...cleanupStatus.role_cleanup!, role_ids: selectedIds } },
+      [],
+      async <T,>(path: string) => {
+        if (path === '/api/stripe/cleanup-roles')
+          return {
+            can_manage_roles: true,
+            roles: [
+              ...roles,
+              { id: '444444444444444444', name: '<img src=x onerror=alert(1)>', manageable: true },
+            ],
+          } as T;
+        return {
+          ...cleanupStatus,
+          role_cleanup: { ...cleanupStatus.role_cleanup!, role_ids: selectedIds },
+        } as T;
+      },
+    );
+    await screen.findByText('Live restricted key saved');
+    tab('Role cleanup');
+    await screen.findByLabelText('Find subscriber roles');
+    const search = screen.getByLabelText('Find subscriber roles');
+    fireEvent.change(search, { target: { value: '<img' } });
+    const extra = await screen.findByLabelText('<img src=x onerror=alert(1)>');
+    expect(extra).toHaveProperty('disabled', true);
+    expect(document.querySelector('img')).toBeNull();
+    fireEvent.change(search, { target: { value: 'Unavailable role' } });
+    const missing = screen.getByLabelText(new RegExp(`Unavailable role \\(${selectedIds[0]}\\)`));
+    expect(missing).toHaveProperty('checked', true);
+    expect(missing).toHaveProperty('disabled', false);
+    fireEvent.click(missing);
+    fireEvent.change(search, { target: { value: '<img' } });
+    fireEvent.click(screen.getByLabelText('<img src=x onerror=alert(1)>'));
+    expect(screen.getByText(/20 of 20 selected/)).toBeTruthy();
+    expect(p.api).not.toHaveBeenCalledWith('/api/stripe/config', expect.anything());
+  });
+
+  it('preserves a cleanup draft and its original revision across a status refresh', async () => {
+    let revision = 'revision-1';
+    const p = page(cleanupStatus, [], async <T,>(path: string) => {
+      if (path === '/api/stripe/cleanup-roles') return cleanupRoles as T;
+      return { ...cleanupStatus, revision } as T;
+    });
+    await screen.findByText('Live restricted key saved');
+    tab('Role cleanup');
+    fireEvent.click(await screen.findByLabelText('Synthetic subscriber'));
+    fireEvent.click(screen.getByLabelText('Remove expired subscriber roles automatically'));
+    revision = 'revision-2';
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+    await screen.findByRole('button', { name: 'Reset draft to saved Stripe settings' });
+    await waitFor(() =>
+      expect(screen.getByLabelText('Synthetic subscriber')).toHaveProperty('checked', true),
+    );
+    fireEvent.submit(screen.getByRole('form', { name: 'Subscriber role cleanup' }));
+    await waitFor(() =>
+      expect(p.api).toHaveBeenCalledWith(
+        '/api/stripe/config',
+        expect.objectContaining({
+          body: expect.objectContaining({
+            expected_revision: 'revision-1',
+            role_cleanup_enabled: true,
+          }),
+        }),
+      ),
+    );
+  });
+
+  it('shows cleanup failures and re-added role reports without exposing raw sync errors', async () => {
+    page({
+      ...cleanupStatus,
+      role_cleanup: {
+        ...cleanupStatus.role_cleanup!,
+        enabled: true,
+        last_run: '2026-10-23T01:00:00Z',
+        removed_roles: 2,
+        failed_members: 1,
+        readded_members: 1,
+        last_error: 'PRIVATE_CLEANUP_ERROR',
+        reports: [
+          {
+            discord_user_id: '123456789012345678',
+            status: 'failed',
+            removed_role_ids: [],
+            attempted_at: '2026-10-23T01:00:00Z',
+            message: 'The bot could not remove the selected subscriber role.',
+          },
+          {
+            discord_user_id: '223456789012345678',
+            status: 'readded',
+            removed_role_ids: [cleanupRoles.roles[0]!.id],
+            attempted_at: '2026-10-23T01:00:00Z',
+            message: 'A previously removed subscriber role was added again.',
+          },
+        ],
+      },
+    });
+    await screen.findByText('Live restricted key saved');
+    tab('Role cleanup');
+    await screen.findByLabelText('Synthetic subscriber');
+    expect(screen.getByText('2 roles removed')).toBeTruthy();
+    expect(screen.getByText('1 member with failed removals')).toBeTruthy();
+    expect(screen.getByText('Role removal needs attention')).toBeTruthy();
+    expect(screen.getByText('Subscriber roles re-added')).toBeTruthy();
+    expect(screen.getByText(/Review the affected members and other bots/)).toBeTruthy();
+    expect(screen.getByText('Retry paused cleanup members')).toBeTruthy();
+    expect(screen.getByText(/Jellyport pauses a member after three failed removals/)).toBeTruthy();
+    expect(
+      screen.getByText(/disable role cleanup and save, then re-enable it and save/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/Refreshing billing alone keeps paused members held for review/),
+    ).toBeTruthy();
+    expect(document.body.textContent).not.toContain('PRIVATE_CLEANUP_ERROR');
+  });
+
+  it('does not loop failed role reads and supports a private-error-safe retry', async () => {
+    let fail = true;
+    const p = page(cleanupStatus, [], async <T,>(path: string) => {
+      if (path === '/api/stripe/cleanup-roles') {
+        if (fail) throw new Error('PRIVATE_ROLE_RESPONSE');
+        return cleanupRoles as T;
+      }
+      return cleanupStatus as T;
+    });
+    await screen.findByText('Live restricted key saved');
+    tab('Role cleanup');
+    await screen.findByText(/Discord roles could not be loaded/);
+    const calls = (p.api as ReturnType<typeof vi.fn>).mock.calls.length;
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    expect(p.api).toHaveBeenCalledTimes(calls);
+    expect(document.body.textContent).not.toContain('PRIVATE_ROLE_RESPONSE');
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh Discord roles' }));
+    await waitFor(() =>
+      expect(p.notify).toHaveBeenCalledWith(
+        'Discord roles could not be loaded. Check the bot connection and retry.',
+        true,
+      ),
+    );
+    fail = false;
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh Discord roles' }));
+    await screen.findByLabelText('Synthetic subscriber');
+    expect(p.notify).toHaveBeenCalledWith('Refreshing Discord roles…');
+    expect(p.notify).toHaveBeenCalledWith('Discord roles refreshed.');
+  });
+
+  it('aborts role lookup when navigating away and ignores a late result', async () => {
+    let finish!: (roles: typeof cleanupRoles) => void;
+    let signal!: AbortSignal;
+    const p = page(cleanupStatus, [], async <T,>(path: string, options?: ApiOptions) => {
+      if (path === '/api/stripe/cleanup-roles') {
+        signal = options!.signal!;
+        return new Promise<typeof cleanupRoles>((resolve) => {
+          finish = resolve;
+        }) as Promise<T>;
+      }
+      return cleanupStatus as T;
+    });
+    await screen.findByText('Live restricted key saved');
+    tab('Role cleanup');
+    expect(signal.aborted).toBe(false);
+    tab('Connection');
+    expect(signal.aborted).toBe(true);
+    await act(async () => finish(cleanupRoles));
+    expect(screen.queryByLabelText('Synthetic subscriber')).toBeNull();
+    expect(p.notify).not.toHaveBeenCalled();
+  });
+
+  it('reports failed cleanup configuration saves without leaking raw responses', async () => {
+    const p = page(cleanupStatus, [], async <T,>(path: string) => {
+      if (path === '/api/stripe/cleanup-roles') return cleanupRoles as T;
+      if (path === '/api/stripe/config') throw new Error('PRIVATE_SAVE_RESPONSE');
+      return cleanupStatus as T;
+    });
+    await screen.findByText('Live restricted key saved');
+    tab('Role cleanup');
+    fireEvent.click(await screen.findByLabelText('Synthetic subscriber'));
+    fireEvent.click(screen.getByLabelText('Remove expired subscriber roles automatically'));
+    fireEvent.submit(screen.getByRole('form', { name: 'Subscriber role cleanup' }));
+    await waitFor(() =>
+      expect(p.notify).toHaveBeenCalledWith(
+        expect.stringContaining('Stripe settings could not be saved'),
+        true,
+      ),
+    );
+    expect(screen.getByLabelText('Synthetic subscriber')).toHaveProperty('checked', true);
+    expect(document.body.textContent).not.toContain('PRIVATE_SAVE_RESPONSE');
+  });
+
   it('makes live verified billing automation an explicit saved choice and explains the activation baseline', async () => {
     const p = page({ ...connected, mode: 'live', automation_enabled: false });
     await screen.findByText('Live restricted key saved');
@@ -215,6 +575,8 @@ describe('Stripe integration settings', () => {
           api_key: 'rk_test_synthetic_only',
           sync_enabled: false,
           automation_enabled: false,
+          role_cleanup_enabled: false,
+          role_cleanup_role_ids: [],
           expected_revision: 'revision-1',
           price_tiers: [],
         },
@@ -228,6 +590,8 @@ describe('Stripe integration settings', () => {
         body: {
           sync_enabled: false,
           automation_enabled: false,
+          role_cleanup_enabled: false,
+          role_cleanup_role_ids: [],
           expected_revision: 'revision-2',
           price_tiers: [],
         },

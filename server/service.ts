@@ -328,6 +328,16 @@ export interface BotAdapter {
   }>;
   memberTagState?(id: string): Promise<{ id: string; username: string; roles: string[] } | null>;
   updateTagRoles?(id: string, add: string[], remove: string[]): Promise<void>;
+  listSubscriberRoles?(): Promise<{
+    roles: Array<{ id: string; name: string; manageable: boolean }>;
+    can_manage_roles: boolean;
+  }>;
+  removeSubscriberRole?(
+    id: string,
+    roleId: string,
+    allowedRoleIds: string[],
+    guard: () => void,
+  ): Promise<void>;
   membershipActive(id: string): Promise<boolean | null>;
   activeMembers(): Promise<Array<{ id: string; username: string }> | null>;
   searchMembers?(query: string): Promise<DiscordMemberSearchResult>;
@@ -1328,6 +1338,37 @@ export class Service {
   }
   recipientRequiresSubscription(discordId: string): boolean {
     return this.memberships.get(discordId, this.store.settings())?.access_mode !== 'complimentary';
+  }
+  /** Subscriber roles affect the whole Discord owner. A Family account on either
+   * server therefore protects that owner's roles, even when other slots are paid.
+   * Only confirmed IDs/links are considered; names never establish an exemption. */
+  subscriberRoleCleanupExempt(discordId: string): boolean {
+    const settings = this.store.settings();
+    const membership = this.memberships.get(discordId, settings);
+    if (membership?.access_mode === 'complimentary') return true;
+    // A decision saved against another paired server must not be silently lost.
+    if (!membership && this.memberships.hasOtherScope(discordId, settings)) return true;
+    const exceptions = this.mediaOwnerships.exceptions(settings);
+    if (exceptions.has(`discord:${discordId}`)) return true;
+    // A standalone account may have been approved before its Discord owner was
+    // linked. Preserve that exact account's annotation after the rows combine.
+    const protectedAccount = (kind: 'emby' | 'jellyfin', accountId: string) =>
+      exceptions.has(`account:${kind}:${accountId}`) ||
+      this.profiles.get(kind, accountId, settings)?.family === true;
+    for (const owner of this.mediaOwnerships.list(settings))
+      if (owner.discord_user_id === discordId && protectedAccount(owner.kind, owner.account_id))
+        return true;
+    for (const mapping of this.mappings.list(settings))
+      if (
+        mapping.discord_user_id === discordId &&
+        (protectedAccount('emby', mapping.source_user_id) ||
+          (mapping.target_user_id && protectedAccount('jellyfin', mapping.target_user_id)))
+      )
+        return true;
+    for (const link of this.store.links())
+      if (link.discord_user_id === discordId && protectedAccount('jellyfin', link.remote_id))
+        return true;
+    return false;
   }
   recipientRequiresMembershipRole(discordId: string): boolean {
     return (

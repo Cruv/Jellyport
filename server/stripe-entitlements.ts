@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Store } from './store.js';
-import type { StripePaidPeriod, StripeSnapshot } from './stripe-client.js';
+import type { StripePaidPeriod, StripeSnapshot, StripeSubscription } from './stripe-client.js';
 import { ServiceError } from './errors.js';
 import { DEFAULT_MEMBERSHIP_TIERS } from './memberships.js';
 
@@ -53,6 +53,101 @@ export function stripeAuthority(
 }
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString();
 const freshMs = 30 * 60_000;
+export interface StripeBillingDecision {
+  owner: string;
+  action: 'subscribe' | 'expire';
+  subscriptions: StripeSubscription[];
+  subscription: StripeSubscription;
+  period: StripePaidPeriod;
+  tier: string;
+}
+/** Invoice-backed decisions shared by media automation and the independent
+ * Discord cleanup backstop. Unknown billing and any still-active replacement
+ * preserve access across every approved customer owned by the member. */
+export function stripeBillingDecisions(
+  snapshot: StripeSnapshot,
+  links: Array<{ customer_id: string; discord_user_id: string }>,
+  priceTiers: Array<{ price_id: string; tier_id: string }>,
+  periods: Map<string, StripePaidPeriod | null>,
+  time: number,
+): StripeBillingDecision[] {
+  if (snapshot.mode !== 'live') return [];
+  const decisions: StripeBillingDecision[] = [];
+  const owners = new Set(links.map((link) => link.discord_user_id));
+  for (const owner of owners) {
+    const customers = new Set(
+      links.filter((link) => link.discord_user_id === owner).map((link) => link.customer_id),
+    );
+    const subscriptions = snapshot.subscriptions.filter((subscription) =>
+      customers.has(subscription.customer_id),
+    );
+    if (
+      !subscriptions.length ||
+      [...customers].some(
+        (customer) => !subscriptions.some((entry) => entry.customer_id === customer),
+      )
+    )
+      continue;
+    const recognized = subscriptions.map((subscription) => {
+      const period = periods.get(subscription.id),
+        item = subscription.items[0];
+      const tier = item
+        ? priceTiers.find((entry) => entry.price_id === item.price_id)?.tier_id
+        : null;
+      if (
+        !period ||
+        !tier ||
+        subscription.items.length !== 1 ||
+        item?.quantity !== 1 ||
+        subscription.pause_collection ||
+        period.customer_id !== subscription.customer_id ||
+        period.subscription_id !== subscription.id ||
+        period.price_id !== item.price_id ||
+        !Number.isSafeInteger(subscription.created) ||
+        subscription.created! * 1000 > time + 30_000 ||
+        period.paid_at * 1000 > time + 30_000
+      )
+        return null;
+      return { subscription, period, tier };
+    });
+    if (recognized.some((entry) => !entry)) continue;
+    const paid = recognized.filter((entry) => entry !== null);
+    const active = paid.filter(
+      (entry) =>
+        entry.subscription.status === 'active' &&
+        entry.period.start * 1000 <= time &&
+        entry.period.end * 1000 > time,
+    );
+    let selected =
+      active.length === 1 &&
+      paid.every(
+        (entry) =>
+          entry === active[0] ||
+          (['canceled', 'incomplete_expired'].includes(entry.subscription.status) &&
+            typeof entry.subscription.ended_at === 'number' &&
+            entry.subscription.ended_at * 1000 <= time &&
+            entry.period.end * 1000 <= time),
+      )
+        ? active[0]
+        : undefined;
+    let action: 'subscribe' | 'expire' = 'subscribe';
+    if (
+      !selected &&
+      paid.every(
+        (entry) =>
+          ['canceled', 'incomplete_expired'].includes(entry.subscription.status) &&
+          typeof entry.subscription.ended_at === 'number' &&
+          entry.subscription.ended_at * 1000 <= time &&
+          entry.period.end * 1000 <= time,
+      )
+    ) {
+      selected = [...paid].sort((a, b) => b.period.end - a.period.end)[0];
+      action = 'expire';
+    }
+    if (selected) decisions.push({ owner, action, subscriptions, ...selected });
+  }
+  return decisions;
+}
 export class StripeEntitlements {
   private state: Activation | null;
   constructor(
@@ -171,73 +266,14 @@ export class StripeEntitlements {
     const state = this.state!,
       facts: StripeEntitlementFact[] = [],
       time = this.now();
-    const owners = new Set(links.map((link) => link.discord_user_id));
-    for (const owner of owners) {
-      const customers = new Set(
-        links.filter((link) => link.discord_user_id === owner).map((link) => link.customer_id),
-      );
-      const subscriptions = snapshot.subscriptions.filter((subscription) =>
-        customers.has(subscription.customer_id),
-      );
-      if (!subscriptions.length) continue;
-      const recognized = subscriptions.map((subscription) => {
-        const period = periods.get(subscription.id),
-          item = subscription.items[0];
-        const tier = item
-          ? priceTiers.find((entry) => entry.price_id === item.price_id)?.tier_id
-          : null;
-        if (
-          !period ||
-          !tier ||
-          subscription.items.length !== 1 ||
-          item?.quantity !== 1 ||
-          subscription.pause_collection ||
-          period.customer_id !== subscription.customer_id ||
-          period.subscription_id !== subscription.id ||
-          period.price_id !== item.price_id ||
-          !Number.isSafeInteger(subscription.created) ||
-          subscription.created! * 1000 > time + 30_000 ||
-          period.paid_at * 1000 > time + 30_000
-        )
-          return null;
-        return { subscription, period, tier };
-      });
-      if (recognized.some((entry) => !entry)) continue;
-      const paid = recognized.filter((entry) => entry !== null);
-      const active = paid.filter(
-        (entry) =>
-          entry.subscription.status === 'active' &&
-          entry.period.start * 1000 <= time &&
-          entry.period.end * 1000 > time,
-      );
-      let selected =
-        active.length === 1 &&
-        paid.every(
-          (entry) =>
-            entry === active[0] ||
-            (['canceled', 'incomplete_expired'].includes(entry.subscription.status) &&
-              typeof entry.subscription.ended_at === 'number' &&
-              entry.subscription.ended_at * 1000 <= time &&
-              entry.period.end * 1000 <= time),
-        )
-          ? active[0]
-          : undefined;
-      let action: 'subscribe' | 'expire' = 'subscribe';
-      if (
-        !selected &&
-        paid.every(
-          (entry) =>
-            ['canceled', 'incomplete_expired'].includes(entry.subscription.status) &&
-            typeof entry.subscription.ended_at === 'number' &&
-            entry.subscription.ended_at * 1000 <= time &&
-            entry.period.end * 1000 <= time,
-        )
-      ) {
-        selected = [...paid].sort((a, b) => b.period.end - a.period.end)[0];
-        action = 'expire';
-      }
-      if (!selected) continue;
-      const { subscription, period, tier } = selected;
+    for (const {
+      owner,
+      action,
+      subscriptions,
+      subscription,
+      period,
+      tier,
+    } of stripeBillingDecisions(snapshot, links, priceTiers, periods, time)) {
       const event_id = `stripe-${digest([generation, owner, action, subscriptions.map((sub) => sub.id).sort(), period.invoice_id, period.end, tier])}`;
       facts.push({
         provider: 'stripe',

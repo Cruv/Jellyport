@@ -163,6 +163,28 @@ verified paid period ends. Persisted event claims prevent replay after an uncert
 process interruption; unresolved actions require administrator review. Signed
 billing webhooks are not implemented.
 
+The optional subscriber-role cleanup backstop has a separate encrypted, default-off
+policy and uncertain-write receipts. It requires live invoice-backed expiry,
+approved customer identities, mapped prices, periodic refresh and Stripe as the
+selected authority, independently of media-account automation. It removes only
+explicitly selected roles through individual Discord role endpoints; it has no
+role-add, member-removal or media-account mutation capability. Fresh hierarchy and
+permission checks refuse administrator, media-organization, managed, unknown or
+privileged roles. A whole-member complimentary policy, approved access exception,
+or any confirmed Family account protects the entire owner from cleanup.
+
+Each bounded serial pass rechecks billing freshness, link/price authority,
+configuration, bot lifecycle and current exemptions before writes. Failed billing
+reads invalidate cleanup evidence. Role readback distinguishes acknowledged
+removal from uncertain writes; restart requires fresh billing verification and
+reconciles current role state. Bounded retries pause after repeated failures, and
+observing a removed role return pauses that member for review. A verified paid
+renewal starts a new access cycle. Reports retain at most 200 outcomes with member
+and role IDs, fixed safe explanations and timestamps, encrypted locally and exposed
+only through the administrator/CSRF/no-store boundary. They are not administrator
+DMs, public messages, or raw upstream errors. This does not identify which other
+bot or administrator re-added a role or revoke unrelated channel permissions.
+
 ## Administrator bot message history
 
 Enabled administrators can reopen the exact captured credential DM, including its

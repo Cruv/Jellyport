@@ -27,6 +27,27 @@ export interface StripeIntegrationStatus {
   linked_customer_count: number;
   price_tiers: { price_id: string; tier_id: string }[];
   hints: { id: string; username: string; tier: string; observed_at: string }[];
+  role_cleanup?: {
+    enabled: boolean;
+    role_ids: string[];
+    last_run: string | null;
+    running: boolean;
+    removed_roles: number;
+    failed_members: number;
+    readded_members: number;
+    last_error: string | null;
+    reports: {
+      discord_user_id: string;
+      status: 'removed' | 'failed' | 'readded' | 'skipped';
+      removed_role_ids: string[];
+      attempted_at: string;
+      message: string;
+    }[];
+  };
+}
+interface CleanupRoleOptions {
+  roles: { id: string; name: string; manageable: boolean }[];
+  can_manage_roles: boolean;
 }
 export interface StripeSubscriptionReview {
   subscription_id: string;
@@ -66,6 +87,13 @@ export default function StripeIntegrationPanel({
   const [rowsRevision, setRowsRevision] = useState('');
   const [syncEnabled, setSyncEnabled] = useState(false);
   const [automationEnabled, setAutomationEnabled] = useState(false);
+  const [roleCleanupEnabled, setRoleCleanupEnabled] = useState(false);
+  const [cleanupRoleIds, setCleanupRoleIds] = useState<string[]>([]);
+  const [cleanupRoles, setCleanupRoles] = useState<CleanupRoleOptions | null>(null);
+  const [cleanupRolesBusy, setCleanupRolesBusy] = useState(false);
+  const [cleanupRolesError, setCleanupRolesError] = useState(false);
+  const [cleanupRolesRefresh, setCleanupRolesRefresh] = useState(0);
+  const [cleanupRoleQuery, setCleanupRoleQuery] = useState('');
   const [priceTiers, setPriceTiers] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
@@ -90,6 +118,7 @@ export default function StripeIntegrationPanel({
   const [member, setMember] = useState<DiscordMember | null>(null);
   const key = useRef<HTMLInputElement | null>(null);
   const initialized = useRef(false);
+  const cleanupRolesNotify = useRef(false);
   const configDirty = useRef(false);
   const draftRevision = useRef('');
   const mounted = useRef(false);
@@ -112,6 +141,8 @@ export default function StripeIntegrationPanel({
       draftRevision.current = value.revision;
       setSyncEnabled(value.sync_enabled);
       setAutomationEnabled(value.automation_enabled === true);
+      setRoleCleanupEnabled(value.role_cleanup?.enabled === true);
+      setCleanupRoleIds([...new Set(value.role_cleanup?.role_ids || [])]);
       setPriceTiers(
         Object.fromEntries(value.price_tiers.map((item) => [item.price_id, item.tier_id])),
       );
@@ -182,10 +213,36 @@ export default function StripeIntegrationPanel({
   }, [active, demo, tab, status?.revision, status?.running, read]);
 
   useEffect(() => {
-    if (!active || demo || !status?.running || busy) return;
+    if (!active || demo || tab !== 'cleanup' || !status?.configured) return;
+    const abort = new AbortController();
+    const manual = cleanupRolesNotify.current;
+    cleanupRolesNotify.current = false;
+    setCleanupRoles(null);
+    setCleanupRolesError(false);
+    setCleanupRolesBusy(true);
+    void api<CleanupRoleOptions>('/api/stripe/cleanup-roles', { signal: abort.signal })
+      .then((value) => {
+        if (abort.signal.aborted) return;
+        setCleanupRoles(value);
+        if (manual) notify('Discord roles refreshed.');
+      })
+      .catch(() => {
+        if (abort.signal.aborted) return;
+        setCleanupRolesError(true);
+        if (manual)
+          notify('Discord roles could not be loaded. Check the bot connection and retry.', true);
+      })
+      .finally(() => {
+        if (!abort.signal.aborted) setCleanupRolesBusy(false);
+      });
+    return () => abort.abort();
+  }, [api, notify, active, demo, tab, status?.configured, status?.revision, cleanupRolesRefresh]);
+
+  useEffect(() => {
+    if (!active || demo || !(status?.running || status?.role_cleanup?.running) || busy) return;
     const timer = setTimeout(() => void read(false, tab === 'review'), 2500);
     return () => clearTimeout(timer);
-  }, [active, demo, status?.running, busy, read, tab]);
+  }, [active, demo, status?.running, status?.role_cleanup?.running, busy, read, tab]);
 
   async function mutate(
     kind: string,
@@ -220,6 +277,9 @@ export default function StripeIntegrationPanel({
         setDisconnectRevision(null);
         setReview(null);
         setMember(null);
+        setCleanupRoles(null);
+        setCleanupRolesError(false);
+        setCleanupRolesBusy(false);
       }
       setLoadedRows(false);
       if (kind === 'link' || kind === 'unlink') {
@@ -301,7 +361,7 @@ export default function StripeIntegrationPanel({
     }
   }
 
-  function save(event: FormEvent) {
+  function save(event: FormEvent, cleanup = false) {
     event.preventDefault();
     if (!status || busy || changing.current) return;
     const apiKey = key.current?.value.trim();
@@ -314,6 +374,24 @@ export default function StripeIntegrationPanel({
       setError('Use a restricted Stripe key beginning with rk_live_ or rk_test_.');
       return;
     }
+    if (
+      roleCleanupEnabled &&
+      (!syncEnabled ||
+        status.mode !== 'live' ||
+        !status.last_sync ||
+        cleanupRoleIds.length === 0 ||
+        (cleanup &&
+          (!cleanupRoles?.can_manage_roles ||
+            cleanupRoleIds.some(
+              (id) => !cleanupRoles.roles.some((role) => role.id === id && role.manageable),
+            ))))
+    ) {
+      const detail =
+        'Role cleanup needs a synced live Stripe key, periodic billing refresh, and at least one removable subscriber role. Check the Role cleanup tab.';
+      setError(detail);
+      notify(detail, true);
+      return;
+    }
     void mutate(
       'save',
       '/api/stripe/config',
@@ -321,14 +399,18 @@ export default function StripeIntegrationPanel({
         ...(apiKey ? { api_key: apiKey } : {}),
         sync_enabled: syncEnabled,
         automation_enabled: automationEnabled,
+        role_cleanup_enabled: roleCleanupEnabled,
+        role_cleanup_role_ids: cleanupRoleIds,
         expected_revision: draftRevision.current,
         price_tiers: Object.entries(priceTiers)
           .filter(([, tier]) => tier)
           .map(([price_id, tier_id]) => ({ price_id, tier_id })),
       },
-      automationEnabled
-        ? 'Stripe membership automation settings saved. Existing subscribers remain protected by the activation baseline.'
-        : 'Stripe settings saved. Account changes remain under review.',
+      cleanup
+        ? 'Subscriber role cleanup settings saved.'
+        : automationEnabled
+          ? 'Stripe membership automation settings saved. Existing subscribers remain protected by the activation baseline.'
+          : 'Stripe settings saved. Account changes remain under review.',
     );
   }
 
@@ -353,17 +435,46 @@ export default function StripeIntegrationPanel({
     ].some((value) => value?.toLowerCase().includes(term));
   });
   const pagination = usePagination(filtered, 5, `${scope}:${query}`);
+  const cleanupPagination = usePagination(status?.role_cleanup?.reports || [], 5);
+  const selectedCleanupRoles = cleanupRoleIds.map((id) => ({
+    id,
+    name: cleanupRoles?.roles.find((role) => role.id === id)?.name || `Unavailable role (${id})`,
+    manageable: cleanupRoles?.roles.some((role) => role.id === id && role.manageable) || false,
+  }));
+  const availableCleanupRoles = cleanupRoles
+    ? [
+        ...cleanupRoles.roles,
+        ...selectedCleanupRoles.filter(
+          (selected) => !cleanupRoles.roles.some((role) => role.id === selected.id),
+        ),
+      ]
+    : [];
+  const cleanupRolePagination = usePagination(
+    availableCleanupRoles.filter((role) =>
+      role.name.toLowerCase().includes(cleanupRoleQuery.trim().toLowerCase()),
+    ),
+    10,
+    cleanupRoleQuery,
+  );
   const suggested = status?.hints.find((hint) => hint.id === review?.proposed_discord_id);
 
   return (
     <div className="settings-group" aria-label="Stripe billing integration">
       <Callout
-        title={status?.automation_enabled ? 'Verified billing management' : 'Billing review only'}
+        title={
+          status?.automation_enabled
+            ? 'Verified billing management'
+            : status?.role_cleanup?.enabled
+              ? 'Verified subscriber role cleanup'
+              : 'Billing review only'
+        }
         icon="info"
       >
-        {status?.automation_enabled
-          ? 'Stripe access remains read-only. Verified paid periods can drive the Jellyport account actions you enabled; uncertain billing preserves existing access. Family and complimentary access remain admin-managed.'
-          : 'Stripe reads subscription status. Syncing and approving identity links do not create, disable, or change media accounts. Family and complimentary access remain admin-managed.'}
+        {status?.role_cleanup?.enabled && !status.automation_enabled
+          ? 'Stripe subscription verification can remove only your selected subscriber roles. MEE6 continues initial role assignment and its normal cancellation cleanup. Media account automation remains separate.'
+          : status?.automation_enabled
+            ? 'Stripe access remains read-only. Verified paid periods can drive the Jellyport account actions you enabled; uncertain billing preserves existing access. Family and complimentary access remain admin-managed.'
+            : 'Stripe reads subscription status. Syncing and approving identity links do not create, disable, or change media accounts. Family and complimentary access remain admin-managed.'}
       </Callout>
       {demo && <p className="section-note">Stripe connections are unavailable in the demo.</p>}
       <IdentityReviewResult result={identityResult} />
@@ -373,6 +484,7 @@ export default function StripeIntegrationPanel({
         tabs={[
           { id: 'connection', label: 'Connection' },
           { id: 'review', label: 'Review links' },
+          { id: 'cleanup', label: 'Role cleanup' },
           { id: 'mee6', label: 'MEE6 identity hints' },
         ]}
         value={tab}
@@ -460,9 +572,11 @@ export default function StripeIntegrationPanel({
                     'sync',
                     '/api/stripe/sync',
                     {},
-                    status.automation_enabled
-                      ? 'Stripe sync started. Verified billing actions follow your saved automation policy.'
-                      : 'Stripe sync started. No media accounts will be changed.',
+                    status.role_cleanup?.enabled
+                      ? 'Stripe sync started. Expired subscriber roles will be checked under your saved cleanup policy.'
+                      : status.automation_enabled
+                        ? 'Stripe sync started. Verified billing actions follow your saved automation policy.'
+                        : 'Stripe sync started. No media accounts will be changed.',
                   )
                 }
               >
@@ -488,7 +602,8 @@ export default function StripeIntegrationPanel({
                   Create a restricted key in Stripe → Developers → API keys. Choose Read for
                   Customers, Products, Prices, Subscriptions, and Checkout Sessions. Leave every
                   other permission at None. For membership automation, also enable Read for
-                  Invoices. No write permissions are needed.
+                  Invoices. Role cleanup also requires Invoices Read. No write permissions are
+                  needed.
                 </p>
                 <p>
                   Use a live key to inspect live subscriptions, including MEE6 subscriptions. Enter
@@ -537,8 +652,9 @@ export default function StripeIntegrationPanel({
                     Refresh billing every 15 minutes
                   </label>
                   <p className="muted text-tiny mt-4">
-                    Reads billing data. Access changes require verified membership automation and
-                    the separate account-action switches.
+                    Reads billing data. Media account changes require verified membership automation
+                    and the separate account-action switches. Subscriber role cleanup has its own
+                    opt-in policy.
                   </p>
                 </div>
                 <label className="toggle">
@@ -549,6 +665,7 @@ export default function StripeIntegrationPanel({
                     onChange={(event) => {
                       configDirty.current = true;
                       setSyncEnabled(event.target.checked);
+                      if (!event.target.checked) setRoleCleanupEnabled(false);
                     }}
                     disabled={demo || !!busy || status?.running || !status}
                   />
@@ -656,6 +773,330 @@ export default function StripeIntegrationPanel({
             </form>
           </div>
         </section>
+      </TabPanel>
+      <TabPanel id="settings-stripe" tabId="cleanup" active={tab === 'cleanup'}>
+        <section className="panel">
+          <div className="panel-header">
+            <div>
+              <h3>Subscriber role cleanup</h3>
+              <p>A Stripe-backed safety net for roles left behind after paid access expires.</p>
+            </div>
+          </div>
+          <div className="panel-body form-stack">
+            <Callout title="Keep MEE6 role assignment enabled" icon="info">
+              MEE6 continues granting roles and its normal cancellation cleanup. Jellyport only
+              removes the subscriber or tier roles you select after verifying that linked paid
+              access has expired. It never adds roles. A late invoice payment alone does not restore
+              a canceled subscription.
+            </Callout>
+            <p className="section-note">
+              Family accounts, complimentary access, and approved access exceptions stay
+              admin-managed. This policy does not require a Jellyfin account or enable media account
+              automation. Select Stripe as the subscription source in Settings → Automation, and
+              enable Invoices Read on the restricted Stripe key. Incomplete or uncertain billing
+              verification preserves roles for review.
+            </p>
+            <form
+              className="form-stack"
+              aria-label="Subscriber role cleanup"
+              onSubmit={(event) => save(event, true)}
+            >
+              <div className="toggle-row">
+                <div>
+                  <label htmlFor="stripe-cleanup-sync" className="switch-label">
+                    Refresh billing every 15 minutes for cleanup
+                  </label>
+                  <p className="muted text-tiny mt-4">
+                    Uses the same periodic billing refresh as the Connection tab.
+                  </p>
+                </div>
+                <label className="toggle">
+                  <input
+                    id="stripe-cleanup-sync"
+                    type="checkbox"
+                    checked={syncEnabled}
+                    onChange={(event) => {
+                      configDirty.current = true;
+                      setSyncEnabled(event.target.checked);
+                      if (!event.target.checked) setRoleCleanupEnabled(false);
+                    }}
+                    disabled={demo || !!busy || status?.running || !status}
+                  />
+                  <span className="toggle-track" aria-hidden="true" />
+                </label>
+              </div>
+              <div className="toggle-row">
+                <div>
+                  <label htmlFor="stripe-role-cleanup-enabled" className="switch-label">
+                    Remove expired subscriber roles automatically
+                  </label>
+                  <p className="muted text-tiny mt-4">
+                    Disabled by default. Requires a synced live key, periodic billing refresh, and a
+                    bot allowed to manage the selected roles.
+                  </p>
+                </div>
+                <label className="toggle">
+                  <input
+                    id="stripe-role-cleanup-enabled"
+                    type="checkbox"
+                    checked={roleCleanupEnabled}
+                    onChange={(event) => {
+                      configDirty.current = true;
+                      setRoleCleanupEnabled(event.target.checked);
+                    }}
+                    disabled={
+                      demo ||
+                      !!busy ||
+                      status?.running ||
+                      !status ||
+                      (!roleCleanupEnabled &&
+                        (!status.configured ||
+                          status.mode !== 'live' ||
+                          !status.last_sync ||
+                          !syncEnabled ||
+                          !cleanupRoles?.can_manage_roles))
+                    }
+                  />
+                  <span className="toggle-track" aria-hidden="true" />
+                </label>
+              </div>
+              {!status?.configured && (
+                <p className="section-note">Connect Stripe and complete a live sync first.</p>
+              )}
+              {cleanupRolesBusy && <p role="status">Loading Discord subscriber roles…</p>}
+              {cleanupRolesError && (
+                <p className="error-block" role="alert">
+                  Discord roles could not be loaded. Check the bot connection and retry. No selected
+                  roles have been changed.
+                </p>
+              )}
+              {cleanupRoles && !cleanupRoles.can_manage_roles && (
+                <p className="error-block" role="alert">
+                  The bot cannot manage Discord roles. Grant Manage Roles and place its role above
+                  the subscriber roles before enabling cleanup.
+                </p>
+              )}
+              {cleanupRoles && (
+                <>
+                  <div className="field">
+                    <label htmlFor="stripe-cleanup-role-search">Find subscriber roles</label>
+                    <input
+                      id="stripe-cleanup-role-search"
+                      type="search"
+                      value={cleanupRoleQuery}
+                      onChange={(event) => setCleanupRoleQuery(event.target.value)}
+                      placeholder="Search Discord role names"
+                    />
+                    <small>
+                      {cleanupRoleIds.length} of 20 selected. Choose only paid subscriber and tier
+                      roles. Administrator, managed, protected, and bot-inaccessible roles cannot be
+                      selected.
+                    </small>
+                  </div>
+                  <div className="record-list" role="group" aria-label="Subscriber roles">
+                    {cleanupRolePagination.items.map((role) => {
+                      const selected = cleanupRoleIds.includes(role.id);
+                      return (
+                        <label className="check-label inline-panel" key={role.id}>
+                          <input
+                            type="checkbox"
+                            className="checkbox"
+                            checked={selected}
+                            disabled={
+                              demo ||
+                              !!busy ||
+                              status?.running ||
+                              (!selected &&
+                                (!cleanupRoles.can_manage_roles ||
+                                  !role.manageable ||
+                                  cleanupRoleIds.length >= 20))
+                            }
+                            onChange={(event) => {
+                              configDirty.current = true;
+                              setCleanupRoleIds((current) =>
+                                event.target.checked
+                                  ? [...new Set([...current, role.id])].slice(0, 20)
+                                  : current.filter((id) => id !== role.id),
+                              );
+                            }}
+                          />
+                          <span className="text-break">
+                            {role.name}
+                            {!role.manageable && (
+                              <small className="muted"> · Unavailable for subscriber cleanup</small>
+                            )}
+                          </span>
+                        </label>
+                      );
+                    })}
+                    {cleanupRolePagination.total === 0 && (
+                      <p className="section-note">No roles match this view.</p>
+                    )}
+                  </div>
+                  <Pagination
+                    label="Subscriber roles"
+                    page={cleanupRolePagination.page}
+                    total={cleanupRolePagination.total}
+                    pageSize={cleanupRolePagination.pageSize}
+                    onPageChange={cleanupRolePagination.setPage}
+                    onPageSizeChange={cleanupRolePagination.setPageSize}
+                  />
+                </>
+              )}
+              {cleanupRoleIds.length > 0 &&
+                cleanupRoles &&
+                selectedCleanupRoles.some((role) => !role.manageable) && (
+                  <p className="error-block" role="alert">
+                    A selected role is unavailable or protected. Deselect it before enabling
+                    cleanup, or disable this policy to save the configuration.
+                  </p>
+                )}
+              <div className="button-row">
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={demo || !!busy || !status || status.running || cleanupRolesBusy}
+                >
+                  {busy === 'save' ? 'Saving…' : 'Save role cleanup'}
+                </button>
+                <button
+                  type="button"
+                  className="btn btn-quiet"
+                  disabled={demo || !!busy || cleanupRolesBusy || !status?.configured}
+                  onClick={() => {
+                    cleanupRolesNotify.current = true;
+                    setCleanupRolesRefresh((value) => value + 1);
+                    notify('Refreshing Discord roles…');
+                  }}
+                >
+                  <Icon name="refresh" /> Refresh Discord roles
+                </button>
+                {status && configDirty.current && draftRevision.current !== status.revision && (
+                  <button
+                    type="button"
+                    className="btn btn-quiet"
+                    disabled={!!busy}
+                    onClick={() => {
+                      configDirty.current = false;
+                      acceptStatus(status);
+                      setError('');
+                    }}
+                  >
+                    Reset draft to saved Stripe settings
+                  </button>
+                )}
+              </div>
+            </form>
+          </div>
+        </section>
+        {status?.role_cleanup && (
+          <section className="panel">
+            <div className="panel-header">
+              <div>
+                <h3>Role cleanup results</h3>
+                <p>
+                  {status.role_cleanup.running
+                    ? 'Checking expired subscriber roles…'
+                    : status.role_cleanup.last_run
+                      ? `Last check: ${date(status.role_cleanup.last_run)}`
+                      : 'No role cleanup check has run yet.'}
+                </p>
+              </div>
+            </div>
+            <div className="panel-body form-stack">
+              <div className="job-meta">
+                <span>
+                  {num(status.role_cleanup.removed_roles)}{' '}
+                  {status.role_cleanup.removed_roles === 1 ? 'role' : 'roles'} removed
+                </span>
+                <span>
+                  {num(status.role_cleanup.failed_members)}{' '}
+                  {status.role_cleanup.failed_members === 1 ? 'member' : 'members'} with failed
+                  removals
+                </span>
+                <span>
+                  {num(status.role_cleanup.readded_members)}{' '}
+                  {status.role_cleanup.readded_members === 1 ? 'member' : 'members'} with re-added
+                  roles
+                </span>
+              </div>
+              {status.role_cleanup.last_error && (
+                <p className="error-block" role="alert">
+                  The last cleanup check could not complete. Check the bot permissions and live
+                  Stripe key’s Invoices Read permission. Paused members need explicit approval to
+                  retry; follow the retry instructions below.
+                </p>
+              )}
+              {status.role_cleanup.readded_members > 0 && (
+                <Callout title="Removed subscriber roles were re-added" icon="info">
+                  Review the affected members and other bots’ role rules. These members are paused
+                  for review. Jellyport never grants these roles, and a paid old invoice does not
+                  reactivate a canceled subscription.
+                </Callout>
+              )}
+              <details className="help-disclosure">
+                <summary>Retry paused cleanup members</summary>
+                <div className="support-note">
+                  <p>
+                    Jellyport pauses a member after three failed removals or when a removed role is
+                    added again. Fix the bot permissions or competing role rules first.
+                  </p>
+                  <p>
+                    To approve another attempt, disable role cleanup and save, then re-enable it and
+                    save. Run Test &amp; sync Stripe afterward to verify billing again. Refreshing
+                    billing alone keeps paused members held for review.
+                  </p>
+                </div>
+              </details>
+              <div className="record-list">
+                {cleanupPagination.items.map((report, index) => (
+                  <article
+                    className="summary-card"
+                    key={`${report.discord_user_id}:${report.attempted_at}:${index}`}
+                  >
+                    <div className="text-break">
+                      <h4>
+                        {report.status === 'removed'
+                          ? 'Subscriber roles removed'
+                          : report.status === 'readded'
+                            ? 'Subscriber roles re-added'
+                            : report.status === 'failed'
+                              ? 'Role removal needs attention'
+                              : 'Roles preserved'}
+                      </h4>
+                      <p className="text-small">{report.message}</p>
+                      <p className="muted text-small">
+                        Discord member {report.discord_user_id} · {date(report.attempted_at)}
+                      </p>
+                      {report.removed_role_ids.length > 0 && (
+                        <p className="text-small">
+                          Removed:{' '}
+                          {report.removed_role_ids
+                            .map(
+                              (id) =>
+                                cleanupRoles?.roles.find((role) => role.id === id)?.name || id,
+                            )
+                            .join(', ')}
+                        </p>
+                      )}
+                    </div>
+                  </article>
+                ))}
+                {cleanupPagination.total === 0 && (
+                  <p className="section-note">No role cleanup reports yet.</p>
+                )}
+              </div>
+              <Pagination
+                label="Role cleanup reports"
+                page={cleanupPagination.page}
+                total={cleanupPagination.total}
+                pageSize={cleanupPagination.pageSize}
+                onPageChange={cleanupPagination.setPage}
+                onPageSizeChange={cleanupPagination.setPageSize}
+              />
+            </div>
+          </section>
+        )}
       </TabPanel>
       <TabPanel id="settings-stripe" tabId="review" active={tab === 'review'}>
         <section className="panel">

@@ -192,7 +192,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     createHash('sha256').update(JSON.stringify(store.settings())).digest('hex');
   const bot = new BotManager(service);
   service.bot = bot;
-  const stripe = new StripeIntegration(store, {
+  const stripe: StripeIntegration = new StripeIntegration(store, {
     onEntitlement: (fact) => service.recordStripeEntitlement(fact),
     clientFactory: options.stripeClientFactory,
     resolveDiscordMember: async (id) => {
@@ -200,6 +200,54 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       if (identity.id !== id)
         throw new ServiceError('The Discord member identity could not be verified.');
       return { id, username: identity.username };
+    },
+    roleCleanup: {
+      listRoles: async () => {
+        if (!service.bot?.listSubscriberRoles)
+          throw new ServiceError('Connect the Discord bot before configuring role cleanup.');
+        return service.bot.listSubscriberRoles();
+      },
+      memberState: async (id) => {
+        if (!service.bot?.memberTagState)
+          throw new ServiceError('Discord membership cannot be verified for role cleanup.');
+        return service.bot.memberTagState(id);
+      },
+      removeRole: async (id, roleId, roleIds, guard) => {
+        if (!service.bot?.removeSubscriberRole)
+          throw new ServiceError('Discord subscriber role cleanup is unavailable.');
+        return service.bot.removeSubscriberRole(id, roleId, roleIds, guard);
+      },
+      isExempt: (id): boolean => {
+        if (service.subscriberRoleCleanupExempt(id)) return true;
+        const exceptions = service.mediaOwnerships.exceptions(store.settings());
+        // Retain a reviewed standalone customer's exception after its exact
+        // customer ID is subsequently approved for a Discord owner.
+        return stripe
+          .subscriptions()
+          .some(
+            (row) => row.linked_discord_id === id && exceptions.has(`stripe:${row.customer_id}`),
+          );
+      },
+      context: () =>
+        createHash('sha256')
+          .update(
+            JSON.stringify([
+              ...[
+                'discord_enabled',
+                'discord_bot_token',
+                'discord_application_id',
+                'discord_guild_id',
+                'discord_admin_role_id',
+                'discord_member_role_id',
+                'discord_emby_role_id',
+                'discord_jellyfin_role_id',
+                'new_subscriber_source',
+              ].map((field) => store.settings()[field as keyof import('./types.js').Settings]),
+              service.mediaOwnerships.scope(store.settings()),
+              store.authState(),
+            ]),
+          )
+          .digest('hex'),
     },
   });
   service.verifyStripeEntitlement = (fact) => stripe.assertEntitlement(fact);
@@ -1564,7 +1612,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   registerUserMappingRoutes(app);
   registerDiscordMemberRoutes(app);
   registerAccountRoleRoutes(app);
-  registerStripeRoutes(app, stripe, demo);
+  registerStripeRoutes(app, stripe, demo, async () => {
+    if (!service.bot?.listSubscriberRoles)
+      throw new ServiceError('Connect the Discord bot before choosing cleanup roles.');
+    return service.bot.listSubscriberRoles();
+  });
   registerIdentityReviewRoutes(app, identities, (request) => {
     const original = session(request);
     return () => {
@@ -1650,6 +1702,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       void stripe.sync().catch(() => {});
   }, 15 * 60_000);
   stripePolling.unref();
+  const roleCleanupPolling = setInterval(() => {
+    if (!demo && store.authState()?.kind === 'configured')
+      void stripe.reconcileRoleCleanup().catch(() => {});
+  }, 5 * 60_000);
+  roleCleanupPolling.unref();
   let closing = false;
   const retention = setInterval(() => {
     try {
@@ -1668,6 +1725,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     clearInterval(retention);
     clearInterval(maintenance);
     clearInterval(stripePolling);
+    clearInterval(roleCleanupPolling);
     previews.close();
     cloneReviews.close();
     const identitiesClosed = identities.close();
@@ -1687,6 +1745,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     if (demo || store.authState()?.kind === 'configured') await service.start();
     if (!demo && store.authState()?.kind === 'configured')
       void identities.roleSync.start().catch(() => {});
+    if (!demo && store.authState()?.kind === 'configured')
+      void stripe.reconcileRoleCleanup().catch(() => {});
     await app.ready();
     return app;
   } catch (error) {

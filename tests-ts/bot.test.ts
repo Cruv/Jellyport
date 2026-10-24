@@ -387,6 +387,163 @@ describe('Discord organizational roles', () => {
   });
 });
 
+describe('Stripe subscriber role cleanup transport', () => {
+  it('lists subscriber roles separately from informational roles and removes only the allowlisted role', async () => {
+    const { manager, target, targetRoles, roles } = await roleFixture({
+      new_subscriber_source: 'stripe',
+    });
+    roles.set(
+      '88',
+      tagRole('88', 'Subscriber chat', { permissions: PermissionFlagsBits.SendMessages }),
+    );
+    const available = await manager.listSubscriberRoles();
+    expect(
+      available.roles
+        .filter((role) => role.manageable)
+        .map((role) => role.id)
+        .sort(),
+    ).toEqual(['55', '88']);
+    const guard = vi.fn();
+    await manager.removeSubscriberRole('22', '55', ['55', '88'], guard);
+    expect(targetRoles.remove).toHaveBeenCalledExactlyOnceWith(
+      '55',
+      'Jellyport verified Stripe subscription expiry',
+    );
+    expect(targetRoles.add).not.toHaveBeenCalled();
+    expect(targetRoles.set).not.toHaveBeenCalled();
+    expect(target.roles.cache.has('66')).toBe(true);
+    expect(target.roles.cache.has('44')).toBe(true);
+    expect(guard).toHaveBeenCalledTimes(5);
+  });
+
+  it.each([
+    'admin',
+    'organization',
+    'everyone',
+    'managed',
+    'privileged',
+    'higher',
+    'equal',
+    'missing',
+    'duplicate',
+    'unselected',
+    'no-permission',
+    'wrong-source',
+  ])('rejects %s subscriber cleanup without a Discord write', async (unsafe) => {
+    const { manager, roles, bot, targetRoles } = await roleFixture({
+      new_subscriber_source: unsafe === 'wrong-source' ? 'trusted_messages' : 'stripe',
+    });
+    let selected = ['55'];
+    let roleId = '55';
+    if (unsafe === 'admin') selected = [(roleId = '99')];
+    if (unsafe === 'organization') selected = [(roleId = '66')];
+    if (unsafe === 'everyone') selected = [(roleId = '123')];
+    if (unsafe === 'managed') roles.set('55', tagRole('55', 'Managed', { managed: true }));
+    if (unsafe === 'privileged')
+      roles.set('55', tagRole('55', 'Moderator', { permissions: PermissionFlagsBits.ManageGuild }));
+    if (unsafe === 'higher') roles.set('55', tagRole('55', 'High', { position: 11 }));
+    if (unsafe === 'equal') roles.set('55', tagRole('55', 'Equal', { position: 10 }));
+    if (unsafe === 'missing') roles.delete('55');
+    if (unsafe === 'duplicate') selected = ['55', '55'];
+    if (unsafe === 'unselected') roleId = '44';
+    if (unsafe === 'no-permission') bot.permissions.has.mockReturnValue(false);
+    await expect(manager.removeSubscriberRole('22', roleId, selected, () => {})).rejects.toThrow();
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+    expect(targetRoles.add).not.toHaveBeenCalled();
+    expect(targetRoles.set).not.toHaveBeenCalled();
+  });
+
+  it('rechecks billing and exemption authority after asynchronous member reads', async () => {
+    const { manager, guild, bot, target, targetRoles } = await roleFixture({
+      new_subscriber_source: 'stripe',
+    });
+    let allowed = true;
+    guild.members.fetch.mockImplementation(async ({ user }) => {
+      if (user === '10') return bot;
+      allowed = false;
+      return target;
+    });
+    await expect(
+      manager.removeSubscriberRole('22', '55', ['55'], () => {
+        if (!allowed) throw new Error('Authority changed');
+      }),
+    ).rejects.toThrow('Authority changed');
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    PermissionFlagsBits.ManageNicknames,
+    PermissionFlagsBits.ManageGuildExpressions,
+    PermissionFlagsBits.MuteMembers,
+    PermissionFlagsBits.DeafenMembers,
+    PermissionFlagsBits.MoveMembers,
+    PermissionFlagsBits.PinMessages,
+    PermissionFlagsBits.BypassSlowmode,
+    1n << 62n,
+  ])('rejects moderation or unknown subscriber permissions (%s)', async (permission) => {
+    const { manager, roles, targetRoles } = await roleFixture({ new_subscriber_source: 'stripe' });
+    roles.set('55', tagRole('55', 'Unsafe subscriber', { permissions: permission }));
+    expect(
+      (await manager.listSubscriberRoles()).roles.find((role) => role.id === '55')?.manageable,
+    ).toBe(false);
+    await expect(manager.removeSubscriberRole('22', '55', ['55'], () => {})).rejects.toThrow(
+      'administrative',
+    );
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+  });
+
+  it('checks exact human guild membership, skips already absent roles, and redacts upstream failures', async () => {
+    const { manager, target, targetRoles, guild, bot } = await roleFixture({
+      new_subscriber_source: 'stripe',
+    });
+    target.roles.cache.delete('55');
+    await manager.removeSubscriberRole('22', '55', ['55'], () => {});
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+    target.roles.cache.set('55', { id: '55' });
+    target.user.bot = true;
+    await expect(manager.removeSubscriberRole('22', '55', ['55'], () => {})).rejects.toThrow(
+      'human',
+    );
+    target.user.bot = false;
+    guild.members.fetch.mockImplementation(async ({ user }) =>
+      user === '10' ? bot : member('23', 'wrong', { roles: ['55'] }),
+    );
+    await expect(manager.removeSubscriberRole('22', '55', ['55'], () => {})).rejects.toThrow(
+      'exact human',
+    );
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+    guild.members.fetch.mockImplementation(async ({ user }) => (user === '10' ? bot : target));
+    targetRoles.remove.mockRejectedValue(new Error('PRIVATE-TOKEN'));
+    await expect(manager.removeSubscriberRole('22', '55', ['55'], () => {})).rejects.toThrow(
+      'could not be confirmed',
+    );
+    await manager
+      .removeSubscriberRole('22', '55', ['55'], () => {})
+      .catch((error) => expect(String(error)).not.toContain('PRIVATE-TOKEN'));
+  });
+
+  it('stops a delayed cleanup when the bot connection is replaced', async () => {
+    const { manager, guild, settings, bot, target, targetRoles } = await roleFixture({
+      new_subscriber_source: 'stripe',
+    });
+    let finish!: (value: ReturnType<typeof member>) => void;
+    guild.members.fetch.mockImplementation(async ({ user }) => {
+      if (user === '10') return bot;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    });
+    const pending = manager.removeSubscriberRole('22', '55', ['55'], () => {});
+    const assertion = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+    await manager.restart(settings);
+    await assertion;
+    finish(target);
+    await Promise.resolve();
+    expect(targetRoles.remove).not.toHaveBeenCalled();
+  });
+});
+
 describe('Discord authorization and identity', () => {
   it.each([
     ['123', '123', true, [], undefined, true],

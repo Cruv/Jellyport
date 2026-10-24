@@ -1,5 +1,123 @@
 import { test, expect, paidOwner, expectContainedLayout } from './media-admin-fixtures';
 
+test('subscriber role cleanup can remove expired roles while media automation stays off', async ({
+  page,
+  admin,
+  mutations,
+}, info) => {
+  const { store, stripe, service } = admin.app.jellyport;
+  const subscriberRole = '444444444444444444';
+  const communityRole = '555555555555555555';
+  let roles = [subscriberRole, communityRole];
+  const removals: Array<{ id: string; role: string }> = [];
+  const beforeAccounts = structuredClone(admin.servers.users);
+  Object.assign(service.bot!, {
+    listSubscriberRoles: async () => ({
+      can_manage_roles: true,
+      roles: [
+        { id: subscriberRole, name: 'Synthetic paid crew', manageable: true },
+        { id: communityRole, name: 'Synthetic community access', manageable: true },
+        { id: '666666666666666666', name: 'Synthetic administrator', manageable: false },
+      ],
+    }),
+    memberTagState: async (id: string) => ({ id, username: 'crew_owner', roles: [...roles] }),
+    removeSubscriberRole: async (
+      id: string,
+      role: string,
+      allowed: string[],
+      guard: () => void,
+    ) => {
+      guard();
+      expect(id).toBe(paidOwner);
+      expect(allowed).toEqual([subscriberRole]);
+      expect(role).toBe(subscriberRole);
+      removals.push({ id, role });
+      roles = roles.filter((value) => value !== role);
+    },
+  });
+  store.saveSettings({
+    ...store.settings(),
+    discord_enabled: true,
+    discord_guild_id: '333333333333333333',
+    new_subscriber_source: 'stripe',
+  });
+  await stripe.configure({
+    expected_revision: stripe.status().revision,
+    api_key: 'rk_live_syntheticBrowserOnly123',
+    sync_enabled: false,
+    automation_enabled: false,
+  });
+  await stripe.sync();
+  await stripe.linkCustomer({
+    customer_id: 'cus_Crew0',
+    discord_user_id: paidOwner,
+    expected_revision: stripe.status().revision,
+  });
+  await stripe.configure({
+    expected_revision: stripe.status().revision,
+    sync_enabled: true,
+    automation_enabled: false,
+    price_tiers: [{ price_id: 'price_Crew', tier_id: 'sloop' }],
+  });
+  await page.goto('/#/settings/stripe');
+  await expect(page.getByText('Live restricted key saved', { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole('checkbox', {
+      name: 'Use verified Stripe billing for membership automation',
+      exact: true,
+    }),
+  ).not.toBeChecked();
+  await page.getByRole('tab', { name: 'Role cleanup', exact: true }).click();
+  await expect(page.getByText('Keep MEE6 role assignment enabled', { exact: true })).toBeVisible();
+  const selected = page.getByRole('checkbox', { name: 'Synthetic paid crew', exact: true });
+  await selected.check();
+  await expect(page.getByRole('checkbox', { name: /Synthetic administrator/ })).toBeDisabled();
+  await page.getByText('Remove expired subscriber roles automatically', { exact: true }).click();
+  await expect(
+    page.getByRole('checkbox', {
+      name: 'Remove expired subscriber roles automatically',
+      exact: true,
+    }),
+  ).toBeChecked();
+  await expectContainedLayout(page);
+  await page.screenshot({
+    path: info.outputPath('subscriber-role-cleanup-policy.png'),
+    fullPage: true,
+  });
+  await page.getByRole('button', { name: 'Save role cleanup', exact: true }).click();
+  await expect(
+    page.getByText('Subscriber role cleanup settings saved.', { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText('Verified subscriber role cleanup', { exact: true })).toBeVisible();
+  expect(stripe.status()).toMatchObject({
+    automation_enabled: false,
+    role_cleanup: { enabled: true, role_ids: [subscriberRole] },
+  });
+  await page.getByRole('button', { name: 'Test & sync Stripe', exact: true }).click();
+  await expect.poll(() => removals).toEqual([{ id: paidOwner, role: subscriberRole }]);
+  await expect(page.getByText('1 role removed', { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole('heading', { name: 'Subscriber roles removed', exact: true }),
+  ).toBeVisible();
+  await expectContainedLayout(page);
+  await page.screenshot({
+    path: info.outputPath('subscriber-role-cleanup-result.png'),
+    fullPage: true,
+  });
+  expect(roles).toEqual([communityRole]);
+  expect(stripe.status()).toMatchObject({
+    automation_enabled: false,
+    role_cleanup: { enabled: true, removed_roles: 1, failed_members: 0 },
+  });
+  expect(admin.servers.users).toEqual(beforeAccounts);
+  expect(admin.writes).toEqual([]);
+  expect(admin.stateWrites).toEqual([]);
+  expect(admin.createdCredentials).toEqual([]);
+  expect(store.jobs()).toEqual([]);
+  expect(store.membershipRecords()).toEqual([]);
+  expect(mutations).toEqual(['POST /api/stripe/config', 'POST /api/stripe/sync']);
+});
+
 test('Stripe connection, paginated identity review and disconnect preserve media accounts', async ({
   page,
   admin,

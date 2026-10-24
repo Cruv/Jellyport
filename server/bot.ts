@@ -772,6 +772,140 @@ export class BotManager {
     };
   }
 
+  /** Subscriber roles may grant normal channel access, but never delegate
+   * administrative/moderation privileges to the billing cleanup worker. */
+  private manageableSubscriberRole(
+    role: Role,
+    context: Awaited<ReturnType<BotManager['tagRoleContext']>>,
+  ): boolean {
+    const { guild, bot, settings, canManageRoles } = context;
+    // Explicit normal-member bits also reject newly introduced permissions
+    // until their meaning is reviewed, rather than trusting an incomplete denylist.
+    const ordinary =
+      PermissionFlagsBits.CreateInstantInvite |
+      PermissionFlagsBits.AddReactions |
+      PermissionFlagsBits.PrioritySpeaker |
+      PermissionFlagsBits.Stream |
+      PermissionFlagsBits.ViewChannel |
+      PermissionFlagsBits.SendMessages |
+      PermissionFlagsBits.SendTTSMessages |
+      PermissionFlagsBits.EmbedLinks |
+      PermissionFlagsBits.AttachFiles |
+      PermissionFlagsBits.ReadMessageHistory |
+      PermissionFlagsBits.UseExternalEmojis |
+      PermissionFlagsBits.Connect |
+      PermissionFlagsBits.Speak |
+      PermissionFlagsBits.UseVAD |
+      PermissionFlagsBits.ChangeNickname |
+      PermissionFlagsBits.UseApplicationCommands |
+      PermissionFlagsBits.RequestToSpeak |
+      PermissionFlagsBits.CreatePublicThreads |
+      PermissionFlagsBits.CreatePrivateThreads |
+      PermissionFlagsBits.UseExternalStickers |
+      PermissionFlagsBits.SendMessagesInThreads |
+      PermissionFlagsBits.UseEmbeddedActivities |
+      PermissionFlagsBits.UseSoundboard |
+      PermissionFlagsBits.UseExternalSounds |
+      PermissionFlagsBits.SendVoiceMessages |
+      PermissionFlagsBits.SendPolls |
+      PermissionFlagsBits.UseExternalApps;
+    return (
+      canManageRoles &&
+      role.guild.id === guild.id &&
+      role.id !== guild.id &&
+      ![
+        settings.discord_admin_role_id,
+        settings.discord_emby_role_id,
+        settings.discord_jellyfin_role_id,
+      ].includes(role.id) &&
+      !role.managed &&
+      (role.permissions.bitfield & ~ordinary) === 0n &&
+      !!bot.roles.highest &&
+      role.comparePositionTo(bot.roles.highest) < 0
+    );
+  }
+
+  async listSubscriberRoles(): Promise<{
+    roles: DiscordTagRole[];
+    can_manage_roles: boolean;
+  }> {
+    const context = await this.tagRoleContext();
+    return {
+      roles: [...context.roles.values()]
+        .filter((role) => snowflake(role.id) && typeof role.name === 'string')
+        .map((role) => ({
+          id: role.id,
+          name: role.name,
+          manageable: this.manageableSubscriberRole(role, context),
+        }))
+        .sort(
+          (left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
+        ),
+      can_manage_roles: context.canManageRoles,
+    };
+  }
+
+  /** Called only by the Stripe cleanup worker with a current authority guard.
+   * One individual DELETE preserves every role outside the explicit allowlist. */
+  async removeSubscriberRole(
+    userId: string,
+    roleId: string,
+    allowedRoleIds: string[],
+    guard: () => void,
+  ): Promise<void> {
+    if (
+      snowflake(userId) !== userId ||
+      !Array.isArray(allowedRoleIds) ||
+      !allowedRoleIds.length ||
+      allowedRoleIds.length > 20 ||
+      new Set(allowedRoleIds).size !== allowedRoleIds.length ||
+      allowedRoleIds.some((id) => snowflake(id) !== id) ||
+      !allowedRoleIds.includes(roleId) ||
+      typeof guard !== 'function'
+    )
+      throw new BotError('Select distinct subscriber roles for Stripe cleanup.');
+    guard();
+    const context = await this.tagRoleContext();
+    guard();
+    if (context.settings.new_subscriber_source !== 'stripe')
+      throw new BotError('Select Stripe as the subscription authority before cleaning up roles.');
+    for (const id of allowedRoleIds) {
+      const role = context.roles.get(id);
+      if (!role || !this.manageableSubscriberRole(role, context))
+        throw new BotError(
+          'Subscriber cleanup roles must be below the bot, unmanaged, distinct from administrator and media organization roles, and have no administrative permissions. The bot needs Manage Roles.',
+        );
+    }
+    const member = await this.fetchMember(userId);
+    guard();
+    if (
+      member.id !== userId ||
+      !recipientEligible(member.guild.id, context.guild.id, {
+        bot: member.user.bot,
+        roleIds: member.roles.cache.keys(),
+      })
+    )
+      throw new BotError('Subscriber cleanup requires the exact human Discord server member.');
+    this.checkActive();
+    if (this.client !== context.client || this.settings !== context.settings) throw new Stopped();
+    guard();
+    if (!member.roles.cache.has(roleId)) return;
+    try {
+      await this.wait(
+        member.roles.remove(roleId, 'Jellyport verified Stripe subscription expiry'),
+        20_000,
+      );
+      this.checkActive();
+      if (this.client !== context.client || this.settings !== context.settings) throw new Stopped();
+      guard();
+    } catch (error) {
+      if (error instanceof Stopped) throw error;
+      throw new BotError(
+        'Discord subscriber role removal could not be confirmed. Check the cleanup report and bot permissions.',
+      );
+    }
+  }
+
   async memberTagState(
     userId: string,
   ): Promise<{ id: string; username: string; roles: string[] } | null> {

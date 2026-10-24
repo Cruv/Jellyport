@@ -406,7 +406,7 @@ The most useful next steps for reducing administrator input are:
 3. **Scheduled migration catch-up:** repeat the merge for selected linked users until their move is complete, preserving newer Jellyfin activity.
 4. **Tier-specific settings and grace periods:** extend account-count tiers with saved account-role selection and configurable payment grace periods.
 
-These are future features. **Settings → Stripe** now supports restricted-key, read-only subscription synchronization and reviewed Stripe customer-to-Discord links, including explicit identity candidates from available Checkout fields and MEE6 identity hints. Optional polling refreshes every fifteen minutes. It remains review-only by default. Optional [invoice-backed billing automation](docs/stripe-automation.md) adds verified paid access decisions and future-subscriber creation after explicit activation; it also requires Invoices Read permission. See [Stripe connection and MEE6 identity announcements](docs/discord-setup.md#mee6-and-stripe-access) for the five required Read permissions and setup steps. A documented public MEE6 billing API has not been identified; API visibility of the Discord relationship still needs verification for each connected account.
+These are future features. **Settings → Stripe** now supports restricted-key, read-only subscription synchronization and reviewed Stripe customer-to-Discord links, including explicit identity candidates from available Checkout fields and MEE6 identity hints. Optional polling refreshes every fifteen minutes. It remains review-only by default. Optional [invoice-backed billing automation](docs/stripe-automation.md) adds verified paid access decisions and future-subscriber creation after explicit activation; it also requires Invoices Read permission. The independent [subscriber-role cleanup backstop](docs/stripe-automation.md#subscriber-role-cleanup-backstop) can remove selected Discord roles left behind after verified expiry while MEE6 continues assigning roles. It preserves approved exceptions and does not require media-account automation. See [Stripe connection and MEE6 identity announcements](docs/discord-setup.md#mee6-and-stripe-access) for the five required Read permissions and setup steps. A documented public MEE6 billing API has not been identified; API visibility of the Discord relationship still needs verification for each connected account.
 
 ## Data and backups
 
@@ -486,6 +486,9 @@ The browser uses authenticated session cookies. Mutating API requests require th
 | Read managed memberships or provision a member's account allowance | `GET /api/memberships`, `POST /api/memberships/provision` |
 | Save a paid or complimentary access policy without media account changes | `POST /api/memberships/access` |
 | Discover safe Discord organization roles | `GET /api/discord/tag-roles` |
+| Read Stripe status and private cleanup reports | `GET /api/stripe/status` |
+| Discover selectable subscriber roles for cleanup | `GET /api/stripe/cleanup-roles` |
+| Configure Stripe connection, billing or role cleanup with revision checks | `POST /api/stripe/config` |
 | Preview or apply Discord organization role changes | `POST /api/discord/tags/preview`, `POST /api/discord/tags/apply` |
 | Inspect or recover an incomplete creation | `GET /api/accounts/recovery`, `POST /api/accounts/recover` |
 | List or inspect jobs | `GET /api/jobs`, `GET /api/jobs/{job_id}` |

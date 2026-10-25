@@ -3,7 +3,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../server/store.js';
-import { StripeIntegration } from '../server/stripe-integration.js';
+import { StripeIntegration, type StripeMigrationDraft } from '../server/stripe-integration.js';
+import { Memberships } from '../server/memberships.js';
+import type { Job } from '../server/service.js';
 import {
   StripeClient,
   type StripePaidPeriod,
@@ -42,6 +44,19 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+const migrationDraft = (tier_id = 'galleon', customer_id = 'cus_member'): StripeMigrationDraft => ({
+  customer_ids: [customer_id],
+  price_tiers: [{ price_id: 'price_member', tier_id }],
+});
+const queuedMigration = (): Job => ({
+  id: 'migration-draft-job',
+  kind: 'migrate',
+  status: 'queued',
+  created_at: new Date(base * 1000).toISOString(),
+  updated_at: new Date(base * 1000).toISOString(),
+  progress: { processed: 0, total: 1 },
+  results: [],
+});
 async function fixture(source: 'stripe' | 'trusted_messages' = 'stripe') {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-synthetic-stripe-migration-'));
   const store = new Store(directory);
@@ -114,6 +129,22 @@ async function fixture(source: 'stripe' | 'trusted_messages' = 'stripe') {
       clock += ms;
     },
   };
+}
+async function draftFixture() {
+  const f = await fixture('trusted_messages');
+  Object.assign(f.data.subscriptions[0]!, {
+    customer_name: 'Synthetic Crew Owner',
+    customer_email: 'crew@example.invalid',
+  });
+  f.data.products.push({ id: 'prod_member', name: 'Synthetic Crew Plan', active: true });
+  await f.integration.sync();
+  await f.configure({ price_tiers: [] });
+  f.integration.unlinkCustomer({
+    customer_id: 'cus_member',
+    expected_revision: f.integration.status().revision,
+  });
+  f.snapshot.mockClear();
+  return f;
 }
 afterEach(async () => {
   for (const { directory, store, integration } of resources.splice(0)) {
@@ -394,6 +425,398 @@ describe('owner-scoped Stripe membership evidence for migration', () => {
     await vi.waitFor(() => expect(f.customerRead).toHaveBeenCalledTimes(2));
     await f.integration.stop();
     expect(await work).toMatchObject({ status: 'unavailable' });
+  });
+});
+
+describe('inline migration billing relationship drafts', () => {
+  it('discovers customers, current price mappings and untrusted identity suggestions without API calls or writes', async () => {
+    const f = await draftFixture();
+    f.data.subscriptions[0]!.identity_candidates.push({
+      discord_user_id: owner,
+      source: 'customer_metadata',
+      field: 'discord_id',
+    });
+    await f.integration.sync();
+    f.snapshot.mockClear();
+    const changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
+    const result = f.integration.searchMigrationCustomers(owner, 'CREW@EXAMPLE');
+    expect(result).toMatchObject({
+      available: true,
+      next_cursor: null,
+      customers: [
+        {
+          id: 'cus_member',
+          name: 'Synthetic Crew Owner',
+          email: 'crew@example.invalid',
+          linked_discord_id: null,
+          suggested: true,
+          prices: [{ price_id: 'price_member', name: 'Synthetic Crew Plan', tier_id: null }],
+        },
+      ],
+    });
+    expect(result.tiers).toContainEqual({ id: 'galleon', name: 'Galleon', account_limit: 3 });
+    expect(f.integration.subscriptions()[0]!.linked_discord_id).toBeNull();
+    expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
+    expect(f.customerRead).not.toHaveBeenCalled();
+    expect(f.snapshot).not.toHaveBeenCalled();
+  });
+  it('paginates the local inventory in bounded, context-specific pages', async () => {
+    const f = await draftFixture();
+    for (let index = 0; index < 54; index++)
+      f.data.subscriptions.push({
+        ...subscription(`cus_search${index}`, `search${index}`),
+        customer_name: `Synthetic ${String(index).padStart(2, '0')}`,
+      });
+    await f.integration.sync();
+    f.snapshot.mockClear();
+    const first = f.integration.searchMigrationCustomers(owner);
+    const second = f.integration.searchMigrationCustomers(owner, '', first.next_cursor!);
+    const third = f.integration.searchMigrationCustomers(owner, '', second.next_cursor!);
+    expect([first.customers.length, second.customers.length, third.customers.length]).toEqual([
+      25, 25, 5,
+    ]);
+    expect(
+      new Set([...first.customers, ...second.customers, ...third.customers].map((row) => row.id))
+        .size,
+    ).toBe(55);
+    expect(() =>
+      f.integration.searchMigrationCustomers(owner, 'changed', first.next_cursor!),
+    ).toThrow('search changed');
+    expect(() => f.integration.searchMigrationCustomers('100009', '', first.next_cursor!)).toThrow(
+      'search changed',
+    );
+    expect(f.snapshot).not.toHaveBeenCalled();
+    await f.integration.refreshMigrationCustomers();
+    expect(() => f.integration.searchMigrationCustomers(owner, '', first.next_cursor!)).toThrow(
+      'search changed',
+    );
+  });
+  it('explicitly refreshes a stale customer inventory privately without syncing or triggering automation', async () => {
+    const f = await draftFixture();
+    f.advance(25 * 60 * 60_000);
+    f.data.subscriptions.push({
+      ...subscription('cus_new', 'new'),
+      customer_name: 'New Synthetic Owner',
+    });
+    expect(f.integration.searchMigrationCustomers(owner).available).toBe(false);
+    const status = f.integration.status(),
+      changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
+    expect(await f.integration.refreshMigrationCustomers()).toMatchObject({ available: true });
+    expect(
+      f.integration.searchMigrationCustomers(owner, 'New Synthetic').customers.map((row) => row.id),
+    ).toEqual(['cus_new']);
+    expect(f.integration.status().last_sync).toBe(status.last_sync);
+    expect(f.integration.subscriptions().some((row) => row.customer_id === 'cus_new')).toBe(false);
+    expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
+    expect(f.onEntitlement).not.toHaveBeenCalled();
+    expect(f.store.membershipRecords()).toEqual([]);
+    expect(f.snapshot).toHaveBeenCalledTimes(1);
+  });
+  it('shares explicit inventory reads and lets one caller cancel without affecting another', async () => {
+    const f = await draftFixture(),
+      blocked = deferred<StripeSnapshot>();
+    f.snapshot.mockImplementationOnce(async () => blocked.promise);
+    const controller = new AbortController();
+    const canceled = f.integration.refreshMigrationCustomers(controller.signal);
+    const rejection = expect(canceled).rejects.toThrow('canceled');
+    const other = f.integration.refreshMigrationCustomers();
+    controller.abort();
+    await rejection;
+    blocked.resolve(structuredClone(f.data));
+    expect(await other).toMatchObject({ available: true });
+    expect(f.snapshot).toHaveBeenCalledTimes(1);
+  });
+  it('verifies draft customer and tier choices without persisting either relationship', async () => {
+    const f = await draftFixture();
+    const before = f.integration.status(),
+      changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
+    const review = await f.integration.reviewMembership(owner, undefined, migrationDraft());
+    expect(review).toMatchObject({
+      status: 'verified',
+      account_limit: 3,
+      changes: {
+        customer_links: [
+          {
+            customer_id: 'cus_member',
+            name: 'Synthetic Crew Owner',
+            email: 'crew@example.invalid',
+          },
+        ],
+        price_mappings: [
+          {
+            price_id: 'price_member',
+            price_name: 'Synthetic Crew Plan',
+            tier_id: 'galleon',
+            tier_name: 'Galleon',
+          },
+        ],
+      },
+    });
+    expect(review.proof!.draft).toEqual(migrationDraft());
+    expect(() => f.integration.assertMigrationMembership(review.proof!)).not.toThrow();
+    expect(f.integration.status()).toEqual(before);
+    expect(f.integration.subscriptions()[0]!.linked_discord_id).toBeNull();
+    expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
+    expect(f.store.jobs()).toEqual([]);
+    expect(f.store.membershipRecords()).toEqual([]);
+    expect(f.onEntitlement).not.toHaveBeenCalled();
+    expect(f.snapshot).not.toHaveBeenCalled();
+    expect(JSON.stringify(review.proof).length).toBeLessThan(16 * 1024);
+  });
+  it('binds a proof and shared cache to the exact draft rather than only the owner', async () => {
+    const f = await draftFixture();
+    const large = await f.integration.reviewMembership(owner, undefined, migrationDraft());
+    const small = await f.integration.reviewMembership(
+      owner,
+      undefined,
+      migrationDraft('brigantine'),
+    );
+    expect([large.account_limit, small.account_limit]).toEqual([3, 2]);
+    expect(large.proof!.draft_hash).not.toBe(small.proof!.draft_hash);
+    expect(() =>
+      f.integration.assertMigrationMembership({ ...large.proof!, draft: migrationDraft('sloop') }),
+    ).toThrow('changed or expired');
+    expect((await f.integration.reviewMembership(owner)).status).toBe('unlinked');
+    expect(
+      (await f.integration.reviewMembership(owner, undefined, migrationDraft())).proof!.token,
+    ).toBe(large.proof!.token);
+    expect(f.customerRead).toHaveBeenCalledTimes(2);
+  });
+  it.each(['foreign-owner', 'existing-price', 'unknown-customer', 'unknown-price', 'unknown-tier'])(
+    'rejects a conflicting or unverified %s draft',
+    async (kind) => {
+      const f = await draftFixture(),
+        draft = migrationDraft();
+      if (kind === 'foreign-owner') await f.link('cus_member', '100009');
+      if (kind === 'existing-price') {
+        await f.configure({ price_tiers: [{ price_id: 'price_member', tier_id: 'sloop' }] });
+      }
+      if (kind === 'unknown-customer') draft.customer_ids = ['cus_unknown'];
+      if (kind === 'unknown-price') draft.price_tiers[0]!.price_id = 'price_unknown';
+      if (kind === 'unknown-tier') draft.price_tiers[0]!.tier_id = 'missing';
+      await expect(f.integration.reviewMembership(owner, undefined, draft)).rejects.toThrow();
+      expect(f.customerRead).not.toHaveBeenCalled();
+      expect(f.store.membershipRecords()).toEqual([]);
+    },
+  );
+  it('writes the reviewed billing links, mappings, membership and durable queue in one transaction', async () => {
+    const f = await draftFixture();
+    const proof = (await f.integration.reviewMembership(owner, undefined, migrationDraft())).proof!;
+    const stage = f.integration.prepareMigrationCommit(
+      [proof],
+      new Map([[owner, 'verified.owner']]),
+    );
+    const memberships = new Memberships(f.store),
+      before = f.integration.status();
+    const request = {
+      source_user_id: 'source-synthetic',
+      discord_user_id: owner,
+      membership_slot: 1,
+    };
+    f.store.saveQueuedJob(queuedMigration(), [request], f.store.settings(), () => {
+      stage.persistInTransaction();
+      memberships.saveInTransaction(
+        {
+          discord_user_id: owner,
+          base_username: 'verified.owner',
+          tier_id: 'galleon',
+          account_limit: 3,
+          active: true,
+          provision_jellyfin: false,
+        },
+        f.store.settings(),
+      );
+      expect(f.integration.status().revision).toBe(before.revision);
+    });
+    stage.publishAfterCommit();
+    expect(f.integration.status()).toMatchObject({
+      linked_customer_count: 1,
+      price_tiers: [{ price_id: 'price_member', tier_id: 'galleon' }],
+    });
+    expect(f.integration.subscriptions()[0]!.linked_discord_id).toBe(owner);
+    expect(f.integration.status().last_sync).toBe(before.last_sync);
+    expect(memberships.get(owner, f.store.settings())).toMatchObject({
+      account_limit: 3,
+      provision_jellyfin: false,
+    });
+    expect(f.store.queuedJobs()[0]!.requests[0]).toMatchObject(request);
+    const restored = new StripeIntegration(f.store);
+    expect(restored.status()).toMatchObject({
+      linked_customer_count: 1,
+      price_tiers: [{ price_id: 'price_member', tier_id: 'galleon' }],
+    });
+    await restored.stop();
+    expect(f.onEntitlement).not.toHaveBeenCalled();
+  });
+  it('rolls all local decisions back after queue persistence fails and leaves memory unchanged', async () => {
+    const f = await draftFixture();
+    const proof = (await f.integration.reviewMembership(owner, undefined, migrationDraft())).proof!;
+    const stage = f.integration.prepareMigrationCommit(
+      [proof],
+      new Map([[owner, 'verified.owner']]),
+    );
+    const memberships = new Memberships(f.store),
+      before = f.integration.status();
+    const failure = vi.spyOn(f.store, 'saveJob').mockImplementationOnce(() => {
+      throw new Error('Synthetic queue persistence failure');
+    });
+    expect(() =>
+      f.store.saveQueuedJob(queuedMigration(), [], f.store.settings(), () => {
+        stage.persistInTransaction();
+        memberships.saveInTransaction(
+          {
+            discord_user_id: owner,
+            base_username: 'verified.owner',
+            tier_id: 'galleon',
+            account_limit: 3,
+          },
+          f.store.settings(),
+        );
+      }),
+    ).toThrow('Synthetic queue persistence failure');
+    failure.mockRestore();
+    expect(f.integration.status()).toEqual(before);
+    expect(f.store.jobs()).toEqual([]);
+    expect(f.store.queuedJobs()).toEqual([]);
+    expect(memberships.get(owner, f.store.settings())).toBeNull();
+    const restored = new StripeIntegration(f.store);
+    expect(restored.status()).toMatchObject({ linked_customer_count: 0, price_tiers: [] });
+    await restored.stop();
+  });
+  it.each(['customer', 'price'])(
+    'rejects conflicting %s assignments across owners before any writes',
+    async (kind) => {
+      const f = await draftFixture();
+      const first = (await f.integration.reviewMembership(owner, undefined, migrationDraft()))
+        .proof!;
+      let otherDraft = migrationDraft();
+      if (kind === 'price') {
+        f.data.subscriptions.push(subscription('cus_other', 'other'));
+        f.periods.set('sub_other', period('cus_other', 'other'));
+        await f.integration.refreshMigrationCustomers();
+        otherDraft = migrationDraft('brigantine', 'cus_other');
+      }
+      const second = (await f.integration.reviewMembership('100009', undefined, otherDraft)).proof!;
+      const changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
+      expect(() =>
+        f.integration.prepareMigrationCommit(
+          [first, second],
+          new Map([
+            [owner, 'first.owner'],
+            ['100009', 'other.owner'],
+          ]),
+        ),
+      ).toThrow(kind === 'price' ? 'different tiers' : 'different Discord owners');
+      expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
+      expect(f.integration.status().linked_customer_count).toBe(0);
+    },
+  );
+  it('commits compatible owner drafts together with one shared price mapping and revision', async () => {
+    const f = await draftFixture();
+    f.data.subscriptions.push(subscription('cus_other', 'other'));
+    f.periods.set('sub_other', period('cus_other', 'other'));
+    await f.integration.refreshMigrationCustomers();
+    const first = (await f.integration.reviewMembership(owner, undefined, migrationDraft())).proof!;
+    const second = (
+      await f.integration.reviewMembership(
+        '100009',
+        undefined,
+        migrationDraft('galleon', 'cus_other'),
+      )
+    ).proof!;
+    const before = f.integration.status();
+    const stage = f.integration.prepareMigrationCommit(
+      [first, second],
+      new Map([
+        [owner, 'first.owner'],
+        ['100009', 'other.owner'],
+      ]),
+    );
+    f.store.saveQueuedJob(queuedMigration(), [], f.store.settings(), stage.persistInTransaction);
+    stage.publishAfterCommit();
+    expect(f.integration.status().revision).not.toBe(before.revision);
+    expect(f.integration.status()).toMatchObject({
+      linked_customer_count: 2,
+      price_tiers: [{ price_id: 'price_member', tier_id: 'galleon' }],
+    });
+    expect(
+      f.integration
+        .subscriptions()
+        .map((row) => [row.customer_id, row.linked_discord_id])
+        .sort(),
+    ).toEqual([
+      ['cus_member', owner],
+      ['cus_other', '100009'],
+    ]);
+    expect(f.onEntitlement).not.toHaveBeenCalled();
+  });
+  it('merges only accepted new-customer observations into the durable inventory without claiming global freshness', async () => {
+    const f = await draftFixture(),
+      lastSync = f.integration.status().last_sync;
+    const originalRows = f.integration.subscriptions();
+    f.data.subscriptions.push({
+      ...subscription('cus_new', 'new'),
+      customer_name: 'New Synthetic Owner',
+    });
+    f.data.subscriptions.push(subscription('cus_unselected', 'unselected'));
+    f.periods.set('sub_new', period('cus_new', 'new'));
+    await f.integration.refreshMigrationCustomers();
+    const proof = (
+      await f.integration.reviewMembership(owner, undefined, migrationDraft('galleon', 'cus_new'))
+    ).proof!;
+    const stage = f.integration.prepareMigrationCommit(
+      [proof],
+      new Map([[owner, 'verified.owner']]),
+    );
+    f.store.saveQueuedJob(queuedMigration(), [], f.store.settings(), stage.persistInTransaction);
+    stage.publishAfterCommit();
+    expect(
+      f.integration
+        .subscriptions()
+        .map((row) => row.customer_id)
+        .sort(),
+    ).toEqual(['cus_member', 'cus_new']);
+    expect(f.integration.subscriptions().find((row) => row.customer_id === 'cus_member')).toEqual({
+      ...originalRows[0],
+      tier_id: 'galleon',
+    });
+    expect(f.integration.status().last_sync).toBe(lastSync);
+    expect(f.onEntitlement).not.toHaveBeenCalled();
+  });
+  it('rechecks evidence at persistence and requires an active queue transaction', async () => {
+    const f = await draftFixture();
+    const proof = (await f.integration.reviewMembership(owner, undefined, migrationDraft())).proof!;
+    const stage = f.integration.prepareMigrationCommit(
+      [proof],
+      new Map([[owner, 'verified.owner']]),
+    );
+    expect(stage.persistInTransaction).toThrow('accepted migration transaction');
+    await f.configure({ price_tiers: [] });
+    expect(() =>
+      f.store.saveQueuedJob(queuedMigration(), [], f.store.settings(), stage.persistInTransaction),
+    ).toThrow('billing configuration changed');
+    expect(f.store.jobs()).toEqual([]);
+    expect(f.integration.status().linked_customer_count).toBe(0);
+  });
+  it('never invokes enabled automation during explicit customer inventory refresh', async () => {
+    const f = await fixture();
+    await f.configure({ automation_enabled: true, sync_enabled: true });
+    const changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
+    expect(await f.integration.refreshMigrationCustomers()).toMatchObject({ available: true });
+    expect(f.onEntitlement).not.toHaveBeenCalled();
+    expect(f.store.membershipRecords()).toEqual([]);
+    expect(f.store.subscriptions()).toEqual([]);
+    expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
+  });
+  it('times out a private inventory refresh and preserves the last known local observations', async () => {
+    const f = await draftFixture();
+    f.snapshot.mockImplementationOnce(async () => new Promise(() => {}));
+    vi.useFakeTimers();
+    const pending = f.integration.refreshMigrationCustomers();
+    await vi.advanceTimersByTimeAsync(20_001);
+    expect(await pending).toMatchObject({ available: false });
+    expect(f.integration.searchMigrationCustomers(owner).customers[0]!.id).toBe('cus_member');
+    expect(f.onEntitlement).not.toHaveBeenCalled();
   });
 });
 

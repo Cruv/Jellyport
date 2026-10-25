@@ -1,3 +1,4 @@
+import { completeMigrationWizard } from './fixtures';
 import type { Locator, Page } from '@playwright/test';
 import {
   test,
@@ -208,6 +209,7 @@ test('real backup imports, daily execution and restart preserve original freshne
   await page.getByRole('checkbox', { name: 'Select synthetic_member', exact: true }).check();
   await page.getByRole('button', { name: 'Preview migration (1)', exact: true }).click();
   const review = page.getByRole('dialog', { name: 'Review your migration', exact: true });
+  await completeMigrationWizard(review);
   await expect(review).toContainText('Merge into existing account');
   expect(imports.writes).toEqual([]);
   const accepted = page.waitForResponse(

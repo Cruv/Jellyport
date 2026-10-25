@@ -156,7 +156,7 @@ For roles saved before 0.6.1, copy settings from the source account again and re
 
 ## Migrate users
 
-Select 1–100 distinct Emby users, review the preview, and start the migration. Usernames match exactly by default. Use **User mappings** for simplified usernames, different existing Jellyfin usernames, or other identity exceptions; case-only conflicts are never guessed.
+Select 1–100 distinct Emby users, then complete **Owners → Billing → Accounts → Review** in one migration wizard. Assign one Discord owner to several accounts, confirm a suggested Stripe customer or explicitly approve complimentary access for a new owner, map a missing Stripe price to a configured tier, choose an existing Jellyfin destination for an unmapped source, and review the account slots without leaving the wizard. Existing confirmed relationships and access policies are reused. All relationship changes stay as drafts until **Start migration**, which saves them with the queued work in one transaction; Back retains the draft and Cancel discards it. Usernames match exactly by default. Existing approved mappings remain protected; use **User mappings** for explicit corrections to those decisions or custom new-account names.
 
 Migration transfers **played / unplayed status only**. A confidently matched item played in Emby becomes played in Jellyfin. An unplayed source item never clears an existing Jellyfin played flag; untouched items on a fresh account remain unplayed. Resume positions, play counts, playback dates, favorites, ratings/likes, playlists, profile images and Emby preferences are not migrated. Mid-episode and mid-movie progress is unsupported. New accounts still receive normal Jellyfin role/template defaults and generated passwords.
 

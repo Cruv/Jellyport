@@ -1,3 +1,4 @@
+import { completeMigrationWizard } from './fixtures';
 import { test, expect, navigate, expectContainedLayout, isCompactLayout } from './fixtures';
 import type { DirectoryUser, Users } from '../frontend/src/types';
 
@@ -417,12 +418,14 @@ test('migration review defers history and closing it never accepts the migration
   await page.getByRole('checkbox', { name: 'Select river', exact: true }).check();
   await page.getByRole('button', { name: 'Preview migration (1)', exact: true }).click();
   const review = page.getByRole('dialog', { name: 'Review your migration' });
+  await completeMigrationWizard(review);
   await expect(review).toBeVisible();
+  await review.getByText('History & matching details for river', { exact: true }).click();
   await expect(review.getByText('History details deferred', { exact: true })).toBeVisible();
   await expect(review).toContainText(
     'existing Jellyfin password and account permissions will be preserved',
   );
-  await review.getByRole('button', { name: 'Back to users', exact: true }).click();
+  await review.getByRole('button', { name: 'Cancel', exact: true }).click();
   await expect(review).toHaveCount(0);
   await expect(page.getByRole('checkbox', { name: 'Select river', exact: true })).toBeChecked();
   expect(mutations).toContain('POST /api/migrations/preview');

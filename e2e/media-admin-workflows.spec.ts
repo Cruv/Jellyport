@@ -1,3 +1,4 @@
+import { completeMigrationWizard } from './fixtures';
 import type { Page, Response } from '@playwright/test';
 import {
   test,
@@ -118,11 +119,12 @@ test('saving an exact destination mapping is reflected in migration review witho
   await page.getByRole('checkbox', { name: 'Select alex', exact: true }).check();
   await page.getByRole('button', { name: 'Preview migration (1)', exact: true }).click();
   const review = page.getByRole('dialog', { name: 'Review your migration', exact: true });
+  await completeMigrationWizard(review);
   await expect(review).toContainText('Mapped Emby account: alex → Jellyfin: river');
   await expect(review).toContainText('Merge into existing account');
   await expect(review).toContainText('History details deferred');
   await page.screenshot({ path: test.info().outputPath('mapped-review.png'), fullPage: true });
-  await review.getByRole('button', { name: 'Back to users', exact: true }).click();
+  await review.getByRole('button', { name: 'Cancel', exact: true }).click();
   expect(admin.servers.users.jellyfin).toEqual(before);
   expect(admin.writes).toEqual([]);
   expect(mutations).not.toContain('POST /api/migrations');

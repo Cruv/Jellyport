@@ -813,8 +813,12 @@ export default function App() {
     const recipients: Record<string, string> = {};
     const membershipSlots: Record<string, number> = {};
     const membershipReviewTokens: Record<string, string> = {};
+    const accountReviewTokens: Record<string, string> = {};
     const mappingRevisions: Record<string, string | null> = {};
     dialog.preview.users.forEach((user) => {
+      const accountToken = String(values.get(`account-review-${user.source_user_id}`) || '').trim();
+      if (accountToken && !user.history_only)
+        accountReviewTokens[user.source_user_id] = accountToken;
       const value = user.history_only
         ? ''
         : String(
@@ -846,6 +850,9 @@ export default function App() {
           ...(Object.keys(membershipSlots).length ? { membership_slots: membershipSlots } : {}),
           ...(Object.keys(membershipReviewTokens).length
             ? { membership_review_tokens: membershipReviewTokens }
+            : {}),
+          ...(Object.keys(accountReviewTokens).length
+            ? { account_review_tokens: accountReviewTokens }
             : {}),
           ...(Object.keys(mappingRevisions).length ? { mapping_revisions: mappingRevisions } : {}),
         },
@@ -1356,6 +1363,7 @@ export default function App() {
           apply={apply}
           busy={busy}
           notify={notify}
+          templateUserId={settings?.template_user_id}
         />
       )}
     </WorkspaceNoticeProvider>
@@ -1556,6 +1564,7 @@ function DialogContent({
   apply,
   busy,
   notify,
+  templateUserId,
 }: {
   api: Api;
   dialog: Dialog;
@@ -1570,6 +1579,7 @@ function DialogContent({
   apply: (event: SubscriptionEvent) => void;
   busy: Set<string>;
   notify: (text: string, error?: boolean) => void;
+  templateUserId?: string;
 }) {
   if (dialog.kind === 'cleanup')
     return <HistoryCleanupDialog review={dialog} close={close} submit={cleanupHistory} />;
@@ -1583,6 +1593,7 @@ function DialogContent({
         startMigration={startMigration}
         refreshPreview={refreshPreview}
         busy={busy}
+        templateUserId={templateUserId}
       />
     );
   if (dialog.kind === 'job') {

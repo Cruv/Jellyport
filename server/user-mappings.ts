@@ -379,6 +379,45 @@ export class UserMappings {
       throw error;
     }
   }
+  /** Caller owns the queue-admission transaction and exact source/recipient
+   * review. Adopt only an ownerless mapping; keep both media identities intact. */
+  confirmMigrationOwner(
+    id: string,
+    expectedRevision: string,
+    discordUserId: string,
+    discordUsername: string,
+    slot: number,
+    settings: Settings,
+  ): UserMapping {
+    const mapping = this.get(id, settings);
+    if (!mapping || mapping.revision !== expectedRevision || mapping.discord_user_id)
+      throw new ServiceError(
+        'The mapped owner changed. Prepare a new review before confirming its owner.',
+      );
+    const updated: UserMapping = {
+      ...mapping,
+      discord_user_id: discordUserId,
+      discord_username: discordUsername,
+      membership_slot: slot,
+      revision: randomUUID(),
+    };
+    validateInput(updated);
+    if (
+      this.list(settings).some(
+        (other) =>
+          other.id !== id &&
+          other.discord_user_id === discordUserId &&
+          (other.membership_slot ?? 1) === slot,
+      )
+    )
+      throw new ServiceError('This Discord user is already mapped to another Emby user.');
+    this.checkLinks(updated, settings);
+    this.store.db
+      .prepare('UPDATE user_mappings SET encrypted=? WHERE id=?')
+      .run(this.store.encrypt(updated), id);
+    this.invalidateCache();
+    return structuredClone(updated);
+  }
   /** Pin a newly created account so later name reuse cannot redirect a mapping. */
   bindTarget(
     id: string,

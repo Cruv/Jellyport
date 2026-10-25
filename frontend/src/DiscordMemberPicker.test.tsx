@@ -31,6 +31,27 @@ afterEach(() => {
 });
 
 describe('Discord member picker', () => {
+  it('can defer role-based membership hints to a separate authoritative membership review', () => {
+    const props = {
+      api: vi.fn() as Api,
+      value: { ...alex, membership_active: null },
+      onChange: vi.fn(),
+    };
+    const { rerender } = render(<DiscordMemberPicker {...props} />);
+    expect(screen.getByText('Membership checked when submitted.')).toBeTruthy();
+    rerender(<DiscordMemberPicker {...props} showMembershipStatus={false} />);
+    expect(screen.queryByText('Membership checked when submitted.')).toBeNull();
+    expect(screen.getByText('@alex.real')).toBeTruthy();
+    rerender(
+      <DiscordMemberPicker
+        {...props}
+        value={{ ...alex, membership_active: false }}
+        showMembershipStatus={false}
+      />,
+    );
+    expect(screen.queryByText('Membership is not currently active.')).toBeNull();
+  });
+
   it('waits for interaction, recommends an exact username, and fills the stable ID after selection', async () => {
     const api = vi.fn(async () => searchResult()) as Api;
     const changed = vi.fn();

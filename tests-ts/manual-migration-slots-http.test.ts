@@ -330,3 +330,146 @@ describe('reviewed manual migration account slots', () => {
     },
   );
 });
+
+describe('session-owned migration membership review', () => {
+  async function linkedFixture() {
+    const f = await fixture();
+    f.store.db.exec('DELETE FROM memberships');
+    f.store.saveSettings({ ...f.store.settings(), new_subscriber_source: 'stripe' });
+    const lookup = vi.fn(async () => ({
+      status: 'verified' as const,
+      tier_id: 'galleon',
+      tier_name: 'Galleon',
+      account_limit: 3,
+      message: 'Synthetic verified paid subscription',
+      proof: {
+        token: 'private-stripe-evidence',
+        owner_id: owner,
+        tier_id: 'galleon',
+        tier_name: 'Galleon',
+        account_limit: 3,
+        observed_at: new Date().toISOString(),
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        paid_through: '2099-01-01T00:00:00.000Z',
+        context: 'synthetic-context',
+      },
+    }));
+    f.service.reviewStripeMigrationMembership = lookup;
+    f.service.verifyStripeMigrationMembership = vi.fn();
+    const review = await f.review();
+    const resolve = () =>
+      f.app.inject({
+        method: 'POST',
+        url: `/api/migrations/preview/${review.id}/membership`,
+        headers: f.headers,
+        payload: { discord_user_id: owner },
+      });
+    return { ...f, lookup, review, resolve };
+  }
+  it('keeps proof private and enrolls the reviewed owner when migration is accepted', async () => {
+    const f = await linkedFixture();
+    const membership = await f.resolve();
+    expect(membership.statusCode).toBe(200);
+    expect(membership.headers['cache-control']).toBe('no-store');
+    const body = membership.json();
+    expect(body).toMatchObject({
+      discord_user_id: owner,
+      status: 'active',
+      source: 'stripe',
+      tier_name: 'Galleon',
+      account_limit: 3,
+      allowed_slots: [1, 2, 3],
+      review_token: expect.any(String),
+    });
+    expect(JSON.stringify(body)).not.toMatch(
+      /private-stripe-evidence|stripe_proof|previous_revision|settings_hash/,
+    );
+    expect(
+      JSON.stringify(
+        (
+          await f.app.inject({ url: `/api/migrations/preview/${f.review.id}`, headers: f.headers })
+        ).json(),
+      ),
+    ).not.toContain(body.review_token);
+    expect(f.service.memberships.get(owner, f.store.settings())).toBeNull();
+    expect(f.store.jobs()).toEqual([]);
+    const accepted = await f.app.inject({
+      method: 'POST',
+      url: '/api/migrations',
+      headers: f.headers,
+      payload: {
+        ...f.payload(f.review.id),
+        membership_review_tokens: { [owner]: body.review_token },
+      },
+    });
+    expect(accepted.statusCode).toBe(202);
+    await f.service.jobTasks.get(accepted.json().id);
+    expect(f.service.memberships.get(owner, f.store.settings())).toMatchObject({
+      tier_id: 'galleon',
+      account_limit: 3,
+      provision_jellyfin: false,
+    });
+    expect(f.lookup).toHaveBeenCalledTimes(2);
+  });
+  it('rejects foreign sessions, forged tokens and changed owner IDs', async () => {
+    const f = await linkedFixture();
+    const body = (await f.resolve()).json();
+    const other = await f.login();
+    expect(
+      (
+        await f.app.inject({
+          method: 'POST',
+          url: `/api/migrations/preview/${f.review.id}/membership`,
+          headers: other,
+          payload: { discord_user_id: owner },
+        })
+      ).statusCode,
+    ).toBe(404);
+    for (const tokens of [
+      { [owner]: '00000000-0000-4000-8000-000000000000' },
+      { '223456789012345678': body.review_token },
+    ])
+      expect(
+        (
+          await f.app.inject({
+            method: 'POST',
+            url: '/api/migrations',
+            headers: f.headers,
+            payload: { ...f.payload(f.review.id), membership_review_tokens: tokens },
+          })
+        ).statusCode,
+      ).toBe(400);
+    expect(f.store.jobs()).toEqual([]);
+    expect(f.service.memberships.get(owner, f.store.settings())).toBeNull();
+  });
+  it.each(['cancel', 'logout'] as const)(
+    'discards a membership lookup after %s',
+    async (action) => {
+      const f = await linkedFixture();
+      let release!: () => void;
+      const wait = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const response = await f.lookup();
+      f.lookup.mockClear();
+      f.lookup.mockImplementation(async () => {
+        await wait;
+        return response;
+      });
+      const pending = f.resolve().then((result) => result);
+      await vi.waitFor(() => expect(f.lookup).toHaveBeenCalled());
+      if (action === 'cancel')
+        await f.app.inject({
+          method: 'DELETE',
+          url: `/api/migrations/preview/${f.review.id}`,
+          headers: f.headers,
+        });
+      else await f.app.inject({ method: 'POST', url: '/api/logout', headers: f.headers });
+      release();
+      expect((await pending).statusCode).toBe(action === 'logout' ? 401 : 404);
+      expect(f.store.jobs()).toEqual([]);
+      expect(f.service.memberships.get(owner, f.store.settings())).toBeNull();
+      expect(f.service.bot!.sendCredentials).not.toHaveBeenCalled();
+    },
+  );
+});

@@ -812,6 +812,7 @@ export default function App() {
     const values = new FormData(event.currentTarget);
     const recipients: Record<string, string> = {};
     const membershipSlots: Record<string, number> = {};
+    const membershipReviewTokens: Record<string, string> = {};
     const mappingRevisions: Record<string, string | null> = {};
     dialog.preview.users.forEach((user) => {
       const value = user.history_only
@@ -821,6 +822,8 @@ export default function App() {
           ).trim();
       if (value) {
         recipients[user.source_user_id] = value;
+        const token = String(values.get(`membership-review-${value}`) || '').trim();
+        if (token) membershipReviewTokens[value] = token;
         const locked = !!user.discord_user_id && (!!user.mapping_id || !!user.owner_basis);
         const slot = Number(values.get(`slot-${user.source_user_id}`));
         if (!locked && [1, 2, 3].includes(slot)) membershipSlots[user.source_user_id] = slot;
@@ -841,6 +844,9 @@ export default function App() {
             : {}),
           discord_recipients: recipients,
           ...(Object.keys(membershipSlots).length ? { membership_slots: membershipSlots } : {}),
+          ...(Object.keys(membershipReviewTokens).length
+            ? { membership_review_tokens: membershipReviewTokens }
+            : {}),
           ...(Object.keys(mappingRevisions).length ? { mapping_revisions: mappingRevisions } : {}),
         },
       });

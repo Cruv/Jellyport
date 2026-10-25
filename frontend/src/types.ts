@@ -85,6 +85,17 @@ export interface Membership {
   active?: boolean;
   links: MembershipLink[];
 }
+export interface MigrationOwnerMembership {
+  review_token: string;
+  discord_user_id: string;
+  status: 'active' | 'complimentary' | 'unlinked' | 'inactive' | 'unavailable' | 'held';
+  source: 'stripe' | 'saved' | 'legacy';
+  tier_id: string | null;
+  tier_name: string | null;
+  account_limit: number | null;
+  allowed_slots: number[];
+  message: string;
+}
 export type RoleSection = 'policy' | 'configuration' | 'display';
 export interface RoleParameters {
   policy: Record<string, unknown>;

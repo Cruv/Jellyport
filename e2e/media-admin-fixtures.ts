@@ -28,6 +28,7 @@ export interface AdminFixture {
   createdCredentials: Array<{ username: string; password: string }>;
   loseCreateResponse: (name: string) => void;
   loseRenameReadback: (name: string) => void;
+  activateStripeSubscription: () => void;
 }
 
 // Writable end-to-end fixtures exercise the real HTTP handlers, Store and workers.
@@ -67,6 +68,7 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
       let loseName: string | null = null;
       let loseRenameName: string | null = null;
       let lostRenameReadbackId: string | null = null;
+      let stripeMigrationActive = false;
       const identity = {
         serverId: 'demo-jellyfin',
         userId: 'synthetic-admin',
@@ -91,56 +93,66 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
         stripeClientFactory: (key) => {
           const mode = key.startsWith('rk_live_') ? ('live' as const) : ('test' as const);
           const now = Math.floor(Date.now() / 1000);
+          const snapshot = async () => ({
+            mode,
+            completed_at: new Date().toISOString(),
+            products: [{ id: 'prod_Crew', name: 'Synthetic crew plan', active: true }],
+            subscriptions: Array.from({ length: mode === 'live' ? 1 : 24 }, (_, index) => ({
+              id: `sub_Crew${index}`,
+              customer_id: `cus_Crew${index}`,
+              customer_name: index === 0 ? 'Synthetic crew owner' : `Synthetic member ${index}`,
+              customer_email: `crew${index}@example.test`,
+              status: mode === 'live' && !stripeMigrationActive ? 'canceled' : 'active',
+              ...(mode === 'live' && !stripeMigrationActive
+                ? { created: now - 90 * 86400, ended_at: now - 30 * 86400 }
+                : mode === 'live' && stripeMigrationActive
+                  ? { created: now - 90 * 86400 }
+                  : {}),
+              collection_method: 'charge_automatically' as const,
+              pause_collection: mode === 'test' && index === 0,
+              cancel_at_period_end: false,
+              items: [
+                {
+                  id: `si_Crew${index}`,
+                  price_id: 'price_Crew',
+                  product_id: 'prod_Crew',
+                  quantity: 1,
+                  ...(mode === 'live' && stripeMigrationActive
+                    ? { current_period_end: now + 29 * 86400 }
+                    : {}),
+                },
+              ],
+              identity_candidates:
+                index === 0
+                  ? [
+                      {
+                        discord_user_id: paidOwner,
+                        source: 'subscription_metadata' as const,
+                        field: 'discord_user_id',
+                      },
+                    ]
+                  : [],
+            })),
+          });
           return {
             mode,
-            snapshot: async () => ({
-              mode,
-              completed_at: new Date().toISOString(),
-              products: [{ id: 'prod_Crew', name: 'Synthetic crew plan', active: true }],
-              subscriptions: Array.from({ length: mode === 'live' ? 1 : 24 }, (_, index) => ({
-                id: `sub_Crew${index}`,
-                customer_id: `cus_Crew${index}`,
-                customer_name: index === 0 ? 'Synthetic crew owner' : `Synthetic member ${index}`,
-                customer_email: `crew${index}@example.test`,
-                status: mode === 'live' ? 'canceled' : 'active',
-                ...(mode === 'live'
-                  ? { created: now - 90 * 86400, ended_at: now - 30 * 86400 }
-                  : {}),
-                collection_method: 'charge_automatically' as const,
-                pause_collection: mode === 'test' && index === 0,
-                cancel_at_period_end: false,
-                items: [
-                  {
-                    id: `si_Crew${index}`,
-                    price_id: 'price_Crew',
-                    product_id: 'prod_Crew',
-                    quantity: 1,
-                  },
-                ],
-                identity_candidates:
-                  index === 0
-                    ? [
-                        {
-                          discord_user_id: paidOwner,
-                          source: 'subscription_metadata' as const,
-                          field: 'discord_user_id',
-                        },
-                      ]
-                    : [],
-              })),
-            }),
+            snapshot,
+            customerSubscriptions: async (customerId: string) =>
+              (await snapshot()).subscriptions.filter((row) => row.customer_id === customerId),
             checkoutIdentityCandidates: async () => [],
             paidPeriod: async (subscriptionId) =>
               mode === 'live'
                 ? {
-                    invoice_id: 'in_SyntheticHistorical',
+                    invoice_id: stripeMigrationActive
+                      ? 'in_SyntheticCurrent'
+                      : 'in_SyntheticHistorical',
                     customer_id: 'cus_Crew0',
                     subscription_id: subscriptionId,
-                    paid_at: now - 29 * 86400,
-                    created: now - 60 * 86400,
+                    paid_at: stripeMigrationActive ? now - 86400 : now - 29 * 86400,
+                    created: stripeMigrationActive ? now - 86400 : now - 60 * 86400,
                     price_id: 'price_Crew',
-                    start: now - 60 * 86400,
-                    end: now - 30 * 86400,
+                    start: stripeMigrationActive ? now - 86400 : now - 60 * 86400,
+                    end: stripeMigrationActive ? now + 29 * 86400 : now - 30 * 86400,
                   }
                 : null,
           };
@@ -272,6 +284,9 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
         createdCredentials,
         loseCreateResponse: (name) => (loseName = name),
         loseRenameReadback: (name) => (loseRenameName = name),
+        activateStripeSubscription: () => {
+          stripeMigrationActive = true;
+        },
       });
     } finally {
       try {

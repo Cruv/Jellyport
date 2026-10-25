@@ -237,3 +237,42 @@ it('rejects oversized preview results without retaining or returning their data'
   expect(tasks.get('owner', 'config', task.id)?.preview).toBeUndefined();
   tasks.close();
 });
+
+it('keeps bounded membership evidence private, session-owned and limited to the retained review lifetime', async () => {
+  vi.useFakeTimers();
+  const tasks = new PreviewTasks(async () => ({ users: ['synthetic'] }), { retentionMs: 1000 });
+  try {
+    const preview = tasks.start('admin-session', 'config', ['source']);
+    await flush();
+    const evidence = { tier: 'synthetic', private_proof: 'fictional-server-only-evidence' };
+    expect(tasks.retainAttachment('other-session', 'config', preview.id, 'token', evidence)).toBe(
+      false,
+    );
+    expect(tasks.retainAttachment('admin-session', 'config', preview.id, 'token', evidence)).toBe(
+      true,
+    );
+    expect(JSON.stringify(tasks.get('admin-session', 'config', preview.id))).not.toContain(
+      evidence.private_proof,
+    );
+    const copy = tasks.attachment<typeof evidence>('admin-session', 'config', preview.id, 'token')!;
+    copy.tier = 'edited';
+    expect(
+      tasks.attachment<typeof evidence>('admin-session', 'config', preview.id, 'token'),
+    ).toEqual(evidence);
+    expect(tasks.attachment('other-session', 'config', preview.id, 'token')).toBeUndefined();
+    expect(() =>
+      tasks.retainAttachment('admin-session', 'config', preview.id, 'oversized', {
+        text: 'a'.repeat(16 * 1024),
+      }),
+    ).toThrow('too many membership checks');
+    for (let index = 1; index < 200; index++)
+      tasks.retainAttachment('admin-session', 'config', preview.id, `token-${index}`, evidence);
+    expect(() =>
+      tasks.retainAttachment('admin-session', 'config', preview.id, 'over-limit', evidence),
+    ).toThrow('too many membership checks');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(tasks.attachment('admin-session', 'config', preview.id, 'token')).toBeUndefined();
+  } finally {
+    tasks.close();
+  }
+});

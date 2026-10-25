@@ -247,53 +247,62 @@ export class Memberships {
     }
   }
   save(input: MembershipInput, settings: Settings, expectedRevision?: string): Membership {
-    validateInput(input);
-    const server = scope(this.store, settings);
-    if (!server) throw new ServiceError('Configure Jellyfin before creating memberships.');
     this.store.db.exec('BEGIN IMMEDIATE');
     try {
-      const all = this.records();
-      const existing = all.find(
-        (value) => sameScope(value, server) && value.discord_user_id === input.discord_user_id,
-      );
-      if (expectedRevision !== undefined && existing?.revision !== expectedRevision)
-        throw new ServiceError('The membership changed. Review it before retrying.');
-      if (!existing && all.length >= 10_000) throw new ServiceError('Too many saved memberships.');
-      if (
-        existing &&
-        existing.base_username === input.base_username &&
-        existing.tier_id === input.tier_id &&
-        existing.account_limit === input.account_limit &&
-        existing.access_mode === (input.access_mode ?? 'subscription') &&
-        existing.provision_jellyfin === (input.provision_jellyfin ?? true) &&
-        existing.new_subscriber_pending === input.new_subscriber_pending &&
-        existing.active === (input.active ?? true) &&
-        existing.inactive_reason === (input.active === false ? input.inactive_reason : undefined)
-      ) {
-        this.store.db.exec('COMMIT');
-        return existing;
-      }
-      const membership: Membership = {
-        discord_user_id: input.discord_user_id,
-        base_username: input.base_username,
-        tier_id: input.tier_id,
-        account_limit: input.account_limit,
-        access_mode: input.access_mode ?? 'subscription',
-        provision_jellyfin: input.provision_jellyfin ?? true,
-        ...(input.new_subscriber_pending ? { new_subscriber_pending: true as const } : {}),
-        active: input.active ?? true,
-        ...(input.active === false && input.inactive_reason
-          ? { inactive_reason: input.inactive_reason }
-          : {}),
-        ...server,
-        revision: randomUUID(),
-      };
-      this.store.saveMembershipRecord(recordId(membership), membership);
+      const saved = this.saveInTransaction(input, settings, expectedRevision);
       this.store.db.exec('COMMIT');
-      return membership;
+      return saved;
     } catch (error) {
       this.store.db.exec('ROLLBACK');
       throw error;
     }
+  }
+  /** The caller owns one synchronous transaction containing the reviewed
+   * entitlement decision and the queued work that consumes its final revision. */
+  saveInTransaction(
+    input: MembershipInput,
+    settings: Settings,
+    expectedRevision?: string,
+  ): Membership {
+    validateInput(input);
+    const server = scope(this.store, settings);
+    if (!server) throw new ServiceError('Configure Jellyfin before creating memberships.');
+    const all = this.records();
+    const existing = all.find(
+      (value) => sameScope(value, server) && value.discord_user_id === input.discord_user_id,
+    );
+    if (expectedRevision !== undefined && existing?.revision !== expectedRevision)
+      throw new ServiceError('The membership changed. Review it before retrying.');
+    if (!existing && all.length >= 10_000) throw new ServiceError('Too many saved memberships.');
+    if (
+      existing &&
+      existing.base_username === input.base_username &&
+      existing.tier_id === input.tier_id &&
+      existing.account_limit === input.account_limit &&
+      existing.access_mode === (input.access_mode ?? 'subscription') &&
+      existing.provision_jellyfin === (input.provision_jellyfin ?? true) &&
+      existing.new_subscriber_pending === input.new_subscriber_pending &&
+      existing.active === (input.active ?? true) &&
+      existing.inactive_reason === (input.active === false ? input.inactive_reason : undefined)
+    ) {
+      return existing;
+    }
+    const membership: Membership = {
+      discord_user_id: input.discord_user_id,
+      base_username: input.base_username,
+      tier_id: input.tier_id,
+      account_limit: input.account_limit,
+      access_mode: input.access_mode ?? 'subscription',
+      provision_jellyfin: input.provision_jellyfin ?? true,
+      ...(input.new_subscriber_pending ? { new_subscriber_pending: true as const } : {}),
+      active: input.active ?? true,
+      ...(input.active === false && input.inactive_reason
+        ? { inactive_reason: input.inactive_reason }
+        : {}),
+      ...server,
+      revision: randomUUID(),
+    };
+    this.store.saveMembershipRecord(recordId(membership), membership);
+    return membership;
   }
 }

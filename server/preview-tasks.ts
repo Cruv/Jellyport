@@ -22,6 +22,7 @@ interface Entry<T> {
   timer: ReturnType<typeof setTimeout>;
   value: PreviewTask<T>;
   startedAt: number;
+  attachments: Map<string, unknown>;
 }
 interface Controls {
   signal: AbortSignal;
@@ -92,6 +93,7 @@ export class PreviewTasks<T> {
       ),
       value,
       startedAt: performance.now(),
+      attachments: new Map(),
     };
     entry.timer.unref();
     this.entries.set(value.id, entry);
@@ -156,6 +158,31 @@ export class PreviewTasks<T> {
       return undefined;
     }
     return structuredClone(entry.value);
+  }
+
+  /** Bounded private evidence retained with its ready, session-owned review;
+   * never included in polling responses and released on cancellation/expiry. */
+  retainAttachment(
+    owner: string,
+    context: string,
+    id: string,
+    key: string,
+    value: unknown,
+  ): boolean {
+    if (this.get(owner, context, id)?.status !== 'ready') return false;
+    const entry = this.entries.get(id)!;
+    if (
+      (!entry.attachments.has(key) && entry.attachments.size >= 200) ||
+      Buffer.byteLength(JSON.stringify(value)) > 16 * 1024
+    )
+      throw new ServiceError('This review has too many membership checks. Prepare a fresh review.');
+    entry.attachments.set(key, structuredClone(value));
+    return true;
+  }
+  attachment<A>(owner: string, context: string, id: string, key: string): A | undefined {
+    if (this.get(owner, context, id)?.status !== 'ready') return undefined;
+    const value = this.entries.get(id)!.attachments.get(key);
+    return value === undefined ? undefined : (structuredClone(value) as A);
   }
 
   cancel(owner: string, id: string): boolean {

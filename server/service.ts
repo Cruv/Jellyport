@@ -55,6 +55,7 @@ import {
   validateMembershipSlot,
   type MembershipAccessMode,
   type Membership,
+  type MembershipInput,
 } from './memberships.js';
 import type { Link } from './store.js';
 import { AccountProfiles, type AccountProfileInput } from './account-profiles.js';
@@ -86,6 +87,10 @@ import { AccountRenames } from './account-rename.js';
 import { MediaOwnerships, type MediaOwnership } from './media-ownership.js';
 import { NewSubscriberPolicy } from './new-subscriber-policy.js';
 import type { StripeEntitlementFact } from './stripe-entitlements.js';
+import type {
+  StripeMigrationMembershipProof,
+  StripeMigrationMembershipReview,
+} from './stripe-integration.js';
 import { automaticAccountNameCandidates, parseAccountUsername } from './account-naming.js';
 import type { IdentityRoster } from './identity-review-types.js';
 import {
@@ -440,6 +445,24 @@ interface NewSubscriberGuard {
   event_id: string;
   enrolled_membership?: Membership;
 }
+export interface MigrationOwnerMembership {
+  discord_user_id: string;
+  status: 'active' | 'complimentary' | 'unlinked' | 'inactive' | 'unavailable' | 'held';
+  source: 'stripe' | 'saved' | 'legacy';
+  tier_id: string | null;
+  tier_name: string | null;
+  account_limit: number | null;
+  allowed_slots: number[];
+  message: string;
+}
+/** Server-retained review only. Browsers receive its summary and an opaque token. */
+export interface ReviewedMigrationMembership {
+  summary: MigrationOwnerMembership;
+  settings_hash: string;
+  previous_revision: string | null;
+  proposed?: MembershipInput;
+  stripe_proof?: StripeMigrationMembershipProof;
+}
 export function now(): string {
   return new Date().toISOString();
 }
@@ -516,6 +539,11 @@ function previewItemSummary(item: MediaItem): MigrationItemSummary {
 /** Account jobs and subscription actions share a mutation lock released between users. */
 export class Service {
   verifyStripeEntitlement?: (fact: StripeEntitlementFact) => void;
+  reviewStripeMigrationMembership?: (
+    id: string,
+    signal?: AbortSignal,
+  ) => Promise<StripeMigrationMembershipReview>;
+  verifyStripeMigrationMembership?: (proof: StripeMigrationMembershipProof) => void;
   bot: BotAdapter | null = null;
   clientFactory: ClientFactory;
   readonly jobTasks = new Map<string, Promise<void>>();
@@ -2616,6 +2644,148 @@ export class Service {
       },
     ]);
   }
+  private membershipReviewSettings(): string {
+    return createHash('sha256')
+      .update(JSON.stringify([this.store.settings(), this.store.authState()]))
+      .digest('hex');
+  }
+  async reviewMigrationMembership(
+    discordId: string,
+    signal?: AbortSignal,
+  ): Promise<ReviewedMigrationMembership> {
+    const settings = this.store.settings();
+    const settingsHash = this.membershipReviewSettings();
+    const member = this.memberships.get(discordId, settings);
+    const identity = await this.requireBot().recipientIdentity(discordId, false);
+    signal?.throwIfAborted();
+    if (identity.id !== discordId)
+      throw new ServiceError('The Discord owner identity could not be verified.');
+    const summary: MigrationOwnerMembership = {
+      discord_user_id: discordId,
+      status: 'unlinked',
+      source: 'legacy',
+      tier_id: null,
+      tier_name: null,
+      account_limit: null,
+      allowed_slots: [1],
+      message:
+        'No verified membership tier is linked to this Discord owner. Approve their Stripe identity link and price mapping to resolve additional accounts. Single-account administrator migration remains available.',
+    };
+    const result: ReviewedMigrationMembership = {
+      summary,
+      settings_hash: settingsHash,
+      previous_revision: member?.revision ?? null,
+    };
+    const saved = () => {
+      Object.assign(summary, {
+        status: member!.access_mode === 'complimentary' ? 'complimentary' : 'active',
+        source: 'saved',
+        tier_id: member!.tier_id,
+        tier_name:
+          member!.access_mode === 'complimentary'
+            ? 'Complimentary'
+            : ((settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).find(
+                (tier) => tier.id === member!.tier_id,
+              )?.name ?? member!.tier_id),
+        account_limit: member!.account_limit,
+        allowed_slots: Array.from({ length: member!.account_limit }, (_, index) => index + 1),
+        message:
+          member!.access_mode === 'complimentary'
+            ? 'Administrator-managed complimentary allowance is preserved.'
+            : 'Using this Discord owner’s saved membership allowance.',
+      });
+    };
+    if (!member && this.memberships.hasOtherScope(discordId, settings)) {
+      Object.assign(summary, {
+        status: 'held',
+        source: 'saved',
+        allowed_slots: [],
+        message:
+          'This owner has a membership on another paired server. Review its server association first.',
+      });
+    } else if (member?.new_subscriber_pending || member?.active === false) {
+      Object.assign(summary, {
+        status: member.new_subscriber_pending ? 'held' : 'inactive',
+        source: 'saved',
+        allowed_slots: [],
+        tier_id: member.tier_id,
+        account_limit: member.account_limit,
+        message: member.new_subscriber_pending
+          ? 'Account enrollment is paused for review. Migration cannot clear this hold.'
+          : 'This membership is inactive. Review its access policy before migrating.',
+      });
+    } else if (member?.access_mode === 'complimentary') saved();
+    else if (settings.new_subscriber_source === 'stripe' && this.reviewStripeMigrationMembership) {
+      const billing = await this.reviewStripeMigrationMembership(discordId, signal);
+      signal?.throwIfAborted();
+      if (billing.status === 'verified' && billing.proof) {
+        const tier = (settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).find(
+          (tier) => tier.id === billing.tier_id,
+        );
+        if (
+          !tier ||
+          tier.account_limit !== billing.account_limit ||
+          billing.proof.owner_id !== discordId
+        )
+          throw new ServiceError('The verified membership tier changed. Refresh this review.');
+        result.stripe_proof = structuredClone(billing.proof);
+        result.proposed = {
+          discord_user_id: discordId,
+          base_username: member?.base_username ?? identity.username,
+          tier_id: tier.id,
+          account_limit: tier.account_limit,
+          access_mode: 'subscription',
+          active: true,
+          provision_jellyfin: member?.provision_jellyfin ?? false,
+        };
+        Object.assign(summary, {
+          status: 'active',
+          source: 'stripe',
+          tier_id: tier.id,
+          tier_name: tier.name,
+          account_limit: tier.account_limit,
+          allowed_slots: Array.from({ length: tier.account_limit }, (_, index) => index + 1),
+          message:
+            'Verified Stripe membership. Starting migration assigns this allowance to the selected Discord owner; only the accounts in this review are migrated.',
+        });
+      } else if (billing.status === 'unlinked' && member) saved();
+      else
+        Object.assign(summary, {
+          status: billing.status === 'verified' ? 'unavailable' : billing.status,
+          source: 'stripe',
+          allowed_slots: billing.status === 'inactive' || member ? [] : [1],
+          message: billing.message,
+        });
+    } else if (member) saved();
+    this.assertMigrationMembershipReview(result);
+    return result;
+  }
+  private assertMigrationMembershipReview(review: ReviewedMigrationMembership): void {
+    if (
+      review.settings_hash !== this.membershipReviewSettings() ||
+      (this.memberships.get(review.summary.discord_user_id, this.store.settings())?.revision ??
+        null) !== review.previous_revision
+    )
+      throw new ServiceError(
+        'The membership or configuration changed. Refresh this migration review.',
+      );
+    if (review.stripe_proof) {
+      if (!this.verifyStripeMigrationMembership)
+        throw new ServiceError('Stripe membership verification is unavailable.');
+      this.verifyStripeMigrationMembership(review.stripe_proof);
+    }
+  }
+  private membershipReviewFingerprint(review: ReviewedMigrationMembership): string {
+    const { message: _message, ...summary } = review.summary;
+    return JSON.stringify([
+      summary,
+      review.settings_hash,
+      review.previous_revision,
+      review.proposed,
+      review.stripe_proof?.context,
+      review.stripe_proof?.paid_through,
+    ]);
+  }
   async migrateUsers(
     sourceUserIds: string[],
     discordRecipients: Record<string, string> = {},
@@ -2627,6 +2797,7 @@ export class Service {
     householdTargets?: Record<string, ReviewedHouseholdAccount>,
     explicitOwnerTargets?: Record<string, Omit<ReviewedHouseholdAccount, 'discord_username'>>,
     admissionGuard?: () => void,
+    reviewedMemberships?: Record<string, ReviewedMigrationMembership>,
   ): Promise<Job> {
     admissionGuard?.();
     const requestedAt = now();
@@ -2649,6 +2820,52 @@ export class Service {
     const settings = this.store.settings();
     this.requireServer(settings, 'emby');
     this.requireServer(settings, 'jellyfin');
+    const resolvedMemberships = new Map<string, ReviewedMigrationMembership>();
+    if (reviewedMemberships) {
+      const owners = new Set(
+        sourceUserIds.flatMap((id) => {
+          if (historyOnlyTargets?.[id]) return [];
+          const owner =
+            discordRecipients[id] ||
+            this.mappings.getForSource(id, settings)?.discord_user_id ||
+            householdTargets?.[id]?.discord_user_id;
+          return owner ? [owner] : [];
+        }),
+      );
+      if (
+        owners.size !== Object.keys(reviewedMemberships).length ||
+        [...owners].some((id) => !Object.hasOwn(reviewedMemberships, id))
+      )
+        throw new ServiceError('Review the membership of every selected Discord owner.');
+      const pending = [...owners];
+      const failed = new AbortController();
+      const signal = AbortSignal.any([failed.signal, AbortSignal.timeout(20_000)]);
+      try {
+        await Promise.all(
+          Array.from({ length: Math.min(4, pending.length) }, async () => {
+            while (pending.length) {
+              admissionGuard?.();
+              signal.throwIfAborted();
+              const owner = pending.shift()!;
+              const reviewed = reviewedMemberships[owner]!;
+              const current = await this.reviewMigrationMembership(owner, signal);
+              admissionGuard?.();
+              if (
+                this.membershipReviewFingerprint(current) !==
+                this.membershipReviewFingerprint(reviewed)
+              )
+                throw new ServiceError(
+                  'This owner’s membership tier or access changed. Refresh the migration review before starting.',
+                );
+              resolvedMemberships.set(owner, current);
+            }
+          }),
+        );
+      } catch (error) {
+        failed.abort();
+        throw error;
+      }
+    }
     const reviewedHouseholds = householdTargets ?? {};
     const explicitOwners = explicitOwnerTargets ?? {};
     const reviewedOwners = { ...reviewedHouseholds, ...explicitOwners };
@@ -2804,6 +3021,7 @@ export class Service {
           'The selected recipient or mapping differs from this Emby account’s approved owner or slot.',
         );
       const member = recipient ? this.memberships.get(recipient, settings) : null;
+      const resolved = recipient ? resolvedMemberships.get(recipient) : undefined;
       if (recipient) {
         const slotKey = `${recipient}:${slot}`;
         if (recipientSlots.has(slotKey))
@@ -2811,8 +3029,11 @@ export class Service {
             'Choose a different Discord recipient or approved membership slot for each account.',
           );
         recipientSlots.add(slotKey);
-        if (slot > 1) {
-          const member = this.memberships.get(recipient, settings);
+        if (resolved && !resolved.summary.allowed_slots.includes(slot))
+          throw new ServiceError(
+            `This Discord owner’s reviewed membership does not cover account ${slot}. ${resolved.summary.message}`,
+          );
+        if (slot > 1 && !resolved?.proposed) {
           if (!member?.active || slot > member.account_limit)
             throw new ServiceError(
               'Assign an active membership tier covering this account slot before migrating.',
@@ -2834,7 +3055,7 @@ export class Service {
         },
         discord_user_id: recipient,
         membership_slot: slot,
-        ...(member ? { membership_revision: member.revision } : {}),
+        ...(member && !resolved?.proposed ? { membership_revision: member.revision } : {}),
         ...(mapping
           ? {
               username: mapping.target_username,
@@ -3042,7 +3263,7 @@ export class Service {
         requests,
         requestedAt,
         previewTiming,
-        approved.length
+        approved.length || resolvedMemberships.size
           ? (queuedRequests) => {
               admissionGuard?.();
               if (JSON.stringify(settings) !== JSON.stringify(this.store.settings()))
@@ -3054,7 +3275,21 @@ export class Service {
                 this.assertMembershipRequest(request, settings);
                 if (ownershipServerId) this.sourceOwnership(request, settings, ownershipServerId);
               }
+              for (const review of resolvedMemberships.values())
+                this.assertMigrationMembershipReview(review);
               assertExplicitTargetSlots();
+              for (const [owner, review] of resolvedMemberships) {
+                if (!review.proposed) continue;
+                const member = this.memberships.saveInTransaction(
+                  review.proposed,
+                  settings,
+                  review.previous_revision ?? undefined,
+                );
+                for (const request of queuedRequests)
+                  if (request.discord_user_id === owner && !request.history_only_target)
+                    request.membership_revision = member.revision;
+              }
+              for (const request of queuedRequests) this.assertMembershipRequest(request, settings);
               const additions = approved.flatMap((record) => {
                 const target = explicitTargets.get(record.account_id);
                 return this.migrationIdentityAdditions(

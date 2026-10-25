@@ -31,6 +31,18 @@ test('migration review finds a selected owner’s verified Stripe tier and enrol
     price_tiers: [{ price_id: 'price_Crew', tier_id: 'galleon' }],
   });
   expect(service.memberships.get(paidOwner, store.settings())).toBeNull();
+  // Stripe may confirm access before MEE6 assigns its subscriber role. The
+  // verified human must remain selectable without manually entering an ID.
+  const searchMembers = service.bot!.searchMembers!.bind(service.bot);
+  service.bot!.searchMembers = async (query) => {
+    const found = await searchMembers(query);
+    return {
+      ...found,
+      members: found.members.map((member) =>
+        member.id === paidOwner ? { ...member, membership_active: false } : member,
+      ),
+    };
+  };
   expect(admin.createdCredentials).toEqual([]);
   const originalEmby = structuredClone(admin.servers.users.emby);
   const existingPasswordCount = admin.createdCredentials.length;

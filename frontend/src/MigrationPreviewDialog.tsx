@@ -407,6 +407,7 @@ function MigrationRecipient({
         }
         id={`recipient-${user.source_user_id}`}
         inputName={user.source_user_id}
+        allowInactive
         showMembershipStatus={false}
       />
       <p className="subtle text-tiny">

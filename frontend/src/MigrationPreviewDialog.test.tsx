@@ -60,6 +60,53 @@ function manualOwners() {
 }
 
 describe('reviewed migration account slots', () => {
+  it.each(['active', 'complimentary'] as const)(
+    'can select an owner without a subscriber Discord role and use their verified %s allowance',
+    async (status) => {
+      const api = vi.fn(async (path, options) =>
+        String(path).endsWith('/membership')
+          ? entitlement((options?.body as { discord_user_id: string }).discord_user_id, 3, {
+              status,
+              source: status === 'complimentary' ? 'saved' : 'stripe',
+              tier_name: status === 'complimentary' ? 'Complimentary' : 'Galleon',
+            })
+          : {
+              members: [
+                {
+                  id: owner,
+                  username: 'crew_owner',
+                  display_name: null,
+                  nickname: null,
+                  membership_active: false,
+                },
+              ],
+              truncated: false,
+            },
+      ) as Api;
+      const { form, startMigration } = setup([users[0]], false, api);
+      fireEvent.change(screen.getByLabelText('Discord recipient (optional)'), {
+        target: { value: 'crew_owner' },
+      });
+      fireEvent.click(await screen.findByRole('button', { name: 'Select @crew_owner' }));
+      await screen.findByText(
+        `${status === 'complimentary' ? 'Complimentary' : 'Galleon'} · 3 accounts`,
+      );
+      expect(screen.getByLabelText('Discord recipient ID (advanced)')).toHaveProperty('value', '');
+      expect(new FormData(form).get('source-a')).toBe(owner);
+      fireEvent.change(screen.getByLabelText('Membership account slot for first-personal-name'), {
+        target: { value: '3' },
+      });
+      expect(screen.getByRole('button', { name: 'Start migration' })).toHaveProperty(
+        'disabled',
+        false,
+      );
+      expect(screen.queryByText('Membership is not currently active.')).toBeNull();
+      fireEvent.submit(form);
+      expect(startMigration).toHaveBeenCalledTimes(1);
+      expect(api).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it('requires distinct reviewed slots when arbitrary account names share one manually confirmed owner', async () => {
     const { startMigration, form } = setup();
     expect(screen.queryByRole('combobox')).toBeNull();

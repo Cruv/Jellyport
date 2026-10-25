@@ -569,8 +569,9 @@ export class StripeIntegration {
       }
     });
   }
-  /** Resolve only the selected owner's approved billing identities. This read is
-   * independent of automation and never applies events or provisions accounts. */
+  /** Resolve only the selected owner's approved billing identities. An explicit
+   * migration review may read Stripe while trusted messages remain the automatic
+   * subscription source; this never applies events or provisions accounts. */
   async reviewMembership(
     ownerId: string,
     signal?: AbortSignal,
@@ -586,13 +587,10 @@ export class StripeIntegration {
     if (
       this.stopped ||
       !settings.discord_enabled ||
-      settings.new_subscriber_source !== 'stripe' ||
       !validSnowflake(this.guild()) ||
       !this.state.api_key.startsWith('rk_live_')
     )
-      return unavailable(
-        'Connect live Stripe as the subscription source to find this member’s paid tier.',
-      );
+      return unavailable('Connect live Stripe to find this member’s paid tier.');
     if (this.task)
       return unavailable(
         'Wait for the current Stripe synchronization to finish, then refresh this membership.',

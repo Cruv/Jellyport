@@ -381,14 +381,14 @@ describe('reviewed migration account slots', () => {
         tier_name: null,
         account_limit: null,
         message:
-          'No linked subscription was found. One manually approved account is allowed; extra slots need a verified membership.',
+          'No saved membership was found. One manually approved account is allowed; extra slots need a verified membership.',
       }),
     ) as Api;
     setup([users[0]], false, api);
     fireEvent.change(screen.getByLabelText('Discord recipient ID (advanced)'), {
       target: { value: owner },
     });
-    await screen.findByText('No linked membership');
+    await screen.findByText('No saved membership');
     expect(screen.getByText(/extra slots need a verified membership/)).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Start migration' })).toHaveProperty(
       'disabled',
@@ -399,6 +399,29 @@ describe('reviewed migration account slots', () => {
       'disabled',
       true,
     );
+  });
+
+  it('distinguishes an unlinked Stripe identity from missing saved membership and preserves the server explanation', async () => {
+    const message =
+      'Approve this Discord member’s Stripe customer link to find their paid tier automatically.';
+    const api = vi.fn(async () =>
+      entitlement(owner, 1, {
+        status: 'unlinked',
+        source: 'stripe',
+        tier_id: null,
+        tier_name: null,
+        account_limit: null,
+        message,
+      }),
+    ) as Api;
+    setup([users[0]], false, api);
+    fireEvent.change(screen.getByLabelText('Discord recipient ID (advanced)'), {
+      target: { value: owner },
+    });
+    await screen.findByText('Stripe identity not linked');
+    expect(screen.getByText(message)).toBeTruthy();
+    expect(screen.queryByText('No saved membership')).toBeNull();
+    expect(screen.queryByText(/no (?:active )?subscription/i)).toBeNull();
   });
 
   it('keeps complimentary allowances usable without billing or role assumptions', async () => {

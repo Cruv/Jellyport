@@ -42,14 +42,14 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
-async function fixture() {
+async function fixture(source: 'stripe' | 'trusted_messages' = 'stripe') {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-synthetic-stripe-migration-'));
   const store = new Store(directory);
   store.saveSettings({
     ...store.settings(),
     discord_enabled: true,
     discord_guild_id: '200001',
-    new_subscriber_source: 'stripe',
+    new_subscriber_source: source,
     jellyfin_url: 'http://jellyfin.example.test',
     auto_provision: false,
     auto_disable: false,
@@ -125,31 +125,69 @@ afterEach(async () => {
 });
 
 describe('owner-scoped Stripe membership evidence for migration', () => {
-  it('finds the paid tier with automation disabled, without applying global events or writing memberships', async () => {
-    const f = await fixture();
-    expect(f.integration.status().automation_enabled).toBe(false);
-    const changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
-    f.snapshot.mockClear();
-    const result = await f.integration.reviewMembership(owner);
-    expect(result).toMatchObject({
+  it.each(['stripe', 'trusted_messages'] as const)(
+    'finds the paid tier with %s automatic source without applying events or writing memberships',
+    async (source) => {
+      const f = await fixture(source);
+      expect(f.integration.status().automation_enabled).toBe(false);
+      const changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
+      f.snapshot.mockClear();
+      const result = await f.integration.reviewMembership(owner);
+      expect(result).toMatchObject({
+        status: 'verified',
+        tier_id: 'galleon',
+        tier_name: 'Galleon',
+        account_limit: 3,
+      });
+      expect(result.proof).toMatchObject({
+        owner_id: owner,
+        paid_through: new Date((base + 3600) * 1000).toISOString(),
+      });
+      expect(() => f.integration.assertMigrationMembership(result.proof!)).not.toThrow();
+      expect(f.customerRead.mock.calls.map(([id]) => id)).toEqual(['cus_member']);
+      expect(f.invoiceRead.mock.calls.map(([id]) => id)).toEqual(['sub_member']);
+      expect(f.snapshot).not.toHaveBeenCalled();
+      expect(f.onEntitlement).not.toHaveBeenCalled();
+      expect(f.store.membershipRecords()).toEqual([]);
+      expect(f.store.subscriptions()).toEqual([]);
+      expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
+      expect(JSON.stringify(result)).not.toMatch(/cus_member|sub_member|in_member|rk_live/);
+    },
+  );
+  it('keeps automatic Stripe enrollment guarded while trusted messages remain the source', async () => {
+    const f = await fixture('trusted_messages');
+    expect(await f.integration.reviewMembership(owner)).toMatchObject({
       status: 'verified',
       tier_id: 'galleon',
-      tier_name: 'Galleon',
       account_limit: 3,
     });
-    expect(result.proof).toMatchObject({
-      owner_id: owner,
-      paid_through: new Date((base + 3600) * 1000).toISOString(),
-    });
-    expect(() => f.integration.assertMigrationMembership(result.proof!)).not.toThrow();
-    expect(f.customerRead.mock.calls.map(([id]) => id)).toEqual(['cus_member']);
-    expect(f.invoiceRead.mock.calls.map(([id]) => id)).toEqual(['sub_member']);
-    expect(f.snapshot).not.toHaveBeenCalled();
+    await expect(f.configure({ automation_enabled: true })).rejects.toThrow(
+      'Select Stripe as the subscription source',
+    );
+    expect(f.integration.status().automation_enabled).toBe(false);
     expect(f.onEntitlement).not.toHaveBeenCalled();
     expect(f.store.membershipRecords()).toEqual([]);
     expect(f.store.subscriptions()).toEqual([]);
-    expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
-    expect(JSON.stringify(result)).not.toMatch(/cus_member|sub_member|in_member|rk_live/);
+  });
+  it('finds a newly approved Stripe identity link on retry while trusted messages remain the source', async () => {
+    const f = await fixture('trusted_messages');
+    f.integration.unlinkCustomer({
+      customer_id: 'cus_member',
+      expected_revision: f.integration.status().revision,
+    });
+    expect(await f.integration.reviewMembership(owner)).toMatchObject({ status: 'unlinked' });
+    expect(f.customerRead).not.toHaveBeenCalled();
+    await f.link();
+    f.snapshot.mockClear();
+    expect(await f.integration.reviewMembership(owner)).toMatchObject({
+      status: 'verified',
+      tier_id: 'galleon',
+      account_limit: 3,
+    });
+    expect(f.customerRead).toHaveBeenCalledTimes(1);
+    expect(f.snapshot).not.toHaveBeenCalled();
+    expect(f.onEntitlement).not.toHaveBeenCalled();
+    expect(f.store.membershipRecords()).toEqual([]);
   });
   it('never trusts unapproved metadata, names or an unrelated owner', async () => {
     const f = await fixture();

@@ -2129,6 +2129,12 @@ describe('React account safeguards', () => {
     fireEvent.change(within(dialog).getByLabelText('Membership account slot for other-name'), {
       target: { value: '2' },
     });
+    await waitFor(() =>
+      expect(
+        (within(dialog).getByRole('button', { name: 'Start migration' }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false),
+    );
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
     await waitFor(() =>
       expect(requests.filter((request) => request.path === '/api/migrations')).toHaveLength(1),
@@ -2758,6 +2764,20 @@ describe('React account safeguards', () => {
     expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
   });
   it('shows approved identity exceptions and submits the preview mapping revision with its verified recipient', async () => {
+    const originalFetch = fetch;
+    let releaseMembership!: () => void;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((path: string, options?: RequestInit) => {
+        if (path === '/api/migrations/preview/preview-mapped/membership')
+          return new Promise<Response>((resolve, reject) => {
+            releaseMembership = () => {
+              void originalFetch(path, options).then(resolve, reject);
+            };
+          });
+        return originalFetch(path, options);
+      }),
+    );
     responses['/api/users'] = { emby: [{ Id: 'complex', Name: 'Mr. Complex !' }], jellyfin: [] };
     responses['/api/migrations/preview'] = {
       id: 'preview-mapped',
@@ -2809,6 +2829,15 @@ describe('React account safeguards', () => {
         }) as HTMLButtonElement
       ).disabled,
     ).toBe(true);
+    const start = within(dialog).getByRole('button', {
+      name: 'Start migration',
+    }) as HTMLButtonElement;
+    expect(start.disabled).toBe(true);
+    fireEvent.click(start);
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+    await waitFor(() => expect(releaseMembership).toBeTypeOf('function'));
+    await act(async () => releaseMembership());
+    await waitFor(() => expect(start.disabled).toBe(false));
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
     await waitFor(() =>
       expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),

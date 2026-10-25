@@ -212,6 +212,24 @@ beforeEach(() => {
     'fetch',
     vi.fn(async (path: string, options?: RequestInit) => {
       requests.push({ path, options });
+      if (!(path in responses) && /^\/api\/migrations\/preview\/[^/]+\/membership$/.test(path)) {
+        const { discord_user_id } = JSON.parse(String(options?.body));
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            review_token: `review-token-${discord_user_id}`,
+            discord_user_id,
+            status: 'active',
+            source: 'saved',
+            tier_id: 'galleon',
+            tier_name: 'Galleon',
+            account_limit: 3,
+            allowed_slots: [1, 2, 3],
+            message: 'The saved membership covers these accounts.',
+          }),
+        };
+      }
       if (!(path in responses)) throw new Error(`Unexpected request: ${path}`);
       const value = responses[path];
       const status = statuses[path] || 200;
@@ -2037,6 +2055,12 @@ describe('React account safeguards', () => {
     expect(requests.some((request) => request.path.startsWith('/api/discord/members'))).toBe(false);
     fireEvent.focus(within(dialog).getAllByLabelText('Discord recipient (optional)')[1]);
     fireEvent.click(await within(dialog).findByRole('button', { name: 'Select @river' }));
+    await waitFor(() =>
+      expect(within(dialog).getByRole('button', { name: 'Start migration' })).toHaveProperty(
+        'disabled',
+        false,
+      ),
+    );
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
     await waitFor(() =>
       expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
@@ -2048,6 +2072,7 @@ describe('React account safeguards', () => {
       migration_scope: 'watched_only',
       discord_recipients: { 'e-river': '123456789012345678' },
       membership_slots: { 'e-river': 1 },
+      membership_review_tokens: { '123456789012345678': 'review-token-123456789012345678' },
     });
   });
   it('submits reviewed distinct slots for differently named accounts sharing one selected Discord owner', async () => {
@@ -2118,6 +2143,7 @@ describe('React account safeguards', () => {
       migration_scope: 'watched_only',
       discord_recipients: { 'source-a': '123456789012345678', 'source-b': '123456789012345678' },
       membership_slots: { 'source-a': 1, 'source-b': 2 },
+      membership_review_tokens: { '123456789012345678': 'review-token-123456789012345678' },
     });
   });
   it('shows deferred played flags without invented zero counts and narrows legacy approval', async () => {
@@ -2796,6 +2822,7 @@ describe('React account safeguards', () => {
       preview_id: 'preview-mapped',
       migration_scope: 'watched_only',
       discord_recipients: { complex: '123456789012345678' },
+      membership_review_tokens: { '123456789012345678': 'review-token-123456789012345678' },
       mapping_revisions: { complex: 'approved-revision' },
     });
   });

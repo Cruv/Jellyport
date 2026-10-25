@@ -9,6 +9,7 @@ export interface DiscordMemberPickerProps {
   autoSearch?: boolean;
   disabled?: boolean;
   allowInactive?: boolean;
+  showMembershipStatus?: boolean;
   label?: string;
   id?: string;
   inputName?: string;
@@ -22,6 +23,7 @@ export default function DiscordMemberPicker({
   autoSearch = false,
   disabled = false,
   allowInactive = false,
+  showMembershipStatus = true,
   label = 'Discord member',
   id,
   inputName,
@@ -110,10 +112,12 @@ export default function DiscordMemberPicker({
             {value.nickname && value.nickname !== value.display_name && (
               <small>Server nickname: {value.nickname}</small>
             )}
-            {value.membership_active === false && (
+            {showMembershipStatus && value.membership_active === false && (
               <small>Membership is not currently active.</small>
             )}
-            {value.membership_active === null && <small>Membership checked when submitted.</small>}
+            {showMembershipStatus && value.membership_active === null && (
+              <small>Membership checked when submitted.</small>
+            )}
           </div>
           <button
             type="button"
@@ -196,7 +200,9 @@ export default function DiscordMemberPicker({
                       {member.nickname && member.nickname !== member.display_name && (
                         <small>Server nickname: {member.nickname}</small>
                       )}
-                      {member.membership_active === false && <small>Membership inactive</small>}
+                      {showMembershipStatus && member.membership_active === false && (
+                        <small>Membership inactive</small>
+                      )}
                     </span>
                     {exact.length === 1 && exact[0].id === member.id && (
                       <small>Exact username match</small>

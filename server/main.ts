@@ -11,12 +11,16 @@ import { registerDiscordMemberRoutes } from './discord-members.js';
 import { registerAccountRoleRoutes } from './account-roles.js';
 import { registerStripeRoutes } from './stripe-routes.js';
 import { StripeIntegration, type StripeIntegrationOptions } from './stripe-integration.js';
-import { createHash, randomBytes, scrypt, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Store } from './store.js';
-import { Service, type ReviewedHouseholdAccount } from './service.js';
+import {
+  Service,
+  type ReviewedHouseholdAccount,
+  type ReviewedMigrationMembership,
+} from './service.js';
 import { PreviewTasks } from './preview-tasks.js';
 import { CloneReviews, type CloneAccountsInput } from './account-cloning.js';
 import type { MigrationScope } from './migration.js';
@@ -76,6 +80,7 @@ interface MigrationRequest {
   source_user_ids: string[];
   discord_recipients?: Record<string, string>;
   membership_slots?: Record<string, number>;
+  membership_review_tokens?: Record<string, string>;
   mapping_revisions?: Record<string, string | null>;
   migration_scope?: MigrationScope;
   use_snapshots?: boolean;
@@ -150,6 +155,13 @@ const migrationSchema = {
       maxProperties: 100,
       propertyNames: id,
       additionalProperties: { type: 'integer', minimum: 1, maximum: 3 },
+    },
+    membership_review_tokens: {
+      type: 'object',
+      minProperties: 1,
+      maxProperties: 100,
+      propertyNames: { type: 'string', pattern: '^[0-9]{5,22}$' },
+      additionalProperties: { type: 'string', format: 'uuid' },
     },
     mapping_revisions: {
       type: 'object',
@@ -259,6 +271,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     },
   });
   service.verifyStripeEntitlement = (fact) => stripe.assertEntitlement(fact);
+  service.reviewStripeMigrationMembership = (id, signal) => stripe.reviewMembership(id, signal);
+  service.verifyStripeMigrationMembership = (proof) => stripe.assertMigrationMembership(proof);
   bot.onIdentityHint = (hint) => stripe.recordDiscordHint(hint);
   const organization = new UserOrganization(service);
   const identities = new IdentityReview(service, stripe, organization);
@@ -1139,6 +1153,53 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         ? { canceled: true }
         : unavailablePreview(reply),
   );
+  app.post<{ Params: { id: string }; Body: { discord_user_id: string } }>(
+    '/api/migrations/preview/:id/membership',
+    {
+      schema: {
+        params: previewParams,
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['discord_user_id'],
+          properties: { discord_user_id: { type: 'string', pattern: '^[0-9]{5,22}$' } },
+        },
+      },
+    },
+    async (request, reply) => {
+      const cookie = request.cookies[COOKIE]!;
+      const context = previewContext();
+      const signed = session(request);
+      const reviewed = previews.get(cookie, context, request.params.id);
+      if (
+        reviewed?.status !== 'ready' ||
+        !reviewed.preview?.users.some((user) => !user.history_only)
+      )
+        return unavailablePreview(reply);
+      const controller = new AbortController();
+      const abort = () => controller.abort();
+      request.raw.once('aborted', abort);
+      try {
+        const resolution = await service.reviewMigrationMembership(
+          request.body.discord_user_id,
+          AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]),
+        );
+        if (!signed?.authenticated || session(request) !== signed)
+          throw new JellyfinAuthError('Sign in again before reviewing account membership.', 401);
+        if (controller.signal.aborted || previewContext() !== context)
+          throw new ServiceError(
+            'The migration review changed or was canceled. Prepare a new review.',
+          );
+        const token = randomUUID();
+        if (!previews.retainAttachment(cookie, context, request.params.id, token, resolution))
+          return unavailablePreview(reply);
+        reply.header('Cache-Control', 'no-store');
+        return { ...resolution.summary, review_token: token };
+      } finally {
+        request.raw.removeListener('aborted', abort);
+      }
+    },
+  );
   app.post<{ Body: MigrationRequest }>(
     '/api/migrations',
     { schema: { body: migrationSchema } },
@@ -1151,6 +1212,25 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         : undefined;
       const approvalSession = session(request);
       const approvalContext = previewContext();
+      let reviewedMemberships: Record<string, ReviewedMigrationMembership> | undefined;
+      if (request.body.membership_review_tokens) {
+        if (!reviewed?.preview || reviewed.status !== 'ready')
+          throw new ServiceError('Prepare a migration review before resolving membership.');
+        reviewedMemberships = Object.create(null) as Record<string, ReviewedMigrationMembership>;
+        for (const [owner, token] of Object.entries(request.body.membership_review_tokens)) {
+          const resolution = previews.attachment<ReviewedMigrationMembership>(
+            request.cookies[COOKIE]!,
+            approvalContext,
+            reviewed.id,
+            token,
+          );
+          if (!resolution || resolution.summary.discord_user_id !== owner)
+            throw new ServiceError(
+              'This membership review expired or belongs to a different owner. Refresh the review.',
+            );
+          reviewedMemberships[owner] = resolution;
+        }
+      }
       const manualOwners: Record<
         string,
         Omit<ReviewedHouseholdAccount, 'discord_username'>
@@ -1254,7 +1334,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           reviewed?.preview?.household_targets,
         ];
         if (manualApproval) migrationArguments[8] = manualOwners;
-        if (manualApproval || approvedMappingOwner) migrationArguments[9] = guardOwnerApproval;
+        if (manualApproval || approvedMappingOwner || reviewedMemberships)
+          migrationArguments[9] = guardOwnerApproval;
+        if (reviewedMemberships) migrationArguments[10] = reviewedMemberships;
         const job = await service.migrateUsers(...migrationArguments);
         // The duration is now copied into the durable job; release session-owned review data.
         if (reviewed) previews.cancel(request.cookies[COOKIE]!, reviewed.id);

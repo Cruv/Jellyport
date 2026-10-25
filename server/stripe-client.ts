@@ -383,9 +383,29 @@ export class StripeClient {
     signal?: AbortSignal,
     budget: ReadBudget = { bytes: 0 },
   ): Promise<StripeSubscription[]> {
+    return this.readSubscriptions(signal, budget);
+  }
+
+  /** Stripe's documented customer filter includes every status and retains the
+   * same cursor, response, identity and mode validation as the full inventory. */
+  async customerSubscriptions(
+    customerId: string,
+    signal?: AbortSignal,
+  ): Promise<StripeSubscription[]> {
+    id(customerId, 'cus');
+    return this.readSubscriptions(signal, { bytes: 0 }, customerId);
+  }
+
+  private async readSubscriptions(
+    signal?: AbortSignal,
+    budget: ReadBudget = { bytes: 0 },
+    customerId?: string,
+  ): Promise<StripeSubscription[]> {
+    const parameters = new URLSearchParams({ status: 'all', 'expand[]': 'data.customer' });
+    if (customerId) parameters.set('customer', customerId);
     return this.list(
       '/v1/subscriptions',
-      new URLSearchParams({ status: 'all', 'expand[]': 'data.customer' }),
+      parameters,
       (row) => {
         if (row.object !== 'subscription') throw new StripeClientError('invalid_response');
         this.checkMode(row);
@@ -402,10 +422,13 @@ export class StripeClient {
           throw new StripeClientError('invalid_response');
         const status = optionalLabel(row.status, 40);
         if (!status || !/^[a-z_]+$/.test(status)) throw new StripeClientError('invalid_response');
+        const customer_id = id(customer?.id ?? row.customer, 'cus');
+        if (customerId && customer_id !== customerId)
+          throw new StripeClientError('invalid_response');
         return {
           id: id(row.id, 'sub'),
           created: timestamp(row.created),
-          customer_id: id(customer?.id ?? row.customer, 'cus'),
+          customer_id,
           customer_name: optionalLabel(customer?.name, 200),
           customer_email: optionalLabel(customer?.email, 320),
           status,
@@ -444,7 +467,7 @@ export class StripeClient {
         };
       },
       this.signal(signal),
-      this.maxItems,
+      customerId ? Math.min(this.maxItems, 100) : this.maxItems,
       budget,
     );
   }

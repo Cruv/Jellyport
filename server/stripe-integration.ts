@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { ServiceError } from './errors.js';
 import { DEFAULT_MEMBERSHIP_TIERS } from './memberships.js';
 import {
@@ -12,6 +12,7 @@ import type { Store } from './store.js';
 import {
   StripeEntitlements,
   stripeAuthority,
+  stripeBillingDecisions,
   type StripeEntitlementFact,
 } from './stripe-entitlements.js';
 import {
@@ -107,7 +108,29 @@ export interface StripeIntegrationConfiguration {
   role_cleanup_role_ids?: string[];
 }
 type BillingClient = Pick<StripeClient, 'mode' | 'snapshot' | 'checkoutIdentityCandidates'> &
-  Partial<Pick<StripeClient, 'paidPeriod'>>;
+  Partial<Pick<StripeClient, 'paidPeriod' | 'customerSubscriptions'>>;
+
+/** Private, short-lived server evidence. This is never accepted from a browser
+ * or persisted as a substitute for a membership decision. */
+export interface StripeMigrationMembershipProof {
+  readonly token: string;
+  readonly owner_id: string;
+  readonly tier_id: string;
+  readonly tier_name: string;
+  readonly account_limit: number;
+  readonly observed_at: string;
+  readonly expires_at: string;
+  readonly paid_through: string;
+  readonly context: string;
+}
+export interface StripeMigrationMembershipReview {
+  status: 'verified' | 'inactive' | 'unlinked' | 'unavailable';
+  tier_id?: string;
+  tier_name?: string;
+  account_limit?: number;
+  message: string;
+  proof?: StripeMigrationMembershipProof;
+}
 export interface StripeIntegrationOptions {
   clientFactory?: (key: string) => BillingClient;
   resolveDiscordMember?: (id: string) => Promise<{ id?: string; username: string }>;
@@ -124,6 +147,26 @@ const stripePrice = /^price_[A-Za-z0-9]{1,240}$/;
 const checkoutTtl = 24 * 60 * 60 * 1000;
 const maxHints = 500;
 const maxCheckoutLookups = 100;
+const migrationReviewTtl = 60_000;
+const maxMigrationReviews = 128;
+const maxMigrationOwners = 4;
+const maxMigrationCustomers = 20;
+const maxMigrationSubscriptions = 100;
+const migrationReviewTimeout = 20_000;
+const migrationDigest = (value: unknown) =>
+  createHash('sha256').update(JSON.stringify(value)).digest('hex');
+
+/** A caller may abandon a shared read without canceling other reviewers. */
+function waitForMigrationReview<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  const canceled = () => new ServiceError('Membership review was canceled.');
+  if (signal.aborted) return Promise.reject(canceled());
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => reject(canceled());
+    signal.addEventListener('abort', aborted, { once: true });
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', aborted));
+  });
+}
 
 function cleanText(value: unknown, maximum: number): value is string {
   return (
@@ -164,6 +207,17 @@ export class StripeIntegration {
   private stopped = false;
   private readonly clientFactory: (key: string) => BillingClient;
   private readonly now: () => number;
+  private readonly migrationReviews = new Map<
+    string,
+    { expires: number; review: StripeMigrationMembershipReview }
+  >();
+  private readonly migrationReviewTasks = new Map<
+    string,
+    Promise<StripeMigrationMembershipReview>
+  >();
+  private readonly migrationReviewControllers = new Set<AbortController>();
+  private migrationReviewActive = 0;
+  private readonly migrationReviewWaiters: Array<() => void> = [];
   constructor(
     readonly store: Store,
     readonly options: StripeIntegrationOptions = {},
@@ -470,6 +524,276 @@ export class StripeIntegration {
             : null,
       };
     });
+  }
+  private migrationContext(): string {
+    this.scope();
+    const settings = this.store.settings(),
+      auth = this.store.authState();
+    return migrationDigest([
+      this.state.generation,
+      this.state.revision,
+      this.state.guild_id,
+      stripeAuthority(this.state.links, this.state.price_tiers, this.store),
+      settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS,
+      settings.new_subscriber_source,
+      settings.discord_enabled,
+      settings.emby_url,
+      settings.jellyfin_url,
+      auth?.kind === 'configured' ? auth.serverId : null,
+    ]);
+  }
+  private acquireMigrationOwner(signal: AbortSignal): Promise<() => void> {
+    return new Promise((resolve, reject) => {
+      const canceled = () => {
+        const index = this.migrationReviewWaiters.indexOf(grant);
+        if (index !== -1) this.migrationReviewWaiters.splice(index, 1);
+        reject(new ServiceError('Membership review was canceled.'));
+      };
+      const grant = () => {
+        signal.removeEventListener('abort', canceled);
+        if (signal.aborted || this.stopped) return canceled();
+        this.migrationReviewActive++;
+        let released = false;
+        resolve(() => {
+          if (released) return;
+          released = true;
+          this.migrationReviewActive--;
+          this.migrationReviewWaiters.shift()?.();
+        });
+      };
+      if (signal.aborted || this.stopped) return canceled();
+      if (this.migrationReviewActive < maxMigrationOwners) grant();
+      else {
+        signal.addEventListener('abort', canceled, { once: true });
+        this.migrationReviewWaiters.push(grant);
+      }
+    });
+  }
+  /** Resolve only the selected owner's approved billing identities. This read is
+   * independent of automation and never applies events or provisions accounts. */
+  async reviewMembership(
+    ownerId: string,
+    signal?: AbortSignal,
+  ): Promise<StripeMigrationMembershipReview> {
+    if (signal?.aborted) throw new ServiceError('Membership review was canceled.');
+    if (!validSnowflake(ownerId)) throw new ServiceError('Select a valid Discord member.');
+    const context = this.migrationContext();
+    const unavailable = (message: string): StripeMigrationMembershipReview => ({
+      status: 'unavailable',
+      message,
+    });
+    const settings = this.store.settings();
+    if (
+      this.stopped ||
+      !settings.discord_enabled ||
+      settings.new_subscriber_source !== 'stripe' ||
+      !validSnowflake(this.guild()) ||
+      !this.state.api_key.startsWith('rk_live_')
+    )
+      return unavailable(
+        'Connect live Stripe as the subscription source to find this member’s paid tier.',
+      );
+    if (this.task)
+      return unavailable(
+        'Wait for the current Stripe synchronization to finish, then refresh this membership.',
+      );
+    const key = `${context}:${ownerId}`,
+      time = this.now();
+    for (const [id, entry] of this.migrationReviews)
+      if (entry.expires <= time) this.migrationReviews.delete(id);
+    const cached = this.migrationReviews.get(key);
+    if (cached) return structuredClone(cached.review);
+    const existing = this.migrationReviewTasks.get(key);
+    if (existing) return structuredClone(await waitForMigrationReview(existing, signal));
+    if (this.migrationReviewTasks.size >= maxMigrationReviews)
+      return unavailable('Membership reviews are busy. Try again shortly.');
+    while (this.migrationReviews.size + this.migrationReviewTasks.size >= maxMigrationReviews) {
+      const oldest = this.migrationReviews.keys().next().value;
+      if (!oldest) break;
+      this.migrationReviews.delete(oldest);
+    }
+    const links = structuredClone(
+      this.state.links.filter((link) => link.discord_user_id === ownerId),
+    );
+    if (!links.length)
+      return {
+        status: 'unlinked',
+        message:
+          'Approve this Discord member’s Stripe customer link to find their paid tier automatically.',
+      };
+    if (links.length > maxMigrationCustomers)
+      return unavailable(
+        'This member has too many linked billing identities for a migration review. Review their subscriptions first.',
+      );
+    const controller = new AbortController();
+    this.migrationReviewControllers.add(controller);
+    const timer = setTimeout(() => controller.abort(), migrationReviewTimeout);
+    timer.unref();
+    const current = () => {
+      if (
+        controller.signal.aborted ||
+        this.stopped ||
+        this.task ||
+        this.migrationContext() !== context
+      )
+        throw new ServiceError('The billing review changed or expired. Refresh this membership.');
+    };
+    const run = async (): Promise<StripeMigrationMembershipReview> => {
+      let release: (() => void) | undefined;
+      try {
+        release = await this.acquireMigrationOwner(controller.signal);
+        current();
+        const client = this.clientFactory(this.state.api_key);
+        if (client.mode !== 'live' || !client.customerSubscriptions || !client.paidPeriod)
+          return unavailable(
+            'The Stripe connection cannot verify current subscriptions and paid invoices. Check its read permissions.',
+          );
+        const subscriptions: StripeSnapshot['subscriptions'] = [];
+        const seen = new Set<string>();
+        for (const link of links) {
+          current();
+          const rows = await waitForMigrationReview(
+            client.customerSubscriptions(link.customer_id, controller.signal),
+            controller.signal,
+          );
+          current();
+          if (
+            !Array.isArray(rows) ||
+            subscriptions.length + rows.length > maxMigrationSubscriptions
+          )
+            return unavailable(
+              'This member’s subscription history exceeds the safe migration review limit. Review their billing first.',
+            );
+          for (const row of rows) {
+            if (row.customer_id !== link.customer_id || seen.has(row.id))
+              throw new ServiceError('Stripe returned conflicting customer subscriptions.');
+            seen.add(row.id);
+            subscriptions.push(row);
+          }
+        }
+        const periods = new Map<string, StripePaidPeriod | null>();
+        for (const subscription of subscriptions) {
+          current();
+          periods.set(
+            subscription.id,
+            await waitForMigrationReview(
+              client.paidPeriod(subscription.id, controller.signal),
+              controller.signal,
+            ),
+          );
+        }
+        current();
+        const decision = stripeBillingDecisions(
+          {
+            mode: 'live',
+            subscriptions,
+            products: [],
+            completed_at: new Date(this.now()).toISOString(),
+          },
+          links,
+          this.state.price_tiers,
+          periods,
+          this.now(),
+        ).find((item) => item.owner === ownerId);
+        if (!decision)
+          return unavailable(
+            'Stripe could not verify one active, paid, mapped tier for this member. Review their customer links, price mappings and invoices.',
+          );
+        if (decision.action === 'expire')
+          return {
+            status: 'inactive',
+            message:
+              'Stripe confirms this member’s paid subscription has ended. A late payment of an old invoice does not renew access.',
+          };
+        const tier = (this.store.settings().membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).find(
+          (item) => item.id === decision.tier,
+        );
+        if (
+          !tier ||
+          !Number.isInteger(tier.account_limit) ||
+          tier.account_limit < 1 ||
+          tier.account_limit > 3
+        )
+          return unavailable(
+            'The paid Stripe price needs a current Jellyport membership tier mapping.',
+          );
+        const observed = this.now(),
+          paidThrough = decision.period.end * 1000;
+        const proof: StripeMigrationMembershipProof = {
+          token: randomUUID(),
+          owner_id: ownerId,
+          tier_id: tier.id,
+          tier_name: tier.name,
+          account_limit: tier.account_limit,
+          observed_at: new Date(observed).toISOString(),
+          expires_at: new Date(Math.min(observed + migrationReviewTtl, paidThrough)).toISOString(),
+          paid_through: new Date(paidThrough).toISOString(),
+          context,
+        };
+        current();
+        return {
+          status: 'verified',
+          tier_id: tier.id,
+          tier_name: tier.name,
+          account_limit: tier.account_limit,
+          message: `Verified ${tier.name} membership covers ${tier.account_limit} account${tier.account_limit === 1 ? '' : 's'}.`,
+          proof,
+        };
+      } catch {
+        return unavailable(
+          controller.signal.aborted
+            ? 'Stripe membership verification timed out. Try again after checking the connection.'
+            : 'Stripe membership could not be verified. Check the connection and refresh this membership.',
+        );
+      } finally {
+        release?.();
+        clearTimeout(timer);
+        this.migrationReviewControllers.delete(controller);
+      }
+    };
+    const task = run()
+      .then((review) => {
+        this.migrationReviewTasks.delete(key);
+        if (
+          !this.stopped &&
+          !controller.signal.aborted &&
+          this.migrationContext() === context &&
+          !this.task
+        ) {
+          const expires = review.proof ? Date.parse(review.proof.expires_at) : this.now() + 10_000;
+          this.migrationReviews.set(key, { expires, review: structuredClone(review) });
+        }
+        return review;
+      })
+      .finally(() => this.migrationReviewTasks.delete(key));
+    this.migrationReviewTasks.set(key, task);
+    return structuredClone(await waitForMigrationReview(task, signal));
+  }
+  /** Exact cached proof and current local authority are checked synchronously in
+   * the migration's final admission transaction; the caller cannot forge a tier. */
+  assertMigrationMembership(proof: StripeMigrationMembershipProof): void {
+    const context = this.migrationContext(),
+      time = this.now();
+    const cached = this.migrationReviews.get(`${context}:${proof.owner_id}`);
+    const observed = Date.parse(proof.observed_at),
+      expires = Date.parse(proof.expires_at);
+    if (
+      this.stopped ||
+      this.task ||
+      !cached?.review.proof ||
+      cached.expires <= time ||
+      context !== proof.context ||
+      migrationDigest(cached.review.proof) !== migrationDigest(proof) ||
+      !Number.isFinite(observed) ||
+      time < observed ||
+      time - observed > migrationReviewTtl ||
+      !Number.isFinite(expires) ||
+      time >= expires ||
+      time >= Date.parse(proof.paid_through)
+    )
+      throw new ServiceError(
+        'The verified Stripe membership changed or expired. Refresh the migration review.',
+      );
   }
   sync(): Promise<StripeIntegrationStatus> {
     this.scope();
@@ -899,6 +1223,12 @@ export class StripeIntegration {
   async stop(): Promise<void> {
     this.stopped = true;
     this.controller?.abort();
-    await Promise.all([this.task?.catch(() => {}), this.roleCleanup.stop()]);
+    for (const controller of this.migrationReviewControllers) controller.abort();
+    this.migrationReviews.clear();
+    await Promise.all([
+      this.task?.catch(() => {}),
+      this.roleCleanup.stop(),
+      ...[...this.migrationReviewTasks.values()].map((task) => task.catch(() => {})),
+    ]);
   }
 }

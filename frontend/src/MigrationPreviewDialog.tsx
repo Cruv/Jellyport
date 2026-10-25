@@ -466,7 +466,10 @@ function MigrationRecipient({
                   ['active', 'complimentary'].includes(membership.value.status)
                     ? `${membership.value.tier_name || (membership.value.status === 'complimentary' ? 'Complimentary' : 'Subscription')} · ${membership.value.account_limit} ${membership.value.account_limit === 1 ? 'account' : 'accounts'}`
                     : {
-                        unlinked: 'No linked membership',
+                        unlinked:
+                          membership.value.source === 'stripe'
+                            ? 'Stripe identity not linked'
+                            : 'No saved membership',
                         inactive: 'Membership inactive',
                         unavailable: 'Membership unavailable',
                         held: 'Membership needs review',

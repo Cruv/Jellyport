@@ -2715,7 +2715,10 @@ export class Service {
           : 'This membership is inactive. Review its access policy before migrating.',
       });
     } else if (member?.access_mode === 'complimentary') saved();
-    else if (settings.new_subscriber_source === 'stripe' && this.reviewStripeMigrationMembership) {
+    else if (
+      this.reviewStripeMigrationMembership &&
+      (settings.new_subscriber_source === 'stripe' || !member)
+    ) {
       const billing = await this.reviewStripeMigrationMembership(discordId, signal);
       signal?.throwIfAborted();
       if (billing.status === 'verified' && billing.proof) {

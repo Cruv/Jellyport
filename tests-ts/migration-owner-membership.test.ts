@@ -121,50 +121,79 @@ describe('membership assignment during reviewed migration', () => {
       );
     return { review, accept };
   }
-  it('derives a Galleon allowance for one selected owner and atomically assigns only the three reviewed arbitrary accounts', async () => {
-    const original = structuredClone(servers.users.emby);
-    const { review, accept } = await prepare();
+  it.each(['stripe', 'trusted_messages'] as const)(
+    'derives a Galleon allowance with %s automation and atomically assigns only the three reviewed arbitrary accounts',
+    async (source) => {
+      store.saveSettings({ ...store.settings(), new_subscriber_source: source });
+      const original = structuredClone(servers.users.emby);
+      const { review, accept } = await prepare();
+      expect(review.summary).toMatchObject({
+        source: 'stripe',
+        tier_name: 'Galleon',
+        account_limit: 3,
+        allowed_slots: [1, 2, 3],
+      });
+      expect(service.memberships.get(owner, store.settings())).toBeNull();
+      expect(store.jobs()).toEqual([]);
+      const job = await accept();
+      await service.jobTasks.get(job.id);
+      expect(service.getJob(job.id).status).toBe('completed');
+      expect(lookup).toHaveBeenCalledTimes(2); // One view and one admission, never per account.
+      const member = service.memberships.get(owner, store.settings())!;
+      expect(member).toMatchObject({
+        tier_id: 'galleon',
+        account_limit: 3,
+        active: true,
+        provision_jellyfin: false,
+      });
+      expect(
+        store
+          .links()
+          .map((link) => [link.username, link.membership_slot])
+          .sort(),
+      ).toEqual([
+        ['Cabin', 2],
+        ['Harbor', 1],
+        ['Studio', 3],
+      ]);
+      for (let index = 0; index < sourceIds.length; index++) {
+        const target = servers.users.jellyfin.find(
+          (user) => user.Name === ['Harbor', 'Cabin', 'Studio'][index],
+        )!;
+        expect([...servers.played[target.Id]!]).toEqual([String(index + 1)]);
+      }
+      expect(servers.users.emby).toEqual(original);
+      expect(service.bot!.sendCredentials).toHaveBeenCalledTimes(3);
+      expect(
+        vi.mocked(service.bot!.sendCredentials).mock.calls.every((call) => call[0] === owner),
+      ).toBe(true);
+      expect(store.jobs()).toHaveLength(1);
+      expect(store.settings().new_subscriber_source).toBe(source);
+    },
+  );
+  it('preserves an existing trusted-message membership without consulting optional Stripe billing', async () => {
+    store.saveSettings({ ...store.settings(), new_subscriber_source: 'trusted_messages' });
+    const member = service.memberships.save(
+      {
+        discord_user_id: owner,
+        base_username: 'crew_owner',
+        tier_id: 'brigantine',
+        account_limit: 2,
+        active: true,
+        provision_jellyfin: false,
+      },
+      store.settings(),
+    );
+    const review = await service.reviewMigrationMembership(owner);
     expect(review.summary).toMatchObject({
-      source: 'stripe',
-      tier_name: 'Galleon',
-      account_limit: 3,
-      allowed_slots: [1, 2, 3],
+      source: 'saved',
+      tier_id: 'brigantine',
+      account_limit: 2,
+      allowed_slots: [1, 2],
     });
-    expect(service.memberships.get(owner, store.settings())).toBeNull();
+    expect(lookup).not.toHaveBeenCalled();
+    expect(service.memberships.get(owner, store.settings())).toEqual(member);
     expect(store.jobs()).toEqual([]);
-    const job = await accept();
-    await service.jobTasks.get(job.id);
-    expect(service.getJob(job.id).status).toBe('completed');
-    expect(lookup).toHaveBeenCalledTimes(2); // One view and one admission, never per account.
-    const member = service.memberships.get(owner, store.settings())!;
-    expect(member).toMatchObject({
-      tier_id: 'galleon',
-      account_limit: 3,
-      active: true,
-      provision_jellyfin: false,
-    });
-    expect(
-      store
-        .links()
-        .map((link) => [link.username, link.membership_slot])
-        .sort(),
-    ).toEqual([
-      ['Cabin', 2],
-      ['Harbor', 1],
-      ['Studio', 3],
-    ]);
-    for (let index = 0; index < sourceIds.length; index++) {
-      const target = servers.users.jellyfin.find(
-        (user) => user.Name === ['Harbor', 'Cabin', 'Studio'][index],
-      )!;
-      expect([...servers.played[target.Id]!]).toEqual([String(index + 1)]);
-    }
-    expect(servers.users.emby).toEqual(original);
-    expect(service.bot!.sendCredentials).toHaveBeenCalledTimes(3);
-    expect(
-      vi.mocked(service.bot!.sendCredentials).mock.calls.every((call) => call[0] === owner),
-    ).toBe(true);
-    expect(store.jobs()).toHaveLength(1);
   });
   it('rolls back new membership, source ownership, adopted mapping and queue if persistence fails', async () => {
     const mapping = service.mappings.save(
@@ -245,21 +274,25 @@ describe('membership assignment during reviewed migration', () => {
       expect(store.jobs()).toEqual([]);
     },
   );
-  it('does not infer an allowance from a generic active Discord role or an unlinked billing customer', async () => {
-    lookup.mockResolvedValue({
-      status: 'unlinked',
-      message: 'Approve the billing identity link first.',
-    });
-    const { review, accept } = await prepare();
-    expect(review.summary).toMatchObject({
-      status: 'unlinked',
-      account_limit: null,
-      allowed_slots: [1],
-    });
-    await expect(accept()).rejects.toThrow('reviewed membership does not cover account 2');
-    expect(service.memberships.get(owner, store.settings())).toBeNull();
-    expect(store.jobs()).toEqual([]);
-  });
+  it.each(['stripe', 'trusted_messages'] as const)(
+    'does not infer an allowance from a generic active Discord role or an unlinked billing customer with %s automation',
+    async (source) => {
+      store.saveSettings({ ...store.settings(), new_subscriber_source: source });
+      lookup.mockResolvedValue({
+        status: 'unlinked',
+        message: 'Approve the billing identity link first.',
+      });
+      const { review, accept } = await prepare();
+      expect(review.summary).toMatchObject({
+        status: 'unlinked',
+        account_limit: null,
+        allowed_slots: [1],
+      });
+      await expect(accept()).rejects.toThrow('reviewed membership does not cover account 2');
+      expect(service.memberships.get(owner, store.settings())).toBeNull();
+      expect(store.jobs()).toEqual([]);
+    },
+  );
   it('rejects a configuration change or withdrawn approval before saving any membership', async () => {
     const { accept } = await prepare();
     let withdrawn = false;

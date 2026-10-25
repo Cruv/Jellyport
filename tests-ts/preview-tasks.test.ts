@@ -276,3 +276,61 @@ it('keeps bounded membership evidence private, session-owned and limited to the 
     tasks.close();
   }
 });
+
+it('replaces a wizard relationship draft without accumulating stale tokens and aborts follow-up reads on cancel', async () => {
+  const tasks = new PreviewTasks(async () => ({ users: ['source'] }));
+  try {
+    const task = tasks.start('admin', 'config', ['source']);
+    await flush();
+    const signal = tasks.signal('admin', 'config', task.id)!;
+    expect(signal.aborted).toBe(false);
+    expect(tasks.signal('foreign', 'config', task.id)).toBeUndefined();
+    for (let index = 0; index < 205; index++)
+      expect(
+        tasks.retainAttachment(
+          'admin',
+          'config',
+          task.id,
+          `version-${index}`,
+          { index },
+          'membership:owner',
+        ),
+      ).toBe(true);
+    expect(tasks.attachment('admin', 'config', task.id, 'version-0')).toBeUndefined();
+    expect(tasks.attachment('admin', 'config', task.id, 'version-204')).toEqual({ index: 204 });
+    for (let index = 0; index < 199; index++)
+      tasks.retainAttachment('admin', 'config', task.id, `other-${index}`, {});
+    expect(() => tasks.retainAttachment('admin', 'config', task.id, 'overflow', {})).toThrow(
+      'too many membership checks',
+    );
+    expect(
+      tasks.retainAttachment(
+        'admin',
+        'config',
+        task.id,
+        'final-version',
+        { approved: true },
+        'membership:owner',
+      ),
+    ).toBe(true);
+    expect(() =>
+      tasks.retainAttachment(
+        'admin',
+        'config',
+        task.id,
+        'oversized',
+        { data: 'x'.repeat(17 * 1024) },
+        'membership:owner',
+      ),
+    ).toThrow('too many membership checks');
+    expect(tasks.attachment('admin', 'config', task.id, 'final-version')).toEqual({
+      approved: true,
+    });
+    expect(tasks.get('admin', 'config', task.id)).not.toHaveProperty('attachments');
+    expect(tasks.cancel('admin', task.id)).toBe(true);
+    expect(signal.aborted).toBe(true);
+    expect(tasks.attachment('admin', 'config', task.id, 'final-version')).toBeUndefined();
+  } finally {
+    tasks.close();
+  }
+});

@@ -34,6 +34,7 @@ export interface Users {
   emby: MediaUser[];
   jellyfin: MediaUser[];
   errors?: Record<string, string>;
+  template_user_id?: string;
 }
 export interface UserMapping {
   id: string;
@@ -95,6 +96,49 @@ export interface MigrationOwnerMembership {
   account_limit: number | null;
   allowed_slots: number[];
   message: string;
+  existing_member?: {
+    access_mode: 'subscription' | 'complimentary';
+    active: boolean;
+    held: boolean;
+    account_limit: number;
+    tier_id: string;
+  } | null;
+  occupied_slots?: Array<{ slot: number; emby_user_id?: string; jellyfin_user_id?: string }>;
+  billing_changes?: {
+    customer_links: Array<{ customer_id: string; name: string | null; email: string | null }>;
+    price_mappings: Array<{
+      price_id: string;
+      price_name: string | null;
+      tier_id: string;
+      tier_name: string;
+    }>;
+  };
+}
+export interface MigrationBillingInventory {
+  customers: Array<{
+    id: string;
+    name: string | null;
+    email: string | null;
+    linked_discord_id: string | null;
+    linked_username: string | null;
+    suggested: boolean;
+    prices: Array<{ price_id: string; name: string; tier_id: string | null }>;
+  }>;
+  tiers: Array<{ id: string; name: string; account_limit: number }>;
+  next_cursor: string | null;
+  last_sync: string | null;
+  available: boolean;
+  message: string;
+}
+export interface MigrationBillingSelection {
+  customer_ids: string[];
+  price_tiers: Array<{ price_id: string; tier_id: string }>;
+}
+export interface MigrationAccountReview {
+  source_user_id: string;
+  target_user_id: string;
+  target_username: string;
+  review_token: string;
 }
 export type RoleSection = 'policy' | 'configuration' | 'display';
 export interface RoleParameters {

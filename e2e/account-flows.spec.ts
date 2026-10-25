@@ -1,3 +1,4 @@
+import { completeMigrationWizard } from './fixtures';
 import { test, expect, navigate, expectContainedLayout } from './fixtures';
 
 test('creates an independent account and reveals its credentials only on request', async ({
@@ -48,6 +49,7 @@ test('explicit approval runs a played-only migration through the real demo backe
   await page.getByRole('checkbox', { name: 'Select river', exact: true }).check();
   await page.getByRole('button', { name: 'Preview migration (1)', exact: true }).click();
   const review = page.getByRole('dialog', { name: 'Review your migration' });
+  await completeMigrationWizard(review);
   await expect(review).toBeVisible();
   expect(mutations).not.toContain('POST /api/migrations');
   const accepted = page.waitForResponse(

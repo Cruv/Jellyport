@@ -100,7 +100,7 @@ for (const protection of ['administrator', 'template'] as const) {
     });
 
     // Merely reviewing or backing out cannot approve personal-state writes.
-    await review.getByRole('button', { name: 'Back to users', exact: true }).click();
+    await review.getByRole('button', { name: 'Cancel', exact: true }).click();
     await expect(review).toHaveCount(0);
     expect(imports.writes).toEqual([]);
     expect(imports.userDataWrites).toEqual([]);

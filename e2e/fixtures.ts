@@ -103,3 +103,17 @@ export async function isCompactLayout(page: Page) {
       window.matchMedia('(max-width: 700px), (max-width: 1100px) and (pointer: coarse)').matches,
   );
 }
+
+/** Follow the reviewed wizard without submitting it or bypassing disabled steps. */
+export async function completeMigrationWizard(review: Locator): Promise<void> {
+  for (let step = 0; step < 4; step++) {
+    if (await review.getByRole('heading', { name: 'Final migration review', exact: true }).count())
+      return;
+    const next = review.getByRole('button', { name: /^Next:/ });
+    await expect(next).toBeEnabled();
+    await next.click();
+  }
+  await expect(
+    review.getByRole('heading', { name: 'Final migration review', exact: true }),
+  ).toBeVisible();
+}

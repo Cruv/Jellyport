@@ -3497,3 +3497,96 @@ progress.progress-track::-moz-progress-bar {
     padding-block: 6px;
   }
 }
+
+/* Migration setup keeps one task in view and shares billing per owner. */
+.migration-wizard-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  list-style: none;
+  padding: 0;
+  margin: 0 0 24px;
+}
+.migration-wizard-steps li {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+.migration-wizard-steps li span {
+  display: grid;
+  place-items: center;
+  min-width: 24px;
+  height: 24px;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+}
+.migration-wizard-steps li[aria-current] {
+  color: var(--purple);
+  font-weight: 650;
+}
+.migration-account-list {
+  display: grid;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.migration-account-choice {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  cursor: pointer;
+}
+.migration-account-choice input {
+  flex: 0 0 auto;
+  margin-top: 4px;
+}
+.migration-account-choice span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.migration-account-choice small {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+}
+.migration-owner-summary {
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow-wrap: anywhere;
+}
+.migration-owner-summary > h4 {
+  margin: 0 0 10px;
+}
+.migration-owner-summary p {
+  margin: 8px 0;
+}
+.migration-review-account {
+  margin-top: 12px;
+  padding: 14px;
+}
+.migration-review-account .preview-user-header {
+  padding: 0;
+  flex-wrap: wrap;
+}
+@media (max-width: 600px) {
+  .migration-wizard-steps {
+    gap: 4px;
+  }
+  .migration-wizard-steps li {
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.76rem;
+  }
+  .migration-owner-summary {
+    padding: 14px;
+  }
+  .migration-account-choice {
+    padding: 12px;
+  }
+}

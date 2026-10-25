@@ -122,6 +122,37 @@ export interface StripeMigrationMembershipProof {
   readonly expires_at: string;
   readonly paid_through: string;
   readonly context: string;
+  readonly draft?: StripeMigrationDraft;
+  readonly draft_hash?: string;
+}
+export interface StripeMigrationDraft {
+  customer_ids: string[];
+  price_tiers: StripePriceTier[];
+}
+export interface StripeMigrationChanges {
+  customer_links: Array<{ customer_id: string; name: string | null; email: string | null }>;
+  price_mappings: Array<{
+    price_id: string;
+    price_name: string | null;
+    tier_id: string;
+    tier_name: string;
+  }>;
+}
+export interface StripeMigrationCustomers {
+  customers: Array<{
+    id: string;
+    name: string | null;
+    email: string | null;
+    linked_discord_id: string | null;
+    linked_username: string | null;
+    suggested: boolean;
+    prices: Array<{ price_id: string; name: string | null; tier_id: string | null }>;
+  }>;
+  tiers: Array<{ id: string; name: string; account_limit: number }>;
+  next_cursor: string | null;
+  last_sync: string | null;
+  available: boolean;
+  message: string;
 }
 export interface StripeMigrationMembershipReview {
   status: 'verified' | 'inactive' | 'unlinked' | 'unavailable';
@@ -130,6 +161,7 @@ export interface StripeMigrationMembershipReview {
   account_limit?: number;
   message: string;
   proof?: StripeMigrationMembershipProof;
+  changes?: StripeMigrationChanges;
 }
 export interface StripeIntegrationOptions {
   clientFactory?: (key: string) => BillingClient;
@@ -209,8 +241,24 @@ export class StripeIntegration {
   private readonly now: () => number;
   private readonly migrationReviews = new Map<
     string,
-    { expires: number; review: StripeMigrationMembershipReview }
+    {
+      expires: number;
+      review: StripeMigrationMembershipReview;
+      subscriptions?: StripeSnapshot['subscriptions'];
+    }
   >();
+  private migrationInventory: {
+    revision: string;
+    context: string;
+    snapshot: StripeSnapshot;
+    observed_at: string;
+  } | null = null;
+  private migrationInventoryTask: Promise<{
+    available: boolean;
+    message: string;
+    last_sync: string | null;
+  }> | null = null;
+  private migrationInventoryController: AbortController | null = null;
   private readonly migrationReviewTasks = new Map<
     string,
     Promise<StripeMigrationMembershipReview>
@@ -542,6 +590,250 @@ export class StripeIntegration {
       auth?.kind === 'configured' ? auth.serverId : null,
     ]);
   }
+  private migrationCustomerInventory() {
+    const context = this.migrationContext();
+    const privateInventory =
+      this.migrationInventory?.context === context ? this.migrationInventory : null;
+    const snapshot = privateInventory?.snapshot ?? this.state.snapshot;
+    const observed = privateInventory?.observed_at ?? this.state.last_sync;
+    const time = Date.parse(observed ?? '');
+    return {
+      snapshot,
+      observed,
+      revision: privateInventory?.revision ?? this.state.revision,
+      available:
+        !!snapshot &&
+        snapshot.mode === 'live' &&
+        Number.isFinite(time) &&
+        this.now() >= time &&
+        this.now() - time <= checkoutTtl,
+    };
+  }
+  /** Local discovery only. Suggestions never establish customer ownership. */
+  searchMigrationCustomers(ownerId: string, query = '', cursor?: string): StripeMigrationCustomers {
+    if (!validSnowflake(ownerId) || typeof query !== 'string' || query.length > 200)
+      throw new ServiceError('Select a Discord owner and a search of at most 200 characters.');
+    const inventory = this.migrationCustomerInventory();
+    const result: StripeMigrationCustomers = {
+      customers: [],
+      tiers: (this.store.settings().membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).map(
+        ({ id, name, account_limit }) => ({ id, name, account_limit }),
+      ),
+      next_cursor: null,
+      last_sync: inventory.observed,
+      available: inventory.available && !this.stopped,
+      message: inventory.available
+        ? 'Choose the Stripe customer whose subscription belongs to this Discord owner. Suggestions require your approval.'
+        : 'Refresh the billing customer list here before choosing a customer.',
+    };
+    if (!result.available || !inventory.snapshot) return result;
+    const snapshot = inventory.snapshot,
+      search = query.trim().toLowerCase();
+    const links = new Map(this.state.links.map((entry) => [entry.customer_id, entry]));
+    const prices = new Map(this.state.price_tiers.map((entry) => [entry.price_id, entry.tier_id]));
+    const products = new Map(snapshot.products.map((entry) => [entry.id, entry.name]));
+    const grouped = new Map<string, StripeMigrationCustomers['customers'][number]>();
+    for (const subscription of snapshot.subscriptions) {
+      const link = links.get(subscription.customer_id);
+      let customer = grouped.get(subscription.customer_id);
+      if (!customer) {
+        customer = {
+          id: subscription.customer_id,
+          name: subscription.customer_name ?? null,
+          email: subscription.customer_email ?? null,
+          linked_discord_id: link?.discord_user_id ?? null,
+          linked_username: link?.username ?? null,
+          suggested: false,
+          prices: [],
+        };
+        grouped.set(customer.id, customer);
+      }
+      customer.suggested ||= subscription.identity_candidates.some(
+        (candidate) =>
+          candidate.discord_user_id === ownerId &&
+          (!candidate.guild_id || candidate.guild_id === this.guild()),
+      );
+      for (const item of subscription.items)
+        if (!customer.prices.some((price) => price.price_id === item.price_id))
+          customer.prices.push({
+            price_id: item.price_id,
+            name: products.get(item.product_id) ?? item.price_nickname ?? null,
+            tier_id: prices.get(item.price_id) ?? null,
+          });
+    }
+    const rows = [...grouped.values()]
+      .filter(
+        (customer) =>
+          !search ||
+          [customer.id, customer.name, customer.email].some((value) =>
+            value?.toLowerCase().includes(search),
+          ),
+      )
+      .sort(
+        (a, b) =>
+          Number(b.suggested) - Number(a.suggested) ||
+          (a.name ?? a.email ?? a.id).localeCompare(b.name ?? b.email ?? b.id) ||
+          a.id.localeCompare(b.id),
+      );
+    const fingerprint = migrationDigest([
+      this.migrationContext(),
+      inventory.revision,
+      inventory.observed,
+      ownerId,
+      search,
+    ]);
+    let offset = 0;
+    if (cursor) {
+      const [context, value, extra] = cursor.split(':');
+      if (context !== fingerprint || extra || !/^(0|[1-9][0-9]{0,5})$/.test(value ?? ''))
+        throw new ServiceError('The customer search changed. Search again from the first page.');
+      offset = Number(value);
+      if (offset > rows.length)
+        throw new ServiceError('The customer search changed. Search again.');
+    }
+    result.customers = rows.slice(offset, offset + 25);
+    if (offset + 25 < rows.length) result.next_cursor = `${fingerprint}:${offset + 25}`;
+    return result;
+  }
+  /** Explicit inventory refresh for the migration wizard. It keeps observations
+   * private until acceptance and does not invoke billing automation or syncing. */
+  async refreshMigrationCustomers(
+    signal?: AbortSignal,
+  ): Promise<{ available: boolean; message: string; last_sync: string | null }> {
+    if (signal?.aborted) throw new ServiceError('Membership review was canceled.');
+    if (this.migrationInventoryTask)
+      return structuredClone(await waitForMigrationReview(this.migrationInventoryTask, signal));
+    const context = this.migrationContext();
+    if (this.stopped || !this.state.api_key.startsWith('rk_live_') || this.task)
+      return {
+        available: false,
+        message:
+          'Connect live Stripe and wait for any current synchronization before refreshing customers.',
+        last_sync: null,
+      };
+    const controller = new AbortController();
+    this.migrationInventoryController = controller;
+    const timer = setTimeout(() => controller.abort(), migrationReviewTimeout);
+    timer.unref();
+    const task = (async () => {
+      try {
+        const client = this.clientFactory(this.state.api_key);
+        const snapshot = await waitForMigrationReview(
+          client.snapshot(controller.signal),
+          controller.signal,
+        );
+        if (
+          this.stopped ||
+          controller.signal.aborted ||
+          context !== this.migrationContext() ||
+          this.task ||
+          client.mode !== 'live' ||
+          snapshot.mode !== 'live' ||
+          snapshot.subscriptions.length > 10_000
+        )
+          throw new ServiceError('Billing inventory changed during refresh.');
+        const observed_at = new Date(this.now()).toISOString();
+        this.migrationInventory = {
+          revision: randomUUID(),
+          context,
+          snapshot: structuredClone(snapshot),
+          observed_at,
+        };
+        return {
+          available: true,
+          message:
+            'Customer list refreshed for this migration review. No links, accounts or automation settings were changed.',
+          last_sync: observed_at,
+        };
+      } catch {
+        return {
+          available: false,
+          message:
+            'Customer list could not be refreshed. Check the Stripe connection and try again.',
+          last_sync: null,
+        };
+      } finally {
+        clearTimeout(timer);
+        this.migrationInventoryController = null;
+      }
+    })().finally(() => {
+      this.migrationInventoryTask = null;
+    });
+    this.migrationInventoryTask = task;
+    return structuredClone(await waitForMigrationReview(task, signal));
+  }
+  private normalizeMigrationDraft(
+    ownerId: string,
+    draft?: StripeMigrationDraft,
+  ): StripeMigrationDraft | undefined {
+    if (!draft) return undefined;
+    if (
+      !Array.isArray(draft.customer_ids) ||
+      draft.customer_ids.length > 20 ||
+      !Array.isArray(draft.price_tiers) ||
+      draft.price_tiers.length > 20 ||
+      new Set(draft.customer_ids).size !== draft.customer_ids.length ||
+      new Set(draft.price_tiers.map((entry) => entry?.price_id)).size !== draft.price_tiers.length
+    )
+      throw new ServiceError(
+        'Review at most 20 distinct customers and price mappings for one owner.',
+      );
+    const inventory = this.migrationCustomerInventory();
+    const tiers = this.store.settings().membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS;
+    const customers = new Set([
+      ...this.state.links
+        .filter((link) => link.discord_user_id === ownerId)
+        .map((link) => link.customer_id),
+      ...draft.customer_ids,
+    ]);
+    for (const customer of draft.customer_ids) {
+      const previous = this.state.links.find((link) => link.customer_id === customer);
+      if (!stripeCustomer.test(customer) || (previous && previous.discord_user_id !== ownerId))
+        throw new ServiceError(
+          'This Stripe customer already belongs to a different Discord owner. Review the identity link before reassigning it.',
+        );
+      if (
+        !inventory.available ||
+        !inventory.snapshot?.subscriptions.some((row) => row.customer_id === customer)
+      )
+        throw new ServiceError(
+          'Refresh the customer list in this review and select a saved Stripe customer.',
+        );
+    }
+    for (const mapping of draft.price_tiers) {
+      const previous = this.state.price_tiers.find((entry) => entry.price_id === mapping?.price_id);
+      if (
+        !mapping ||
+        !stripePrice.test(mapping.price_id) ||
+        !tiers.some((tier) => tier.id === mapping.tier_id) ||
+        !inventory.snapshot?.subscriptions.some(
+          (row) =>
+            customers.has(row.customer_id) &&
+            row.items.some((item) => item.price_id === mapping.price_id),
+        )
+      )
+        throw new ServiceError(
+          'Select a price from this customer’s subscriptions and an existing Jellyport tier.',
+        );
+      if (previous && previous.tier_id !== mapping.tier_id)
+        throw new ServiceError(
+          'This price already maps to a different tier. Review its global mapping before changing it.',
+        );
+    }
+    const normalized = {
+      customer_ids: draft.customer_ids
+        .filter((customer) => !this.state.links.some((link) => link.customer_id === customer))
+        .sort(),
+      price_tiers: draft.price_tiers
+        .filter(
+          (mapping) => !this.state.price_tiers.some((entry) => entry.price_id === mapping.price_id),
+        )
+        .map(({ price_id, tier_id }) => ({ price_id, tier_id }))
+        .sort((a, b) => a.price_id.localeCompare(b.price_id)),
+    };
+    if (!normalized.customer_ids.length && !normalized.price_tiers.length) return undefined;
+    return normalized;
+  }
   private acquireMigrationOwner(signal: AbortSignal): Promise<() => void> {
     return new Promise((resolve, reject) => {
       const canceled = () => {
@@ -575,6 +867,7 @@ export class StripeIntegration {
   async reviewMembership(
     ownerId: string,
     signal?: AbortSignal,
+    draft?: StripeMigrationDraft,
   ): Promise<StripeMigrationMembershipReview> {
     if (signal?.aborted) throw new ServiceError('Membership review was canceled.');
     if (!validSnowflake(ownerId)) throw new ServiceError('Select a valid Discord member.');
@@ -595,7 +888,9 @@ export class StripeIntegration {
       return unavailable(
         'Wait for the current Stripe synchronization to finish, then refresh this membership.',
       );
-    const key = `${context}:${ownerId}`,
+    const normalizedDraft = this.normalizeMigrationDraft(ownerId, draft);
+    const draftHash = normalizedDraft ? migrationDigest(normalizedDraft) : undefined;
+    const key = `${context}:${ownerId}${draftHash ? `:${draftHash}` : ''}`,
       time = this.now();
     for (const [id, entry] of this.migrationReviews)
       if (entry.expires <= time) this.migrationReviews.delete(id);
@@ -613,6 +908,9 @@ export class StripeIntegration {
     const links = structuredClone(
       this.state.links.filter((link) => link.discord_user_id === ownerId),
     );
+    for (const customer of normalizedDraft?.customer_ids ?? [])
+      links.push({ customer_id: customer, discord_user_id: ownerId, username: '' });
+    const priceTiers = [...this.state.price_tiers, ...(normalizedDraft?.price_tiers ?? [])];
     if (!links.length)
       return {
         status: 'unlinked',
@@ -636,6 +934,7 @@ export class StripeIntegration {
       )
         throw new ServiceError('The billing review changed or expired. Refresh this membership.');
     };
+    let reviewedSubscriptions: StripeSnapshot['subscriptions'] | undefined;
     const run = async (): Promise<StripeMigrationMembershipReview> => {
       let release: (() => void) | undefined;
       try {
@@ -669,6 +968,17 @@ export class StripeIntegration {
             subscriptions.push(row);
           }
         }
+        if (
+          normalizedDraft?.price_tiers.some(
+            (mapping) =>
+              !subscriptions.some((row) =>
+                row.items.some((item) => item.price_id === mapping.price_id),
+              ),
+          )
+        )
+          throw new ServiceError(
+            'A selected subscription price changed. Refresh the customer review.',
+          );
         const periods = new Map<string, StripePaidPeriod | null>();
         for (const subscription of subscriptions) {
           current();
@@ -689,7 +999,7 @@ export class StripeIntegration {
             completed_at: new Date(this.now()).toISOString(),
           },
           links,
-          this.state.price_tiers,
+          priceTiers,
           periods,
           this.now(),
         ).find((item) => item.owner === ownerId);
@@ -727,8 +1037,41 @@ export class StripeIntegration {
           expires_at: new Date(Math.min(observed + migrationReviewTtl, paidThrough)).toISOString(),
           paid_through: new Date(paidThrough).toISOString(),
           context,
+          ...(normalizedDraft
+            ? { draft: structuredClone(normalizedDraft), draft_hash: draftHash }
+            : {}),
         };
         current();
+        reviewedSubscriptions = structuredClone(subscriptions);
+        const inventory = this.migrationCustomerInventory().snapshot;
+        const changes: StripeMigrationChanges | undefined = normalizedDraft
+          ? {
+              customer_links: normalizedDraft.customer_ids.map((customer_id) => {
+                const source = subscriptions.find((row) => row.customer_id === customer_id);
+                return {
+                  customer_id,
+                  name: source?.customer_name ?? null,
+                  email: source?.customer_email ?? null,
+                };
+              }),
+              price_mappings: normalizedDraft.price_tiers.map(({ price_id, tier_id }) => {
+                const item = subscriptions
+                  .flatMap((row) => row.items)
+                  .find((entry) => entry.price_id === price_id);
+                return {
+                  price_id,
+                  tier_id,
+                  price_name:
+                    inventory?.products.find((product) => product.id === item?.product_id)?.name ??
+                    item?.price_nickname ??
+                    null,
+                  tier_name: (settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).find(
+                    (entry) => entry.id === tier_id,
+                  )!.name,
+                };
+              }),
+            }
+          : undefined;
         return {
           status: 'verified',
           tier_id: tier.id,
@@ -736,6 +1079,7 @@ export class StripeIntegration {
           account_limit: tier.account_limit,
           message: `Verified ${tier.name} membership covers ${tier.account_limit} account${tier.account_limit === 1 ? '' : 's'}.`,
           proof,
+          ...(changes ? { changes } : {}),
         };
       } catch {
         return unavailable(
@@ -759,7 +1103,13 @@ export class StripeIntegration {
           !this.task
         ) {
           const expires = review.proof ? Date.parse(review.proof.expires_at) : this.now() + 10_000;
-          this.migrationReviews.set(key, { expires, review: structuredClone(review) });
+          this.migrationReviews.set(key, {
+            expires,
+            review: structuredClone(review),
+            ...(review.proof && reviewedSubscriptions
+              ? { subscriptions: reviewedSubscriptions }
+              : {}),
+          });
         }
         return review;
       })
@@ -772,7 +1122,9 @@ export class StripeIntegration {
   assertMigrationMembership(proof: StripeMigrationMembershipProof): void {
     const context = this.migrationContext(),
       time = this.now();
-    const cached = this.migrationReviews.get(`${context}:${proof.owner_id}`);
+    const cached = this.migrationReviews.get(
+      `${context}:${proof.owner_id}${proof.draft_hash ? `:${proof.draft_hash}` : ''}`,
+    );
     const observed = Date.parse(proof.observed_at),
       expires = Date.parse(proof.expires_at);
     if (
@@ -792,6 +1144,119 @@ export class StripeIntegration {
       throw new ServiceError(
         'The verified Stripe membership changed or expired. Refresh the migration review.',
       );
+  }
+  /** Stage additions for the queue's existing transaction. Until publication,
+   * in-memory authority remains unchanged and failed queue writes roll back all
+   * billing, ownership and membership decisions together. */
+  prepareMigrationCommit(
+    proofs: StripeMigrationMembershipProof[],
+    names: Map<string, string>,
+  ): { persistInTransaction: () => void; publishAfterCommit: () => void } {
+    if (
+      proofs.length > 100 ||
+      new Set(proofs.map((proof) => proof.owner_id)).size !== proofs.length
+    )
+      throw new ServiceError('Review each Discord owner once before accepting billing links.');
+    for (const proof of proofs) this.assertMigrationMembership(proof);
+    const context = this.migrationContext(),
+      next = structuredClone(this.state);
+    let changed = false;
+    for (const proof of proofs) {
+      const draft = proof.draft;
+      if (!draft) continue;
+      const entry = this.migrationReviews.get(`${context}:${proof.owner_id}:${proof.draft_hash}`);
+      const username = names.get(proof.owner_id);
+      if (draft.customer_ids.length && !cleanText(username, 64))
+        throw new ServiceError(
+          'Verify this Discord owner again before approving the customer link.',
+        );
+      for (const customer_id of draft.customer_ids) {
+        const existing = next.links.find((link) => link.customer_id === customer_id);
+        if (existing && existing.discord_user_id !== proof.owner_id)
+          throw new ServiceError(
+            'One Stripe customer cannot be assigned to different Discord owners in this migration.',
+          );
+        if (existing) continue;
+        const subscriptions = entry?.subscriptions?.filter(
+          (row) => row.customer_id === customer_id,
+        );
+        if (!subscriptions?.length)
+          throw new ServiceError(
+            'The selected customer’s current subscription evidence is unavailable. Refresh the review.',
+          );
+        next.links.push({ customer_id, discord_user_id: proof.owner_id, username: username! });
+        changed = true;
+        // Add only newly selected customers absent from the durable inventory.
+        // Retain its last_sync; a targeted read never claims global freshness.
+        if (!next.snapshot?.subscriptions.some((row) => row.customer_id === customer_id)) {
+          const inventory = this.migrationCustomerInventory().snapshot;
+          next.snapshot ??= {
+            mode: 'live',
+            subscriptions: [],
+            products: [],
+            completed_at: inventory?.completed_at ?? proof.observed_at,
+          };
+          const ids = new Set(next.snapshot.subscriptions.map((row) => row.id));
+          if (
+            next.snapshot.subscriptions.length + subscriptions.length > 10_000 ||
+            subscriptions.some((row) => ids.has(row.id))
+          )
+            throw new ServiceError(
+              'The customer inventory cannot adopt these subscription identities safely. Refresh Stripe before retrying.',
+            );
+          next.snapshot.subscriptions.push(...structuredClone(subscriptions));
+          const products = new Set(
+            subscriptions.flatMap((row) => row.items.map((item) => item.product_id)),
+          );
+          for (const product of inventory?.products ?? [])
+            if (
+              products.has(product.id) &&
+              !next.snapshot.products.some((entry) => entry.id === product.id)
+            )
+              next.snapshot.products.push(structuredClone(product));
+        }
+      }
+      for (const mapping of draft.price_tiers) {
+        const existing = next.price_tiers.find((entry) => entry.price_id === mapping.price_id);
+        if (existing && existing.tier_id !== mapping.tier_id)
+          throw new ServiceError(
+            'The same Stripe price cannot map to different tiers in this migration.',
+          );
+        if (!existing) {
+          next.price_tiers.push(structuredClone(mapping));
+          changed = true;
+        }
+      }
+    }
+    if (next.price_tiers.length > 100 || next.links.length > 10_000)
+      throw new ServiceError(
+        'The reviewed billing links or price mappings exceed their safe storage limits.',
+      );
+    if (changed) next.revision = randomUUID();
+    let persisted = false;
+    return {
+      persistInTransaction: () => {
+        if (!this.store.db.isTransaction)
+          throw new ServiceError(
+            'Billing links must be saved with the accepted migration transaction.',
+          );
+        if (persisted || context !== this.migrationContext())
+          throw new ServiceError(
+            'The billing configuration changed. Refresh the migration review.',
+          );
+        for (const proof of proofs) this.assertMigrationMembership(proof);
+        if (changed)
+          this.store.db
+            .prepare('INSERT OR REPLACE INTO stripe_integration_state (id,encrypted) VALUES (1,?)')
+            .run(this.store.encrypt(next));
+        persisted = true;
+      },
+      // The caller invokes this synchronously after queue commit, before its
+      // scheduled worker microtask. Every fallible validation precedes commit.
+      publishAfterCommit: () => {
+        if (persisted && changed) this.state = next;
+      },
+    };
   }
   sync(): Promise<StripeIntegrationStatus> {
     this.scope();
@@ -1221,10 +1686,12 @@ export class StripeIntegration {
   async stop(): Promise<void> {
     this.stopped = true;
     this.controller?.abort();
+    this.migrationInventoryController?.abort();
     for (const controller of this.migrationReviewControllers) controller.abort();
     this.migrationReviews.clear();
     await Promise.all([
       this.task?.catch(() => {}),
+      this.migrationInventoryTask?.catch(() => {}),
       this.roleCleanup.stop(),
       ...[...this.migrationReviewTasks.values()].map((task) => task.catch(() => {})),
     ]);

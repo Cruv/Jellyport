@@ -666,11 +666,21 @@ async function selectAndPreview() {
   fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
   await screen.findByText('Preparing migration review… 0 of 2 users complete.');
 }
+async function finishMigrationWizard(dialog = screen.getByRole('dialog')) {
+  for (let phase = 0; phase < 4; phase++) {
+    if (within(dialog).queryByRole('heading', { name: 'Final migration review' })) return;
+    const next = within(dialog).getByRole('button', { name: /^Next:/ });
+    await waitFor(() => expect(next).toHaveProperty('disabled', false));
+    fireEvent.click(next);
+  }
+  expect(within(dialog).getByRole('heading', { name: 'Final migration review' })).toBeTruthy();
+}
 async function selectAndPreviewReady() {
   fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
   fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
   fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
   await screen.findByRole('dialog');
+  await finishMigrationWizard();
 }
 describe('React account safeguards', () => {
   it('keeps a newer draft and blocks duplicate saves when an old Settings request finishes after remount', async () => {
@@ -2046,21 +2056,22 @@ describe('React account safeguards', () => {
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     const dialog = await screen.findByRole('dialog');
+    expect(requests.some((request) => request.path.startsWith('/api/discord/members'))).toBe(false);
+    fireEvent.click(within(dialog).getByRole('checkbox', { name: 'Assign alex' }));
+    fireEvent.change(within(dialog).getByLabelText('Discord owner'), {
+      target: { value: 'river' },
+    });
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Select @river' }));
+    fireEvent.click(
+      within(dialog).getByRole('button', { name: 'Assign owner to selected accounts' }),
+    );
+    await finishMigrationWizard(dialog);
     expect(within(dialog).getByText('Merge into existing account')).toBeTruthy();
     expect(
       within(dialog).getByText(
         'The existing Jellyfin password and account permissions will be preserved.',
       ),
     ).toBeTruthy();
-    expect(requests.some((request) => request.path.startsWith('/api/discord/members'))).toBe(false);
-    fireEvent.focus(within(dialog).getAllByLabelText('Discord recipient (optional)')[1]);
-    fireEvent.click(await within(dialog).findByRole('button', { name: 'Select @river' }));
-    await waitFor(() =>
-      expect(within(dialog).getByRole('button', { name: 'Start migration' })).toHaveProperty(
-        'disabled',
-        false,
-      ),
-    );
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
     await waitFor(() =>
       expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
@@ -2117,11 +2128,27 @@ describe('React account safeguards', () => {
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     const dialog = await screen.findByRole('dialog');
-    for (const input of within(dialog).getAllByLabelText('Discord recipient (optional)')) {
-      fireEvent.change(input, { target: { value: 'shared_owner' } });
-      fireEvent.click(await within(dialog).findByRole('button', { name: 'Select @shared_owner' }));
-    }
-    expect(within(dialog).getByRole('button', { name: 'Start migration' })).toHaveProperty(
+    fireEvent.change(within(dialog).getByLabelText('Discord owner'), {
+      target: { value: 'shared_owner' },
+    });
+    fireEvent.click(await within(dialog).findByRole('button', { name: 'Select @shared_owner' }));
+    fireEvent.click(
+      within(dialog).getByRole('button', { name: 'Assign owner to selected accounts' }),
+    );
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Next: Billing' }));
+    await within(dialog).findByText('Galleon · 3 accounts');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Next: Accounts' }));
+    expect(
+      within(dialog).getByLabelText('Membership account slot for personal-name'),
+    ).toHaveProperty('value', '1');
+    expect(within(dialog).getByLabelText('Membership account slot for other-name')).toHaveProperty(
+      'value',
+      '2',
+    );
+    fireEvent.change(within(dialog).getByLabelText('Membership account slot for other-name'), {
+      target: { value: '1' },
+    });
+    expect(within(dialog).getByRole('button', { name: 'Next: Review' })).toHaveProperty(
       'disabled',
       true,
     );
@@ -2129,12 +2156,7 @@ describe('React account safeguards', () => {
     fireEvent.change(within(dialog).getByLabelText('Membership account slot for other-name'), {
       target: { value: '2' },
     });
-    await waitFor(() =>
-      expect(
-        (within(dialog).getByRole('button', { name: 'Start migration' }) as HTMLButtonElement)
-          .disabled,
-      ).toBe(false),
-    );
+    await finishMigrationWizard(dialog);
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
     await waitFor(() =>
       expect(requests.filter((request) => request.path === '/api/migrations')).toHaveLength(1),
@@ -2178,6 +2200,7 @@ describe('React account safeguards', () => {
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     const dialog = await screen.findByRole('dialog');
+    await finishMigrationWizard(dialog);
     expect(within(dialog).getAllByText('History details deferred')).toHaveLength(2);
     expect(
       within(dialog).getAllByText(/Matching and played flags are read after approval/),
@@ -2238,6 +2261,7 @@ describe('React account safeguards', () => {
     expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
     responses['/api/migrations/preview/preview-task-1'] = readyPreviewTask;
     const dialog = await screen.findByRole('dialog', {}, { timeout: 3000 });
+    await finishMigrationWizard(dialog);
     expect(within(dialog).getByRole('button', { name: 'Start migration' })).toBeTruthy();
     expect(screen.queryByText(/Preparing migration review/)).toBeNull();
     expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
@@ -2296,7 +2320,8 @@ describe('React account safeguards', () => {
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText('2 users selected · played status only')).toBeTruthy();
+    await finishMigrationWizard(dialog);
+    expect(within(dialog).getByText('2 accounts selected · played status only')).toBeTruthy();
     expect(
       within(dialog).getByText(/New accounts still use your account role or template defaults/),
     ).toBeTruthy();
@@ -2339,7 +2364,8 @@ describe('React account safeguards', () => {
       );
       fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
       const dialog = await screen.findByRole('dialog');
-      expect(within(dialog).getByText('2 users selected · played status only')).toBeTruthy();
+      await finishMigrationWizard(dialog);
+      expect(within(dialog).getByText('2 accounts selected · played status only')).toBeTruthy();
       expect(within(dialog).queryByText('Favorites in Emby')).toBeNull();
       fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
       await waitFor(() =>
@@ -2378,6 +2404,7 @@ describe('React account safeguards', () => {
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
     const dialog = await screen.findByRole('dialog');
+    await finishMigrationWizard(dialog);
     expect(within(dialog).getByText('Saved Emby data selected.')).toBeTruthy();
     expect(within(dialog).getAllByText(/Saved Emby snapshot/)).toHaveLength(2);
     expect(
@@ -2465,7 +2492,7 @@ describe('React account safeguards', () => {
     const dialog = screen.getByRole('dialog');
     expect(within(dialog).getByText(/Review build: 1.3 seconds/)).toBeTruthy();
     expect(requests.some(({ options }) => options?.method === 'DELETE')).toBe(false);
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Back to users' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(requests.filter(({ options }) => options?.method === 'DELETE')).toHaveLength(1);
   });
@@ -2522,9 +2549,12 @@ describe('React account safeguards', () => {
     await screen.findByText('This migration review expired. Prepare a new preview.');
     responses['/api/migrations/preview'] = { ...readyPreviewTask, id: 'refreshed-preview' };
     fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: 'Refresh review' }),
+      within(screen.getByRole('dialog')).getByRole('button', {
+        name: 'Discard this draft and refresh the review',
+      }),
     );
     await screen.findByRole('dialog');
+    await finishMigrationWizard();
     expect(requests.filter(({ options }) => options?.method === 'DELETE')).toHaveLength(1);
     expect(requests.filter(({ path }) => path === '/api/migrations')).toHaveLength(1);
     responses['/api/migrations'] = { ...job, kind: 'migrate' };
@@ -2812,6 +2842,20 @@ describe('React account safeguards', () => {
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (1)' }));
     const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('checkbox', { name: 'Assign simple' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    const recipient = dialog.querySelector('input[name="complex"]') as HTMLInputElement;
+    expect(recipient.value).toBe('123456789012345678');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Next: Billing' }));
+    const next = within(dialog).getByRole('button', { name: 'Next: Accounts' });
+    expect(next).toHaveProperty('disabled', true);
+    fireEvent.click(next);
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+    await waitFor(() => expect(releaseMembership).toBeTypeOf('function'));
+    await act(async () => releaseMembership());
+    await finishMigrationWizard(dialog);
     expect(
       within(dialog).getByText('Mapped Emby account: Mr. Complex ! → Jellyfin: simple'),
     ).toBeTruthy();
@@ -2819,25 +2863,7 @@ describe('React account safeguards', () => {
     expect(within(dialog).queryByText('Favorites in Emby')).toBeNull();
     expect(within(dialog).queryByText('Resume positions')).toBeNull();
     expect(within(dialog).queryByText('Playlists')).toBeNull();
-    const recipient = dialog.querySelector('input[name="complex"]') as HTMLInputElement;
-    expect(recipient.value).toBe('123456789012345678');
     expect(within(dialog).getByText('@discord.original')).toBeTruthy();
-    expect(
-      (
-        within(dialog).getByRole('button', {
-          name: 'Clear Discord member @discord.original',
-        }) as HTMLButtonElement
-      ).disabled,
-    ).toBe(true);
-    const start = within(dialog).getByRole('button', {
-      name: 'Start migration',
-    }) as HTMLButtonElement;
-    expect(start.disabled).toBe(true);
-    fireEvent.click(start);
-    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
-    await waitFor(() => expect(releaseMembership).toBeTypeOf('function'));
-    await act(async () => releaseMembership());
-    await waitFor(() => expect(start.disabled).toBe(false));
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
     await waitFor(() =>
       expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),

@@ -317,67 +317,75 @@ export class UserMappings {
       );
   }
   save(input: SaveUserMapping, settings: Settings, expectedRevision?: string): UserMapping {
+    this.store.db.exec('BEGIN IMMEDIATE');
+    try {
+      const mapping = this.saveInTransaction(input, settings, expectedRevision);
+      this.store.db.exec('COMMIT');
+      return mapping;
+    } catch (error) {
+      this.store.db.exec('ROLLBACK');
+      this.invalidateCache();
+      throw error;
+    }
+  }
+  /** Caller owns the local transaction and invalidates this cache on rollback. */
+  saveInTransaction(
+    input: SaveUserMapping,
+    settings: Settings,
+    expectedRevision?: string,
+  ): UserMapping {
     validateInput(input);
     const servers = serverPair(settings);
     if (!servers)
       throw new ServiceError('Configure both media servers before creating user mappings.');
-    this.store.db.exec('BEGIN IMMEDIATE');
-    try {
-      const all = this.all();
-      const active = all.filter((mapping) => sameServers(mapping, servers));
-      if (input.id && !active.some((mapping) => mapping.id === input.id))
-        throw new ServiceError('This user mapping no longer exists for the configured servers.');
+    const all = this.all();
+    const active = all.filter((mapping) => sameServers(mapping, servers));
+    if (input.id && !active.some((mapping) => mapping.id === input.id))
+      throw new ServiceError('This user mapping no longer exists for the configured servers.');
+    if (
+      expectedRevision &&
+      active.find((mapping) => mapping.id === input.id)?.revision !== expectedRevision
+    )
+      throw new ServiceError('The user mapping changed. Review it before retrying the migration.');
+    if (!input.id && all.length >= MAX_MAPPINGS)
+      throw new ServiceError('Too many saved user mappings.');
+    for (const mapping of active) {
+      if (mapping.id === input.id) continue;
+      if (mapping.source_user_id === input.source_user_id)
+        throw new ServiceError('This Emby user already has a saved mapping. Edit that mapping.');
       if (
-        expectedRevision &&
-        active.find((mapping) => mapping.id === input.id)?.revision !== expectedRevision
+        (input.target_user_id && mapping.target_user_id === input.target_user_id) ||
+        nameKey(mapping.target_username) === nameKey(input.target_username)
       )
         throw new ServiceError(
-          'The user mapping changed. Review it before retrying the migration.',
+          'This Jellyfin account or username is already mapped to another Emby user.',
         );
-      if (!input.id && all.length >= MAX_MAPPINGS)
-        throw new ServiceError('Too many saved user mappings.');
-      for (const mapping of active) {
-        if (mapping.id === input.id) continue;
-        if (mapping.source_user_id === input.source_user_id)
-          throw new ServiceError('This Emby user already has a saved mapping. Edit that mapping.');
-        if (
-          (input.target_user_id && mapping.target_user_id === input.target_user_id) ||
-          nameKey(mapping.target_username) === nameKey(input.target_username)
-        )
-          throw new ServiceError(
-            'This Jellyfin account or username is already mapped to another Emby user.',
-          );
-        if (
-          input.discord_user_id &&
-          mapping.discord_user_id === input.discord_user_id &&
-          (mapping.membership_slot ?? 1) === (input.membership_slot ?? 1)
-        )
-          throw new ServiceError('This Discord user is already mapped to another Emby user.');
-      }
-      this.checkLinks(input, settings);
-      const mapping: UserMapping = {
-        id: input.id ?? randomUUID(),
-        source_server_url: servers[0],
-        source_user_id: input.source_user_id,
-        source_username: input.source_username,
-        target_server_url: servers[1],
-        target_user_id: input.target_user_id,
-        target_username: input.target_username,
-        discord_user_id: input.discord_user_id,
-        discord_username: input.discord_username,
-        membership_slot: input.membership_slot ?? 1,
-        revision: randomUUID(),
-      };
-      this.store.db
-        .prepare('INSERT OR REPLACE INTO user_mappings (id,encrypted) VALUES (?,?)')
-        .run(mapping.id, this.store.encrypt(mapping));
-      this.store.db.exec('COMMIT');
-      mappingCaches.delete(this.store);
-      return mapping;
-    } catch (error) {
-      this.store.db.exec('ROLLBACK');
-      throw error;
+      if (
+        input.discord_user_id &&
+        mapping.discord_user_id === input.discord_user_id &&
+        (mapping.membership_slot ?? 1) === (input.membership_slot ?? 1)
+      )
+        throw new ServiceError('This Discord user is already mapped to another Emby user.');
     }
+    this.checkLinks(input, settings);
+    const mapping: UserMapping = {
+      id: input.id ?? randomUUID(),
+      source_server_url: servers[0],
+      source_user_id: input.source_user_id,
+      source_username: input.source_username,
+      target_server_url: servers[1],
+      target_user_id: input.target_user_id,
+      target_username: input.target_username,
+      discord_user_id: input.discord_user_id,
+      discord_username: input.discord_username,
+      membership_slot: input.membership_slot ?? 1,
+      revision: randomUUID(),
+    };
+    this.store.db
+      .prepare('INSERT OR REPLACE INTO user_mappings (id,encrypted) VALUES (?,?)')
+      .run(mapping.id, this.store.encrypt(mapping));
+    this.invalidateCache();
+    return mapping;
   }
   /** Caller owns the queue-admission transaction and exact source/recipient
    * review. Adopt only an ownerless mapping; keep both media identities intact. */

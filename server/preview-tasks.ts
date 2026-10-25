@@ -23,6 +23,7 @@ interface Entry<T> {
   value: PreviewTask<T>;
   startedAt: number;
   attachments: Map<string, unknown>;
+  attachmentSlots: Map<string, string>;
 }
 interface Controls {
   signal: AbortSignal;
@@ -94,6 +95,7 @@ export class PreviewTasks<T> {
       value,
       startedAt: performance.now(),
       attachments: new Map(),
+      attachmentSlots: new Map(),
     };
     entry.timer.unref();
     this.entries.set(value.id, entry);
@@ -160,6 +162,12 @@ export class PreviewTasks<T> {
     return structuredClone(entry.value);
   }
 
+  /** Private cancellation for reads made inside a retained wizard. */
+  signal(owner: string, context: string, id: string): AbortSignal | undefined {
+    if (!this.get(owner, context, id)) return undefined;
+    return this.entries.get(id)?.controller.signal;
+  }
+
   /** Bounded private evidence retained with its ready, session-owned review;
    * never included in polling responses and released on cancellation/expiry. */
   retainAttachment(
@@ -168,15 +176,19 @@ export class PreviewTasks<T> {
     id: string,
     key: string,
     value: unknown,
+    slot?: string,
   ): boolean {
     if (this.get(owner, context, id)?.status !== 'ready') return false;
     const entry = this.entries.get(id)!;
+    const previous = slot ? entry.attachmentSlots.get(slot) : undefined;
     if (
-      (!entry.attachments.has(key) && entry.attachments.size >= 200) ||
+      (!entry.attachments.has(key) && !previous && entry.attachments.size >= 200) ||
       Buffer.byteLength(JSON.stringify(value)) > 16 * 1024
     )
       throw new ServiceError('This review has too many membership checks. Prepare a fresh review.');
+    if (previous && previous !== key) entry.attachments.delete(previous);
     entry.attachments.set(key, structuredClone(value));
+    if (slot) entry.attachmentSlots.set(slot, key);
     return true;
   }
   attachment<A>(owner: string, context: string, id: string, key: string): A | undefined {

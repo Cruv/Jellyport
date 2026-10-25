@@ -661,8 +661,14 @@ export class Store {
       return result;
     });
   }
-  saveQueuedJob(job: Job, requests: JobRequest[], settings: Settings): void {
+  saveQueuedJob(
+    job: Job,
+    requests: JobRequest[],
+    settings: Settings,
+    beforePersist?: () => void,
+  ): void {
     this.transaction(() => {
+      beforePersist?.();
       this.saveJob(job);
       this.db
         .prepare('INSERT INTO job_queue VALUES (?,?)')

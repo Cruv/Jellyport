@@ -19,13 +19,12 @@ import {
   Modal,
   Status,
   SourceSnapshotNote,
-  UserCell,
 } from './components';
 import SettingsPage from './SettingsPage';
 import BotMessageHistoryPanel from './BotMessageHistoryPanel';
 import AuthScreen from './AuthScreen';
 import UserMappingsPage from './UserMappingsPage';
-import DiscordMemberPicker from './DiscordMemberPicker';
+import MigrationPreviewDialog from './MigrationPreviewDialog';
 import AccountRolesPage from './AccountRolesPage';
 import MemberManagementPage from './MemberManagementPage';
 import UserDirectoryPage from './UserDirectoryPage';
@@ -55,8 +54,6 @@ import {
   type SubscriptionEvent,
   type Users,
   type UserMapping,
-  type DiscordMember,
-  type PreviewUser,
   type SourceSnapshotStatus,
   type HistoryCleanupResult,
 } from './types';
@@ -814,6 +811,7 @@ export default function App() {
     if (dialog?.kind !== 'preview') return;
     const values = new FormData(event.currentTarget);
     const recipients: Record<string, string> = {};
+    const membershipSlots: Record<string, number> = {};
     const mappingRevisions: Record<string, string | null> = {};
     dialog.preview.users.forEach((user) => {
       const value = user.history_only
@@ -821,7 +819,12 @@ export default function App() {
         : String(
             values.get(user.source_user_id) || values.get(`manual-${user.source_user_id}`) || '',
           ).trim();
-      if (value) recipients[user.source_user_id] = value;
+      if (value) {
+        recipients[user.source_user_id] = value;
+        const locked = !!user.discord_user_id && (!!user.mapping_id || !!user.owner_basis);
+        const slot = Number(values.get(`slot-${user.source_user_id}`));
+        if (!locked && [1, 2, 3].includes(slot)) membershipSlots[user.source_user_id] = slot;
+      }
       if (user.mapping_revision !== undefined)
         mappingRevisions[user.source_user_id] = user.mapping_revision;
     });
@@ -837,6 +840,7 @@ export default function App() {
             ? { source_snapshot_ids: dialog.preview.source_snapshot_ids }
             : {}),
           discord_recipients: recipients,
+          ...(Object.keys(membershipSlots).length ? { membership_slots: membershipSlots } : {}),
           ...(Object.keys(mappingRevisions).length ? { mapping_revisions: mappingRevisions } : {}),
         },
       });
@@ -1351,68 +1355,6 @@ export default function App() {
     </WorkspaceNoticeProvider>
   );
 }
-function MigrationRecipient({ user, api }: { user: PreviewUser; api: Api }) {
-  const [member, setMember] = useState<DiscordMember | null>(
-    user.discord_user_id
-      ? {
-          id: user.discord_user_id,
-          username: user.discord_username || user.username,
-          display_name: null,
-          nickname: null,
-          membership_active: null,
-        }
-      : null,
-  );
-  const mapped = !!user.discord_user_id && (!!user.mapping_id || !!user.owner_basis);
-  return (
-    <>
-      <DiscordMemberPicker
-        api={api}
-        value={member}
-        onChange={setMember}
-        suggestedQuery={
-          user.discord_username || user.owner_search || user.source_username || user.username
-        }
-        disabled={mapped}
-        label={
-          user.membership_slot
-            ? `Discord owner · account ${user.membership_slot}`
-            : 'Discord recipient (optional)'
-        }
-        id={`recipient-${user.source_user_id}`}
-        inputName={user.source_user_id}
-      />
-      <p className="subtle text-tiny">
-        {mapped
-          ? user.owner_basis === 'numbered_suggestion'
-            ? 'Starting confirms this suggested owner and account slot. Every new household account sends its own credentials to this same owner. Save a user mapping to choose a different owner.'
-            : 'This member and account slot are confirmed by your saved mapping or ownership review. Edit the mapping to change them.'
-          : user.target_exists
-            ? 'Select a member to link membership management. Existing credentials are preserved.'
-            : 'Select a member for private credential delivery. For different usernames, save a user mapping first.'}
-      </p>
-      {!mapped && (
-        <details>
-          <summary>Advanced Discord details</summary>
-          <div className="field">
-            <label htmlFor={`manual-recipient-${user.source_user_id}`}>
-              Discord recipient ID (advanced)
-            </label>
-            <input
-              id={`manual-recipient-${user.source_user_id}`}
-              name={`manual-${user.source_user_id}`}
-              disabled={!!member}
-              inputMode="numeric"
-              pattern="[0-9]{15,22}"
-              maxLength={22}
-              autoComplete="off"
-            />
-          </div>
-        </details>
-      )}
-    </>
-  );
-}
 
 function HistoryCleanupDialog({
   review,
@@ -1625,158 +1567,18 @@ function DialogContent({
 }) {
   if (dialog.kind === 'cleanup')
     return <HistoryCleanupDialog review={dialog} close={close} submit={cleanupHistory} />;
-  if (dialog.kind === 'preview') {
-    const users = dialog.preview.users;
+  if (dialog.kind === 'preview')
     return (
-      <Modal
-        title="Review your migration"
-        description={`${users.length} ${users.length === 1 ? 'user' : 'users'} selected · played status only`}
-        wide
+      <MigrationPreviewDialog
+        key={dialog.previewId}
+        review={dialog}
+        api={api}
         close={close}
-        footer={
-          <>
-            <button className="btn btn-quiet" onClick={close} disabled={busy.has('migration')}>
-              Back to users
-            </button>
-            <button
-              className="btn btn-quiet"
-              onClick={refreshPreview}
-              disabled={busy.has('migration')}
-            >
-              Refresh review
-            </button>
-            <button
-              className="btn btn-primary"
-              type="submit"
-              form="migration-preview-form"
-              disabled={busy.has('migration')}
-            >
-              {busy.has('migration') ? <span className="spinner" /> : <Icon name="migrate" />}
-              {busy.has('migration') ? 'Starting migration…' : 'Start migration'}
-            </button>
-          </>
-        }
-      >
-        {dialog.reviewElapsedMs !== undefined && (
-          <p className="subtle text-small">
-            Review build: {(dialog.reviewElapsedMs / 1000).toFixed(1)} seconds. This is included in
-            the combined migration timing after approval; time spent reviewing is excluded.
-          </p>
-        )}
-        <Callout icon="shield" title="Preview before you move.">
-          Played flags from either server are preserved. Only played or unplayed status is migrated;
-          resume positions, playback dates, play counts, favorites, playlists, ratings, profile
-          images, and preferences are not imported. Existing Jellyfin personal state stays
-          unchanged. New accounts still use your account role or template defaults. Unmatched and
-          ambiguous items appear in the results and are not changed.
-        </Callout>
-        {dialog.preview.source_snapshot_ids && (
-          <Callout icon="info" title="Saved Emby data selected.">
-            This migration uses the captured snapshots shown below. Their versions stay fixed after
-            approval, even if a newer capture finishes. Activity after each capture window is not
-            included.
-          </Callout>
-        )}
-        <form id="migration-preview-form" onSubmit={startMigration}>
-          {users.map((user) => (
-            <section className="preview-user" key={user.source_user_id}>
-              <div className="preview-user-header">
-                <UserCell name={user.username} />
-                <span className={`status ${user.target_exists ? '' : 'good'}`}>
-                  {user.history_only
-                    ? 'Watch history only'
-                    : user.target_exists
-                      ? 'Merge into existing account'
-                      : 'Create new account'}
-                </span>
-              </div>
-              {user.history_only && (
-                <Callout icon="shield" title="Protected account · watch history only">
-                  Add played flags to this existing administrator or template account. Its password,
-                  permissions, Home settings, and Discord ownership stay unchanged.
-                  <p className="text-small">Jellyfin account ID: {user.target_user_id}</p>
-                </Callout>
-              )}
-              {user.mapping_id && (
-                <p className="subtle text-small">
-                  Mapped Emby account: {user.source_username} → Jellyfin: {user.username}
-                </p>
-              )}
-              {user.source_snapshot && <SourceSnapshotNote snapshot={user.source_snapshot} />}
-              {user.stats ? (
-                <div className="preview-stats">
-                  {[
-                    { value: user.stats.source_played, label: 'Played in Emby', color: '' },
-                    { value: user.stats.matched, label: 'Matched to Jellyfin', color: 'mint' },
-                    {
-                      value: user.stats.unmatched,
-                      label: 'Unmatched',
-                      color: user.stats.unmatched ? '' : 'muted',
-                    },
-                    {
-                      value: user.stats.ambiguous,
-                      label: 'Ambiguous',
-                      color: user.stats.ambiguous ? '' : 'muted',
-                    },
-                  ].map((stat) => (
-                    <div className="preview-stat" key={stat.label}>
-                      <strong className={stat.color}>{num(stat.value)}</strong>
-                      <span>{stat.label}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <Callout icon="info" title="History details deferred">
-                  This lightweight review checks accounts without scanning their history. Matching
-                  and played flags are read after approval. Counts and item issues will appear in
-                  the migration results.
-                </Callout>
-              )}
-              <div className="preview-user-body">
-                {user.warnings?.map((warning, index) => (
-                  <p className="subtle text-small" key={index}>
-                    {warning}
-                  </p>
-                ))}
-                {!!user.stats?.already_played && (
-                  <p className="subtle text-tiny mb-14">
-                    {num(user.stats.already_played)} matched items are already played on Jellyfin.
-                  </p>
-                )}
-                {user.stats && (
-                  <>
-                    <Issues
-                      label="Unmatched items"
-                      items={user.unmatched}
-                      count={user.stats.unmatched}
-                    />
-                    <Issues
-                      label="Ambiguous items"
-                      items={user.ambiguous}
-                      count={user.stats.ambiguous}
-                      ambiguous
-                    />
-                  </>
-                )}
-                {user.target_exists && (
-                  <p className="subtle text-tiny mb-14">
-                    The existing Jellyfin password and account permissions will be preserved.
-                  </p>
-                )}
-                {!user.history_only && (
-                  <MigrationRecipient
-                    key={`${user.source_user_id}:${user.mapping_revision || ''}`}
-                    user={user}
-                    api={api}
-                  />
-                )}
-              </div>
-            </section>
-          ))}
-        </form>
-      </Modal>
+        startMigration={startMigration}
+        refreshPreview={refreshPreview}
+        busy={busy}
+      />
     );
-  }
   if (dialog.kind === 'job') {
     const job = dialog.job;
     const migrationJob = ['migrate', 'migration'].includes(job.kind);

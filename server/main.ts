@@ -16,7 +16,7 @@ import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Store } from './store.js';
-import { Service } from './service.js';
+import { Service, type ReviewedHouseholdAccount } from './service.js';
 import { PreviewTasks } from './preview-tasks.js';
 import { CloneReviews, type CloneAccountsInput } from './account-cloning.js';
 import type { MigrationScope } from './migration.js';
@@ -75,6 +75,7 @@ interface MigrationRequest {
   preview_id?: string;
   source_user_ids: string[];
   discord_recipients?: Record<string, string>;
+  membership_slots?: Record<string, number>;
   mapping_revisions?: Record<string, string | null>;
   migration_scope?: MigrationScope;
   use_snapshots?: boolean;
@@ -142,6 +143,13 @@ const migrationSchema = {
       type: 'object',
       maxProperties: 100,
       additionalProperties: { type: 'string', pattern: '^[0-9]{5,22}$' },
+    },
+    membership_slots: {
+      type: 'object',
+      minProperties: 1,
+      maxProperties: 100,
+      propertyNames: id,
+      additionalProperties: { type: 'integer', minimum: 1, maximum: 3 },
     },
     mapping_revisions: {
       type: 'object',
@@ -1141,6 +1149,52 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       const reviewed = request.body.preview_id
         ? previews.get(request.cookies[COOKIE]!, previewContext(), request.body.preview_id)
         : undefined;
+      const approvalSession = session(request);
+      const approvalContext = previewContext();
+      const manualOwners: Record<
+        string,
+        Omit<ReviewedHouseholdAccount, 'discord_username'>
+      > = Object.create(null);
+      if (request.body.membership_slots) {
+        if (!reviewed?.preview || reviewed.status !== 'ready')
+          throw new ServiceError('Prepare a migration review before assigning account slots.');
+        for (const [sourceId, slot] of Object.entries(request.body.membership_slots)) {
+          const user = reviewed.preview.users.find((entry) => entry.source_user_id === sourceId);
+          const source = reviewed.preview.owner_assignment_sources?.[sourceId];
+          const recipient = request.body.discord_recipients?.[sourceId];
+          if (
+            !request.body.source_user_ids.includes(sourceId) ||
+            !user ||
+            user.history_only ||
+            reviewed.preview.history_only_targets?.[sourceId] ||
+            !Object.hasOwn(reviewed.preview.owner_assignment_sources ?? {}, sourceId) ||
+            !Object.hasOwn(request.body.discord_recipients ?? {}, sourceId) ||
+            !source ||
+            !recipient
+          )
+            throw new ServiceError(
+              'Choose an owner and account slot for an unprotected account in this review.',
+            );
+          manualOwners[sourceId] = { ...source, discord_user_id: recipient, slot };
+        }
+      }
+      const manualApproval = Object.keys(manualOwners).length > 0;
+      const approvedMappingOwner = reviewed?.preview?.users.some(
+        (user) => user.mapping_id && user.owner_basis === 'approved',
+      );
+      const guardOwnerApproval = () => {
+        if (!approvalSession?.authenticated || session(request) !== approvalSession)
+          throw new JellyfinAuthError('Sign in again before approving account owners.', 401);
+        if (
+          !reviewed ||
+          previews.get(request.cookies[COOKIE]!, approvalContext, reviewed.id)?.status !==
+            'ready' ||
+          previewContext() !== approvalContext
+        )
+          throw new ServiceError(
+            'This migration review changed or was canceled. Prepare a new review.',
+          );
+      };
       let mappingRevisions = request.body.mapping_revisions;
       let previewTiming;
       if (request.body.preview_id) {
@@ -1189,7 +1243,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         throw new ServiceError('This migration review is already being accepted.');
       if (reviewed) acceptingPreviews.add(reviewed.id);
       try {
-        const job = await service.migrateUsers(
+        const migrationArguments: Parameters<Service['migrateUsers']> = [
           request.body.source_user_ids,
           request.body.discord_recipients,
           mappingRevisions,
@@ -1198,7 +1252,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           previewTiming,
           reviewed?.preview?.history_only_targets,
           reviewed?.preview?.household_targets,
-        );
+        ];
+        if (manualApproval) migrationArguments[8] = manualOwners;
+        if (manualApproval || approvedMappingOwner) migrationArguments[9] = guardOwnerApproval;
+        const job = await service.migrateUsers(...migrationArguments);
         // The duration is now copied into the durable job; release session-owned review data.
         if (reviewed) previews.cancel(request.cookies[COOKIE]!, reviewed.id);
         return reply.code(202).send(job);

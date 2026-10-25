@@ -159,6 +159,31 @@ describe('reviewed household source accounts', () => {
       preview.household_targets,
     );
   }
+  function acceptManual(
+    preview: Preview,
+    slots: Record<string, number>,
+    admissionGuard?: () => void,
+  ) {
+    return service.migrateUsers(
+      preview.users.map((user) => user.source_user_id),
+      Object.fromEntries(preview.users.map((user) => [user.source_user_id, owner])),
+      Object.fromEntries(
+        preview.users.map((user) => [user.source_user_id, user.mapping_revision ?? null]),
+      ),
+      preview.migration_scope,
+      preview.source_snapshot_ids,
+      undefined,
+      preview.history_only_targets,
+      preview.household_targets,
+      Object.fromEntries(
+        Object.entries(slots).map(([id, slot]) => [
+          id,
+          { ...preview.owner_assignment_sources![id]!, discord_user_id: owner, slot },
+        ]),
+      ),
+      admissionGuard,
+    );
+  }
 
   it('suggests numbered accounts from a complete roster without approving ownership or reading history', async () => {
     const preview = await service.preview(sources);
@@ -213,6 +238,264 @@ describe('reviewed household source accounts', () => {
     const preview = await service.preview(['e-second', 'e-third']);
     expect(preview.users.every((user) => user.discord_user_id === null)).toBe(true);
     expect(preview.household_targets).toBeUndefined();
+    expect(preview.owner_assignment_sources?.['e-second']).toEqual({
+      source_username: 'Jim_2',
+      server_id: 'demo-emby',
+    });
+  });
+
+  it('migrates differently named accounts into explicitly reviewed slots for one Discord owner', async () => {
+    store.db.exec('DELETE FROM media_ownership');
+    servers.users.emby[0]!.Name = 'Cinema-Profile';
+    servers.users.emby[1]!.Name = 'Cartoon-Profile';
+    bot.roster.complete = false;
+    const preview = await service.preview(['e-base', 'e-second']);
+    expect(preview.users.every((user) => user.discord_user_id === null)).toBe(true);
+    expect(service.mediaOwnerships.list(store.settings())).toHaveLength(0);
+    const job = await finish(await acceptManual(preview, { 'e-base': 1, 'e-second': 2 }));
+    expect(job.status).toBe('completed');
+    expect(job.results.map((result) => result.username)).toEqual([
+      'Cinema-Profile',
+      'Cartoon-Profile',
+    ]);
+    expect(
+      store.linksForMember(owner).map((link) => [link.username, link.membership_slot]),
+    ).toEqual([
+      ['Cinema-Profile', 1],
+      ['Cartoon-Profile', 2],
+    ]);
+    for (const [id, slot] of [
+      ['e-base', 1],
+      ['e-second', 2],
+    ] as const)
+      expect(service.mediaOwnerships.get('emby', 'demo-emby', id, store.settings())).toMatchObject({
+        discord_user_id: owner,
+        slot,
+      });
+    expect(bot.sendCredentials.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+      [owner, 'Cinema-Profile'],
+      [owner, 'Cartoon-Profile'],
+    ]);
+    expect(reset).not.toHaveBeenCalled();
+  });
+
+  it('preserves an ownerless destination mapping while confirming a custom second slot', async () => {
+    servers.users.emby[1]!.Name = 'Legacy-Child';
+    service.mappings.save(
+      {
+        source_user_id: 'e-second',
+        source_username: 'Legacy-Child',
+        target_user_id: null,
+        target_username: 'Child-Profile',
+        discord_user_id: null,
+        discord_username: null,
+      },
+      store.settings(),
+    );
+    const mapping = service.mappings.getForSource('e-second', store.settings())!;
+    const job = await finish(
+      await acceptManual(await service.preview(['e-second']), { 'e-second': 2 }),
+    );
+    expect(job.results.map((result) => result.error)).toEqual([undefined]);
+    expect(job.status).toBe('completed');
+    expect(store.link(owner, 2)?.username).toBe('Child-Profile');
+    expect(service.mappings.getForSource('e-second', store.settings())).toMatchObject({
+      id: mapping.id,
+      source_user_id: mapping.source_user_id,
+      source_username: mapping.source_username,
+      target_username: mapping.target_username,
+      target_user_id: store.link(owner, 2)?.remote_id,
+      discord_user_id: owner,
+      discord_username: 'Jim',
+      membership_slot: 2,
+    });
+    const next = await service.preview(['e-second']);
+    expect(next.users[0]).toMatchObject({
+      discord_user_id: owner,
+      membership_slot: 2,
+      owner_basis: 'mapping',
+    });
+  });
+
+  it('keeps duplicate slot protection when two names are assigned to the same owner slot', async () => {
+    servers.users.emby[1]!.Name = 'Separate-Profile';
+    const preview = await service.preview(['e-base', 'e-second']);
+    await expect(acceptManual(preview, { 'e-base': 1, 'e-second': 1 })).rejects.toThrow(
+      'different Discord recipient or approved membership slot',
+    );
+    expect(store.jobs()).toHaveLength(0);
+    expect(service.mediaOwnerships.list(store.settings())).toHaveLength(1);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('adopts an ownerless new-target mapping for its already approved exact source owner and slot', async () => {
+    servers.users.emby[1]!.Name = 'Approved-Legacy';
+    service.mappings.save(
+      {
+        source_user_id: 'e-second',
+        source_username: 'Approved-Legacy',
+        target_user_id: null,
+        target_username: 'Approved-Child',
+        discord_user_id: null,
+        discord_username: null,
+      },
+      store.settings(),
+    );
+    register('e-second', owner, 2);
+    const sourceOwner = service.mediaOwnerships.get(
+      'emby',
+      'demo-emby',
+      'e-second',
+      store.settings(),
+    );
+    const preview = await service.preview(['e-second']);
+    expect(preview.users[0]).toMatchObject({
+      discord_user_id: owner,
+      membership_slot: 2,
+      owner_basis: 'approved',
+    });
+    const job = await finish(await accept(preview));
+    expect(job.results.map((result) => result.error)).toEqual([undefined]);
+    expect(job.status).toBe('completed');
+    expect(service.mediaOwnerships.get('emby', 'demo-emby', 'e-second', store.settings())).toEqual(
+      sourceOwner,
+    );
+    expect(service.mappings.getForSource('e-second', store.settings())).toMatchObject({
+      source_user_id: 'e-second',
+      source_username: 'Approved-Legacy',
+      target_username: 'Approved-Child',
+      discord_user_id: owner,
+      discord_username: 'Jim',
+      membership_slot: 2,
+    });
+    expect(store.link(owner, 2)?.username).toBe('Approved-Child');
+  });
+
+  it.each(['source-owner', 'mapping-owner', 'tier', 'target-slot', 'target-owner', 'source-name'])(
+    'rejects a conflicting %s before saving a manual ownership approval',
+    async (conflict) => {
+      servers.users.emby[1]!.Name = 'Separate-Profile';
+      const preview = await service.preview(['e-second']);
+      if (conflict === 'source-owner') register('e-second', other, 2);
+      else if (conflict === 'mapping-owner') {
+        store.db.exec('DELETE FROM media_ownership');
+        service.mappings.save(
+          {
+            source_user_id: 'e-second',
+            source_username: 'Separate-Profile',
+            target_user_id: null,
+            target_username: 'Separate-Profile',
+            discord_user_id: owner,
+            discord_username: 'Jim',
+            membership_slot: 1,
+          },
+          store.settings(),
+        );
+      } else if (conflict === 'tier') {
+        const member = service.memberships.get(owner, store.settings())!;
+        service.memberships.save(
+          { ...member, account_limit: 1, tier_id: 'sloop' },
+          store.settings(),
+          member.revision,
+        );
+      } else if (conflict === 'target-slot')
+        store.saveLink(owner, 'Existing-Profile', 'different-existing', false, 2);
+      else if (conflict === 'target-owner') {
+        servers.users.jellyfin.push({
+          Id: 'owned-target',
+          Name: 'Separate-Profile',
+          Policy: { IsAdministrator: false, IsDisabled: false },
+        });
+        service.mediaOwnerships.save(
+          [
+            {
+              kind: 'jellyfin',
+              server_id: 'demo-jellyfin',
+              account_id: 'owned-target',
+              username: 'Separate-Profile',
+              discord_user_id: other,
+              slot: 2,
+            },
+          ],
+          store.settings(),
+        );
+      } else servers.users.emby[1]!.Name = 'Renamed-Profile';
+      await expect(acceptManual(preview, { 'e-second': 2 })).rejects.toThrow();
+      expect(store.jobs()).toHaveLength(0);
+      expect(create).not.toHaveBeenCalled();
+      if (conflict !== 'source-owner')
+        expect(
+          service.mediaOwnerships.get('emby', 'demo-emby', 'e-second', store.settings()),
+        ).toBeNull();
+    },
+  );
+
+  it('rolls back source approvals if queued work cannot be persisted', async () => {
+    servers.users.emby[1]!.Name = 'Separate-Profile';
+    const preview = await service.preview(['e-second']);
+    const save = vi.spyOn(store, 'saveJob').mockImplementationOnce(() => {
+      throw new Error('Synthetic queue write failure');
+    });
+    await expect(acceptManual(preview, { 'e-second': 2 })).rejects.toThrow(
+      'Synthetic queue write failure',
+    );
+    save.mockRestore();
+    expect(store.jobs()).toHaveLength(0);
+    expect(
+      service.mediaOwnerships.get('emby', 'demo-emby', 'e-second', store.settings()),
+    ).toBeNull();
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('restores an ownerless mapping and its cached revision after queue persistence rolls back', async () => {
+    servers.users.emby[1]!.Name = 'Separate-Profile';
+    service.mappings.save(
+      {
+        source_user_id: 'e-second',
+        source_username: 'Separate-Profile',
+        target_user_id: null,
+        target_username: 'Separate-Profile',
+        discord_user_id: null,
+        discord_username: null,
+      },
+      store.settings(),
+    );
+    const mapping = service.mappings.getForSource('e-second', store.settings())!;
+    const preview = await service.preview(['e-second']);
+    const save = vi.spyOn(store, 'saveJob').mockImplementationOnce(() => {
+      // Populate the cache while the newly approved mapping is still visible.
+      expect(service.mappings.get(mapping.id, store.settings())?.discord_user_id).toBe(owner);
+      throw new Error('Synthetic persistence failure after mapping approval');
+    });
+    await expect(acceptManual(preview, { 'e-second': 2 })).rejects.toThrow(
+      'Synthetic persistence failure after mapping approval',
+    );
+    save.mockRestore();
+    expect(service.mappings.getForSource('e-second', store.settings())).toEqual(mapping);
+    expect(
+      service.mediaOwnerships.get('emby', 'demo-emby', 'e-second', store.settings()),
+    ).toBeNull();
+    expect(store.jobs()).toHaveLength(0);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('does not save approval when a reviewed session expires during Discord verification', async () => {
+    servers.users.emby[1]!.Name = 'Separate-Profile';
+    const preview = await service.preview(['e-second']);
+    let active = true;
+    vi.spyOn(bot, 'validateRecipient').mockImplementation(async () => {
+      active = false;
+    });
+    await expect(
+      acceptManual(preview, { 'e-second': 2 }, () => {
+        if (!active) throw new Error('Synthetic review expired');
+      }),
+    ).rejects.toThrow('Synthetic review expired');
+    expect(store.jobs()).toHaveLength(0);
+    expect(
+      service.mediaOwnerships.get('emby', 'demo-emby', 'e-second', store.settings()),
+    ).toBeNull();
+    expect(create).not.toHaveBeenCalled();
   });
 
   it('honors a reviewed legacy naming alias without renaming its existing source account', async () => {

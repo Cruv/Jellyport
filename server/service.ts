@@ -1102,6 +1102,10 @@ export class Service {
     source_snapshot_ids?: Record<string, string>;
     history_only_targets?: Record<string, ReviewedHistoryTarget>;
     household_targets?: Record<string, ReviewedHouseholdAccount>;
+    owner_assignment_sources?: Record<
+      string,
+      Pick<ReviewedHouseholdAccount, 'source_username' | 'server_id'>
+    >;
   }> {
     const scope = migrationScope(options.migration_scope);
     const checkCanceled = () => {
@@ -1191,7 +1195,7 @@ export class Service {
                 target.Policy?.IsAdministrator === true),
             );
             const registeredIdentity =
-              !mapping && !historyOnly && registeredOwner
+              !mapping?.discord_user_id && !historyOnly && registeredOwner
                 ? await this.requireBot().recipientIdentity(registeredOwner.discord_user_id, false)
                 : null;
             if (
@@ -1290,14 +1294,26 @@ export class Service {
           const suggestions = await this.householdSuggestions(users, settings);
           checkCanceled();
           const householdTargets: Record<string, ReviewedHouseholdAccount> = {};
-          if (Object.keys(suggestions).length) {
+          const ownerAssignmentSources: Record<
+            string,
+            Pick<ReviewedHouseholdAccount, 'source_username' | 'server_id'>
+          > = {};
+          if (
+            Object.keys(suggestions).length ||
+            (settings.discord_enabled && users.some((user) => !user.history_only))
+          ) {
             const info = snapshotInfo ?? (await emby.systemInfo());
             checkCanceled();
             if (typeof info.Id !== 'string' || !info.Id)
               throw new ServiceError(
-                'The Emby server identity could not be verified for numbered account review.',
+                'The Emby server identity could not be verified for account owner review.',
               );
             for (const user of users) {
+              if (!user.history_only)
+                ownerAssignmentSources[user.source_user_id] = {
+                  source_username: user.source_username,
+                  server_id: info.Id,
+                };
               const suggested = suggestions[user.source_user_id];
               if (!suggested) continue;
               householdTargets[user.source_user_id] = { ...suggested, server_id: info.Id };
@@ -1316,6 +1332,9 @@ export class Service {
             migration_scope: scope,
             ...(Object.keys(householdTargets).length
               ? { household_targets: householdTargets }
+              : {}),
+            ...(Object.keys(ownerAssignmentSources).length
+              ? { owner_assignment_sources: ownerAssignmentSources }
               : {}),
             ...(Object.keys(historyOnlyTargets).length
               ? { history_only_targets: historyOnlyTargets }
@@ -2606,7 +2625,10 @@ export class Service {
     previewTiming?: Job['preview_timing'],
     historyOnlyTargets?: Record<string, ReviewedHistoryTarget>,
     householdTargets?: Record<string, ReviewedHouseholdAccount>,
+    explicitOwnerTargets?: Record<string, Omit<ReviewedHouseholdAccount, 'discord_username'>>,
+    admissionGuard?: () => void,
   ): Promise<Job> {
+    admissionGuard?.();
     const requestedAt = now();
     const scope = migrationScope(requestedScope);
     if (
@@ -2628,14 +2650,51 @@ export class Service {
     this.requireServer(settings, 'emby');
     this.requireServer(settings, 'jellyfin');
     const reviewedHouseholds = householdTargets ?? {};
+    const explicitOwners = explicitOwnerTargets ?? {};
+    const reviewedOwners = { ...reviewedHouseholds, ...explicitOwners };
     if (
-      Object.keys(reviewedHouseholds).some(
+      Object.keys(reviewedOwners).some(
         (id) => !sourceUserIds.includes(id) || historyOnlyTargets?.[id],
       )
     )
       throw new ServiceError(
         'Household owners must belong to selected, unprotected source accounts.',
       );
+    for (const [id, proof] of Object.entries(explicitOwners)) {
+      validateMembershipSlot(proof.slot);
+      if (
+        !proof.source_username ||
+        !proof.server_id ||
+        !Object.hasOwn(discordRecipients, id) ||
+        discordRecipients[id] !== proof.discord_user_id
+      )
+        throw new ServiceError(
+          'Confirm a Discord recipient and account slot for each reviewed source account.',
+        );
+      const suggested = reviewedHouseholds[id];
+      if (
+        suggested &&
+        (suggested.discord_user_id !== proof.discord_user_id || suggested.slot !== proof.slot)
+      )
+        throw new ServiceError(
+          'The selected owner or slot differs from the suggested household review. Save an explicit user mapping for exceptions.',
+        );
+    }
+    if (Object.keys(explicitOwners).length) {
+      await this.withClient(settings, 'emby', async (client) => {
+        const info = await client.systemInfo();
+        admissionGuard?.();
+        for (const [id, proof] of Object.entries(explicitOwners)) {
+          const user = await client.user(id);
+          admissionGuard?.();
+          if (info.Id !== proof.server_id || user.Id !== id || user.Name !== proof.source_username)
+            throw new ServiceError(
+              'The reviewed account identity changed. Prepare a new migration review.',
+            );
+        }
+      });
+      admissionGuard?.();
+    }
     if (Object.keys(reviewedHouseholds).length) {
       const sourceUsers = await this.withClient(settings, 'emby', async (client) => {
         const info = await client.systemInfo();
@@ -2649,6 +2708,7 @@ export class Service {
         return result;
       });
       const current = await this.householdSuggestions(sourceUsers, settings);
+      admissionGuard?.();
       for (const [id, proof] of Object.entries(reviewedHouseholds)) {
         const actual = current[id];
         if (
@@ -2672,14 +2732,16 @@ export class Service {
     const readOwnershipServerId = () =>
       this.withClient(settings, 'emby', async (client) => {
         const info = await client.systemInfo();
+        admissionGuard?.();
         if (typeof info.Id !== 'string' || !info.Id)
           throw new ServiceError(
             'The Emby server identity could not be verified for approved ownership.',
           );
         return info.Id;
       });
-    if (registeredSources.length || Object.keys(reviewedHouseholds).length)
+    if (registeredSources.length || Object.keys(reviewedOwners).length)
       ownershipServerId = await readOwnershipServerId();
+    admissionGuard?.();
     if (sourceSnapshotIds) {
       if (
         Object.keys(sourceSnapshotIds).length !== sourceUserIds.length ||
@@ -2693,6 +2755,7 @@ export class Service {
         for (const id of sourceUserIds)
           await this.sourceSnapshots.select(id, settings, info.Id, sourceSnapshotIds[id]);
       });
+      admissionGuard?.();
     }
     if (
       historyOnlyTargets &&
@@ -2706,14 +2769,14 @@ export class Service {
         throw new ServiceError(
           'The user mapping changed after preview. Review a new preview before migrating.',
         );
-      const household = reviewedHouseholds[id];
+      const household = reviewedOwners[id];
       const recipient = Object.hasOwn(discordRecipients, id)
         ? discordRecipients[id]
         : household?.discord_user_id;
       if (
         household &&
         (recipient !== household.discord_user_id ||
-          (mapping && (mapping.membership_slot ?? 1) !== household.slot))
+          (mapping?.discord_user_id && (mapping.membership_slot ?? 1) !== household.slot))
       )
         throw new ServiceError(
           'The household recipient or slot differs from the approved review. Save a user mapping for exceptions.',
@@ -2726,7 +2789,9 @@ export class Service {
       const registeredOwner = registeredSources.find(
         (owner) => owner.account_id === id && owner.server_id === ownershipServerId,
       );
-      const slot = mapping?.membership_slot ?? registeredOwner?.slot ?? household?.slot ?? 1;
+      const slot = mapping?.discord_user_id
+        ? (mapping.membership_slot ?? 1)
+        : (registeredOwner?.slot ?? household?.slot ?? mapping?.membership_slot ?? 1);
       if (
         !historyOnly &&
         registeredOwner &&
@@ -2779,11 +2844,130 @@ export class Service {
           : {}),
       };
     });
+    const registeredMappingApprovals: Record<
+      string,
+      Omit<ReviewedHouseholdAccount, 'discord_username'>
+    > = {};
+    for (const request of requests) {
+      const id = request.source_user_id!;
+      if (explicitOwners[id] || request.history_only_target || !request.discord_user_id) continue;
+      const mapping = this.requestMapping(request, settings);
+      const owner = registeredSources.find(
+        (entry) => entry.account_id === id && entry.server_id === ownershipServerId,
+      );
+      if (
+        mapping &&
+        !mapping.discord_user_id &&
+        owner?.discord_user_id === request.discord_user_id &&
+        owner.slot === request.membership_slot
+      ) {
+        const proof = {
+          source_username: owner.username,
+          server_id: owner.server_id,
+          discord_user_id: owner.discord_user_id,
+          slot: owner.slot,
+        };
+        registeredMappingApprovals[id] = proof;
+        reviewedOwners[id] = proof;
+      }
+    }
+    if (Object.keys(registeredMappingApprovals).length) {
+      await this.withClient(settings, 'emby', async (client) => {
+        const info = await client.systemInfo();
+        admissionGuard?.();
+        for (const [id, proof] of Object.entries(registeredMappingApprovals)) {
+          const user = await client.user(id);
+          admissionGuard?.();
+          if (info.Id !== proof.server_id || user.Id !== id || user.Name !== proof.source_username)
+            throw new ServiceError(
+              'The approved source account changed. Prepare a new mapping review.',
+            );
+        }
+      });
+      admissionGuard?.();
+    }
+    const mappingOwnerTargets = { ...explicitOwners, ...registeredMappingApprovals };
     await this.validateRecipients([
       ...new Set(
         requests.flatMap((request) => (request.discord_user_id ? [request.discord_user_id] : [])),
       ),
     ]);
+    admissionGuard?.();
+    // Manually selected account names need exact source ownership approval;
+    // never derive their Discord identity by stripping a suffix or matching a name.
+    const explicitOwnerNames = new Map<string, string>();
+    for (const discordId of new Set(
+      Object.values(mappingOwnerTargets).map((proof) => proof.discord_user_id),
+    )) {
+      const identity = await this.requireBot().recipientIdentity(discordId, false);
+      admissionGuard?.();
+      if (identity.id !== discordId)
+        throw new ServiceError('Discord returned a different reviewed account owner.');
+      explicitOwnerNames.set(discordId, identity.username);
+    }
+    const explicitTargets = new Map<
+      string,
+      { serverId: string; accountId: string | null; username: string }
+    >();
+    if (Object.keys(mappingOwnerTargets).length)
+      await this.withClient(settings, 'jellyfin', async (client) => {
+        const info = await client.systemInfo();
+        admissionGuard?.();
+        const auth = this.store.authState();
+        if (
+          typeof info.Id !== 'string' ||
+          !info.Id ||
+          (auth?.kind === 'configured' && auth.serverId !== info.Id)
+        )
+          throw new ServiceError('The Jellyfin server changed. Prepare a new account review.');
+        const template = await this.template(client, settings);
+        admissionGuard?.();
+        const targets = await client.users();
+        admissionGuard?.();
+        for (const [id, proof] of Object.entries(mappingOwnerTargets)) {
+          const mapping = this.mappings.getForSource(id, settings);
+          const username = mapping?.target_username ?? proof.source_username;
+          const target = this.mappedTarget(targets, mapping, username, settings);
+          if (
+            target &&
+            (target.Id === template.Id ||
+              target.Id === settings.template_user_id ||
+              target.Policy?.IsAdministrator !== false ||
+              target.Policy?.IsDisabled !== false)
+          )
+            throw new ServiceError(
+              'A protected, disabled or unverifiable Jellyfin account cannot receive a new owner. Prepare a history-only review instead.',
+            );
+          explicitTargets.set(id, {
+            serverId: info.Id,
+            accountId: target?.Id ?? null,
+            username,
+          });
+        }
+      });
+    admissionGuard?.();
+    const assertExplicitTargetSlots = () => {
+      const owners = this.mediaOwnerships.list(settings);
+      for (const [id, target] of explicitTargets) {
+        const proof = mappingOwnerTargets[id]!;
+        const reserved = owners.find(
+          (owner) =>
+            owner.kind === 'jellyfin' &&
+            owner.server_id === target.serverId &&
+            owner.discord_user_id === proof.discord_user_id &&
+            owner.slot === proof.slot,
+        );
+        const link = this.store.link(proof.discord_user_id, proof.slot);
+        if (
+          (reserved &&
+            (reserved.account_id !== target.accountId || reserved.username !== target.username)) ||
+          (link && (link.remote_id !== target.accountId || link.username !== target.username))
+        )
+          throw new ServiceError(
+            'This owner already has a different Jellyfin account in the selected slot. Review its identity mapping first.',
+          );
+      }
+    };
     // Preflight may await media or Discord reads. Queueing must use the same
     // configuration that was reviewed, rather than adopting a concurrent edit.
     if (JSON.stringify(settings) !== JSON.stringify(this.store.settings()))
@@ -2792,6 +2976,7 @@ export class Service {
       );
     if (!ownershipServerId && confirmsMigrationOwner) {
       ownershipServerId = await readOwnershipServerId();
+      admissionGuard?.();
       if (JSON.stringify(settings) !== JSON.stringify(this.store.settings()))
         throw new ServiceError(
           'Configuration changed during migration preparation. Prepare a new review.',
@@ -2807,8 +2992,20 @@ export class Service {
       if (ownershipServerId) this.sourceOwnership(request, settings, ownershipServerId);
     const allOwners = this.mediaOwnerships.list(settings);
     const approved: Omit<MediaOwnership, 'scope' | 'approved_at'>[] = [];
-    for (const [id, proof] of Object.entries(reviewedHouseholds)) {
-      if (proof.server_id !== ownershipServerId || this.mappings.getForSource(id, settings))
+    for (const request of requests) {
+      this.requestMapping(request, settings);
+      this.assertMembershipRequest(request, settings);
+    }
+    for (const [id, proof] of Object.entries(reviewedOwners)) {
+      const mapping = this.mappings.getForSource(id, settings);
+      if (
+        proof.server_id !== ownershipServerId ||
+        (mapping &&
+          ((!explicitOwners[id] && !registeredMappingApprovals[id]) ||
+            mapping.source_username !== proof.source_username ||
+            (mapping.discord_user_id && mapping.discord_user_id !== proof.discord_user_id) ||
+            (mapping.discord_user_id && (mapping.membership_slot ?? 1) !== proof.slot)))
+      )
         throw new ServiceError(
           'The household identity changed. Review a new preview or its explicit mapping.',
         );
@@ -2836,21 +3033,91 @@ export class Service {
         slot: proof.slot,
       });
     }
-    // Acceptance approves identity independently of history transfer. Keep the
-    // association even if a later media operation fails, without moving history
-    // between the family's distinct accounts.
-    this.mediaOwnerships.save(approved, settings);
-    for (const request of requests) {
-      const proof = reviewedHouseholds[request.source_user_id ?? ''];
-      if (proof)
-        request.source_ownership = {
-          server_id: proof.server_id,
-          identity_hash: this.ownershipHash(
-            this.mediaOwnerships.get('emby', proof.server_id, request.source_user_id!, settings),
-          ),
-        };
+    // Ownership approval and the queued work are one local commit. Queue
+    // preparation and persistence failures must not leave half an approval.
+    // Later media failures retain this explicit administrator decision.
+    try {
+      return this.queue(
+        'migrate',
+        requests,
+        requestedAt,
+        previewTiming,
+        approved.length
+          ? (queuedRequests) => {
+              admissionGuard?.();
+              if (JSON.stringify(settings) !== JSON.stringify(this.store.settings()))
+                throw new ServiceError(
+                  'Configuration changed during migration preparation. Prepare a new review.',
+                );
+              for (const request of queuedRequests) {
+                this.requestMapping(request, settings);
+                this.assertMembershipRequest(request, settings);
+                if (ownershipServerId) this.sourceOwnership(request, settings, ownershipServerId);
+              }
+              assertExplicitTargetSlots();
+              const additions = approved.flatMap((record) => {
+                const target = explicitTargets.get(record.account_id);
+                return this.migrationIdentityAdditions(
+                  [
+                    record,
+                    ...(target?.accountId
+                      ? [
+                          {
+                            kind: 'jellyfin' as const,
+                            server_id: target.serverId,
+                            account_id: target.accountId,
+                            username: target.username,
+                            discord_user_id: record.discord_user_id,
+                            slot: record.slot,
+                          },
+                        ]
+                      : []),
+                  ],
+                  settings,
+                ).filter((addition) => addition.kind === 'emby');
+              });
+              this.mediaOwnerships.save(additions, settings);
+              for (const request of queuedRequests) {
+                const proof = reviewedOwners[request.source_user_id ?? ''];
+                if (!proof) continue;
+                const mapping = this.requestMapping(request, settings);
+                if (
+                  mappingOwnerTargets[request.source_user_id!] &&
+                  mapping &&
+                  !mapping.discord_user_id
+                ) {
+                  const updated = this.mappings.confirmMigrationOwner(
+                    mapping.id,
+                    mapping.revision,
+                    proof.discord_user_id,
+                    explicitOwnerNames.get(proof.discord_user_id)!,
+                    proof.slot,
+                    settings,
+                  );
+                  request.mapping_revision = updated.revision;
+                }
+                const owner = this.mediaOwnerships.get(
+                  'emby',
+                  proof.server_id,
+                  request.source_user_id!,
+                  settings,
+                );
+                if (!owner)
+                  throw new ServiceError('The reviewed account ownership could not be saved.');
+                request.source_ownership = {
+                  server_id: proof.server_id,
+                  identity_hash: this.ownershipHash(owner),
+                };
+              }
+            }
+          : undefined,
+      );
+    } catch (error) {
+      // A later write can roll back a mapping after an earlier guard populated
+      // its decrypted cache. Never expose that rolled-back owner or revision.
+      this.mappings.invalidateCache();
+      throw error;
     }
-    return this.queue('migrate', requests, requestedAt, previewTiming);
   }
   private async requireRoleServer(client: MediaAPI, role: AccountRole): Promise<void> {
     const info = await client.systemInfo();
@@ -3067,6 +3334,7 @@ export class Service {
     requests: JobRequest[],
     requestedAt?: string,
     previewTiming?: Job['preview_timing'],
+    beforePersist?: (requests: JobRequest[]) => void,
   ): Job {
     if (this.stopping) throw new ServiceError('The app is stopping. Retry after it restarts.');
     const owners = this.mediaOwnerships.list(this.store.settings());
@@ -3135,7 +3403,9 @@ export class Service {
           : { ...request, default_role_revision: role.revision },
       );
     }
-    this.store.saveQueuedJob(job, requests, settings);
+    if (beforePersist)
+      this.store.saveQueuedJob(job, requests, settings, () => beforePersist(requests));
+    else this.store.saveQueuedJob(job, requests, settings);
     this.schedule(job, requests, settings);
     return structuredClone(job);
   }

@@ -2047,6 +2047,77 @@ describe('React account safeguards', () => {
       preview_id: 'preview-bulk',
       migration_scope: 'watched_only',
       discord_recipients: { 'e-river': '123456789012345678' },
+      membership_slots: { 'e-river': 1 },
+    });
+  });
+  it('submits reviewed distinct slots for differently named accounts sharing one selected Discord owner', async () => {
+    responses['/api/users'] = {
+      emby: [
+        { Id: 'source-a', Name: 'personal-name' },
+        { Id: 'source-b', Name: 'other-name' },
+      ],
+      jellyfin: [],
+    };
+    responses['/api/migrations/preview'] = {
+      id: 'shared-owner-preview',
+      status: 'ready',
+      progress: { processed: 2, total: 2 },
+      preview: {
+        users: [
+          {
+            source_user_id: 'source-a',
+            username: 'personal-name',
+            target_exists: false,
+            stats: {},
+          },
+          { source_user_id: 'source-b', username: 'other-name', target_exists: false, stats: {} },
+        ],
+      },
+    };
+    responses['/api/discord/members?query=shared_owner'] = {
+      members: [
+        {
+          id: '123456789012345678',
+          username: 'shared_owner',
+          display_name: null,
+          nickname: null,
+          membership_active: true,
+        },
+      ],
+      truncated: false,
+    };
+    responses['/api/migrations'] = { ...job, kind: 'migrate' };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+    const dialog = await screen.findByRole('dialog');
+    for (const input of within(dialog).getAllByLabelText('Discord recipient (optional)')) {
+      fireEvent.change(input, { target: { value: 'shared_owner' } });
+      fireEvent.click(await within(dialog).findByRole('button', { name: 'Select @shared_owner' }));
+    }
+    expect(within(dialog).getByRole('button', { name: 'Start migration' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(requests.filter((request) => request.path === '/api/migrations')).toHaveLength(0);
+    fireEvent.change(within(dialog).getByLabelText('Membership account slot for other-name'), {
+      target: { value: '2' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
+    await waitFor(() =>
+      expect(requests.filter((request) => request.path === '/api/migrations')).toHaveLength(1),
+    );
+    expect(
+      JSON.parse(
+        String(requests.find((request) => request.path === '/api/migrations')!.options?.body),
+      ),
+    ).toEqual({
+      source_user_ids: ['source-a', 'source-b'],
+      preview_id: 'shared-owner-preview',
+      migration_scope: 'watched_only',
+      discord_recipients: { 'source-a': '123456789012345678', 'source-b': '123456789012345678' },
+      membership_slots: { 'source-a': 1, 'source-b': 2 },
     });
   });
   it('shows deferred played flags without invented zero counts and narrows legacy approval', async () => {

@@ -217,6 +217,82 @@ describe('user directory and informational Discord organization', () => {
     expect(bot.updateTagRoles).not.toHaveBeenCalled();
   });
 
+  it.each(['emby', 'jellyfin'] as const)(
+    'keeps healthy accounts manageable when %s is unavailable without treating its absence as an ownership decision',
+    async (kind) => {
+      linked('complimentary');
+      const otherKind = kind === 'emby' ? 'jellyfin' : 'emby';
+      const original = service.clientFactory;
+      service.clientFactory = (...args) => {
+        const client = original(...args);
+        if (args[2] === kind)
+          client.users = async () => {
+            throw new Error('PRIVATE-EMBY-KEY and private upstream diagnostic');
+          };
+        return client;
+      };
+      const snapshot = await organization.directory();
+      expect(snapshot.complete).toBe(false);
+      expect(snapshot.sources[kind]).toMatchObject({ configured: true, available: false });
+      expect(snapshot.sources[otherKind]).toEqual({ configured: true, available: true });
+      expect(snapshot.users.flatMap((row) => row[kind])).toEqual([]);
+      expect(snapshot.users.flatMap((row) => row[otherKind]).length).toBeGreaterThan(0);
+      const confirmed = snapshot.users.find((row) => row.discord_user_id === owner)!;
+      expect(confirmed.access_mode).toBe('complimentary');
+      expect(confirmed[otherKind].map((account) => account.name)).toEqual(['river']);
+      expect(JSON.stringify(snapshot)).not.toMatch(
+        /PRIVATE-|upstream diagnostic|api_key|bot_token/,
+      );
+      await expect(organization.directory(true)).rejects.toThrow('roles were preserved');
+      await expect(organization.preview()).rejects.toThrow('roles were preserved');
+      expect(bot.updateTagRoles).not.toHaveBeenCalled();
+      expect(mediaWrites).toEqual([]);
+    },
+  );
+
+  it('hides an unverified paired server while showing the independent healthy source', async () => {
+    bindServer('different-jellyfin');
+    const snapshot = await organization.directory();
+    expect(snapshot.complete).toBe(false);
+    expect(snapshot.sources.jellyfin).toMatchObject({ configured: true, available: false });
+    expect(snapshot.sources.jellyfin.error).toContain('paired Jellyfin server changed');
+    expect(snapshot.users.flatMap((row) => row.jellyfin)).toEqual([]);
+    expect(snapshot.users.flatMap((row) => row.emby).length).toBeGreaterThan(0);
+    await expect(organization.preview()).rejects.toThrow('paired Jellyfin server changed');
+    expect(bot.updateTagRoles).not.toHaveBeenCalled();
+    expect(mediaWrites).toEqual([]);
+  });
+
+  it('does not infer an account was removed when its identity check fails after a valid user-list read', async () => {
+    linked();
+    const original = service.clientFactory;
+    service.clientFactory = (...args) => {
+      const client = original(...args);
+      if (args[2] === 'emby') client.systemInfo = async () => ({ Id: '' });
+      return client;
+    };
+    const snapshot = await organization.directory();
+    expect(snapshot.sources.emby.available).toBe(false);
+    expect(snapshot.users.flatMap((row) => row.emby)).toEqual([]);
+    expect(snapshot.users.find((row) => row.discord_user_id === owner)?.jellyfin[0]?.id).toBe(
+      'j-river',
+    );
+    expect(snapshot.complete).toBe(false);
+    await expect(organization.preview()).rejects.toThrow('roles were preserved');
+    expect(bot.updateTagRoles).not.toHaveBeenCalled();
+  });
+
+  it('reports an unconfigured source separately from an unavailable configured source', async () => {
+    updateSettings({ emby_url: '', emby_api_key: '' });
+    const snapshot = await organization.directory();
+    expect(snapshot.sources.emby).toEqual({ configured: false, available: false });
+    expect(snapshot.sources.jellyfin).toEqual({ configured: true, available: true });
+    expect(snapshot.complete).toBe(true);
+    expect(snapshot.users.every((row) => !row.emby.length)).toBe(true);
+    expect(snapshot.users.flatMap((row) => row.jellyfin).length).toBeGreaterThan(0);
+    expect(mediaWrites).toEqual([]);
+  });
+
   it('never derives Discord ownership from a matching current Discord or media username', async () => {
     membership(owner);
     const rows = (await organization.directory()).users;

@@ -3,6 +3,8 @@ import { ServiceError } from './errors.js';
 import type { Service, BotAdapter } from './service.js';
 import type { Settings } from './types.js';
 import type { AccountProfile } from './account-profiles.js';
+import type { MediaAPI, MediaKind, MediaUser } from './media.js';
+import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 
 interface AccountSummary {
   id: string;
@@ -22,6 +24,16 @@ export interface DirectoryUser {
   protected: boolean;
   family: boolean;
   requires_review: boolean;
+}
+export interface DirectorySourceStatus {
+  configured: boolean;
+  available: boolean;
+  error?: string;
+}
+export interface DirectorySnapshot {
+  users: DirectoryUser[];
+  complete: boolean;
+  sources: Record<MediaKind, DirectorySourceStatus>;
 }
 interface TagChange {
   discord_user_id: string;
@@ -54,39 +66,73 @@ export class UserOrganization {
       throw new ServiceError('Connect the Discord bot before organizing member roles.');
     return bot;
   }
-  private async catalog() {
+  private async catalog(requireComplete: boolean) {
     const settings = this.service.store.settings();
-    const users = await this.service.users();
-    if (Object.keys(users.errors).length)
-      throw new ServiceError(
-        'A media server could not be queried. Refresh after restoring the connection; organization roles were preserved.',
-      );
-    const servers: Partial<Record<'emby' | 'jellyfin', string>> = {};
-    for (const kind of ['emby', 'jellyfin'] as const) {
-      if (!settings[`${kind}_url`] || !settings[`${kind}_api_key`]) continue;
-      const client = this.service.client(settings, kind);
-      try {
-        const info = await client.systemInfo();
-        const auth = this.service.store.authState();
-        if (kind === 'jellyfin' && auth?.kind === 'configured' && info.Id !== auth.serverId)
-          throw new ServiceError(
-            'The paired Jellyfin server changed. Organization roles were preserved.',
-          );
-        if (typeof info.Id !== 'string' || !info.Id)
-          throw new ServiceError(
-            'The media server identity could not be verified. Roles were preserved.',
-          );
-        servers[kind] = info.Id;
-      } finally {
-        await client.close();
-      }
-    }
+    const users: Record<MediaKind, MediaUser[]> = { emby: [], jellyfin: [] };
+    const servers: Partial<Record<MediaKind, string>> = {};
+    const sources = {} as Record<MediaKind, DirectorySourceStatus>;
+    await Promise.all(
+      (['emby', 'jellyfin'] as const).map(async (kind) => {
+        const configured = Boolean(settings[`${kind}_url`] && settings[`${kind}_api_key`]);
+        const source: DirectorySourceStatus = { configured, available: false };
+        sources[kind] = source;
+        if (!configured) return;
+        let client: MediaAPI | undefined;
+        try {
+          client = this.service.client(settings, kind);
+          const accounts = await client.users();
+          if (
+            accounts.length > 10_000 ||
+            new Set(accounts.map((account) => account.Id)).size !== accounts.length ||
+            accounts.some(
+              (account) =>
+                typeof account.Id !== 'string' ||
+                !account.Id ||
+                typeof account.Name !== 'string' ||
+                !account.Name,
+            )
+          )
+            throw new Error('Unverified account list');
+          const info = await client.systemInfo();
+          const auth = this.service.store.authState();
+          if (
+            kind === 'jellyfin' &&
+            auth?.kind === 'configured' &&
+            (info.Id !== auth.serverId ||
+              normalizeJellyfinUrl(settings.jellyfin_url) !== normalizeJellyfinUrl(auth.serverUrl))
+          ) {
+            source.error =
+              'The paired Jellyfin server changed. Restore its connection before managing those accounts.';
+            return;
+          }
+          if (typeof info.Id !== 'string' || !info.Id) throw new Error('Unverified server');
+          users[kind] = accounts;
+          servers[kind] = info.Id;
+          source.available = true;
+        } catch {
+          source.error = `Unable to read and verify ${kind === 'emby' ? 'Emby' : 'Jellyfin'} accounts. Check its connection in Settings.`;
+        } finally {
+          await client?.close().catch(() => {});
+        }
+      }),
+    );
     if (JSON.stringify(settings) !== JSON.stringify(this.service.store.settings()))
       throw new ServiceError('Configuration changed. Refresh the user directory.');
-    return { settings, users, servers };
+    const complete = Object.values(sources).every(
+      (source) => !source.configured || source.available,
+    );
+    // Viewing a healthy server must not depend on the other one. A role plan
+    // still needs complete evidence before deciding any remote access tag is absent.
+    if (requireComplete && !complete) {
+      const failure = Object.values(sources).find((source) => source.error)?.error;
+      throw new ServiceError(
+        `${failure ?? 'A media server could not be queried.'} Organization roles were preserved.`,
+      );
+    }
+    return { settings, users, servers, sources, complete };
   }
-  async directory(): Promise<{ users: DirectoryUser[] }> {
-    const { settings, users, servers } = await this.catalog();
+  async directory(requireComplete = false): Promise<DirectorySnapshot> {
+    const { settings, users, servers, sources, complete } = await this.catalog(requireComplete);
     const memberships = this.service.memberships.list(settings);
     const mappings = this.service.mappings.list(settings);
     const rows: DirectoryUser[] = [];
@@ -212,6 +258,8 @@ export class UserOrganization {
           b.discord_username ?? b.jellyfin[0]?.name ?? b.emby[0]?.name ?? b.id,
         ),
       ),
+      sources,
+      complete,
     };
   }
   async listTagRoles() {
@@ -243,7 +291,7 @@ export class UserOrganization {
       );
     if (new Set(selected).size !== selected.length)
       throw new ServiceError('Choose different Emby and Jellyfin organization roles.');
-    const directory = await this.directory();
+    const directory = await this.directory(true);
     const linked = directory.users.filter((user) => user.discord_user_id);
     if (linked.length > 1000)
       throw new ServiceError(
@@ -320,7 +368,7 @@ export class UserOrganization {
         );
       // A review is not authority to act on associations edited while a prior
       // Discord request was in flight. Fresh server/catalog failures abort here.
-      if (fingerprint({ settings, directory: await this.directory() }) !== plan.fingerprint)
+      if (fingerprint({ settings, directory: await this.directory(true) }) !== plan.fingerprint)
         throw new ServiceError(
           'Accounts or identity mappings changed. Preview remaining organization changes again.',
         );
@@ -363,7 +411,7 @@ export class UserOrganization {
     try {
       const settings = this.service.store.settings();
       const plan = await this.plan();
-      const directory = await this.directory();
+      const directory = await this.directory(true);
       if (fingerprint({ settings, directory }) !== plan.fingerprint)
         throw new ServiceError('Ownership changed. Refresh the role review.');
       const desired = new Set(ownerIds);

@@ -132,7 +132,7 @@ describe('reviewed protected-account history migration', () => {
         pins,
       ),
     ).rejects.toThrow('cannot send credentials');
-    expect((await finish(await service.createAccount('river'))).status).toBe('failed');
+    await expect(service.createAccount('river')).rejects.toThrow('already exists');
     expect(servers.played['j-river']).toEqual(new Set(['1']));
     assertNoManagement();
   });

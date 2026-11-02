@@ -172,7 +172,8 @@ describe('review regressions and durable job recovery', () => {
     expect((await finish(await service.createAccount('casey'))).status).toBe('failed');
     const target = servers.users.jellyfin.find((user) => user.Name === 'casey')!;
     servers.played[target.Id] = new Set(['1']);
-    expect((await finish(await service.createAccount('casey'))).status).toBe('failed');
+    await expect(service.createAccount('casey')).rejects.toThrow('uncertain');
+    expect(store.jobs()).toHaveLength(1);
     expect(updates).toEqual([]);
     const info = await service.recoveryInfo('casey');
     expect(info.eligible).toBe(true);
@@ -224,9 +225,8 @@ describe('review regressions and durable job recovery', () => {
       Name: 'straße',
       Policy: { IsAdministrator: false },
     });
-    const result = await finish(await service.createAccount('STRASSE'));
-    expect(result.status).toBe('failed');
-    expect(result.results[0]?.error).toContain('letter case');
+    await expect(service.createAccount('STRASSE')).rejects.toThrow('letter case');
+    expect(store.jobs()).toEqual([]);
     expect(store.account('STRASSE')).toBeNull();
   });
   it('serializes concurrent creation requests for the same account', async () => {

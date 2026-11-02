@@ -161,6 +161,23 @@ beforeEach(() => {
   statuses = {};
   responses = {
     '/api/session': session,
+    '/api/workflow-readiness': {
+      checked_at: new Date().toISOString(),
+      sources: {},
+      actions: Object.fromEntries(
+        [
+          'create_account',
+          'migrate',
+          'migrate_saved',
+          'account_roles',
+          'account_mappings',
+          'discord_roles',
+          'identity_review',
+          'account_access_emby',
+          'account_access_jellyfin',
+        ].map((name) => [name, { ready: true, blockers: [], warnings: [] }]),
+      ),
+    },
     '/api/overview': overview,
     '/api/jobs': { jobs: [job] },
     '/api/jobs/job-1': job,
@@ -212,6 +229,10 @@ beforeEach(() => {
     'fetch',
     vi.fn(async (path: string, options?: RequestInit) => {
       requests.push({ path, options });
+      if (path === '/api/accounts/review' && !(path in responses)) {
+        const input = JSON.parse(String(options?.body));
+        return { ok: true, status: 200, json: async () => ({ ...input, ready: true }) };
+      }
       if (!(path in responses) && /^\/api\/migrations\/preview\/[^/]+\/membership$/.test(path)) {
         const { discord_user_id } = JSON.parse(String(options?.body));
         return {
@@ -1432,7 +1453,7 @@ describe('React account safeguards', () => {
     fireEvent.change(await screen.findByLabelText('Username'), { target: { value: 'alex' } });
     const form = screen.getByLabelText('Username').closest('form')!;
     const submit = within(form).getByRole('button', { name: 'Create account' });
-    expect((submit as HTMLButtonElement).disabled).toBe(false);
+    await waitFor(() => expect((submit as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(submit);
     await waitFor(() =>
       expect(requests.some((request) => request.path === '/api/accounts')).toBe(true),
@@ -1672,6 +1693,9 @@ describe('React account safeguards', () => {
     }
     fireEvent.click(screen.getByRole('button', { name: 'Select @alex.actual' }));
     expect((screen.getByLabelText('Username') as HTMLInputElement).value).toBe('alex.actual');
+    await screen.findByText(
+      'Account name and recipient checked. Existing relationships will be preserved.',
+    );
     fireEvent.click(
       within(screen.getByLabelText('Username').closest('form')!).getByRole('button', {
         name: 'Create account',
@@ -3385,9 +3409,11 @@ describe('React account safeguards', () => {
     const toggle = screen.getByRole('button', { name: 'Toggle navigation' });
     expect(toggle.getAttribute('aria-controls')).toBe('workspace-navigation');
     fireEvent.click(toggle);
-    const first = screen.getByRole('button', { name: 'Overview' });
+    const current = screen.getByRole('button', { name: 'Overview' });
+    const first = screen.getByRole('button', { name: 'Users' });
     const last = screen.getByRole('button', { name: 'Sign out' });
-    expect(document.activeElement).toBe(first);
+    expect(document.activeElement).toBe(current);
+    first.focus();
     fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
     expect(document.activeElement).toBe(last);
     fireEvent.keyDown(window, { key: 'Tab' });
@@ -3411,7 +3437,7 @@ describe('React account safeguards', () => {
 
     toggle.focus();
     fireEvent.keyDown(window, { key: 'Tab' });
-    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Overview' }));
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Users' }));
     toggle.focus();
     fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Sign out' }));
@@ -4123,4 +4149,32 @@ describe('Jellyfin administrator sign-in and setup', () => {
     await waitFor(() => expect(keyField.value).toBe(''));
     expect(requests.some((request) => request.path === '/api/auth/service-key')).toBe(false);
   });
+});
+
+it('shows a creation prerequisite before final submission and keeps the account draft through a fresh check', async () => {
+  responses['/api/accounts/review'] = {
+    detail: 'Synthetic owner already has a confirmed Emby account. Use migration.',
+  };
+  statuses['/api/accounts/review'] = 400;
+  responses['/api/accounts'] = job;
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Create account' }));
+  fireEvent.change(await screen.findByLabelText('Username'), {
+    target: { value: 'synthetic-owner' },
+  });
+  await screen.findByText('Synthetic owner already has a confirmed Emby account. Use migration.');
+  const form = screen.getByLabelText('Username').closest('form')!;
+  const submit = within(form).getByRole('button', { name: 'Create account' });
+  expect((submit as HTMLButtonElement).disabled).toBe(true);
+  fireEvent.submit(form);
+  expect(requests.some((request) => request.path === '/api/accounts')).toBe(false);
+  responses['/api/accounts/review'] = { ready: true, username: 'synthetic-owner' };
+  statuses['/api/accounts/review'] = 200;
+  fireEvent.click(screen.getByRole('button', { name: 'Check account again' }));
+  await waitFor(() => expect((submit as HTMLButtonElement).disabled).toBe(false));
+  expect((screen.getByLabelText('Username') as HTMLInputElement).value).toBe('synthetic-owner');
+  fireEvent.click(submit);
+  await waitFor(() =>
+    expect(requests.filter((request) => request.path === '/api/accounts')).toHaveLength(1),
+  );
 });

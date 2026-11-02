@@ -637,7 +637,8 @@ describe('saved role provisioning and controlled account updates', () => {
   });
   it('stops default provisioning if its saved role is revised while the job is queued', async () => {
     const saved = role(true);
-    const gate = gateInfoAt(1);
+    // Final admission now checks SystemInfo and the default role first; gate the worker's first check.
+    const gate = gateInfoAt(3);
     const job = await service.createAccount('casey');
     await gate.entered;
     service.roles.save({ ...saved, revision: saved.revision, name: 'Changed' }, store.settings());
@@ -649,7 +650,7 @@ describe('saved role provisioning and controlled account updates', () => {
   });
   it('stops default provisioning if the selected default changes while the job is queued', async () => {
     role(true);
-    const gate = gateInfoAt(1),
+    const gate = gateInfoAt(3),
       job = await service.createAccount('casey');
     await gate.entered;
     store.saveSettings({ ...store.settings(), default_role_id: '' });

@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Heading } from './components';
 import IdentityReviewPanel from './IdentityReviewPanel';
 import MembershipsPage from './MembershipsPage';
@@ -21,6 +21,8 @@ export default function MemberManagementPage({
   review,
   ignore,
   busy,
+  focusMember,
+  onFocusConsumed,
 }: {
   settings: Settings;
   api: Api;
@@ -34,9 +36,14 @@ export default function MemberManagementPage({
   review: (event: SubscriptionEvent) => void;
   ignore: (event: SubscriptionEvent) => void;
   busy: boolean;
+  focusMember?: { id: string; username: string; key: number };
+  onFocusConsumed?: (key: number) => void;
 }) {
   const [identityVersion, setIdentityVersion] = useState(0);
   const [tab, setTab] = useRouteTab('memberships');
+  useEffect(() => {
+    if (focusMember) setTab('accounts');
+  }, [focusMember?.key]);
   const attention = events.filter((event) => ['pending', 'failed'].includes(event.status)).length;
   return (
     <div className="page-stack">
@@ -73,6 +80,12 @@ export default function MemberManagementPage({
           notify={notify}
           created={created}
           refreshKey={identityVersion}
+          initialMember={focusMember}
+          handoffKey={focusMember?.key}
+          onInitialMemberApplied={
+            focusMember ? () => onFocusConsumed?.(focusMember.key) : undefined
+          }
+          active={tab === 'accounts'}
           embedded
         />
       </TabPanel>

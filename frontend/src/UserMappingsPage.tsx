@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useRouteTab } from './routing';
+import WorkflowRequirements, { useWorkflowAction } from './WorkflowRequirements';
 import { useWorkspaceDraftState } from './workspace-drafts';
 import { Empty, Heading, Icon, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
@@ -28,6 +29,7 @@ export default function UserMappingsPage({
   templateUserId?: string;
   accountNaming?: AccountNaming;
 }) {
+  const taskReadiness = useWorkflowAction('account_mappings');
   const [view, setView] = useRouteTab('mappings');
   const [query, setQuery] = useState('');
   const filteredMappings = mappings.filter((mapping) =>
@@ -189,6 +191,7 @@ export default function UserMappingsPage({
           </button>
         }
       />
+      <WorkflowRequirements action="account_mappings" />
       <UserWarnings users={users} />
       <Tabs
         id="mapping-views"
@@ -555,7 +558,11 @@ export default function UserMappingsPage({
                     Remove
                   </button>
                 )}
-                <button type="submit" className="btn btn-primary" disabled={busy || !sourceId}>
+                <button
+                  type="submit"
+                  className="btn btn-primary"
+                  disabled={!taskReadiness.ready || busy || !sourceId}
+                >
                   {busy ? <span className="spinner" /> : <Icon name="check" />}
                   {busy ? 'Saving…' : 'Save mapping'}
                 </button>

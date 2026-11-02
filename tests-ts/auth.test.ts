@@ -94,7 +94,12 @@ async function fixture(
   const mediaCalls: Array<Parameters<ClientFactory>> = [];
   const clientFactory: ClientFactory = (...args) => {
     mediaCalls.push(args);
-    return servers.factory(...args);
+    const client = servers.factory(...args);
+    if ((args[2] ?? 'jellyfin') === 'jellyfin') {
+      const systemInfo = client.systemInfo.bind(client);
+      client.systemInfo = async () => ({ ...(await systemInfo()), Id: SERVER_ID });
+    }
+    return client;
   };
   const authentication = options.authentication ?? fakeAuthentication();
   if (options.existingServerUrl || options.legacyPendingCode) {

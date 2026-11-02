@@ -236,6 +236,11 @@ test('unified member review links an Emby-only owner and acknowledges Discord-on
   admin,
   mutations,
 }, info) => {
+  admin.app.jellyport.store.saveSettings({
+    ...admin.app.jellyport.store.settings(),
+    discord_enabled: true,
+    discord_guild_id: '999999999999999999',
+  });
   const store = admin.app.jellyport.store;
   store.saveSettings({ ...store.settings(), discord_guild_id: '333333333333333333' });
   admin.servers.users.emby.push({

@@ -357,8 +357,8 @@ describe('local activity and report cleanup', () => {
       skipped: [{ id: job.id, reason: 'recovery_required' }],
     });
     expect(store.account('synthetic-uncertain')?.status).toBe('uncertain');
-    const retry = await service.createAccount('synthetic-uncertain');
-    await service.jobTasks.get(retry.id);
+    await expect(service.createAccount('synthetic-uncertain')).rejects.toThrow('uncertain');
+    expect(store.jobs()).toHaveLength(1);
     expect(create).toHaveBeenCalledOnce();
   });
 });

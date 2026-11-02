@@ -1,5 +1,5 @@
 import { jobOutcome } from './migration-outcome';
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 import { WorkspaceNotice, useWorkspaceNoticeModal } from './workspace-notices';
 import {
   type Job,
@@ -802,6 +802,15 @@ export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetad
     </p>
   );
 }
+const modalStack: HTMLElement[] = [];
+function updateModalStack() {
+  modalStack.forEach((element, index) => {
+    const covered = index !== modalStack.length - 1;
+    element.inert = covered;
+    if (covered) element.setAttribute('aria-hidden', 'true');
+    else element.removeAttribute('aria-hidden');
+  });
+}
 export function Modal({
   title,
   description,
@@ -820,13 +829,18 @@ export function Modal({
   closeDisabled?: boolean;
 }) {
   const dialog = useRef<HTMLElement>(null);
+  const titleId = useId();
   const noticeActive = useWorkspaceNoticeModal();
   const closeRef = useRef(close);
   closeRef.current = close;
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
+    const current = dialog.current!;
+    modalStack.push(current);
+    updateModalStack();
     document.body.classList.add('modal-open');
     const keydown = (event: KeyboardEvent) => {
+      if (modalStack.at(-1) !== current) return;
       if (event.key === 'Escape') {
         event.preventDefault();
         closeRef.current();
@@ -859,9 +873,30 @@ export function Modal({
     };
     document.addEventListener('keydown', keydown);
     return () => {
-      document.body.classList.remove('modal-open');
+      const wasTop = modalStack.at(-1) === current;
+      const position = modalStack.indexOf(current);
+      if (position >= 0) modalStack.splice(position, 1);
+      current.inert = false;
+      current.removeAttribute('aria-hidden');
+      updateModalStack();
+      if (!modalStack.length) document.body.classList.remove('modal-open');
       document.removeEventListener('keydown', keydown);
-      if (previous?.isConnected) previous.focus();
+      if (wasTop) {
+        const remaining = modalStack.at(-1);
+        const fallback =
+          remaining?.querySelector<HTMLElement>(
+            'button:not(:disabled), input:not(:disabled), select:not(:disabled), [tabindex="0"]',
+          ) ?? document.getElementById('workspace-content');
+        const restore =
+          previous?.isConnected &&
+          previous !== document.body &&
+          (!remaining || remaining.contains(previous))
+            ? previous
+            : fallback;
+        restore?.focus({ preventScroll: true });
+        if (remaining && !remaining.contains(document.activeElement))
+          fallback?.focus({ preventScroll: true });
+      }
     };
   }, []);
   useEffect(() => {
@@ -874,11 +909,11 @@ export function Modal({
         className={`modal${wide ? ' modal-wide' : ''}`}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="modal-title"
+        aria-labelledby={titleId}
       >
         <div className="modal-header">
           <div>
-            <h2 id="modal-title">{title}</h2>
+            <h2 id={titleId}>{title}</h2>
             {description && <p>{description}</p>}
           </div>
           <button

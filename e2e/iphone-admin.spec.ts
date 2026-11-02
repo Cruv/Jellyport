@@ -126,7 +126,9 @@ test('search and account actions remain compact in a large directory', async ({
   const manage = page.getByRole('button', { name: 'Manage Phone member 120', exact: true });
   await expectTouchTarget(manage);
   await manage.click();
-  const access = page.getByRole('button', { name: 'Manage account access for Phone member 120' });
+  const access = page
+    .getByRole('dialog')
+    .getByRole('button', { name: 'Disable selected account', exact: true });
   await expectReachable(page, access);
   await expect(access).toBeVisible();
   await expectContainedLayout(page);

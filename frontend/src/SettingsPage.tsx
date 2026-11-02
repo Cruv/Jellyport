@@ -31,7 +31,7 @@ import {
   type BotMessageTemplates,
   type BotMessageTemplateId,
 } from '../../server/bot-messages';
-import { navigateWorkspace, useRouteTab } from './routing';
+import { navigateWorkspace, useRouteTab, useWorkspaceNavigator } from './routing';
 import { useWorkspaceDraftState } from './workspace-drafts';
 import {
   DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
@@ -196,6 +196,7 @@ function Section({
   );
 }
 export function ConnectionRows({ connections }: { connections: Partial<Connections> }) {
+  const navigate = useWorkspaceNavigator();
   return (
     <div className="server-list">
       {(['emby', 'jellyfin', 'discord'] as const).map((key) => {
@@ -225,7 +226,7 @@ export function ConnectionRows({ connections }: { connections: Partial<Connectio
                   className="text-button"
                   aria-label={`Configure ${key === 'emby' ? 'Emby' : key === 'jellyfin' ? 'Jellyfin' : 'Discord'} connection`}
                   onClick={() =>
-                    navigateWorkspace({
+                    navigate({
                       page: 'settings',
                       tab: key === 'discord' ? 'discord' : 'media',
                       subtab: key === 'discord' ? 'connection' : key,
@@ -252,6 +253,7 @@ export function ConnectionRows({ connections }: { connections: Partial<Connectio
   );
 }
 export function UserWarnings({ users }: { users: Users }) {
+  const navigate = useWorkspaceNavigator();
   return (
     <>
       {Object.entries(users.errors || {}).map(([server, message]) => (
@@ -266,7 +268,7 @@ export function UserWarnings({ users }: { users: Users }) {
             type="button"
             className="text-button"
             onClick={() =>
-              navigateWorkspace({
+              navigate({
                 page: 'settings',
                 tab: 'media',
                 subtab: server === 'jellyfin' ? 'jellyfin' : 'emby',
@@ -289,6 +291,7 @@ export default function SettingsPage({
   notify,
   refresh,
   pendingSave = false,
+  embedded = false,
 }: {
   settings: Settings;
   users: Users;
@@ -297,8 +300,10 @@ export default function SettingsPage({
   notify: Notify;
   refresh: () => Promise<void>;
   pendingSave?: boolean;
+  embedded?: boolean;
 }) {
   const [activeTab] = useRouteTab('settings');
+  const navigateSettings = useWorkspaceNavigator();
   const [serverTab, setServerTab] = useRouteTab('settings', 'media');
   const [accountTab, setAccountTab] = useRouteTab('settings', 'accounts');
   const [discordTab, setDiscordTab] = useRouteTab('settings', 'discord');
@@ -335,7 +340,7 @@ export default function SettingsPage({
       automation: automationTab,
       history: historyTab,
     };
-    navigateWorkspace({ page: 'settings', tab: value, subtab: subsection ?? remembered[value] });
+    navigateSettings({ page: 'settings', tab: value, subtab: subsection ?? remembered[value] });
   }
   function revealField(element: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null) {
     if (!element) return;
@@ -709,10 +714,12 @@ export default function SettingsPage({
   }
   return (
     <div className="page-stack settings-focus">
-      <Heading
-        title="Settings"
-        description="Manage connections, account defaults, and automation one section at a time."
-      />
+      {!embedded && (
+        <Heading
+          title="Settings"
+          description="Manage connections, account defaults, and automation one section at a time."
+        />
+      )}
       <UserWarnings users={users} />
       {pendingSave && busy !== 'save' && (
         <Callout title="A settings save is still in progress.">
@@ -1067,14 +1074,16 @@ export default function SettingsPage({
                                 )}
                             </select>
                             <small>
-                              <button
-                                type="button"
-                                className="text-button"
-                                onClick={() => navigateWorkspace({ page: 'roles' })}
-                              >
-                                Create and update account roles
-                              </button>
-                              . The default applies only to new accounts and inspected
+                              {!embedded && (
+                                <button
+                                  type="button"
+                                  className="text-button"
+                                  onClick={() => navigateWorkspace({ page: 'roles' })}
+                                >
+                                  Create and update account roles
+                                </button>
+                              )}{' '}
+                              The default applies only to new accounts and inspected
                               incomplete-account recovery. Existing migrations keep current
                               permissions and preferences.
                             </small>

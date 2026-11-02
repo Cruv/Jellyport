@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { useRouteTab } from './routing';
+import WorkflowRequirements, { useWorkflowAction } from './WorkflowRequirements';
 import { useWorkspaceDraftState } from './workspace-drafts';
 import { Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
@@ -99,6 +100,7 @@ export default function AccountRolesPage({
   templateUserId?: string;
   defaultRoleId?: string;
 }) {
+  const taskReadiness = useWorkflowAction('account_roles');
   const [view, setView] = useRouteTab('roles');
   const [roleQuery, setRoleQuery] = useState('');
   const [roles, setRoles] = useState<AccountRole[]>([]);
@@ -386,6 +388,7 @@ export default function AccountRolesPage({
           </button>
         }
       />
+      <WorkflowRequirements action="account_roles" />
       <UserWarnings users={users} />
       <Tabs
         id="role-views"
@@ -597,7 +600,7 @@ export default function AccountRolesPage({
                     <button
                       className="btn"
                       type="button"
-                      disabled={busy || !sourceId}
+                      disabled={!taskReadiness.ready || busy || !sourceId}
                       aria-busy={busy}
                       onClick={importSettings}
                     >
@@ -659,7 +662,9 @@ export default function AccountRolesPage({
                     <button
                       className="btn btn-primary"
                       type="submit"
-                      disabled={busy || !parameters || !name.trim() || stale}
+                      disabled={
+                        !taskReadiness.ready || busy || !parameters || !name.trim() || stale
+                      }
                     >
                       {role ? 'Replace saved role' : 'Save new role'}
                     </button>
@@ -898,7 +903,7 @@ export default function AccountRolesPage({
                     <div className="form-actions">
                       <button
                         className="btn btn-primary"
-                        disabled={busy || !canApply}
+                        disabled={!taskReadiness.ready || busy || !canApply}
                         onClick={() => {
                           if (readyRole) {
                             setError('');
@@ -933,7 +938,11 @@ export default function AccountRolesPage({
               <button className="btn" disabled={busy} onClick={() => setReview(null)}>
                 Cancel
               </button>
-              <button className="btn btn-primary" disabled={busy} onClick={apply}>
+              <button
+                className="btn btn-primary"
+                disabled={!taskReadiness.ready || busy}
+                onClick={apply}
+              >
                 {busy ? 'Queuing…' : 'Apply settings'}
               </button>
             </>

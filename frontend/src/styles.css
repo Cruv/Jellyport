@@ -1261,6 +1261,34 @@ th.compact {
   align-items: center;
   gap: 8px;
 }
+.check-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+  cursor: pointer;
+}
+.check-card > input {
+  flex-shrink: 0;
+}
+.check-card > span {
+  display: grid;
+  min-width: 0;
+  gap: 5px;
+  overflow-wrap: anywhere;
+}
+.check-card strong {
+  font-size: 13px;
+  font-weight: 500;
+}
+.check-card small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
 .field label .optional {
   color: var(--subtle);
   font-size: 12px;
@@ -3644,13 +3672,6 @@ progress.progress-track::-moz-progress-bar {
 }
 .workflow-requirements .btn {
   flex-shrink: 0;
-}
-.workflow-return {
-  position: sticky;
-  bottom: -1px;
-  padding-block: 14px;
-  background: var(--surface);
-  border-top: 1px solid var(--line);
 }
 .person-workspace-summary {
   display: grid;

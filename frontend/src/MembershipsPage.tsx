@@ -654,7 +654,7 @@ export default function MembershipsPage({
                         <button
                           type="button"
                           className="btn btn-quiet"
-                          disabled={busy || loading || !identityAction.ready}
+                          disabled={busy || loading}
                           onClick={() => setIdentityOpen(true)}
                         >
                           Review existing account links
@@ -669,7 +669,11 @@ export default function MembershipsPage({
                         </button>
                       </div>
                       {!identityAction.ready && (
-                        <WorkflowRequirements action="identity_review" compact />
+                        <p className="section-note">
+                          Changing Discord relationships is optional. Existing confirmed account
+                          access can still be reviewed; Discord setup is checked when you open
+                          account links.
+                        </p>
                       )}
                     </section>
                   )}
@@ -751,6 +755,7 @@ export default function MembershipsPage({
                   </div>
                   <label className="check-card">
                     <input
+                      className="checkbox"
                       type="checkbox"
                       aria-label="Enable Jellyfin account provisioning"
                       checked={provisionJellyfin}
@@ -777,7 +782,7 @@ export default function MembershipsPage({
                       </p>
                     </div>
                   )}
-                  <div className="form-actions workflow-return">
+                  <div className="form-actions">
                     <button
                       className="btn"
                       type="button"

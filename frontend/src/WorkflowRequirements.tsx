@@ -189,6 +189,19 @@ export function WorkflowProvider({
           close={() => {
             if (!pendingSave) closeSetup();
           }}
+          footer={
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={pendingSave}
+              onClick={() => {
+                closeSetup();
+                void check(true);
+              }}
+            >
+              Return to my task
+            </button>
+          }
         >
           {setupError ? (
             <Callout warning title="Setup needs attention.">
@@ -216,19 +229,6 @@ export function WorkflowProvider({
               />
             </LocalWorkspaceRoute>
           )}
-          <div className="form-actions workflow-return">
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={pendingSave}
-              onClick={() => {
-                closeSetup();
-                void check(true);
-              }}
-            >
-              Return to my task
-            </button>
-          </div>
         </Modal>
       )}
     </Context.Provider>

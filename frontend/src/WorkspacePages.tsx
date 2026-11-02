@@ -698,6 +698,18 @@ export function AccountsPage({
             setRecipientPolicy(false);
             setCreationRetry((value) => value + 1);
           }}
+          footer={
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => {
+                setRecipientPolicy(false);
+                setCreationRetry((value) => value + 1);
+              }}
+            >
+              Return to account draft
+            </button>
+          }
         >
           <LocalWorkspaceRoute initial={{ page: 'memberships', tab: 'accounts', subtab: 'editor' }}>
             <MembershipsPage
@@ -710,18 +722,6 @@ export function AccountsPage({
               handoffKey={1}
             />
           </LocalWorkspaceRoute>
-          <div className="form-actions">
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={() => {
-                setRecipientPolicy(false);
-                setCreationRetry((value) => value + 1);
-              }}
-            >
-              Return to account draft
-            </button>
-          </div>
         </Modal>
       )}
       <Heading

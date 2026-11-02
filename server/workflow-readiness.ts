@@ -229,7 +229,7 @@ export class WorkflowReadiness {
           ...discord,
           ...tags,
           ...server('jellyfin'),
-          ...(settings.discord_emby_role_id ? server('emby') : []),
+          ...(emby.configured ? server('emby') : []),
         ]),
         identity_review: action(discord),
         account_access_emby: action([

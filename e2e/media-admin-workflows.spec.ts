@@ -36,8 +36,15 @@ async function chooseMember(page: Page, username: string) {
 
 async function queueMembership(page: Page, admin: AdminFixture, tier: string) {
   await page.getByRole('combobox', { name: 'Membership tier', exact: true }).selectOption(tier);
-  await page.getByRole('button', { name: 'Review membership update', exact: true }).click();
+  const reviewAction = page.getByRole('button', { name: 'Review membership update', exact: true });
+  await expect(reviewAction).toBeEnabled();
+  await page.screenshot({ path: test.info().outputPath('membership-preflight-viewport.png') });
+  await reviewAction.click();
   const review = page.getByRole('dialog', { name: 'Review membership update', exact: true });
+  await expect(review).toBeVisible();
+  const notice = review.locator('.toast');
+  if (await notice.count()) await expect(notice).toHaveCSS('opacity', '1');
+  await page.screenshot({ path: test.info().outputPath('membership-review-viewport.png') });
   const accepted = page.waitForResponse(
     (response) =>
       new URL(response.url()).pathname === '/api/memberships/workflow/accept' &&

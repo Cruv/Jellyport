@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import MembershipsPage from './MembershipsPage';
+import { WorkflowProvider } from './WorkflowRequirements';
 import {
   defaultMembershipTiers,
   type Api,
@@ -94,6 +95,7 @@ function fixture(
     read?: (signal: AbortSignal) => unknown | Promise<unknown>;
     initialMember?: { id: string; username: string };
     handoffKey?: number;
+    identityBlocked?: boolean;
   } = {},
 ) {
   const members = options.members ?? [structuredClone(membership)];
@@ -101,6 +103,26 @@ function fixture(
   let sequence = 0;
   const api = vi.fn(async (path: string, config?: ApiOptions) => {
     requests.push({ path, options: config });
+    if (path === '/api/workflow-readiness')
+      return {
+        checked_at: new Date().toISOString(),
+        actions: {
+          create_account: { ready: true, blockers: [], warnings: [] },
+          identity_review: options.identityBlocked
+            ? {
+                ready: false,
+                blockers: [
+                  {
+                    code: 'discord_offline',
+                    message: 'Connect Discord before changing identity relationships.',
+                    route: { page: 'settings', tab: 'discord', subtab: 'connection' },
+                  },
+                ],
+                warnings: [],
+              }
+            : { ready: true, blockers: [], warnings: [] },
+        },
+      };
     if (path === '/api/memberships')
       return options.read ? options.read(config!.signal!) : { memberships: members };
     if (path.startsWith('/api/discord/members?')) return { members: [member], truncated: false };
@@ -161,7 +183,23 @@ function fixture(
     initialMember: options.initialMember,
     handoffKey: options.handoffKey,
   };
-  return { ...render(<MembershipsPage {...props} />), props, requests, api, notify, created };
+  const component = <MembershipsPage {...props} />;
+  return {
+    ...render(
+      options.identityBlocked === undefined ? (
+        component
+      ) : (
+        <WorkflowProvider api={api} notify={notify} enabled onSettingsSaved={vi.fn()}>
+          {component}
+        </WorkflowProvider>
+      ),
+    ),
+    props,
+    requests,
+    api,
+    notify,
+    created,
+  };
 }
 async function manage() {
   fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
@@ -296,6 +334,35 @@ describe('membership task workflow', () => {
       false,
     );
     expect(writes(f.requests)).toEqual([]);
+  });
+
+  it('keeps confirmed account updates available when only optional Discord identity review is blocked', async () => {
+    const f = fixture({ identityBlocked: true });
+    await manage();
+    await ready();
+    expect(screen.getByRole('button', { name: 'Save access policy' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(screen.getByRole('button', { name: 'Review membership update' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(screen.queryByText('Before you continue')).toBeNull();
+    expect(screen.getByText(/Changing Discord relationships is optional/)).toBeTruthy();
+    expect(writes(f.requests)).toEqual([]);
+    const links = screen.getByRole('button', { name: 'Review existing account links' });
+    expect(links).toHaveProperty('disabled', false);
+    fireEvent.click(links);
+    expect(screen.getByText('Before you continue')).toBeTruthy();
+    expect(
+      screen.getByText('Connect Discord before changing identity relationships.'),
+    ).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Resolve requirement' })).toBeTruthy();
+    expect(writes(f.requests)).toEqual([]);
+    fireEvent.click(screen.getByRole('button', { name: 'Return without changes' }));
+    await ready();
+    expect(screen.queryByText('Before you continue')).toBeNull();
   });
 
   it('saves a complimentary policy independently of mapping, media defaults or an unavailable account plan', async () => {

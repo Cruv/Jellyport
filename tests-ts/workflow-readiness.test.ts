@@ -120,6 +120,33 @@ describe('workflow requirements before account tasks', () => {
     expect(value.actions.create_account.ready).toBe(false);
     expect(value.actions.account_roles.ready).toBe(true);
   });
+  it('checks every configured media source before a strict Discord role review', async () => {
+    const f = fixture((client, kind) => {
+      if (kind === 'emby')
+        client.systemInfo = async () => {
+          throw new Error('Synthetic offline source');
+        };
+    });
+    f.store.saveSettings({
+      ...f.store.settings(),
+      discord_enabled: true,
+      discord_emby_role_id: '',
+      discord_jellyfin_role_id: '123456789012345678',
+    });
+    f.service.bot = {
+      status: () => ({ connected: true }),
+      listTagRoles: async () => ({
+        can_manage_roles: true,
+        roles: [{ id: '123456789012345678', manageable: true }],
+      }),
+    } as unknown as NonNullable<Service['bot']>;
+    const value = await f.readiness.snapshot();
+    expect(value.actions.account_access_jellyfin.ready).toBe(true);
+    expect(value.actions.discord_roles.ready).toBe(false);
+    expect(value.actions.discord_roles.blockers.map((item) => item.code)).toContain(
+      'emby_connection',
+    );
+  });
   it('bounds a stalled source and never follows it with more reads', async () => {
     vi.useFakeTimers();
     let resolve!: (value: { Id: string }) => void;

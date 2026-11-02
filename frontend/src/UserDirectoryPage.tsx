@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useRouteTab } from './routing';
 import { useWorkspaceDraftState } from './workspace-drafts';
 import { Callout, Empty, Heading, Icon, Loading, Modal } from './components';
@@ -85,6 +85,7 @@ export default function UserDirectoryPage({
   onMigrate?: (sourceIds: string[]) => void;
   onMembership?: (member: { id: string; username: string }) => void;
 }) {
+  const workspaceFormId = useId();
   const [users, setUsers] = useState<DirectoryUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [directorySources, setDirectorySources] = useState<
@@ -1057,6 +1058,44 @@ export default function UserDirectoryPage({
           description="Account access is available immediately. Confirm relationships here only when you need member-based management."
           close={closeWorkspace}
           closeDisabled={busy}
+          footer={
+            accessReview || editing ? (
+              <>
+                <button className="btn" type="button" disabled={busy} onClick={closeWorkspace}>
+                  Cancel
+                </button>
+                {accessReview ? (
+                  <button
+                    className="btn btn-primary"
+                    type="submit"
+                    form={`${workspaceFormId}-access`}
+                    disabled={
+                      busy ||
+                      !accountReadiness.ready ||
+                      accessDisabled ===
+                        profileAccounts(accessReview).find((target) => target.key === accessTarget)
+                          ?.account.disabled
+                    }
+                  >
+                    {busy
+                      ? 'Updating…'
+                      : accessDisabled
+                        ? 'Disable selected account'
+                        : 'Enable selected account'}
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn-primary"
+                    type="submit"
+                    form={`${workspaceFormId}-profile`}
+                    disabled={busy || !accountReadiness.ready}
+                  >
+                    {busy ? 'Saving…' : 'Save family and owner notes'}
+                  </button>
+                )}
+              </>
+            ) : undefined
+          }
         >
           <div className="person-workspace-summary">
             <strong>
@@ -1104,7 +1143,7 @@ export default function UserDirectoryPage({
             }}
           />
           {accessReview && (
-            <form className="form-stack" onSubmit={updateAccess}>
+            <form id={`${workspaceFormId}-access`} className="form-stack" onSubmit={updateAccess}>
               <WorkflowRequirements action={accountAction} compact />
               <div className="field">
                 <label htmlFor="directory-access-account">Media account</label>
@@ -1169,31 +1208,10 @@ export default function UserDirectoryPage({
                   {error}
                 </div>
               )}
-              <div className="form-actions">
-                <button className="btn" type="button" disabled={busy} onClick={closeWorkspace}>
-                  Cancel
-                </button>
-                <button
-                  className="btn btn-primary"
-                  disabled={
-                    busy ||
-                    !accountReadiness.ready ||
-                    accessDisabled ===
-                      profileAccounts(accessReview).find((target) => target.key === accessTarget)
-                        ?.account.disabled
-                  }
-                >
-                  {busy
-                    ? 'Updating…'
-                    : accessDisabled
-                      ? 'Disable selected account'
-                      : 'Enable selected account'}
-                </button>
-              </div>
             </form>
           )}
           {editing && (
-            <form className="form-stack" onSubmit={saveProfile}>
+            <form id={`${workspaceFormId}-profile`} className="form-stack" onSubmit={saveProfile}>
               <WorkflowRequirements action={accountAction} compact />
               <div className="field">
                 <label htmlFor="directory-profile-account">Media account</label>
@@ -1263,14 +1281,6 @@ export default function UserDirectoryPage({
                   {error}
                 </div>
               )}
-              <div className="form-actions">
-                <button className="btn" type="button" disabled={busy} onClick={closeWorkspace}>
-                  Cancel
-                </button>
-                <button className="btn btn-primary" disabled={busy || !accountReadiness.ready}>
-                  {busy ? 'Saving…' : 'Save family and owner notes'}
-                </button>
-              </div>
             </form>
           )}
           {linking && (

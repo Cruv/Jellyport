@@ -525,6 +525,12 @@ describe('User directory and Discord organization', () => {
       'value',
       'Keep this in-progress note',
     );
+    const save = within(dialog).getByRole('button', { name: 'Save family and owner notes' });
+    expect(save.closest('.modal-footer')).toBeTruthy();
+    expect((save as HTMLButtonElement).form).toBe(
+      within(dialog).getByLabelText('Private owner notes').closest('form'),
+    );
+    expect(within(dialog).queryByRole('button', { name: 'Disable selected account' })).toBeNull();
     expect(requests.filter((entry) => entry.options?.method)).toEqual([]);
     expect(localStorage.length + sessionStorage.length).toBe(0);
   });
@@ -1131,7 +1137,9 @@ describe('User directory and Discord organization', () => {
       within(dialog).getByRole('button', { name: 'Clone Jellyfin account for Child' }),
     ).toHaveProperty('disabled', true);
     expect(within(dialog).queryByLabelText('New username 1')).toBeNull();
-    fireEvent.submit(submit.closest('form')!);
+    expect(submit.closest('.modal-footer')).toBeTruthy();
+    expect((submit as HTMLButtonElement).form).toBeTruthy();
+    fireEvent.submit((submit as HTMLButtonElement).form!);
     expect(writes).toEqual([]);
     ready = true;
     fireEvent.click(within(dialog).getByRole('button', { name: 'Check requirements again' }));

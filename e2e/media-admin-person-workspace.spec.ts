@@ -41,6 +41,9 @@ test('independent account access can be disabled and restored without mapping or
   await expect(
     workspace.getByRole('button', { name: 'Disable selected account', exact: true }),
   ).toBeEnabled();
+  await expect(
+    workspace.getByRole('button', { name: 'Disable selected account', exact: true }),
+  ).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: info.outputPath('independent-account-access-viewport.png') });
   await page.screenshot({
     path: info.outputPath('independent-account-access.png'),
@@ -142,6 +145,10 @@ test('a missing prerequisite is repaired within the person task while exact sele
   await workspace
     .getByRole('textbox', { name: 'Private owner notes', exact: true })
     .fill('Keep this private draft while repairing the connection.');
+  await expect(
+    workspace.getByRole('button', { name: 'Save family and owner notes', exact: true }),
+  ).toBeInViewport({ ratio: 1 });
+  await page.screenshot({ path: info.outputPath('person-profile-viewport.png') });
   await workspace.getByRole('button', { name: 'Resolve requirement', exact: true }).click();
   let setup = page.getByRole('dialog', { name: 'Complete required setup', exact: true });
   await expect(setup).toBeVisible();
@@ -230,6 +237,11 @@ test('confirming an owner inside the person workspace is reused for later accoun
   ).toBeChecked();
   expect(relationshipCounts(admin).owners).toBe(0);
   expect(admin.writes).toEqual([]);
+  await page.screenshot({ path: info.outputPath('owner-confirmation-viewport.png') });
+  await workspace
+    .getByRole('checkbox', { name: 'Jellyfin · other_member', exact: true })
+    .scrollIntoViewIfNeeded();
+  await page.screenshot({ path: info.outputPath('owner-account-selection-viewport.png') });
   await workspace
     .getByRole('button', { name: 'Approve identity & update roles', exact: true })
     .click();

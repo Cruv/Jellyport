@@ -128,6 +128,9 @@ describe('requirements within the current task', () => {
         (screen.getByRole('button', { name: 'Confirm task' }) as HTMLButtonElement).disabled,
       ).toBe(false),
     );
+    expect(
+      within(setup).getByRole('button', { name: 'Return to my task' }).closest('.modal-footer'),
+    ).toBeTruthy();
     fireEvent.click(within(setup).getByRole('button', { name: 'Return to my task' }));
     expect(screen.queryByRole('dialog')).toBeNull();
     expect((screen.getByLabelText('Private task draft') as HTMLInputElement).value).toBe(

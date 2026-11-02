@@ -512,6 +512,7 @@ function ApprovalEditor({
           {row.customers.map((customer) => (
             <label className="check-card" key={customer.id}>
               <input
+                className="checkbox"
                 type="checkbox"
                 aria-label={`Confirm Stripe customer ${customer.name || customer.email || customer.id}`}
                 checked={customer.linked_discord_id === member?.id || customerIds.has(customer.id)}

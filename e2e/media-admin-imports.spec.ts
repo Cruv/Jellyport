@@ -24,8 +24,9 @@ async function importBackup(
   kind: 'emby' | 'jellyfin',
   outcome: 'succeeded' | 'failed' = 'succeeded',
   start: 'accepted' | 'rejected' = 'accepted',
+  scope?: Locator,
 ) {
-  const view = await panel(page, kind);
+  const view = scope ?? (await panel(page, kind));
   const path =
     kind === 'emby' ? '/api/source-snapshots/refresh' : '/api/destination-catalog/refresh';
   const accepted = page.waitForResponse(
@@ -296,6 +297,38 @@ test('missing and invalid backups fail visibly, retain original valid history, a
 }, testInfo) => {
   test.setTimeout(60_000);
   await page.goto('/#/migrate');
+  await expect(
+    page.getByText('Import a current Jellyfin matching catalog before migrating.', {
+      exact: true,
+    }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('checkbox', { name: 'Select synthetic_member', exact: true }),
+  ).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Preview migration', exact: true })).toBeDisabled();
+  expect(imports.writes).toEqual([]);
+  expect(imports.app.jellyport.store.jobs()).toEqual([]);
+
+  // Repair the catalog prerequisite in place. Returning from setup refreshes
+  // readiness; no mocked approval or live catalog fallback is permitted.
+  await page.getByRole('button', { name: 'Resolve requirement', exact: true }).click();
+  const setup = page.getByRole('dialog', { name: 'Complete required setup', exact: true });
+  await importBackup(
+    page,
+    imports,
+    'jellyfin',
+    'succeeded',
+    'accepted',
+    setup.getByRole('region', { name: 'Saved Jellyfin matching catalog', exact: true }),
+  );
+  await setup.getByRole('button', { name: 'Return to my task', exact: true }).click();
+  await expect(setup).toHaveCount(0);
+  await expect(
+    page.getByRole('checkbox', { name: 'Select synthetic_member', exact: true }),
+  ).toBeEnabled();
+  await expect(
+    page.getByRole('checkbox', { name: 'Use saved Emby snapshot', exact: true }),
+  ).toBeChecked();
   await page.getByRole('checkbox', { name: 'Select synthetic_member', exact: true }).check();
   await page.getByRole('button', { name: 'Preview migration (1)', exact: true }).click();
   await expect(page.getByText(/No completed database capture is available/)).toBeVisible();

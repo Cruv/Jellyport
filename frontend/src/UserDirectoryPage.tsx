@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useRouteTab } from './routing';
 import { useWorkspaceDraftState } from './workspace-drafts';
 import { Callout, Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import DiscordMemberPicker from './DiscordMemberPicker';
+import { MemberIdentityAccountReview } from './IdentityReviewPanel';
+import WorkflowRequirements, { useWorkflowAction } from './WorkflowRequirements';
 import AccountCloneDialog, {
   AccountRenameDialog,
   type AccountCloneRequest,
@@ -63,6 +65,8 @@ const cloneAccounts = (user: DirectoryUser) =>
   user.jellyfin.filter((account) => account.protected === false && account.disabled === false);
 const renameAccounts = (user: DirectoryUser) =>
   user.jellyfin.filter((account) => account.protected === false);
+const selectedFirst = (accounts: DirectoryAccount[], selectedId: string) =>
+  [...accounts].sort((a, b) => Number(b.id === selectedId) - Number(a.id === selectedId));
 
 export default function UserDirectoryPage({
   settings,
@@ -70,15 +74,25 @@ export default function UserDirectoryPage({
   notify,
   navigate,
   created,
+  onMigrate,
+  onMembership,
 }: {
   settings: Settings;
   api: Api;
   notify: Notify;
   navigate: (page: Page) => void;
   created?: (job: Job) => void;
+  onMigrate?: (sourceIds: string[]) => void;
+  onMembership?: (member: { id: string; username: string }) => void;
 }) {
+  const workspaceFormId = useId();
   const [users, setUsers] = useState<DirectoryUser[]>([]);
   const [loading, setLoading] = useState(true);
+  const [directorySources, setDirectorySources] = useState<
+    Partial<
+      Record<'emby' | 'jellyfin', { configured: boolean; available: boolean; error?: string }>
+    >
+  >({});
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
   const [server, setServer] = useState('all');
@@ -90,8 +104,11 @@ export default function UserDirectoryPage({
   if (sectionGeneration.current.section !== section)
     sectionGeneration.current = { section, version: sectionGeneration.current.version + 1 };
   const [advanced, setAdvanced] = useState(false);
-  const [actionUser, setActionUser] = useState('');
-  useEffect(() => setActionUser(''), [section]);
+  const [workspaceTarget, setWorkspaceTarget] = useState('');
+  const profileDrafts = useRef(
+    new Map<string, { family: boolean; owner: string; notes: string }>(),
+  );
+  const accessDrafts = useRef(new Map<string, boolean>());
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState<DirectoryUser | null>(null);
   const [profileTarget, setProfileTarget] = useState('');
@@ -101,14 +118,14 @@ export default function UserDirectoryPage({
   const [accessReview, setAccessReview] = useState<DirectoryUser | null>(null);
   const [accessTarget, setAccessTarget] = useState('');
   const [accessDisabled, setAccessDisabled] = useState(false);
+  const [toolAccountId, setToolAccountId] = useState('');
   const [cloning, setCloning] = useState<DirectoryUser | null>(null);
   const [cloneReview, setCloneReview] = useState<AccountCloneReview | null>(null);
   const [renaming, setRenaming] = useState<DirectoryUser | null>(null);
   const [renameRecovery, setRenameRecovery] = useState<AccountRenameRecovery | undefined>();
   const [linking, setLinking] = useState<DirectoryUser | null>(null);
   const [member, setMember] = useState<DiscordMember | null>(null);
-  const [target, setTarget] = useState('');
-  const [slot, setSlot] = useState(1);
+  const [ownerReviewing, setOwnerReviewing] = useState(false);
   const [organizer, setOrganizer] = useState(false);
   const [roles, setRoles] = useState<DiscordTagRole[]>([]);
   const [rolesLoaded, setRolesLoaded] = useState(false);
@@ -150,6 +167,8 @@ export default function UserDirectoryPage({
     setRenameRecovery(undefined);
     setLinking(null);
     setPreview(null);
+    profileDrafts.current.clear();
+    accessDrafts.current.clear();
   }, [section]);
   const generation = useRef(0);
   const controllers = useRef(new Set<AbortController>());
@@ -169,11 +188,17 @@ export default function UserDirectoryPage({
       setLoading(true);
       setError('');
       try {
-        const value = await api<{ users: DirectoryUser[] }>('/api/user-directory', {
+        const value = await api<{
+          users: DirectoryUser[];
+          sources?: Partial<
+            Record<'emby' | 'jellyfin', { configured: boolean; available: boolean; error?: string }>
+          >;
+        }>('/api/user-directory', {
           signal: controller.signal,
         });
         if (!mounted.current || controller.signal.aborted || version !== generation.current) return;
         setUsers(value.users);
+        setDirectorySources(value.sources || {});
         if (manual) notify('Users refreshed.');
       } catch (reason) {
         if (mounted.current && !controller.signal.aborted && version === generation.current) {
@@ -218,34 +243,89 @@ export default function UserDirectoryPage({
       if (mounted.current) setBusy(false);
     }
   }
-  function openLink(user: DirectoryUser) {
-    setActionUser('');
-    setLinking(user);
-    setTarget(user.jellyfin[0]?.id || '');
-    setSlot(1);
-    setMember(
-      user.discord_user_id
-        ? {
-            id: user.discord_user_id,
-            username: user.discord_username || user.jellyfin[0]?.name || '',
-            display_name: null,
-            nickname: null,
-            membership_active: null,
-          }
-        : null,
+  const workspaceUser = accessReview || editing || linking;
+  const workspaceAccounts = workspaceUser ? profileAccounts(workspaceUser) : [];
+  const selectedWorkspaceAccount = workspaceAccounts.find((item) => item.key === workspaceTarget);
+  const workspaceCloneAccounts = workspaceUser
+    ? selectedFirst(
+        cloneAccounts(workspaceUser),
+        selectedWorkspaceAccount?.kind === 'jellyfin' ? selectedWorkspaceAccount.account.id : '',
+      )
+    : [];
+  const workspaceRenameAccounts = workspaceUser
+    ? selectedFirst(
+        renameAccounts(workspaceUser),
+        selectedWorkspaceAccount?.kind === 'jellyfin' ? selectedWorkspaceAccount.account.id : '',
+      )
+    : [];
+  const accountAction =
+    selectedWorkspaceAccount?.kind === 'emby' ? 'account_access_emby' : 'account_access_jellyfin';
+  const accountReadiness = useWorkflowAction(accountAction);
+  const identityReadiness = useWorkflowAction('identity_review');
+  const jellyfinReadiness = useWorkflowAction('account_access_jellyfin');
+  const ownerInitialAccounts = useMemo(
+    () =>
+      selectedWorkspaceAccount
+        ? [{ kind: selectedWorkspaceAccount.kind, id: selectedWorkspaceAccount.account.id }]
+        : [],
+    [selectedWorkspaceAccount?.key],
+  );
+  function closeWorkspace() {
+    if (busy) return;
+    clearWorkspace();
+  }
+  function clearWorkspace() {
+    setAccessReview(null);
+    setEditing(null);
+    setLinking(null);
+    setOwnerReviewing(false);
+    setMember(null);
+    profileDrafts.current.clear();
+    accessDrafts.current.clear();
+    setError('');
+  }
+  function selectedAccount(user: DirectoryUser): ProfileAccount | undefined {
+    return (
+      (workspaceUser?.id === user.id
+        ? profileAccounts(user).find((item) => item.key === workspaceTarget)
+        : undefined) || profileAccounts(user)[0]
     );
+  }
+  function openLink(user: DirectoryUser) {
+    const account = selectedAccount(user);
+    if (!account) return;
+    const sameWorkspace = workspaceUser?.id === user.id;
+    setAccessReview(null);
+    setEditing(null);
+    setLinking(user);
+    setWorkspaceTarget(account.key);
+    if (!sameWorkspace) {
+      setOwnerReviewing(false);
+      setMember(null);
+    }
     setError('');
   }
   function selectProfile(target: ProfileAccount) {
+    const draft = profileDrafts.current.get(target.key);
+    setWorkspaceTarget(target.key);
     setProfileTarget(target.key);
-    setProfileFamily(!!target.account.profile?.family);
-    setOwnerName(target.account.profile?.owner_name || '');
-    setOwnerNotes(target.account.profile?.notes || '');
+    setProfileFamily(draft?.family ?? !!target.account.profile?.family);
+    setOwnerName(draft?.owner ?? target.account.profile?.owner_name ?? '');
+    setOwnerNotes(draft?.notes ?? target.account.profile?.notes ?? '');
   }
+  useEffect(() => {
+    if (editing && profileTarget)
+      profileDrafts.current.set(profileTarget, {
+        family: profileFamily,
+        owner: ownerName,
+        notes: ownerNotes,
+      });
+  }, [editing, profileTarget, profileFamily, ownerName, ownerNotes]);
   function openProfile(user: DirectoryUser) {
-    const account = profileAccounts(user)[0];
+    const account = selectedAccount(user);
     if (!account) return;
-    setActionUser('');
+    setAccessReview(null);
+    setLinking(null);
     setEditing(user);
     selectProfile(account);
     setError('');
@@ -253,7 +333,7 @@ export default function UserDirectoryPage({
   function saveProfile(event: FormEvent) {
     event.preventDefault();
     const target = editing && profileAccounts(editing).find((item) => item.key === profileTarget);
-    if (!target) return;
+    if (!target || !accountReadiness.ready) return;
     void run(async (signal) => {
       await api('/api/account-profiles', {
         method: 'POST',
@@ -268,25 +348,27 @@ export default function UserDirectoryPage({
         signal,
       });
       if (!mounted.current || signal.aborted) return;
-      setEditing(null);
+      clearWorkspace();
       notify('Family flag and private owner notes saved.');
       await reload();
     });
   }
   function openAccessReview(user: DirectoryUser) {
-    const target = profileAccounts(user)[0];
+    const target = selectedAccount(user);
     if (!target) return;
-    setActionUser('');
+    setEditing(null);
+    setLinking(null);
     setAccessReview(user);
+    setWorkspaceTarget(target.key);
     setAccessTarget(target.key);
-    setAccessDisabled(!target.account.disabled);
+    setAccessDisabled(accessDrafts.current.get(target.key) ?? !target.account.disabled);
     setError('');
   }
   function updateAccess(event: FormEvent) {
     event.preventDefault();
     const target =
       accessReview && profileAccounts(accessReview).find((item) => item.key === accessTarget);
-    if (!target || accessDisabled === target.account.disabled) return;
+    if (!target || !accountReadiness.ready || accessDisabled === target.account.disabled) return;
     void run(async (signal) => {
       await api('/api/accounts/access', {
         method: 'POST',
@@ -300,25 +382,10 @@ export default function UserDirectoryPage({
         signal,
       });
       if (!mounted.current || signal.aborted) return;
-      setAccessReview(null);
+      clearWorkspace();
       notify(
         `Account ${accessDisabled ? 'disabled' : 'enabled'}. Its password and media data are preserved.`,
       );
-      await reload();
-    });
-  }
-  function link(event: FormEvent) {
-    event.preventDefault();
-    if (!member || !target) return;
-    void run(async (signal) => {
-      await api('/api/accounts/link', {
-        method: 'POST',
-        body: { discord_user_id: member.id, jellyfin_user_id: target, membership_slot: slot },
-        signal,
-      });
-      if (!mounted.current || signal.aborted) return;
-      setLinking(null);
-      notify('Existing account linked. Its password, settings, and media data are preserved.');
       await reload();
     });
   }
@@ -345,6 +412,7 @@ export default function UserDirectoryPage({
       if (!mounted.current || signal.aborted) return;
       setCloning(null);
       setCloneReview(null);
+      clearWorkspace();
       notify('Account cloning started. Open the report to retrieve the new credentials.');
       created(job);
     });
@@ -358,6 +426,7 @@ export default function UserDirectoryPage({
       await api('/api/accounts/rename', { method: 'POST', body: request, signal });
       if (!mounted.current || signal.aborted) return;
       setRenaming(null);
+      clearWorkspace();
       notify('Jellyfin account renamed. Its password, settings, and media data are preserved.');
       await reload();
     });
@@ -467,15 +536,11 @@ export default function UserDirectoryPage({
     25,
     JSON.stringify([search, server, access, family, review]),
   );
-  useEffect(
-    () => setActionUser(''),
-    [pagination.page, pagination.pageSize, search, server, access, family, review],
-  );
   return (
     <div className="page-stack">
       <Heading
         title="Users"
-        description="Review accounts across Emby and Jellyfin, confirm ownership, and manage access."
+        description="Find a person once, then manage their accounts, access, and ownership in one place."
         actions={
           <>
             <button
@@ -502,7 +567,6 @@ export default function UserDirectoryPage({
         value={section}
         onChange={(value) => {
           setSection(value);
-          setActionUser('');
         }}
       />
       {error && !linking && !editing && !accessReview && !cloning && !renaming && (
@@ -522,11 +586,27 @@ export default function UserDirectoryPage({
             icon="warning"
             title={`${reviewCount} ${reviewCount === 1 ? 'user needs' : 'users need'} review`}
           >
-            Confirm an owner or family flag for these accounts. They will not be automatically
-            disabled.{' '}
+            Confirm an owner or Family flag when appropriate. Account access can be managed now.
+            They will not be automatically disabled.{' '}
             <button className="text-button" onClick={() => setReview('review')}>
               Show users needing review
             </button>
+          </Callout>
+        )}
+        {Object.entries(directorySources).some(
+          ([, source]) => source.configured && !source.available,
+        ) && (
+          <Callout warning title="Some server accounts are temporarily unavailable">
+            {Object.entries(directorySources)
+              .filter(([, source]) => source.configured && !source.available)
+              .map(([kind, source]) => (
+                <p key={kind}>
+                  {kind === 'emby' ? 'Emby' : 'Jellyfin'}:{' '}
+                  {source.error || 'The account list could not be verified.'}
+                </p>
+              ))}
+            Available accounts stay visible. Missing server data is not treated as a missing account
+            or unpaid access.
           </Callout>
         )}
         <section className="panel">
@@ -534,7 +614,8 @@ export default function UserDirectoryPage({
             <div>
               <h2>User directory</h2>
               <p>
-                Confirmed links determine account ownership. Unlinked accounts require your review.
+                Manage account access directly. Discord ownership and membership are separate,
+                optional steps.
               </p>
             </div>
             {!loading && <span className="status">{users.length} users</span>}
@@ -716,112 +797,31 @@ export default function UserDirectoryPage({
                       <td className="right" data-label="Actions">
                         {profileAccounts(user).length > 0 ||
                         (!user.protected && (user.emby.length > 0 || user.jellyfin.length > 0)) ? (
-                          <div
-                            className="directory-actions"
-                            onKeyDown={(event) => {
-                              if (event.key !== 'Escape' || actionUser !== user.id) return;
-                              event.preventDefault();
-                              setActionUser('');
-                              event.currentTarget
-                                .querySelector<HTMLButtonElement>('button')
-                                ?.focus();
-                            }}
-                          >
+                          <div className="directory-actions person-directory-actions">
                             <button
-                              className="btn btn-quiet"
+                              className="btn btn-primary btn-small"
                               disabled={busy}
-                              aria-expanded={actionUser === user.id}
-                              aria-controls={`directory-actions-${encodeURIComponent(user.id)}`}
                               aria-label={`Manage ${profileAccounts(user)[0]?.account.name || user.jellyfin[0]?.name || user.emby[0]?.name}`}
                               onClick={(event) => {
-                                // Safari does not focus buttons after a touch click.
-                                // Keep disclosure keyboard events with their owner,
-                                // rather than the search field previously in focus.
                                 event.currentTarget.focus({ preventScroll: true });
-                                setActionUser((value) => (value === user.id ? '' : user.id));
+                                openAccessReview(user);
                               }}
                             >
-                              Manage <span aria-hidden="true">▾</span>
+                              Manage
                             </button>
-                            <div
-                              className="directory-action-menu"
-                              id={`directory-actions-${encodeURIComponent(user.id)}`}
-                              role="group"
-                              aria-label="Account management actions"
-                              hidden={actionUser !== user.id}
-                            >
-                              {profileAccounts(user).length > 0 && (
-                                <button
-                                  className="btn btn-quiet"
-                                  disabled={busy}
-                                  onClick={() => openProfile(user)}
-                                  aria-label={`Family and owner notes for ${profileAccounts(user)[0]!.account.name}`}
-                                >
-                                  Family and notes
-                                </button>
-                              )}
-                              {created && cloneAccounts(user).length > 0 && (
-                                <button
-                                  className="btn btn-quiet"
-                                  disabled={busy}
-                                  onClick={() => {
-                                    setActionUser('');
-                                    setError('');
-                                    setCloneReview(null);
-                                    setCloning(user);
-                                  }}
-                                  aria-label={`Clone Jellyfin account for ${cloneAccounts(user)[0]!.name}`}
-                                >
-                                  Clone account
-                                </button>
-                              )}
-                              {renameAccounts(user).length > 0 && (
-                                <button
-                                  className="btn btn-quiet"
-                                  disabled={busy}
-                                  onClick={() => {
-                                    setActionUser('');
-                                    setError('');
-                                    setRenaming(user);
-                                    inspectRename(renameAccounts(user)[0]!.id);
-                                  }}
-                                  aria-label={`Rename Jellyfin account for ${renameAccounts(user)[0]!.name}`}
-                                >
-                                  Rename account
-                                </button>
-                              )}
-                              {profileAccounts(user).length > 0 && (
-                                <button
-                                  className="btn btn-quiet"
-                                  disabled={busy}
-                                  onClick={() => openAccessReview(user)}
-                                  aria-label={`Manage account access for ${profileAccounts(user)[0]!.account.name}`}
-                                >
-                                  Account access
-                                </button>
-                              )}
-                              {user.jellyfin.length > 0 && !user.protected && (
-                                <button
-                                  className="btn btn-quiet"
-                                  disabled={busy}
-                                  onClick={() => openLink(user)}
-                                  aria-label={`Link Discord owner for ${user.jellyfin[0].name}`}
-                                >
-                                  Discord owner
-                                </button>
-                              )}
-                              {user.emby.length > 0 && !user.protected && (
-                                <button
-                                  className="btn btn-quiet"
-                                  onClick={() => {
-                                    setActionUser('');
-                                    navigate('mappings');
-                                  }}
-                                >
-                                  User mappings
-                                </button>
-                              )}
-                            </div>
+                            {profileAccounts(user).length === 1 && (
+                              <button
+                                className="btn btn-quiet btn-small"
+                                disabled={busy}
+                                aria-label={`${profileAccounts(user)[0]!.account.disabled ? 'Enable' : 'Disable'} ${profileAccounts(user)[0]!.account.name}`}
+                                onClick={(event) => {
+                                  event.currentTarget.focus({ preventScroll: true });
+                                  openAccessReview(user);
+                                }}
+                              >
+                                {profileAccounts(user)[0]!.account.disabled ? 'Enable' : 'Disable'}
+                              </button>
+                            )}
                           </div>
                         ) : (
                           <span className="section-note">
@@ -1013,7 +1013,7 @@ export default function UserDirectoryPage({
       </TabPanel>
       {cloning && (
         <AccountCloneDialog
-          accounts={cloneAccounts(cloning)}
+          accounts={selectedFirst(cloneAccounts(cloning), toolAccountId)}
           existingUsernames={users.flatMap((user) => user.jellyfin.map((account) => account.name))}
           busy={busy}
           error={error}
@@ -1037,7 +1037,7 @@ export default function UserDirectoryPage({
       )}
       {renaming && (
         <AccountRenameDialog
-          accounts={renameAccounts(renaming)}
+          accounts={selectedFirst(renameAccounts(renaming), toolAccountId)}
           existingUsernames={users.flatMap((user) => user.jellyfin.map((account) => account.name))}
           busy={busy}
           error={error}
@@ -1052,271 +1052,420 @@ export default function UserDirectoryPage({
           submit={renameAccount}
         />
       )}
-      {accessReview && (
+      {workspaceUser && !cloning && !renaming && (
         <Modal
-          title="Review account access"
-          description="Change access for one selected media account."
-          close={() => {
-            if (!busy) {
-              setAccessReview(null);
-              setError('');
-            }
-          }}
+          title={`Manage ${workspaceUser.discord_username ? '@' + workspaceUser.discord_username : workspaceAccounts[0]?.account.name || 'account'}`}
+          description="Account access is available immediately. Confirm relationships here only when you need member-based management."
+          close={closeWorkspace}
+          closeDisabled={busy}
+          footer={
+            accessReview || editing ? (
+              <>
+                <button className="btn" type="button" disabled={busy} onClick={closeWorkspace}>
+                  Cancel
+                </button>
+                {accessReview ? (
+                  <button
+                    className="btn btn-primary"
+                    type="submit"
+                    form={`${workspaceFormId}-access`}
+                    disabled={
+                      busy ||
+                      !accountReadiness.ready ||
+                      accessDisabled ===
+                        profileAccounts(accessReview).find((target) => target.key === accessTarget)
+                          ?.account.disabled
+                    }
+                  >
+                    {busy
+                      ? 'Updating…'
+                      : accessDisabled
+                        ? 'Disable selected account'
+                        : 'Enable selected account'}
+                  </button>
+                ) : (
+                  <button
+                    className="btn btn-primary"
+                    type="submit"
+                    form={`${workspaceFormId}-profile`}
+                    disabled={busy || !accountReadiness.ready}
+                  >
+                    {busy ? 'Saving…' : 'Save family and owner notes'}
+                  </button>
+                )}
+              </>
+            ) : undefined
+          }
         >
-          <form className="form-stack" onSubmit={updateAccess}>
-            <div className="field">
-              <label htmlFor="directory-access-account">Media account</label>
-              <select
-                id="directory-access-account"
-                value={accessTarget}
-                disabled={busy}
-                onChange={(event) => {
-                  const target = profileAccounts(accessReview).find(
-                    (item) => item.key === event.target.value,
-                  );
-                  if (!target) return;
-                  setAccessTarget(target.key);
-                  setAccessDisabled(!target.account.disabled);
-                }}
-              >
-                {profileAccounts(accessReview).map((target) => (
-                  <option key={target.key} value={target.key}>
-                    {target.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}: {target.account.name}
-                  </option>
-                ))}
-              </select>
-              <small>
-                Currently{' '}
-                {profileAccounts(accessReview).find((target) => target.key === accessTarget)
-                  ?.account.disabled
-                  ? 'disabled'
-                  : 'enabled'}
-                .
-              </small>
-            </div>
-            <div className="field">
-              <label htmlFor="directory-access-change">Access change</label>
-              <select
-                id="directory-access-change"
-                value={accessDisabled ? 'disable' : 'enable'}
-                disabled={busy}
-                onChange={(event) => setAccessDisabled(event.target.value === 'disable')}
-              >
-                <option value="disable">Disable this account</option>
-                <option value="enable">Enable this account</option>
-              </select>
-            </div>
+          <div className="person-workspace-summary">
+            <strong>
+              {workspaceUser.discord_user_id
+                ? workspaceUser.discord_username
+                  ? '@' + workspaceUser.discord_username
+                  : 'Linked Discord member'
+                : 'Independent media account'}
+            </strong>
             <p>
-              {accessDisabled
-                ? 'Disabling prevents this account from signing in. Its password, watch history, favorites, playlists, and preferences are preserved, so you can enable it again later.'
-                : 'Enabling restores access for this account with its existing password and media data.'}
+              {presenceNames[presence(workspaceUser)]} · {accessNames[workspaceUser.access_mode]}
+              {workspaceUser.account_limit
+                ? ` · ${workspaceUser.account_limit} account allowance`
+                : ''}
             </p>
-            <small>
-              Only the selected account changes. Its family flag, notes, and linked owner’s access
-              policy remain as saved.
-            </small>
-            {error && (
-              <div className="error-block" role="alert">
-                {error}
-              </div>
+            {selectedWorkspaceAccount && (
+              <p>
+                <strong>
+                  {selectedWorkspaceAccount.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}:{' '}
+                  {selectedWorkspaceAccount.account.name}
+                </strong>{' '}
+                · {selectedWorkspaceAccount.account.disabled ? 'Disabled' : 'Enabled'}
+              </p>
             )}
-            <div className="form-actions">
-              <button
-                className="btn"
-                type="button"
-                disabled={busy}
-                onClick={() => setAccessReview(null)}
-              >
-                Cancel
-              </button>
-              <button
-                className="btn btn-primary"
-                disabled={
-                  busy ||
-                  accessDisabled ===
-                    profileAccounts(accessReview).find((target) => target.key === accessTarget)
-                      ?.account.disabled
-                }
-              >
-                {busy
-                  ? 'Updating…'
-                  : accessDisabled
-                    ? 'Disable selected account'
-                    : 'Enable selected account'}
-              </button>
-            </div>
-          </form>
-        </Modal>
-      )}
-      {editing && (
-        <Modal
-          title="Family and owner notes"
-          description="Keep account ownership details private in Jellyport."
-          close={() => {
-            if (!busy) {
-              setEditing(null);
-              setError('');
-            }
-          }}
-        >
-          <form className="form-stack" onSubmit={saveProfile}>
-            <div className="field">
-              <label htmlFor="directory-profile-account">Media account</label>
-              <select
-                id="directory-profile-account"
-                value={profileTarget}
-                disabled={busy}
-                onChange={(event) => {
-                  const target = profileAccounts(editing).find(
-                    (item) => item.key === event.target.value,
-                  );
-                  if (target) selectProfile(target);
-                }}
-              >
-                {profileAccounts(editing).map((target) => (
-                  <option key={target.key} value={target.key}>
-                    {target.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}: {target.account.name}
-                  </option>
-                ))}
-              </select>
-              <small>These notes belong to the selected account on this server.</small>
-            </div>
-            <label className="check-line">
-              <input
-                type="checkbox"
-                checked={profileFamily}
-                disabled={busy}
-                onChange={(event) => setProfileFamily(event.target.checked)}
-              />
-              Family account
-            </label>
-            <p>
-              This flag applies only to the selected account. Family accounts are exempt from
-              automatic billing-based access changes. No Discord membership or payment is required.
-            </p>
             <small>
-              Removing the family flag does not disable the account. Manage the linked owner’s
-              subscription or complimentary access separately in Memberships.
+              {workspaceUser.discord_user_id
+                ? 'Confirmed owner links are already available for this person.'
+                : 'No Discord link is required to change this account’s access or Family flag.'}
             </small>
-            <div className="field">
-              <label htmlFor="directory-profile-owner">Owner name</label>
-              <input
-                id="directory-profile-owner"
-                value={ownerName}
-                maxLength={120}
-                disabled={busy}
-                onChange={(event) => setOwnerName(event.target.value)}
-                placeholder="Who this account belongs to"
-              />
-            </div>
-            <div className="field">
-              <label htmlFor="directory-profile-notes">Private owner notes</label>
-              <textarea
-                id="directory-profile-notes"
-                value={ownerNotes}
-                maxLength={2000}
-                rows={4}
-                disabled={busy}
-                onChange={(event) => setOwnerNotes(event.target.value)}
-                placeholder="Details to help you recognize and manage the account"
-              />
-              <small>Visible only to Jellyport administrators. Never sent to Discord.</small>
-            </div>
-            {error && (
-              <div className="error-block" role="alert">
-                {error}
+          </div>
+          <Tabs
+            id="person-workspace"
+            label="Account workspace sections"
+            tabs={[
+              { id: 'access', label: 'Account access' },
+              { id: 'owner', label: 'Discord owner' },
+              { id: 'profile', label: 'Family & notes' },
+            ]}
+            value={accessReview ? 'access' : linking ? 'owner' : 'profile'}
+            onChange={(value) => {
+              if (busy) return;
+              if (value === 'access') openAccessReview(workspaceUser);
+              else if (value === 'owner') openLink(workspaceUser);
+              else openProfile(workspaceUser);
+            }}
+          />
+          {accessReview && (
+            <form id={`${workspaceFormId}-access`} className="form-stack" onSubmit={updateAccess}>
+              <WorkflowRequirements action={accountAction} compact />
+              <div className="field">
+                <label htmlFor="directory-access-account">Media account</label>
+                <select
+                  id="directory-access-account"
+                  value={accessTarget}
+                  disabled={busy}
+                  onChange={(event) => {
+                    const target = profileAccounts(accessReview).find(
+                      (item) => item.key === event.target.value,
+                    );
+                    if (!target) return;
+                    setAccessTarget(target.key);
+                    setWorkspaceTarget(target.key);
+                    setAccessDisabled(
+                      accessDrafts.current.get(target.key) ?? !target.account.disabled,
+                    );
+                  }}
+                >
+                  {profileAccounts(accessReview).map((target) => (
+                    <option key={target.key} value={target.key}>
+                      {target.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}: {target.account.name}
+                    </option>
+                  ))}
+                </select>
+                <small>
+                  Currently{' '}
+                  {profileAccounts(accessReview).find((target) => target.key === accessTarget)
+                    ?.account.disabled
+                    ? 'disabled'
+                    : 'enabled'}
+                  .
+                </small>
               </div>
-            )}
-            <div className="form-actions">
-              <button
-                className="btn"
-                type="button"
-                disabled={busy}
-                onClick={() => setEditing(null)}
-              >
-                Cancel
-              </button>
-              <button className="btn btn-primary" disabled={busy}>
-                {busy ? 'Saving…' : 'Save family and owner notes'}
-              </button>
-            </div>
-          </form>
-        </Modal>
-      )}
-      {linking && (
-        <Modal
-          title="Link an existing Jellyfin account"
-          description="Choose the confirmed owner. The account keeps its password and data."
-          close={() => {
-            if (!busy) {
-              setLinking(null);
-              setError('');
-            }
-          }}
-        >
-          <form className="form-stack" onSubmit={link}>
-            <div className="field">
-              <label htmlFor="directory-link-account">Existing Jellyfin account</label>
-              <select
-                id="directory-link-account"
-                value={target}
-                disabled={busy}
-                onChange={(event) => setTarget(event.target.value)}
-              >
-                {linking.jellyfin.map((account) => (
-                  <option key={account.id} value={account.id}>
-                    {account.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-            <DiscordMemberPicker
-              api={api}
-              value={member}
-              onChange={setMember}
-              suggestedQuery={linking.jellyfin[0]?.name}
-              autoSearch
-              allowInactive
-              disabled={busy}
-            />
-            <div className="field">
-              <label htmlFor="directory-link-slot">Owner’s account slot</label>
-              <select
-                id="directory-link-slot"
-                value={slot}
-                disabled={busy}
-                onChange={(event) => setSlot(Number(event.target.value))}
-              >
-                {[1, 2, 3].map((value) => (
-                  <option key={value} value={value}>
-                    Slot {value}
-                  </option>
-                ))}
-              </select>
+              <div className="field">
+                <label htmlFor="directory-access-change">Access change</label>
+                <select
+                  id="directory-access-change"
+                  value={accessDisabled ? 'disable' : 'enable'}
+                  disabled={busy}
+                  onChange={(event) => {
+                    const value = event.target.value === 'disable';
+                    setAccessDisabled(value);
+                    accessDrafts.current.set(accessTarget, value);
+                  }}
+                >
+                  <option value="disable">Disable this account</option>
+                  <option value="enable">Enable this account</option>
+                </select>
+              </div>
+              <p>
+                {accessDisabled
+                  ? 'Disabling prevents this account from signing in. Its password, watch history, favorites, playlists, and preferences are preserved, so you can enable it again later.'
+                  : 'Enabling restores access for this account with its existing password and media data.'}
+              </p>
               <small>
-                For a non-paying owner, save complimentary access in Memberships first. Slots 2 and
-                3 must fit their saved account allowance.
+                Only the selected account changes. Its family flag, notes, and linked owner’s access
+                policy remain as saved.
               </small>
-            </div>
-            {error && (
-              <div className="error-block" role="alert">
-                {error}
+              {error && (
+                <div className="error-block" role="alert">
+                  {error}
+                </div>
+              )}
+            </form>
+          )}
+          {editing && (
+            <form id={`${workspaceFormId}-profile`} className="form-stack" onSubmit={saveProfile}>
+              <WorkflowRequirements action={accountAction} compact />
+              <div className="field">
+                <label htmlFor="directory-profile-account">Media account</label>
+                <select
+                  id="directory-profile-account"
+                  value={profileTarget}
+                  disabled={busy}
+                  onChange={(event) => {
+                    const target = profileAccounts(editing).find(
+                      (item) => item.key === event.target.value,
+                    );
+                    if (target) selectProfile(target);
+                  }}
+                >
+                  {profileAccounts(editing).map((target) => (
+                    <option key={target.key} value={target.key}>
+                      {target.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}: {target.account.name}
+                    </option>
+                  ))}
+                </select>
+                <small>These notes belong to the selected account on this server.</small>
               </div>
-            )}
-            <div className="form-actions">
-              <button
-                className="btn"
-                type="button"
-                disabled={busy}
-                onClick={() => setLinking(null)}
-              >
-                Cancel
-              </button>
-              <button className="btn btn-primary" disabled={busy || !member || !target}>
-                {busy ? 'Linking…' : 'Confirm account owner'}
-              </button>
+              <label className="check-line">
+                <input
+                  type="checkbox"
+                  checked={profileFamily}
+                  disabled={busy}
+                  onChange={(event) => setProfileFamily(event.target.checked)}
+                />
+                Family account
+              </label>
+              <p>
+                This flag applies only to the selected account. Family accounts are exempt from
+                automatic billing-based access changes. No Discord membership or payment is
+                required.
+              </p>
+              <small>
+                Removing the family flag does not disable the account. Its confirmed owner and saved
+                membership remain as configured.
+              </small>
+              <div className="field">
+                <label htmlFor="directory-profile-owner">Owner name</label>
+                <input
+                  id="directory-profile-owner"
+                  value={ownerName}
+                  maxLength={120}
+                  disabled={busy}
+                  onChange={(event) => setOwnerName(event.target.value)}
+                  placeholder="Who this account belongs to"
+                />
+              </div>
+              <div className="field">
+                <label htmlFor="directory-profile-notes">Private owner notes</label>
+                <textarea
+                  id="directory-profile-notes"
+                  value={ownerNotes}
+                  maxLength={2000}
+                  rows={4}
+                  disabled={busy}
+                  onChange={(event) => setOwnerNotes(event.target.value)}
+                  placeholder="Details to help you recognize and manage the account"
+                />
+                <small>Visible only to Jellyport administrators. Never sent to Discord.</small>
+              </div>
+              {error && (
+                <div className="error-block" role="alert">
+                  {error}
+                </div>
+              )}
+            </form>
+          )}
+          {linking && (
+            <div className="form-stack">
+              <div className="field">
+                <label htmlFor="directory-owner-account">Media account</label>
+                <select
+                  id="directory-owner-account"
+                  value={workspaceTarget}
+                  disabled={busy || ownerReviewing}
+                  onChange={(event) => setWorkspaceTarget(event.target.value)}
+                >
+                  {workspaceAccounts.map((account) => (
+                    <option key={account.key} value={account.key}>
+                      {account.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}: {account.account.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {linking?.discord_user_id ? (
+                <Callout title="Owner already confirmed">
+                  <p>
+                    @{linking.discord_username || linking.discord_user_id} owns these linked
+                    accounts. Existing links are reused for account and membership actions.
+                  </p>
+                  {onMembership && (
+                    <button
+                      className="btn"
+                      type="button"
+                      disabled={busy}
+                      onClick={() => {
+                        const owner = {
+                          id: linking.discord_user_id!,
+                          username: linking.discord_username || linking.discord_user_id!,
+                        };
+                        closeWorkspace();
+                        onMembership(owner);
+                      }}
+                    >
+                      Manage this member’s access policy
+                    </button>
+                  )}
+                </Callout>
+              ) : !settings.discord_enabled ? (
+                <Callout title="Discord is optional for account management">
+                  Enable, disable, rename, clone, or flag this account as Family without linking
+                  Discord. Connect the bot when you want member ownership or message delivery.
+                  <WorkflowRequirements action="identity_review" compact />
+                </Callout>
+              ) : ownerReviewing && member && selectedWorkspaceAccount ? (
+                <>
+                  <WorkflowRequirements action="identity_review" compact />
+                  <MemberIdentityAccountReview
+                    api={api}
+                    notify={notify}
+                    active={identityReadiness.ready}
+                    member={member}
+                    initialAccounts={ownerInitialAccounts}
+                    onBusyChange={setBusy}
+                    onCancel={() => setOwnerReviewing(false)}
+                    onApplied={() => {
+                      setLinking(null);
+                      setOwnerReviewing(false);
+                      setMember(null);
+                      void reload();
+                    }}
+                  />
+                </>
+              ) : (
+                <>
+                  <Callout title="Confirm ownership once">
+                    Associate existing media accounts with a Discord member. This step does not
+                    require a paid subscription, create an account, or opt anyone into Jellyfin.
+                  </Callout>
+                  <WorkflowRequirements action="identity_review" compact />
+                  <DiscordMemberPicker
+                    api={api}
+                    value={member}
+                    onChange={setMember}
+                    suggestedQuery={selectedWorkspaceAccount?.account.name}
+                    autoSearch
+                    allowInactive
+                    disabled={busy || !identityReadiness.ready}
+                  />
+                  <div className="form-actions">
+                    <button className="btn" type="button" disabled={busy} onClick={closeWorkspace}>
+                      Close
+                    </button>
+                    <button
+                      className="btn btn-primary"
+                      type="button"
+                      disabled={
+                        busy || !identityReadiness.ready || !member || !selectedWorkspaceAccount
+                      }
+                      onClick={() => setOwnerReviewing(true)}
+                    >
+                      Review owner and accounts
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
-          </form>
+          )}
+          <div className="person-workspace-tools">
+            <h3>More for this person</h3>
+            {linking &&
+              (workspaceCloneAccounts.length > 0 || workspaceRenameAccounts.length > 0) && (
+                <WorkflowRequirements action="account_access_jellyfin" compact />
+              )}
+            <div className="person-workspace-actions">
+              {created && workspaceCloneAccounts.length > 0 && (
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={busy || !jellyfinReadiness.ready}
+                  aria-label={`Clone Jellyfin account for ${workspaceCloneAccounts[0]!.name}`}
+                  onClick={() => {
+                    setError('');
+                    setCloneReview(null);
+                    setToolAccountId(
+                      selectedWorkspaceAccount?.kind === 'jellyfin'
+                        ? selectedWorkspaceAccount.account.id
+                        : '',
+                    );
+                    setCloning(workspaceUser);
+                  }}
+                >
+                  Clone account
+                </button>
+              )}
+              {workspaceRenameAccounts.length > 0 && (
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={busy || !jellyfinReadiness.ready}
+                  aria-label={`Rename Jellyfin account for ${workspaceRenameAccounts[0]!.name}`}
+                  onClick={() => {
+                    setError('');
+                    const account = selectedFirst(
+                      renameAccounts(workspaceUser),
+                      selectedWorkspaceAccount?.kind === 'jellyfin'
+                        ? selectedWorkspaceAccount.account.id
+                        : '',
+                    )[0]!;
+                    setToolAccountId(account.id);
+                    setRenaming(workspaceUser);
+                    inspectRename(account.id);
+                  }}
+                >
+                  Rename account
+                </button>
+              )}
+              {onMigrate && workspaceUser.emby.length > 0 && (
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    const ids = workspaceUser.emby.map((account) => account.id);
+                    closeWorkspace();
+                    onMigrate(ids);
+                  }}
+                >
+                  Migrate played status
+                </button>
+              )}
+              {onMembership && workspaceUser.discord_user_id && (
+                <button
+                  className="btn"
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    const member = {
+                      id: workspaceUser.discord_user_id!,
+                      username: workspaceUser.discord_username || workspaceUser.discord_user_id!,
+                    };
+                    closeWorkspace();
+                    onMembership(member);
+                  }}
+                >
+                  Manage membership
+                </button>
+              )}
+            </div>
+          </div>
         </Modal>
       )}
       {preview && (

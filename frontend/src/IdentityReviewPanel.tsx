@@ -10,6 +10,7 @@ import type {
 } from '../../server/identity-review-types';
 import { Callout, Icon, Loading, Modal } from './components';
 import DiscordMemberPicker from './DiscordMemberPicker';
+import WorkflowRequirements, { useWorkflowAction } from './WorkflowRequirements';
 import { useClientLayout } from './client-layout';
 import { Pagination, usePagination } from './ui-layout';
 import { date, num, type Api, type DiscordMember, type Notify } from './types';
@@ -61,6 +62,46 @@ function slotOf(account: IdentityAccount, ownerUsername?: string): number {
   const suffix = Number(account.name.match(/_(\d+)$/)?.[1]);
   return suffix >= 1 && suffix <= 3 ? suffix : 1;
 }
+type InitialAccount = Pick<IdentityAccount, 'kind' | 'id'>;
+function initialAccountSelections(
+  row: IdentityReviewRow,
+  snapshot: IdentityReviewSnapshot,
+  member?: DiscordMember,
+  initialAccounts: InitialAccount[] = [],
+) {
+  const entries: Record<string, { account: IdentityAccount; slot: number; selected: boolean }> = {};
+  for (const account of row.confirmed_accounts)
+    entries[keyOf(account)] = {
+      account,
+      slot: slotOf(account, member?.username || row.member?.username),
+      selected: true,
+    };
+  for (const { account, reliable } of row.suggestions)
+    if (
+      !entries[keyOf(account)] &&
+      (!initialAccounts.length || initialAccounts.some((item) => keyOf(item) === keyOf(account)))
+    )
+      entries[keyOf(account)] = {
+        account,
+        slot: slotOf(account, member?.username || row.member?.username),
+        selected: reliable && !account.ownership_conflict,
+      };
+  for (const initial of initialAccounts) {
+    const account = snapshot.accounts.find((item) => keyOf(item) === keyOf(initial));
+    if (!account || entries[keyOf(account)]) continue;
+    const occupied = new Set(
+      Object.values(entries)
+        .filter((item) => item.selected && item.account.kind === account.kind)
+        .map((item) => item.slot),
+    );
+    const preferred = slotOf(account, member?.username || row.member?.username);
+    const slot = !occupied.has(preferred)
+      ? preferred
+      : [1, 2, 3].find((item) => !occupied.has(item)) || preferred;
+    entries[keyOf(account)] = { account, slot, selected: true };
+  }
+  return entries;
+}
 function suggestedApproval(row: IdentityReviewRow): IdentityApproval | null {
   if (!row.reliable || row.conflict || !row.member) return null;
   const accounts = row.suggestions
@@ -89,11 +130,13 @@ function suggestedApproval(row: IdentityReviewRow): IdentityApproval | null {
     accounts.some((account) => account.slot < 1 || account.slot > 3)
   )
     return null;
-  if (!accounts.length && !row.customers.some((item) => !item.linked_discord_id)) return null;
+  if (!accounts.length) return null;
   return {
     row_id: row.id,
     discord_user_id: row.member.id,
-    stripe_customer_ids: row.customers.map((item) => item.id),
+    // A unique media username does not establish the billing customer's identity.
+    // Bulk media matching must never adopt an unverified Stripe/MEE6 hint.
+    stripe_customer_ids: [],
     accounts,
   };
 }
@@ -305,7 +348,10 @@ function ApprovalEditor({
   row,
   snapshot,
   initialMember,
+  confirmedCustomerIds = [],
+  initialAccounts = [],
   busy,
+  paused = false,
   submit,
   cancel,
 }: {
@@ -313,40 +359,32 @@ function ApprovalEditor({
   row: IdentityReviewRow;
   snapshot: IdentityReviewSnapshot;
   initialMember?: DiscordMember;
+  confirmedCustomerIds?: string[];
+  initialAccounts?: InitialAccount[];
   busy: boolean;
+  paused?: boolean;
   submit: (value: IdentityApproval) => void;
   cancel: () => void;
 }) {
   const id = useId();
   const [member, setMember] = useState<DiscordMember | null>(initialMember || memberValue(row));
+  const [customerIds, setCustomerIds] = useState(
+    () =>
+      new Set(
+        row.customers
+          .filter(
+            (customer) => !customer.linked_discord_id && confirmedCustomerIds.includes(customer.id),
+          )
+          .map((customer) => customer.id),
+      ),
+  );
+  function selectMember(value: DiscordMember | null) {
+    if (value?.id !== member?.id) setCustomerIds(new Set([]));
+    setMember(value);
+  }
   const [accounts, setAccounts] = useState<
     Record<string, { account: IdentityAccount; slot: number; selected: boolean }>
-  >(() =>
-    Object.fromEntries([
-      ...row.suggestions.map(
-        ({ account, reliable }) =>
-          [
-            keyOf(account),
-            {
-              account,
-              slot: slotOf(account, initialMember?.username || row.member?.username),
-              selected: reliable && !account.ownership_conflict,
-            },
-          ] as const,
-      ),
-      ...row.confirmed_accounts.map(
-        (account) =>
-          [
-            keyOf(account),
-            {
-              account,
-              slot: slotOf(account, initialMember?.username || row.member?.username),
-              selected: true,
-            },
-          ] as const,
-      ),
-    ]),
-  );
+  >(() => initialAccountSelections(row, snapshot, initialMember, initialAccounts));
   const [otherAccount, setOtherAccount] = useState('');
   const [search, setSearch] = useState('');
   const [exception, setException] = useState<'preserve' | 'none' | IdentityException['kind']>(
@@ -361,9 +399,29 @@ function ApprovalEditor({
       (!account.owner_discord_id || account.owner_discord_id === member?.id) &&
       account.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()),
   );
+  const selectedAccounts = Object.values(accounts).filter((item) => item.selected);
+  const selectionIssue = !member
+    ? ''
+    : selectedAccounts.some(
+          (item) =>
+            item.account.ownership_conflict ||
+            (item.account.owner_discord_id && item.account.owner_discord_id !== member?.id),
+        )
+      ? 'A selected account already has another confirmed owner. Its existing ownership will be preserved.'
+      : selectedAccounts.some((item) => !snapshot.sources[item.account.kind].complete)
+        ? 'A selected media server is unavailable. Restore its connection before approving that account.'
+        : selectedAccounts.some(
+              (item) => !Number.isInteger(item.slot) || item.slot < 1 || item.slot > 3,
+            )
+          ? 'Use account slots from 1 to 3.'
+          : selectedAccounts.length > 6 ||
+              new Set(selectedAccounts.map((item) => `${item.account.kind}:${item.slot}`)).size !==
+                selectedAccounts.length
+            ? 'Use a different slot for each account on the same media server, with up to three accounts per server.'
+            : '';
   function approve(event: FormEvent) {
     event.preventDefault();
-    if (busy) return;
+    if (busy || paused) return;
     const annotationOnly =
       !member && exception !== 'preserve' && (exception === 'none' || !!note.trim());
     if (!member && !annotationOnly) return;
@@ -406,10 +464,16 @@ function ApprovalEditor({
       return;
     }
     setValidation('');
+    // A media-only correction belongs to the explicitly selected owner's row.
+    // Keep unrelated billing proposals in their original row until separately confirmed.
+    const ownerRow =
+      member && row.member && row.member.id !== member.id && !customerIds.size
+        ? snapshot.rows.find((item) => item.member?.id === member.id)
+        : null;
     submit({
-      row_id: row.id,
+      row_id: ownerRow?.id || row.id,
       discord_user_id: member?.id || '',
-      stripe_customer_ids: annotationOnly ? [] : row.customers.map((customer) => customer.id),
+      stripe_customer_ids: annotationOnly ? [] : [...customerIds],
       accounts: annotationOnly
         ? []
         : selected.map(({ account, slot }) => ({ kind: account.kind, id: account.id, slot })),
@@ -424,27 +488,71 @@ function ApprovalEditor({
         Link existing accounts and update Discord roles. Leave Jellyfin unselected for Emby-only
         members. No accounts are created or migrated.
       </Callout>
+      {selectionIssue && (
+        <p className="error-block" role="alert">
+          {selectionIssue}
+        </p>
+      )}
       {row.conflict && (
         <p className="error-block" role="alert">
           {row.conflict}
         </p>
       )}
       {row.customers.length > 0 && (
-        <div>
+        <fieldset
+          className="form-stack"
+          disabled={busy || paused}
+          style={{ margin: 0, padding: 0, border: 0 }}
+        >
+          <legend>Billing identity</legend>
+          <p className="section-note">
+            Account-name matches do not verify billing ownership. Confirm each new Stripe customer
+            separately, or leave billing unchanged.
+          </p>
           {row.customers.map((customer) => (
-            <p className="section-note" key={customer.id}>
-              Stripe: {customer.name || customer.email || customer.id} ·{' '}
-              {customer.statuses.join(', ') || 'Status unavailable'}
-            </p>
+            <label className="check-card" key={customer.id}>
+              <input
+                className="checkbox"
+                type="checkbox"
+                aria-label={`Confirm Stripe customer ${customer.name || customer.email || customer.id}`}
+                checked={customer.linked_discord_id === member?.id || customerIds.has(customer.id)}
+                disabled={
+                  !member || !!customer.linked_discord_id || !snapshot.sources.stripe.complete
+                }
+                onChange={(event) =>
+                  setCustomerIds((current) => {
+                    const next = new Set(current);
+                    if (event.target.checked) next.add(customer.id);
+                    else next.delete(customer.id);
+                    return next;
+                  })
+                }
+              />
+              <span>
+                <strong>{customer.name || customer.email || customer.id}</strong>
+                <small>
+                  {customer.statuses.join(', ') || 'Status unavailable'} ·{' '}
+                  {customer.linked_discord_id
+                    ? 'Already confirmed'
+                    : 'Confirm this customer belongs to the selected Discord owner'}
+                </small>
+              </span>
+            </label>
           ))}
-        </div>
+          {!snapshot.sources.stripe.complete && (
+            <p className="section-note">
+              Billing is unavailable. Existing billing links are preserved; media ownership can
+              still be reviewed independently.
+            </p>
+          )}
+        </fieldset>
       )}
       <DiscordMemberPicker
         api={api}
         value={member}
-        onChange={setMember}
+        onChange={selectMember}
         suggestedQuery={row.member_candidates[0]?.username || ''}
-        disabled={busy}
+        disabled={busy || paused}
         allowInactive
       />
       {!member && row.member_candidates.length > 0 && (
@@ -454,9 +562,9 @@ function ApprovalEditor({
               key={candidate.id}
               type="button"
               className="btn"
-              disabled={busy}
+              disabled={busy || paused}
               onClick={() =>
-                setMember({
+                selectMember({
                   id: candidate.id,
                   username: candidate.username,
                   display_name: candidate.display_name || null,
@@ -471,7 +579,7 @@ function ApprovalEditor({
         </div>
       )}
       <fieldset
-        disabled={busy}
+        disabled={busy || paused}
         className="form-stack"
         style={{ minWidth: 0, margin: 0, padding: 0, border: 0 }}
       >
@@ -660,6 +768,8 @@ function ApprovalEditor({
           type="submit"
           disabled={
             busy ||
+            paused ||
+            !!selectionIssue ||
             (!member && (exception === 'preserve' || (exception !== 'none' && !note.trim())))
           }
           aria-busy={busy}
@@ -810,6 +920,108 @@ function RecentIdentityRoleTasks({
   );
 }
 
+/** Resolve only the selected owner's missing relationships without leaving the current task. */
+export function MemberIdentityAccountReview({
+  api,
+  notify,
+  demo = false,
+  active = true,
+  member,
+  initialAccounts = [],
+  onApplied,
+  onCancel,
+  onBusyChange,
+}: {
+  api: Api;
+  notify: Notify;
+  demo?: boolean;
+  active?: boolean;
+  member: DiscordMember;
+  initialAccounts?: InitialAccount[];
+  onApplied: (result: IdentityReviewApplyResult) => void;
+  onCancel: () => void;
+  onBusyChange?: (busy: boolean) => void;
+}) {
+  const review = useIdentityReview(api, notify, active, demo);
+  useEffect(() => {
+    onBusyChange?.(active && !!review.busy);
+    return () => onBusyChange?.(false);
+  }, [review.busy, onBusyChange, active]);
+  const row = review.snapshot?.rows.find((item) => item.member?.id === member.id);
+  const initialIssue =
+    review.snapshot &&
+    initialAccounts.some((initial) => {
+      const account = review.snapshot!.accounts.find((item) => keyOf(item) === keyOf(initial));
+      return (
+        !account ||
+        account.ownership_conflict ||
+        (account.owner_discord_id && account.owner_discord_id !== member.id)
+      );
+    });
+  return (
+    <div className="form-stack" aria-label={`Existing accounts for @${member.username}`}>
+      {review.error && (
+        <p className="error-block" role="alert">
+          {review.error}
+        </p>
+      )}
+      {review.busy === 'load' && (
+        <Loading>Checking the selected member’s existing relationships…</Loading>
+      )}
+      {review.snapshot && !row && (
+        <Callout warning title="This Discord member could not be verified">
+          Refresh the member list after restoring the Discord connection. Existing account links and
+          your access-policy draft are preserved.
+        </Callout>
+      )}
+      {initialIssue && (
+        <Callout warning title="The selected account needs an identity correction">
+          One of these accounts is unavailable or already belongs to another confirmed owner. Its
+          saved ownership is preserved. Return to the account list to inspect the current links.
+        </Callout>
+      )}
+      {review.snapshot && row && !initialIssue && (
+        <ApprovalEditor
+          key={`${review.snapshot.revision}:${row.id}`}
+          api={api}
+          row={row}
+          snapshot={review.snapshot}
+          initialMember={member}
+          initialAccounts={initialAccounts}
+          busy={active && !!review.busy}
+          paused={!active}
+          submit={(selection) =>
+            void review.apply([selection]).then((saved) => {
+              if (saved) onApplied(saved);
+            })
+          }
+          cancel={onCancel}
+        />
+      )}
+      {review.snapshot && (!row || initialIssue) && (
+        <button type="button" className="btn" disabled={active && !!review.busy} onClick={onCancel}>
+          Back to my task
+        </button>
+      )}
+      {!review.snapshot && !review.busy && (
+        <div className="button-row">
+          <button
+            type="button"
+            className="btn"
+            disabled={!active}
+            onClick={() => void review.read(true, true)}
+          >
+            Retry relationship check
+          </button>
+          <button type="button" className="btn btn-quiet" onClick={onCancel}>
+            Back to my task
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Inline final step of the Stripe identity dialog; uses the same reviewed apply as bulk work. */
 export function StripeIdentityAccountReview({
   api,
@@ -862,6 +1074,7 @@ export function StripeIdentityAccountReview({
           row={row}
           snapshot={review.snapshot}
           initialMember={member}
+          confirmedCustomerIds={[customerId]}
           busy={!!review.busy}
           submit={(selection) =>
             void review.apply([selection]).then((saved) => {
@@ -895,7 +1108,8 @@ export default function IdentityReviewPanel({
   customerId?: string;
   onApplied?: () => void;
 }) {
-  const review = useIdentityReview(api, notify, active, demo);
+  const readiness = useWorkflowAction('identity_review');
+  const review = useIdentityReview(api, notify, active && readiness.ready, demo);
   const { compactRecords } = useClientLayout();
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
@@ -973,6 +1187,7 @@ export default function IdentityReviewPanel({
   }
   return (
     <div className="page-stack" aria-label="Identity matching and access gaps">
+      <WorkflowRequirements action="identity_review" compact />
       <section className="panel">
         <div
           className="panel-header"
@@ -987,7 +1202,7 @@ export default function IdentityReviewPanel({
           <button
             className="btn btn-quiet"
             type="button"
-            disabled={demo || !!review.busy}
+            disabled={demo || !!review.busy || !readiness.ready}
             onClick={() => {
               setRoleRefresh((current) => current + 1);
               void review.read(true, true);
@@ -1023,7 +1238,7 @@ export default function IdentityReviewPanel({
             refreshKey={`${roleRefresh}:${review.result?.roles.task_id || ''}:${review.result?.roles.status || ''}`}
           />
           {review.busy === 'load' && <Loading>Reading connected directories…</Loading>}
-          {review.snapshot && (
+          {review.snapshot && readiness.ready && (
             <>
               <div className="job-meta">
                 <span>{num(review.snapshot.summary.members)} Discord members</span>
@@ -1235,7 +1450,7 @@ export default function IdentityReviewPanel({
           )}
         </div>
       </section>
-      {active && edited && review.snapshot && (
+      {active && readiness.ready && edited && review.snapshot && (
         <Modal
           title={`Review ${rowTitle(edited)}`}
           description="Confirm existing accounts and record approved access exceptions."
@@ -1255,7 +1470,7 @@ export default function IdentityReviewPanel({
           />
         </Modal>
       )}
-      {active && bulkReview === selectionKey && review.snapshot && (
+      {active && readiness.ready && bulkReview === selectionKey && review.snapshot && (
         <Modal
           title="Approve selected identity links?"
           description="Review every selected owner and their existing media accounts."
@@ -1290,6 +1505,10 @@ export default function IdentityReviewPanel({
             <p>
               Ownership links and configured Discord organization roles will be updated. Emby-only
               members stay Emby-only. No media accounts will be created or disabled.
+            </p>
+            <p className="section-note">
+              This bulk review confirms media accounts only. Stripe customer identities remain
+              unchanged; review unconfirmed billing relationships individually.
             </p>
             {bulkPage.items.map((approval) => {
               const row = rows.find((item) => item.id === approval.row_id)!;

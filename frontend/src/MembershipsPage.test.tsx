@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import MembershipsPage from './MembershipsPage';
+import { WorkflowProvider } from './WorkflowRequirements';
 import {
   defaultMembershipTiers,
   type Api,
@@ -11,6 +12,23 @@ import {
   type Settings,
 } from './types';
 
+vi.mock('./IdentityReviewPanel', () => ({
+  MemberIdentityAccountReview: ({
+    member,
+    onApplied,
+    onCancel,
+  }: {
+    member: { username: string };
+    onApplied: (value: unknown) => void;
+    onCancel: () => void;
+  }) => (
+    <section aria-label="Inline relationships">
+      <p>Reviewed owner @{member.username}</p>
+      <button onClick={() => onApplied({ approved: 1 })}>Confirm selected existing accounts</button>
+      <button onClick={onCancel}>Return without changes</button>
+    </section>
+  ),
+}));
 const ownerId = '123456789012345678';
 const member = {
   id: ownerId,
@@ -39,63 +57,192 @@ const job: Job = {
   id: 'membership-job-1',
   kind: 'membership',
   status: 'queued',
-  created_at: '2026-10-08T12:00:00Z',
+  created_at: '2026-11-02T12:00:00Z',
 };
 const settings = { membership_tiers: defaultMembershipTiers } as Settings;
-
-function page(memberships: Membership[] = [], customApi?: Api) {
-  const requests: { path: string; options?: ApiOptions }[] = [];
-  const api =
-    customApi ||
-    (vi.fn(async (path: string, options?: ApiOptions) => {
-      requests.push({ path, options });
-      if (path === '/api/memberships') return { memberships };
-      if (path === '/api/user-mappings') return { mappings: [] };
-      if (path.startsWith('/api/discord/members?')) return { members: [member], truncated: false };
-      if (path === '/api/memberships/provision') return job;
-      throw new Error(`Unexpected request ${path}`);
-    }) as Api);
+type Plan = {
+  discord_user_id: string;
+  username: string;
+  access_mode: string;
+  tier_id: string;
+  account_limit: number;
+  provision_jellyfin: boolean;
+  accounts: Array<{
+    slot: number;
+    username: string;
+    action: string;
+    kind: string;
+    target_user_id?: string;
+  }>;
+  warnings: string[];
+  policy_only: boolean;
+  review_token: string;
+  expires_at: string;
+};
+type Request = { path: string; options?: ApiOptions };
+const writes = (requests: Request[]) =>
+  requests.filter(
+    ({ path, options }) => options?.method && path !== '/api/memberships/workflow/review',
+  );
+const checks = (requests: Request[]) =>
+  requests.filter(({ path }) => path === '/api/memberships/workflow/review');
+function fixture(
+  options: {
+    members?: Membership[];
+    plan?: (body: any, value: Plan) => Plan | Promise<Plan>;
+    accept?: (body: any, signal: AbortSignal) => unknown | Promise<unknown>;
+    access?: (body: any) => unknown | Promise<unknown>;
+    read?: (signal: AbortSignal) => unknown | Promise<unknown>;
+    initialMember?: { id: string; username: string };
+    handoffKey?: number;
+    identityBlocked?: boolean;
+  } = {},
+) {
+  const members = options.members ?? [structuredClone(membership)];
+  const requests: Request[] = [];
+  let sequence = 0;
+  const api = vi.fn(async (path: string, config?: ApiOptions) => {
+    requests.push({ path, options: config });
+    if (path === '/api/workflow-readiness')
+      return {
+        checked_at: new Date().toISOString(),
+        actions: {
+          create_account: { ready: true, blockers: [], warnings: [] },
+          identity_review: options.identityBlocked
+            ? {
+                ready: false,
+                blockers: [
+                  {
+                    code: 'discord_offline',
+                    message: 'Connect Discord before changing identity relationships.',
+                    route: { page: 'settings', tab: 'discord', subtab: 'connection' },
+                  },
+                ],
+                warnings: [],
+              }
+            : { ready: true, blockers: [], warnings: [] },
+        },
+      };
+    if (path === '/api/memberships')
+      return options.read ? options.read(config!.signal!) : { memberships: members };
+    if (path.startsWith('/api/discord/members?')) return { members: [member], truncated: false };
+    if (path === '/api/memberships/workflow/review') {
+      const body = config!.body as any;
+      const saved = members.find((value) => value.discord_user_id === body.discord_user_id);
+      const tier = defaultMembershipTiers.find((value) => value.id === body.tier_id);
+      const limit = body.account_limit ?? tier?.account_limit ?? 1;
+      const accounts = body.provision_jellyfin
+        ? Array.from({ length: Math.max(limit, saved?.links.length ?? 0) }, (_, index) => {
+            const slot = index + 1;
+            const link = saved?.links.find((value) => value.membership_slot === slot);
+            return {
+              slot,
+              username: link?.username || (slot === 1 ? 'Jim' : `Jim_${slot}`),
+              kind: 'jellyfin',
+              action: slot > limit ? 'disable' : link ? 'manage' : 'create',
+              ...(link ? { target_user_id: link.remote_id } : {}),
+            };
+          })
+        : (saved?.links ?? []).map((link) => ({
+            slot: link.membership_slot,
+            username: link.username,
+            kind: 'jellyfin',
+            action: link.membership_slot > limit ? 'disable' : 'manage',
+            target_user_id: link.remote_id,
+          }));
+      const plan: Plan = {
+        ...body,
+        username: saved?.base_username || 'Jim',
+        tier_id: body.tier_id || 'complimentary',
+        account_limit: limit,
+        accounts,
+        warnings: [],
+        policy_only: !accounts.length,
+        review_token: `review-${++sequence}`,
+        expires_at: new Date(Date.now() + 300000).toISOString(),
+      };
+      return options.plan ? options.plan(body, plan) : plan;
+    }
+    if (path === '/api/memberships/workflow/accept')
+      return options.accept
+        ? options.accept(config!.body, config!.signal!)
+        : { membership: members[0] || membership, job };
+    if (path === '/api/memberships/access')
+      return options.access
+        ? options.access(config!.body)
+        : { ...membership, ...(config!.body as object) };
+    throw new Error(`Unexpected request ${path}`);
+  }) as Api;
   const notify = vi.fn();
   const created = vi.fn();
-  const view = render(
-    <MembershipsPage settings={settings} api={api} notify={notify} created={created} />,
-  );
-  if (!memberships.length && !customApi)
-    fireEvent.click(screen.getByRole('tab', { name: 'Add member' }));
-  return { ...view, api, requests, notify, created };
+  const props = {
+    settings,
+    api,
+    notify,
+    created,
+    initialMember: options.initialMember,
+    handoffKey: options.handoffKey,
+  };
+  const component = <MembershipsPage {...props} />;
+  return {
+    ...render(
+      options.identityBlocked === undefined ? (
+        component
+      ) : (
+        <WorkflowProvider api={api} notify={notify} enabled onSettingsSaved={vi.fn()}>
+          {component}
+        </WorkflowProvider>
+      ),
+    ),
+    props,
+    requests,
+    api,
+    notify,
+    created,
+  };
 }
-const mutations = (requests: { path: string; options?: ApiOptions }[]) =>
-  requests.filter((request) => request.options?.method);
-
+async function manage() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
+}
+async function ready() {
+  const button = await screen.findByRole('button', { name: 'Review membership update' });
+  await waitFor(() => expect(button).toHaveProperty('disabled', false));
+  return button;
+}
+async function chooseNew() {
+  fireEvent.click(await screen.findByRole('button', { name: 'Add member' }));
+  fireEvent.change(screen.getByRole('searchbox', { name: 'Discord member' }), {
+    target: { value: 'Captain Jim' },
+  });
+  fireEvent.click(await screen.findByRole('button', { name: 'Select @Jim' }));
+}
 afterEach(() => {
   cleanup();
-  window.history.replaceState(null, '', window.location.pathname + window.location.search);
+  window.history.replaceState(null, '', window.location.pathname);
   vi.restoreAllMocks();
+  vi.useRealTimers();
   localStorage.clear();
   sessionStorage.clear();
 });
 
-describe('Discord membership account allowances', () => {
-  it('restores the member editor from its route without selecting or provisioning an owner', async () => {
-    window.history.replaceState(null, '', '#/memberships/editor');
-    const p = page([membership]);
+describe('membership task workflow', () => {
+  it('restores an empty editor without selecting a private owner or starting a check', async () => {
+    window.history.replaceState(null, '', '#/memberships/accounts/editor');
+    const f = fixture();
     await waitFor(() =>
       expect(screen.getByLabelText('Access policy')).toHaveProperty('disabled', false),
     );
-    expect(screen.getByRole('tab', { name: 'Add member' }).getAttribute('aria-selected')).toBe(
-      'true',
-    );
     expect(screen.getByRole('searchbox', { name: 'Discord member' })).toHaveProperty('value', '');
-    expect(mutations(p.requests)).toHaveLength(0);
-    expect(p.created).not.toHaveBeenCalled();
+    expect(checks(f.requests)).toEqual([]);
+    expect(writes(f.requests)).toEqual([]);
+    expect(localStorage.length + sessionStorage.length).toBe(0);
   });
 
-  it('retains a selected member policy across history navigation while reloading without the private owner selection', async () => {
+  it('retains the selected policy through history navigation and discards its identity on a reload', async () => {
     window.history.replaceState(null, '', '#/memberships/accounts/list');
-    const first = page([membership]);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
+    const first = fixture();
+    await manage();
     fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
-    expect(window.location.hash).toBe('#/memberships/accounts/editor');
     act(() => window.history.back());
     await waitFor(() =>
       expect(
@@ -110,86 +257,121 @@ describe('Discord membership account allowances', () => {
     );
     expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'brigantine');
     first.unmount();
-    const reloaded = page([membership]);
-    await screen.findByRole('searchbox', { name: 'Discord member' });
-    expect(screen.getByRole('searchbox', { name: 'Discord member' })).toHaveProperty('value', '');
-    expect(mutations(reloaded.requests)).toHaveLength(0);
+    fixture();
+    expect(await screen.findByRole('searchbox', { name: 'Discord member' })).toHaveProperty(
+      'value',
+      '',
+    );
     expect(localStorage.length + sessionStorage.length).toBe(0);
   });
 
-  it('pages and filters the membership directory while keeping an unfinished member policy', async () => {
-    const many = Array.from({ length: 61 }, (_, index) => ({
+  it('pages and filters members without losing a selected policy', async () => {
+    const members = Array.from({ length: 56 }, (_, index) => ({
       ...membership,
-      discord_user_id: String(BigInt(ownerId) + BigInt(index)),
-      base_username: `Member ${index}`,
+      discord_user_id: `${123456789012340000n + BigInt(index)}`,
+      base_username: `Crew ${index}`,
       links: [],
-      access_mode: index % 2 ? ('complimentary' as const) : ('subscription' as const),
     }));
-    const { requests } = page(many);
-    const directory = await screen.findByRole('tabpanel', { name: /Managed memberships/ });
-    await waitFor(() => expect(within(directory).getAllByRole('article')).toHaveLength(25));
-    expect(screen.queryByRole('button', { name: 'Save access policy' })).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
-    expect(within(directory).getByText('Member 25')).toBeTruthy();
-    fireEvent.change(screen.getByLabelText('Find memberships'), { target: { value: 'Member 60' } });
-    expect(within(directory).getAllByRole('article')).toHaveLength(1);
-    expect(within(directory).getByText('Page 1 of 1')).toBeTruthy();
-    fireEvent.change(screen.getByLabelText('Access type'), { target: { value: 'complimentary' } });
-    expect(within(directory).queryByRole('article')).toBeNull();
-    fireEvent.change(screen.getByLabelText('Access type'), { target: { value: 'all' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Manage membership for Member 60' }));
-    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
+    fixture({ members });
+    await screen.findByText('1–25 of 56');
+    fireEvent.change(screen.getByRole('searchbox', { name: 'Find memberships' }), {
+      target: { value: 'Crew 55' },
+    });
+    expect(screen.getByText('1–1 of 1')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Manage membership for Crew 55' }));
+    expect(screen.getByRole('heading', { name: '@Crew 55' })).toBeTruthy();
     fireEvent.click(screen.getByRole('tab', { name: /Managed memberships/ }));
-    expect(screen.queryByRole('button', { name: 'Review membership update' })).toBeNull();
-    fireEvent.click(screen.getByRole('tab', { name: 'Manage member' }));
-    expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'brigantine');
-    expect(mutations(requests)).toHaveLength(0);
+    expect(screen.getByRole('searchbox', { name: 'Find memberships' })).toHaveProperty(
+      'value',
+      'Crew 55',
+    );
   });
 
-  it('cancels a membership review without writing and rebuilds it from the newly selected allowance', async () => {
-    const { requests, created } = page([membership]);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
-    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'sloop' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    expect(within(screen.getByRole('dialog')).getByText('Jim_3')).toBeTruthy();
-    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
-    expect(screen.queryByRole('dialog')).toBeNull();
-    expect(mutations(requests)).toHaveLength(0);
-    expect(created).not.toHaveBeenCalled();
-    expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'sloop');
-
-    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: 'Queue membership update' }),
+  it('checks requirements before enabling final review and reuses the saved exact owner', async () => {
+    let resolve!: (plan: Plan) => void;
+    const f = fixture({
+      plan: (_body, plan) =>
+        new Promise<Plan>((done) => {
+          resolve = () => done(plan);
+        }),
+    });
+    await manage();
+    expect(screen.getByText('Checking account requirements before review…')).toBeTruthy();
+    expect(screen.queryByRole('searchbox', { name: 'Discord member' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Checking requirements…' })).toHaveProperty(
+      'disabled',
+      true,
     );
-    await waitFor(() => expect(created).toHaveBeenCalledWith(job));
-    expect(mutations(requests)).toHaveLength(1);
-    expect(mutations(requests)[0].options?.body).toEqual({
+    await waitFor(() => expect(resolve).toBeTypeOf('function'));
+    await act(async () => resolve({} as Plan));
+    await ready();
+    expect(writes(f.requests)).toHaveLength(0);
+    expect(checks(f.requests)[0].options!.body).toMatchObject({
       discord_user_id: ownerId,
-      tier_id: 'brigantine',
-      expected_account_limit: 2,
-      provision_jellyfin: true,
-      expected_usernames: ['Jim', 'Jim_2'],
       expected_revision: membership.revision,
     });
+    expect(f.requests.some(({ path }) => path === '/api/user-mappings')).toBe(false);
   });
 
-  it('keeps a rejected complimentary policy editable and retries without provisioning accounts', async () => {
-    const requests: { path: string; options?: ApiOptions }[] = [];
-    let attempts = 0;
-    const api = vi.fn(async (path: string, options?: ApiOptions) => {
-      requests.push({ path, options });
-      if (path === '/api/memberships') return { memberships: [membership] };
-      if (path === '/api/user-mappings') return { mappings: [] };
-      if (path === '/api/memberships/access') {
-        if (++attempts === 1) throw new Error('The membership changed. Review its policy again.');
-        return { ...membership, access_mode: 'complimentary', account_limit: 2 };
-      }
-      throw new Error(`Unexpected request ${path}`);
-    }) as Api;
-    const { notify, created } = page([], api);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
+  it('shows a missing prerequisite before final confirmation while preserving the editable draft', async () => {
+    const f = fixture({
+      plan: () => {
+        throw new Error('Choose an account role before creating accounts.');
+      },
+    });
+    await manage();
+    fireEvent.click(screen.getByLabelText('Enable Jellyfin account provisioning'));
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
+    await screen.findByText('Choose an account role before creating accounts.');
+    expect(screen.getByRole('button', { name: 'Review membership update' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'brigantine');
+    expect(screen.getByRole('button', { name: 'Save access policy' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(writes(f.requests)).toEqual([]);
+  });
+
+  it('keeps confirmed account updates available when only optional Discord identity review is blocked', async () => {
+    const f = fixture({ identityBlocked: true });
+    await manage();
+    await ready();
+    expect(screen.getByRole('button', { name: 'Save access policy' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(screen.getByRole('button', { name: 'Review membership update' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(screen.queryByText('Before you continue')).toBeNull();
+    expect(screen.getByText(/Changing Discord relationships is optional/)).toBeTruthy();
+    expect(writes(f.requests)).toEqual([]);
+    const links = screen.getByRole('button', { name: 'Review existing account links' });
+    expect(links).toHaveProperty('disabled', false);
+    fireEvent.click(links);
+    expect(screen.getByText('Before you continue')).toBeTruthy();
+    expect(
+      screen.getByText('Connect Discord before changing identity relationships.'),
+    ).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Resolve requirement' })).toBeTruthy();
+    expect(writes(f.requests)).toEqual([]);
+    fireEvent.click(screen.getByRole('button', { name: 'Return without changes' }));
+    await ready();
+    expect(screen.queryByText('Before you continue')).toBeNull();
+  });
+
+  it('saves a complimentary policy independently of mapping, media defaults or an unavailable account plan', async () => {
+    const f = fixture({
+      plan: () => {
+        throw new Error('Media server unavailable.');
+      },
+    });
+    await manage();
     fireEvent.change(screen.getByLabelText('Access policy'), {
       target: { value: 'complimentary' },
     });
@@ -197,508 +379,436 @@ describe('Discord membership account allowances', () => {
       target: { value: '2' },
     });
     fireEvent.click(screen.getByRole('button', { name: 'Save access policy' }));
-    expect(await screen.findByRole('alert')).toHaveProperty(
-      'textContent',
-      'The membership changed. Review its policy again.',
-    );
-    expect(screen.queryByRole('dialog')).toBeNull();
-    expect(screen.getByLabelText('Access policy')).toHaveProperty('value', 'complimentary');
-    expect(screen.getByLabelText('Complimentary account allowance')).toHaveProperty('value', '2');
-    expect(notify).toHaveBeenCalledExactlyOnceWith(
-      'The membership changed. Review its policy again.',
-      true,
-    );
-    expect(created).not.toHaveBeenCalled();
-    expect(attempts).toBe(1);
-
-    fireEvent.click(screen.getByRole('button', { name: 'Save access policy' }));
-    await waitFor(() =>
-      expect(notify).toHaveBeenCalledWith(
-        'Access policy saved. Media accounts have not been changed.',
-      ),
-    );
-    expect(mutations(requests).map((request) => request.path)).toEqual([
-      '/api/memberships/access',
-      '/api/memberships/access',
-    ]);
-    expect(mutations(requests)[1].options?.body).toEqual({
-      discord_user_id: ownerId,
-      access_mode: 'complimentary',
-      provision_jellyfin: true,
-      account_limit: 2,
-      expected_revision: membership.revision,
+    await waitFor(() => expect(writes(f.requests)).toHaveLength(1));
+    expect(writes(f.requests)[0]).toMatchObject({
+      path: '/api/memberships/access',
+      options: {
+        body: {
+          discord_user_id: ownerId,
+          access_mode: 'complimentary',
+          account_limit: 2,
+          provision_jellyfin: true,
+          expected_revision: membership.revision,
+        },
+      },
     });
-    expect(created).not.toHaveBeenCalled();
+    expect(f.created).not.toHaveBeenCalled();
   });
 
-  it('separates the member editor from the directory and keeps policy and provisioning distinct', async () => {
-    const p = page();
-    expect(screen.getByRole('heading', { name: 'Memberships', level: 1 })).toBeTruthy();
-    await screen.findByText('Give each member their account allowance.');
-    expect(screen.getByText('Access rules and available actions')).toBeTruthy();
-    expect(screen.getByText(/without changing media accounts/)).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Manage membership for Jim' })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Save access policy' })).toHaveProperty(
-      'disabled',
-      true,
+  it('keeps a rejected policy editable and retries only the explicit policy save', async () => {
+    let attempt = 0;
+    const f = fixture({
+      access: (body) => {
+        if (!attempt++) throw new Error('Policy changed. Review before retrying.');
+        return { ...membership, ...body };
+      },
+    });
+    await manage();
+    fireEvent.change(screen.getByLabelText('Access policy'), {
+      target: { value: 'complimentary' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save access policy' }));
+    await screen.findByText('Policy changed. Review before retrying.');
+    expect(screen.getByLabelText('Access policy')).toHaveProperty('value', 'complimentary');
+    fireEvent.click(screen.getByRole('button', { name: 'Save access policy' }));
+    await waitFor(() => expect(writes(f.requests)).toHaveLength(2));
+    expect(writes(f.requests).every(({ path }) => path === '/api/memberships/access')).toBe(true);
+    expect(f.created).not.toHaveBeenCalled();
+  });
+
+  it('defaults a new member to Jellyfin opt-out and does not create an account on policy save', async () => {
+    const f = fixture({ members: [] });
+    await chooseNew();
+    expect(screen.getByLabelText('Enable Jellyfin account provisioning')).toHaveProperty(
+      'checked',
+      false,
+    );
+    await ready();
+    expect(
+      screen.getByText('Policy-only update: no media account or identity mapping is required.'),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Save access policy' }));
+    await waitFor(() => expect(writes(f.requests)).toHaveLength(1));
+    expect(writes(f.requests)[0].path).toBe('/api/memberships/access');
+    expect((writes(f.requests)[0].options!.body as any).provision_jellyfin).toBe(false);
+    expect(f.created).not.toHaveBeenCalled();
+  });
+
+  it('uses checked server names instead of generating assumptions from the Discord username', async () => {
+    const f = fixture({
+      members: [],
+      plan: (_body, plan) => ({
+        ...plan,
+        accounts: [1, 2, 3].map((slot) => ({
+          slot,
+          username: ['SimplifiedJim', 'FamilyJim', 'Cabin'][slot - 1],
+          kind: 'jellyfin',
+          action: 'manage',
+          target_user_id: `j-${slot}`,
+        })),
+        policy_only: false,
+      }),
+    });
+    await chooseNew();
+    fireEvent.click(screen.getByLabelText('Enable Jellyfin account provisioning'));
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'galleon' } });
+    fireEvent.click(await ready());
+    const dialog = screen.getByRole('dialog');
+    for (const name of ['SimplifiedJim', 'FamilyJim', 'Cabin'])
+      expect(within(dialog).getByText(name)).toBeTruthy();
+    expect(within(dialog).queryByText('Jim_2')).toBeNull();
+    expect(writes(f.requests)).toEqual([]);
+  });
+
+  it('requires explicit final confirmation for three slots and submits only the retained server token', async () => {
+    const f = fixture({ members: [] });
+    await chooseNew();
+    fireEvent.click(screen.getByLabelText('Enable Jellyfin account provisioning'));
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'galleon' } });
+    fireEvent.click(await ready());
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText('Jim_2')).toBeTruthy();
+    expect(within(dialog).getByText('Jim_3')).toBeTruthy();
+    expect(writes(f.requests)).toEqual([]);
+    const token = (await Promise.resolve(checks(f.requests).at(-1)))!;
+    expect(token.options!.body).toMatchObject({
+      discord_user_id: ownerId,
+      tier_id: 'galleon',
+      provision_jellyfin: true,
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Queue membership update' }));
+    await waitFor(() => expect(f.created).toHaveBeenCalledWith(job));
+    expect(writes(f.requests)).toHaveLength(1);
+    expect(writes(f.requests)[0]).toMatchObject({
+      path: '/api/memberships/workflow/accept',
+      options: { body: { review_token: expect.stringMatching(/^review-/) } },
+    });
+    expect(Object.keys(writes(f.requests)[0].options!.body as object)).toEqual(['review_token']);
+  });
+
+  it('cancels without writing and checks the changed allowance before reopening final review', async () => {
+    const f = fixture();
+    await manage();
+    fireEvent.click(await ready());
+    fireEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+    expect(writes(f.requests)).toEqual([]);
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
+    fireEvent.click(await ready());
+    expect(within(screen.getByRole('dialog')).getByText('Jim_3')).toBeTruthy();
+    expect(
+      within(screen.getByRole('dialog')).getByText(
+        'Disable this account outside the allowance and preserve its data.',
+      ),
+    ).toBeTruthy();
+    expect((checks(f.requests).at(-1)!.options!.body as any).tier_id).toBe('brigantine');
+    expect(writes(f.requests)).toEqual([]);
+  });
+
+  it('reviews a downgrade with saved custom account names and protected Family outcomes', async () => {
+    const value = structuredClone(membership);
+    value.links[0].username = 'Jim-Captain';
+    value.links[1].username = 'FamilyCabin';
+    fixture({
+      members: [value],
+      plan: (_body, plan) => ({
+        ...plan,
+        accounts: plan.accounts.map((account) =>
+          account.slot === 2 ? { ...account, action: 'family_preserved' } : account,
+        ),
+      }),
+    });
+    await manage();
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'sloop' } });
+    fireEvent.click(await ready());
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByText('Jim-Captain')).toBeTruthy();
+    expect(within(dialog).getByText('FamilyCabin')).toBeTruthy();
+    expect(within(dialog).getByText('Preserve this manually flagged Family account.')).toBeTruthy();
+  });
+
+  it('blocks an inactive paid membership before confirmation instead of silently reactivating it', async () => {
+    const f = fixture({
+      members: [{ ...membership, active: false }],
+      plan: (body, plan) => {
+        if (body.access_mode === 'subscription')
+          throw new Error(
+            'The subscription is inactive. Verify current billing or explicitly choose complimentary access.',
+          );
+        return plan;
+      },
+    });
+    await manage();
+    await screen.findByText(
+      'The subscription is inactive. Verify current billing or explicitly choose complimentary access.',
     );
     expect(screen.getByRole('button', { name: 'Review membership update' })).toHaveProperty(
       'disabled',
       true,
     );
-    expect(mutations(p.requests)).toHaveLength(0);
-  });
-
-  it('reviews approved mapping names before provisioning a member whose server username was simplified', async () => {
-    const mapped = ['SimplifiedJim', 'FamilyJim'].map((username, index) => ({
-      id: `mapping-${index + 1}`,
-      source_user_id: `emby-${index + 1}`,
-      source_username: index === 0 ? 'Jim!' : 'Jim!_2',
-      target_user_id: null,
-      target_username: username,
-      discord_user_id: ownerId,
-      discord_username: 'Jim',
-      membership_slot: index + 1,
-      revision: `mapping-revision-${index + 1}`,
-    }));
-    const api = vi.fn(async (path: string) => {
-      if (path === '/api/memberships') return { memberships: [] };
-      if (path === '/api/user-mappings') return { mappings: mapped };
-      if (path.startsWith('/api/discord/members?')) return { members: [member], truncated: false };
-      throw new Error(`Unexpected request ${path}`);
-    }) as Api;
-    page([], api);
-    await screen.findByText('Give each member their account allowance.');
-    fireEvent.click(screen.getByRole('tab', { name: 'Add member' }));
-    fireEvent.change(screen.getByLabelText('Discord member'), { target: { value: 'Jim' } });
-    fireEvent.click(await screen.findByRole('button', { name: 'Select @Jim' }));
-    fireEvent.click(screen.getByLabelText('Enable Jellyfin account provisioning'));
-    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'galleon' } });
-    expect(screen.getByText('SimplifiedJim, FamilyJim, SimplifiedJim_3')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    const dialog = screen.getByRole('dialog');
-    expect(within(dialog).getByText('SimplifiedJim')).toBeTruthy();
-    expect(within(dialog).getByText('FamilyJim')).toBeTruthy();
-    expect(within(dialog).getByText('SimplifiedJim_3')).toBeTruthy();
-  });
-
-  it('queries the Discord owner and requires review before provisioning all three Galleon slots', async () => {
-    const { requests, created } = page();
-    await screen.findByText('Give each member their account allowance.');
-    fireEvent.change(screen.getByLabelText('Discord member'), { target: { value: 'Captain Jim' } });
-    fireEvent.click(await screen.findByRole('button', { name: 'Select @Jim' }));
-    fireEvent.click(screen.getByLabelText('Enable Jellyfin account provisioning'));
-    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'galleon' } });
-    expect(screen.getByText('Jim, Jim_2, Jim_3')).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    const dialog = screen.getByRole('dialog');
-    expect(within(dialog).getByText('Jim_2')).toBeTruthy();
-    expect(within(dialog).getByText('Jim_3')).toBeTruthy();
-    expect(mutations(requests)).toHaveLength(0);
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Queue membership update' }));
-    await waitFor(() => expect(created).toHaveBeenCalledWith(job));
-    expect(mutations(requests)[0]).toMatchObject({
-      path: '/api/memberships/provision',
-      options: {
-        method: 'POST',
-        body: {
-          discord_user_id: ownerId,
-          tier_id: 'galleon',
-          expected_account_limit: 3,
-          provision_jellyfin: true,
-          expected_usernames: ['Jim', 'Jim_2', 'Jim_3'],
-        },
-      },
+    expect(writes(f.requests)).toEqual([]);
+    fireEvent.change(screen.getByLabelText('Access policy'), {
+      target: { value: 'complimentary' },
     });
-    expect(Object.keys(mutations(requests)[0].options?.body as object)).toEqual([
-      'discord_user_id',
-      'tier_id',
-      'expected_account_limit',
-      'expected_usernames',
-      'provision_jellyfin',
-    ]);
-    expect(localStorage.length).toBe(0);
-    expect(sessionStorage.length).toBe(0);
+    await ready();
+    expect((checks(f.requests).at(-1)!.options!.body as any).access_mode).toBe('complimentary');
   });
 
-  it('reviews a downgrade with saved custom account names and submits the membership revision', async () => {
-    const custom = {
-      ...membership,
-      links: membership.links.map((link) =>
-        link.membership_slot === 2 ? { ...link, username: 'Jim_family' } : link,
-      ),
-    };
-    const { requests } = page([custom]);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
-    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'sloop' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    const dialog = screen.getByRole('dialog');
-    expect(
-      within(dialog).getByText(
-        'Disable these accounts outside the new allowance and keep all their data:',
-      ),
-    ).toBeTruthy();
-    expect(within(dialog).getByText('Jim_family')).toBeTruthy();
-    expect(within(dialog).getByText('Jim_3')).toBeTruthy();
-    expect(mutations(requests)).toHaveLength(0);
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Queue membership update' }));
-    await waitFor(() => expect(mutations(requests)).toHaveLength(1));
-    expect(mutations(requests)[0].options?.body).toEqual({
-      discord_user_id: ownerId,
-      tier_id: 'sloop',
-      expected_account_limit: 1,
-      provision_jellyfin: true,
-      expected_usernames: ['Jim'],
-      expected_revision: membership.revision,
-    });
+  it('omits an empty legacy revision from the read-only plan request', async () => {
+    const f = fixture({ members: [{ ...membership, revision: '' }] });
+    await manage();
+    await ready();
+    expect(checks(f.requests)[0].options!.body).not.toHaveProperty('expected_revision');
   });
 
-  it('explains reactivation and only restores accounts disabled by Jellyport', async () => {
-    page([
-      {
-        ...membership,
-        active: false,
-        tier_id: 'sloop',
-        account_limit: 1,
-        links: membership.links.map((link) => ({
-          ...link,
-          disabled_by_jellyport: link.membership_slot > 1 ? 1 : 0,
-        })),
-      },
-    ]);
-    await screen.findByText(/Inactive membership/);
-    fireEvent.click(screen.getByRole('button', { name: 'Manage membership for Jim' }));
-    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    const dialog = screen.getByRole('dialog');
-    expect(
-      within(dialog).getByText(
-        'This update marks the membership active again and restores eligible accounts.',
-      ),
-    ).toBeTruthy();
-    expect(
-      within(dialog).getByText(/Re-enable the preserved account if Jellyport disabled it/),
-    ).toBeTruthy();
-    expect(
-      within(dialog).getByText(/Accounts disabled outside Jellyport require your review/),
-    ).toBeTruthy();
-  });
-
-  it('omits a blank legacy revision when enrolling an existing primary account', async () => {
-    const { requests } = page([
-      {
-        ...membership,
-        revision: '',
-        tier_id: 'sloop',
-        account_limit: 1,
-        links: [membership.links[0]],
-      },
-    ]);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    fireEvent.click(
-      within(screen.getByRole('dialog')).getByRole('button', { name: 'Queue membership update' }),
-    );
-    await waitFor(() => expect(mutations(requests)).toHaveLength(1));
-    expect(mutations(requests)[0].options?.body).toEqual({
-      discord_user_id: ownerId,
-      tier_id: 'sloop',
-      expected_account_limit: 1,
-      provision_jellyfin: true,
-      expected_usernames: ['Jim'],
-    });
-  });
-
-  it('aborts private membership reads when unmounted and ignores their late responses', async () => {
-    let resolve!: (value: unknown) => void;
+  it('aborts an initial membership read on unmount and ignores its late private result', async () => {
+    let finish!: (value: unknown) => void;
     let signal!: AbortSignal;
-    const api = vi.fn(async (_path: string, options?: ApiOptions) => {
-      if (_path === '/api/user-mappings') return { mappings: [] };
-      signal = options!.signal!;
-      return new Promise((finish) => {
-        resolve = finish;
-      });
-    }) as Api;
-    const { unmount, created, notify } = page([], api);
-    await waitFor(() => expect(resolve).toBeTypeOf('function'));
-    unmount();
+    const f = fixture({
+      read: (current) => {
+        signal = current;
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      },
+    });
+    await waitFor(() => expect(finish).toBeTypeOf('function'));
+    f.unmount();
     expect(signal.aborted).toBe(true);
-    await act(async () => resolve({ memberships: [membership] }));
+    await act(async () => finish({ memberships: [membership] }));
     expect(screen.queryByText('Jim')).toBeNull();
-    expect(created).not.toHaveBeenCalled();
-    expect(notify).not.toHaveBeenCalled();
+    expect(f.created).not.toHaveBeenCalled();
+    expect(f.notify).not.toHaveBeenCalled();
   });
 
-  it('aborts a pending provision response on unmount without reopening jobs or notifications', async () => {
-    let finish!: (value: Job) => void;
+  it('aborts a pending account check and ignores its stale response after the allowance changes', async () => {
+    let finish!: () => void;
+    const f = fixture({
+      plan: (body, plan) =>
+        body.tier_id === 'galleon'
+          ? new Promise((resolve) => {
+              finish = () => resolve(plan);
+            })
+          : plan,
+    });
+    await manage();
+    await waitFor(() => expect(finish).toBeTypeOf('function'));
+    const firstSignal = checks(f.requests)[0].options!.signal!;
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'sloop' } });
+    await ready();
+    expect(firstSignal.aborted).toBe(true);
+    await act(async () => finish());
+    fireEvent.click(await ready());
+    expect(within(screen.getByRole('dialog')).getByText(/Sloop/)).toBeTruthy();
+    expect((checks(f.requests).at(-1)!.options!.body as any).tier_id).toBe('sloop');
+  });
+
+  it('aborts a pending accept response on unmount without opening Activity or showing credentials', async () => {
+    let finish!: (value: unknown) => void;
     let signal!: AbortSignal;
-    const api = vi.fn(async (path: string, options?: ApiOptions) => {
-      if (path === '/api/memberships') return { memberships: [membership] };
-      if (path === '/api/user-mappings') return { mappings: [] };
-      signal = options!.signal!;
-      return new Promise<Job>((resolve) => {
-        finish = resolve;
-      });
-    }) as Api;
-    const { unmount, created, notify } = page([], api);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
+    const f = fixture({
+      accept: (_body, current) => {
+        signal = current;
+        return new Promise((resolve) => {
+          finish = resolve;
+        });
+      },
+    });
+    await manage();
+    fireEvent.click(await ready());
     fireEvent.click(
       within(screen.getByRole('dialog')).getByRole('button', { name: 'Queue membership update' }),
     );
     await waitFor(() => expect(finish).toBeTypeOf('function'));
-    unmount();
+    f.unmount();
     expect(signal.aborted).toBe(true);
-    await act(async () => finish(job));
-    expect(created).not.toHaveBeenCalled();
-    expect(notify).not.toHaveBeenCalled();
+    await act(async () => finish({ membership, job }));
+    expect(f.created).not.toHaveBeenCalled();
+    expect(f.notify).not.toHaveBeenCalled();
   });
 
-  it('keeps a rejected update review open without showing credentials or claiming success', async () => {
-    const api = vi.fn(async (path: string) => {
-      if (path === '/api/memberships') return { memberships: [membership] };
-      if (path === '/api/user-mappings') return { mappings: [] };
-      throw new Error('Membership changed. Refresh and review again.');
-    }) as Api;
-    const { created } = page([], api);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
+  it('discards an unconfirmed accept token, keeps the policy draft and checks current state before retry', async () => {
+    let attempts = 0;
+    const f = fixture({
+      accept: () => {
+        if (!attempts++) throw new Error('The membership changed. Check current requirements.');
+        return { membership, job };
+      },
+    });
+    await manage();
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
+    fireEvent.click(await ready());
     fireEvent.click(
       within(screen.getByRole('dialog')).getByRole('button', { name: 'Queue membership update' }),
     );
-    expect(await within(screen.getByRole('dialog')).findByRole('alert')).toHaveProperty(
-      'textContent',
-      'Membership changed. Refresh and review again.',
+    await screen.findByText('The membership changed. Check current requirements.');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'brigantine');
+    expect(f.created).not.toHaveBeenCalled();
+    fireEvent.click(await ready());
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Queue membership update' }),
     );
-    expect(created).not.toHaveBeenCalled();
+    await waitFor(() => expect(f.created).toHaveBeenCalledOnce());
+    expect((writes(f.requests)[0].options!.body as any).review_token).not.toBe(
+      (writes(f.requests)[1].options!.body as any).review_token,
+    );
   });
 
-  it('submits the reviewed allowance and names when tier settings change before confirmation', async () => {
-    let submitted: unknown;
-    const api = vi.fn(async (path: string, options?: ApiOptions) => {
-      if (path === '/api/memberships')
-        return { memberships: [{ ...membership, tier_id: 'sloop', account_limit: 1 }] };
-      if (path === '/api/user-mappings') return { mappings: [] };
-      submitted = options?.body;
-      throw new Error('The tier allowance changed. Refresh and review again.');
-    }) as Api;
-    const { rerender, notify, created } = page([], api);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    rerender(
+  it('invalidates an open review after setup changes and checks the preserved draft again', async () => {
+    let changed = false;
+    const f = fixture({
+      plan: (_body, plan) => ({ ...plan, account_limit: changed ? 2 : plan.account_limit }),
+    });
+    await manage();
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'sloop' } });
+    fireEvent.click(await ready());
+    changed = true;
+    f.rerender(
       <MembershipsPage
+        {...f.props}
         settings={{
           ...settings,
           membership_tiers: defaultMembershipTiers.map((tier) =>
-            tier.id === 'sloop' ? { ...tier, account_limit: 3 } : tier,
+            tier.id === 'sloop' ? { ...tier, account_limit: 2 } : tier,
           ),
         }}
-        api={api}
-        notify={notify}
-        created={created}
       />,
     );
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'sloop');
+    expect(writes(f.requests)).toEqual([]);
+    fireEvent.click(await ready());
     fireEvent.click(
       within(screen.getByRole('dialog')).getByRole('button', { name: 'Queue membership update' }),
     );
-    expect(await within(screen.getByRole('dialog')).findByRole('alert')).toHaveProperty(
-      'textContent',
-      'The tier allowance changed. Refresh and review again.',
-    );
-    expect(submitted).toEqual({
-      discord_user_id: ownerId,
-      tier_id: 'sloop',
-      expected_account_limit: 1,
-      provision_jellyfin: true,
-      expected_usernames: ['Jim'],
-      expected_revision: membership.revision,
-    });
-    expect(created).not.toHaveBeenCalled();
-    expect(notify).toHaveBeenCalledExactlyOnceWith(
-      'The tier allowance changed. Refresh and review again.',
-      true,
-    );
+    await waitFor(() => expect(writes(f.requests)).toHaveLength(1));
+    expect(Object.keys(writes(f.requests)[0].options!.body as object)).toEqual(['review_token']);
   });
-  it('saves complimentary access for a non-paying member without creating or modifying media accounts', async () => {
-    const requests: { path: string; options?: ApiOptions }[] = [];
-    const api = vi.fn(async (path: string, options?: ApiOptions) => {
-      requests.push({ path, options });
-      if (path === '/api/memberships') return { memberships: [] };
-      if (path === '/api/user-mappings') return { mappings: [] };
-      if (path.startsWith('/api/discord/members?'))
-        return { members: [{ ...member, membership_active: false }], truncated: false };
-      if (path === '/api/memberships/access')
-        return {
-          ...membership,
-          access_mode: 'complimentary',
-          account_limit: 2,
-          tier_id: 'complimentary',
-        };
-      throw new Error(`Unexpected request ${path}`);
-    }) as Api;
-    const { notify, created } = page([], api);
-    await screen.findByText('Give each member their account allowance.');
-    fireEvent.click(screen.getByRole('tab', { name: 'Add member' }));
+
+  it.each(['wrong-owner', 'wrong-allowance', 'missing-expiry'])(
+    'rejects an incomplete or mismatched server plan before confirmation (%s)',
+    async (problem) => {
+      const f = fixture({
+        plan: (_body, plan) => ({
+          ...plan,
+          ...(problem === 'wrong-owner'
+            ? { discord_user_id: '223456789012345678' }
+            : problem === 'wrong-allowance'
+              ? { account_limit: 1 }
+              : { expires_at: '' }),
+        }),
+      });
+      await manage();
+      await screen.findByText('The account review was incomplete. Check requirements again.');
+      expect(screen.getByRole('button', { name: 'Review membership update' })).toHaveProperty(
+        'disabled',
+        true,
+      );
+      expect(writes(f.requests)).toEqual([]);
+    },
+  );
+
+  it('disables an expired final token while keeping the policy draft available for a fresh review', async () => {
+    const f = fixture();
+    await manage();
+    await ready();
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
+    act(() => vi.advanceTimersByTime(300001));
+    expect(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Queue membership update' }),
+    ).toHaveProperty('disabled', true);
+    expect(screen.getByText('Refresh this account review')).toBeTruthy();
+    expect(writes(f.requests)).toEqual([]);
+    fireEvent.click(screen.getByRole('button', { name: 'Check current requirements' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'galleon');
+  });
+
+  it('accepts an opted-out Emby-only policy review with no media job', async () => {
+    const f = fixture({
+      members: [{ ...membership, links: [], provision_jellyfin: false }],
+      accept: () => ({
+        membership: { ...membership, links: [], provision_jellyfin: false },
+        job: null,
+      }),
+    });
+    await manage();
+    fireEvent.click(await ready());
+    expect(
+      within(screen.getByRole('dialog')).getByText(
+        /without creating, migrating, enabling or disabling media accounts/,
+      ),
+    ).toBeTruthy();
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', {
+        name: 'Save reviewed access policy',
+      }),
+    );
+    await waitFor(() =>
+      expect(f.notify).toHaveBeenCalledWith(
+        'Access policy saved. Existing media accounts are unchanged.',
+      ),
+    );
+    expect(f.created).not.toHaveBeenCalled();
+    expect(writes(f.requests)).toHaveLength(1);
+  });
+
+  it('can manage existing Jellyfin accounts without opting into missing-account creation', async () => {
+    const f = fixture({
+      members: [{ ...membership, links: membership.links.slice(0, 1), provision_jellyfin: false }],
+    });
+    await manage();
+    await ready();
+    expect((checks(f.requests).at(-1)!.options!.body as any).provision_jellyfin).toBe(false);
+    fireEvent.click(await ready());
+    expect(within(screen.getByRole('dialog')).getAllByRole('article')).toHaveLength(1);
+  });
+
+  it('saves complimentary policy and account changes in one accepted workflow rather than two partial writes', async () => {
+    const f = fixture();
+    await manage();
     fireEvent.change(screen.getByLabelText('Access policy'), {
       target: { value: 'complimentary' },
     });
-    fireEvent.change(screen.getByLabelText('Discord member'), { target: { value: 'Jim' } });
-    fireEvent.click(await screen.findByRole('button', { name: 'Select @Jim' }));
-    expect(screen.getByLabelText('Access policy')).toHaveProperty('value', 'complimentary');
     fireEvent.change(screen.getByLabelText('Complimentary account allowance'), {
       target: { value: '2' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Save access policy' }));
-    await waitFor(() =>
-      expect(notify).toHaveBeenCalledWith(
-        'Access policy saved. Media accounts have not been changed.',
-      ),
-    );
-    expect(mutations(requests)).toEqual([
-      {
-        path: '/api/memberships/access',
-        options: expect.objectContaining({
-          method: 'POST',
-          body: {
-            discord_user_id: ownerId,
-            access_mode: 'complimentary',
-            provision_jellyfin: false,
-            account_limit: 2,
-          },
-        }),
-      },
-    ]);
-    expect(created).not.toHaveBeenCalled();
-  });
-
-  it('defaults a new subscription member to no Jellyfin provisioning and saves access without creating an account', async () => {
-    const requests: { path: string; options?: ApiOptions }[] = [];
-    const api = vi.fn(async (path: string, options?: ApiOptions) => {
-      requests.push({ path, options });
-      if (path === '/api/memberships') return { memberships: [] };
-      if (path === '/api/user-mappings') return { mappings: [] };
-      if (path.startsWith('/api/discord/members?')) return { members: [member], truncated: false };
-      if (path === '/api/memberships/access')
-        return { ...membership, links: [], provision_jellyfin: false };
-      throw new Error(`Unexpected request ${path}`);
-    }) as Api;
-    const { created, notify } = page([], api);
-    await screen.findByText('Give each member their account allowance.');
-    fireEvent.click(screen.getByRole('tab', { name: 'Add member' }));
-    fireEvent.change(screen.getByLabelText('Discord member'), { target: { value: 'Jim' } });
-    fireEvent.click(await screen.findByRole('button', { name: 'Select @Jim' }));
-    expect(screen.getByLabelText('Enable Jellyfin account provisioning')).toHaveProperty(
-      'checked',
-      false,
-    );
-    expect(screen.getByRole('button', { name: 'Review membership update' })).toHaveProperty(
-      'disabled',
-      true,
-    );
-    fireEvent.submit(screen.getByLabelText('Access policy').closest('form')!);
-    expect(screen.queryByRole('dialog')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: 'Save access policy' }));
-    await waitFor(() =>
-      expect(notify).toHaveBeenCalledWith(
-        'Access policy saved. Media accounts have not been changed.',
-      ),
-    );
-    expect(mutations(requests)).toEqual([
-      expect.objectContaining({
-        path: '/api/memberships/access',
-        options: expect.objectContaining({
-          body: {
-            discord_user_id: ownerId,
-            access_mode: 'subscription',
-            tier_id: 'sloop',
-            provision_jellyfin: false,
-          },
-        }),
-      }),
-    ]);
-    expect(created).not.toHaveBeenCalled();
-  });
-
-  it('preserves a saved Emby-only opt-out when reviewing an existing member', async () => {
-    page([{ ...membership, provision_jellyfin: false, links: [] }]);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
-    expect(screen.getByLabelText('Enable Jellyfin account provisioning')).toHaveProperty(
-      'checked',
-      false,
-    );
-    expect(screen.getByRole('button', { name: 'Review membership update' })).toHaveProperty(
-      'disabled',
-      true,
-    );
-    fireEvent.click(screen.getByLabelText('Enable Jellyfin account provisioning'));
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    expect(screen.getByRole('dialog')).toBeTruthy();
-  });
-
-  it('can review existing Jellyfin access without opting into missing-account creation', async () => {
-    const { requests, created } = page([
-      { ...membership, provision_jellyfin: false, links: [membership.links[0]] },
-    ]);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
-    expect(screen.getByLabelText('Enable Jellyfin account provisioning')).toHaveProperty(
-      'checked',
-      false,
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    const dialog = screen.getByRole('dialog');
-    expect(within(dialog).getByText(/Update existing linked Jellyfin accounts only/)).toBeTruthy();
-    expect(within(dialog).queryByText(/Migrate a matching Emby account/)).toBeNull();
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Queue membership update' }));
-    await waitFor(() => expect(created).toHaveBeenCalledWith(job));
-    expect(mutations(requests)[0].options?.body).toEqual({
-      discord_user_id: ownerId,
-      tier_id: 'galleon',
-      expected_account_limit: 3,
-      expected_usernames: ['Jim'],
-      expected_revision: membership.revision,
-      provision_jellyfin: false,
-    });
-  });
-
-  it('saves a reviewed complimentary policy before queuing accounts using the newly saved revision', async () => {
-    const requests: { path: string; options?: ApiOptions }[] = [];
-    const api = vi.fn(async (path: string, options?: ApiOptions) => {
-      requests.push({ path, options });
-      if (path === '/api/memberships') return { memberships: [membership] };
-      if (path === '/api/user-mappings') return { mappings: [] };
-      if (path === '/api/memberships/access')
-        return {
-          ...membership,
-          access_mode: 'complimentary',
-          account_limit: 1,
-          tier_id: 'complimentary',
-          revision: 'free-revision',
-        };
-      if (path === '/api/memberships/provision') return job;
-      throw new Error(`Unexpected request ${path}`);
-    }) as Api;
-    const { created } = page([], api);
-    fireEvent.click(await screen.findByRole('button', { name: 'Manage membership for Jim' }));
-    fireEvent.change(screen.getByLabelText('Access policy'), {
-      target: { value: 'complimentary' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
-    expect(mutations(requests)).toHaveLength(0);
+    fireEvent.click(await ready());
     fireEvent.click(
       within(screen.getByRole('dialog')).getByRole('button', { name: 'Queue membership update' }),
     );
-    await waitFor(() => expect(created).toHaveBeenCalledWith(job));
-    expect(mutations(requests).map((entry) => entry.path)).toEqual([
-      '/api/memberships/access',
-      '/api/memberships/provision',
+    await waitFor(() => expect(f.created).toHaveBeenCalledOnce());
+    expect(writes(f.requests).map(({ path }) => path)).toEqual([
+      '/api/memberships/workflow/accept',
     ]);
-    expect(mutations(requests)[1].options?.body).toEqual({
-      discord_user_id: ownerId,
-      tier_id: 'complimentary',
-      expected_account_limit: 1,
-      provision_jellyfin: true,
-      expected_usernames: ['Jim'],
-      expected_revision: 'free-revision',
-    });
+    expect((checks(f.requests).at(-1)!.options!.body as any).account_limit).toBe(2);
+  });
+
+  it('opens an exact selected owner handoff once and keeps later policy edits', async () => {
+    const f = fixture({ initialMember: { id: ownerId, username: 'Jim' }, handoffKey: 1 });
+    await ready();
+    expect(screen.getByRole('tab', { name: 'Manage member' }).getAttribute('aria-selected')).toBe(
+      'true',
+    );
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
+    f.rerender(<MembershipsPage {...f.props} handoffKey={1} />);
+    expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'brigantine');
+    expect(screen.queryByRole('searchbox', { name: 'Discord member' })).toBeNull();
+    expect(writes(f.requests)).toEqual([]);
+  });
+
+  it('resolves relationships inline then returns to the same owner and unsaved policy', async () => {
+    const f = fixture();
+    await manage();
+    fireEvent.change(screen.getByLabelText('Membership tier'), { target: { value: 'brigantine' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Review existing account links' }));
+    expect(screen.getByRole('region', { name: 'Inline relationships' })).toBeTruthy();
+    expect(screen.getByText('Reviewed owner @Jim')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm selected existing accounts' }));
+    await ready();
+    expect(screen.getByLabelText('Membership tier')).toHaveProperty('value', 'brigantine');
+    expect(screen.queryByRole('searchbox', { name: 'Discord member' })).toBeNull();
+    expect(writes(f.requests)).toEqual([]);
   });
 });

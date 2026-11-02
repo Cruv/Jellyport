@@ -215,8 +215,11 @@ describe('workspace notices', () => {
         <Workspace />
       </StrictMode>,
     );
-    let dialogs = screen.getAllByRole('dialog');
-    expect(within(dialogs[0]).queryByRole('status')).toBeNull();
+    let dialogs = screen.getAllByRole('dialog', { hidden: true });
+    expect(dialogs).toHaveLength(2);
+    expect(dialogs[0].getAttribute('aria-hidden')).toBe('true');
+    expect(dialogs[0].querySelector('.toast-region')).toBeNull();
+    expect(screen.getAllByRole('dialog')).toHaveLength(1);
     expect(within(dialogs[1]).getByRole('status')).toBeTruthy();
     expect(screen.getAllByRole('status')).toHaveLength(1);
     fireEvent.click(within(dialogs[1]).getByRole('button', { name: 'Close dialog' }));

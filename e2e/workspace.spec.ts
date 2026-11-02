@@ -259,22 +259,30 @@ test('120-user directory keeps rendering bounded and filters reset paging withou
   await expect(page.getByRole('combobox', { name: 'Access policy' })).toBeHidden();
   await page.getByRole('button', { name: 'Clear filters', exact: true }).click();
   const manage = table.getByRole('button', { name: 'Manage Member 001', exact: true });
-  await expect(
-    table.getByRole('button', { name: 'Manage account access for Member 001' }),
-  ).toBeHidden();
   await manage.click();
-  await expect(manage).toHaveAttribute('aria-expanded', 'true');
+  const workspace = page.getByRole('dialog', { name: 'Manage Member 001', exact: true });
+  await expect(workspace).toBeVisible();
+  await expect(workspace.getByRole('tab', { name: 'Account access', exact: true })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
   await expect(
-    table.getByRole('button', { name: 'Manage account access for Member 001' }),
+    workspace.getByRole('combobox', { name: 'Media account', exact: true }),
   ).toBeVisible();
+  await expect(
+    workspace.getByRole('button', { name: 'Disable selected account', exact: true }),
+  ).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(workspace).toHaveCount(0);
+  await expect(manage).toBeFocused();
   const second = table.getByRole('button', { name: 'Manage Member 002', exact: true });
   await second.click();
-  await expect(manage).toHaveAttribute('aria-expanded', 'false');
+  const secondWorkspace = page.getByRole('dialog');
   await expect(
-    table.getByRole('button', { name: 'Manage account access for Member 001' }),
-  ).toBeHidden();
+    secondWorkspace.getByRole('combobox', { name: 'Media account', exact: true }),
+  ).toHaveValue(JSON.stringify(['jellyfin', 'jellyfin-2']));
   await page.keyboard.press('Escape');
-  await expect(second).toHaveAttribute('aria-expanded', 'false');
+  await expect(secondWorkspace).toHaveCount(0);
   await expect(second).toBeFocused();
   await pagination.getByRole('combobox', { name: 'Users per page' }).selectOption('50');
   await expect(table.getByRole('row')).toHaveCount(51);
@@ -446,7 +454,7 @@ test('mobile navigation contains keyboard focus and restores it on dismissal', a
   await expect(nav.getByRole('button', { name: 'Users', exact: true })).toBeFocused();
   await nav.getByRole('button', { name: 'Sign out', exact: true }).focus();
   await page.keyboard.press('Tab');
-  await expect(nav.getByRole('button', { name: 'Overview', exact: true })).toBeFocused();
+  await expect(nav.getByRole('button', { name: 'Users', exact: true })).toBeFocused();
   await page.keyboard.press('Shift+Tab');
   await expect(nav.getByRole('button', { name: 'Sign out', exact: true })).toBeFocused();
   await page.keyboard.press('Escape');

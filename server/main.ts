@@ -25,7 +25,11 @@ import {
   type ReviewedHouseholdAccount,
   type ReviewedMigrationMembership,
   type ReviewedMigrationTarget,
+  type MembershipWorkflowInput,
+  type ReviewedMembershipWorkflow,
 } from './service.js';
+import { WorkflowReadiness } from './workflow-readiness.js';
+import { WorkflowReviews } from './workflow-reviews.js';
 import { PreviewTasks } from './preview-tasks.js';
 import { CloneReviews, type CloneAccountsInput } from './account-cloning.js';
 import type { MigrationScope } from './migration.js';
@@ -220,6 +224,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   const service = new Service(store, { demo, clientFactory });
   const previews = new PreviewTasks((ids, controls) => service.preview(ids, controls));
   const cloneReviews = new CloneReviews();
+  const workflowReadiness = new WorkflowReadiness(service);
+  const workflowReviews = new WorkflowReviews<ReviewedMembershipWorkflow>();
   const acceptingPreviews = new Set<string>();
   const previewContext = () =>
     createHash('sha256').update(JSON.stringify(store.settings())).digest('hex');
@@ -318,6 +324,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     sessions.delete(sid);
     previews.cancelOwner(sid);
     cloneReviews.cancelOwner(sid);
+    workflowReviews.cancelOwner(sid);
     authenticatedSessions.delete(sid);
     anonymousSessions.delete(sid);
     const owned = addresses.get(value.address);
@@ -857,6 +864,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     return result;
   }
   app.get('/api/settings', async () => publicSettings());
+  app.get('/api/workflow-readiness', async () => workflowReadiness.snapshot());
+  app.post('/api/workflow-readiness/refresh', async () => workflowReadiness.snapshot(true));
   app.get('/api/source-snapshots', async () => service.sourceSnapshots.status());
   app.put<{
     Body: {
@@ -1023,6 +1032,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       store.saveSettings(settings);
       previews.close();
       cloneReviews.close();
+      workflowReviews.clear();
       await bot.restart(settings);
       return publicSettings();
     },
@@ -1075,6 +1085,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           throw new JellyfinAuthError('Server configuration changed. Reload the page.', 403);
         previews.close();
         cloneReviews.close();
+        workflowReviews.clear();
         await bot.restart(store.settings());
         return publicSettings();
       } finally {
@@ -1596,15 +1607,51 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   app.post<{ Body: AccountRequest }>(
     '/api/accounts',
     { schema: { body: accountSchema } },
-    async (request, reply) =>
-      reply
-        .code(202)
-        .send(
-          await service.createAccount(
-            request.body.username,
-            request.body.discord_user_id ?? undefined,
-          ),
-        ),
+    async (request, reply) => {
+      const read = workflowRequest(request, reply);
+      try {
+        return reply
+          .code(202)
+          .send(
+            await service.createAccount(
+              request.body.username,
+              request.body.discord_user_id ?? undefined,
+              read.guard,
+              read.signal,
+            ),
+          );
+      } catch (error) {
+        return read.fail(error);
+      } finally {
+        read.dispose();
+      }
+    },
+  );
+  app.post<{ Body: { username: string; discord_user_id?: string } }>(
+    '/api/accounts/review',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['username'],
+          properties: {
+            username: accountFields.username,
+            discord_user_id: { type: 'string', pattern: '^[0-9]{5,22}$' },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const read = workflowRequest(request, reply);
+      try {
+        return await service.reviewAccountCreation(request.body, read.guard, read.signal);
+      } catch (error) {
+        return read.fail(error);
+      } finally {
+        read.dispose();
+      }
+    },
   );
   app.post<{ Body: CloneAccountsInput }>(
     '/api/accounts/clone/review',
@@ -1817,6 +1864,112 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     events: store.subscriptions().map(publicSubscription),
   }));
   app.get('/api/memberships', async () => ({ memberships: service.listMemberships() }));
+  const workflowInputSchema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['discord_user_id', 'access_mode', 'provision_jellyfin'],
+    properties: {
+      discord_user_id: { type: 'string', pattern: '^[0-9]{5,22}$' },
+      access_mode: { type: 'string', enum: ['subscription', 'complimentary'] },
+      provision_jellyfin: { type: 'boolean' },
+      tier_id: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' },
+      account_limit: { type: 'integer', minimum: 1, maximum: 3 },
+      expected_revision: { type: 'string', maxLength: 128 },
+    },
+  };
+  const workflowGuard = (request: FastifyRequest, context: string) => {
+    const signed = session(request);
+    return () => {
+      if (!signed?.authenticated || session(request) !== signed)
+        throw new JellyfinAuthError('Sign in again before confirming account changes.', 401);
+      if (previewContext() !== context)
+        throw new ServiceError('Configuration changed. Check this account workflow again.');
+    };
+  };
+  function workflowRequest(request: FastifyRequest, reply: FastifyReply) {
+    const context = previewContext();
+    const authorize = workflowGuard(request, context);
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    const close = () => {
+      if (!reply.raw.writableEnded) controller.abort();
+    };
+    request.raw.once('aborted', abort);
+    reply.raw.once('close', close);
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(20_000)]);
+    return {
+      context,
+      signal,
+      guard: () => {
+        authorize();
+        signal.throwIfAborted();
+      },
+      fail: (error: unknown): never => {
+        authorize();
+        if (signal.aborted)
+          throw new ServiceError(
+            'This account check timed out or was canceled. Check the connection and try again.',
+          );
+        throw error;
+      },
+      dispose: () => {
+        request.raw.removeListener('aborted', abort);
+        reply.raw.removeListener('close', close);
+      },
+    };
+  }
+  app.post<{ Body: MembershipWorkflowInput }>(
+    '/api/memberships/workflow/review',
+    { schema: { body: workflowInputSchema } },
+    async (request, reply) => {
+      const read = workflowRequest(request, reply);
+      try {
+        const reviewed = await service.reviewMembershipWorkflow(
+          request.body,
+          read.guard,
+          read.signal,
+        );
+        read.guard();
+        return {
+          ...reviewed.summary,
+          ...workflowReviews.save(request.cookies[COOKIE]!, read.context, reviewed),
+        };
+      } catch (error) {
+        return read.fail(error);
+      } finally {
+        read.dispose();
+      }
+    },
+  );
+  app.post<{ Body: { review_token: string } }>(
+    '/api/memberships/workflow/accept',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['review_token'],
+          properties: { review_token: { type: 'string', format: 'uuid' } },
+        },
+      },
+    },
+    async (request, reply) => {
+      const read = workflowRequest(request, reply);
+      try {
+        const reviewed = workflowReviews.take(
+          request.cookies[COOKIE]!,
+          read.context,
+          request.body.review_token,
+        );
+        const result = await service.applyMembershipWorkflow(reviewed, read.guard, read.signal);
+        return reply.code(result.job ? 202 : 200).send(result);
+      } catch (error) {
+        return read.fail(error);
+      } finally {
+        read.dispose();
+      }
+    },
+  );
   app.post<{ Body: Parameters<Service['saveAccountProfile']>[0] }>(
     '/api/account-profiles',
     {
@@ -2107,6 +2260,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   }, 60000);
   retention.unref();
   app.addHook('onClose', async () => {
+    await workflowReadiness.close();
     closing = true;
     clearInterval(retention);
     clearInterval(maintenance);
@@ -2114,6 +2268,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     clearInterval(roleCleanupPolling);
     previews.close();
     cloneReviews.close();
+    workflowReviews.clear();
     const identitiesClosed = identities.close();
     await Promise.all([stripe.stop(), bot.stop(), service.stop(), identitiesClosed]);
     await upkeep;

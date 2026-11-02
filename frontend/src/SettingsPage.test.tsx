@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useLayoutEffect, type ReactNode } from 'react';
 import SettingsPage from './SettingsPage';
+import { LocalWorkspaceRoute } from './routing';
 import { WorkspaceDraftProvider } from './workspace-drafts';
 import { DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE } from '../../server/credential-message';
 import type { Api, ApiOptions, Settings } from './types';
@@ -1115,4 +1116,26 @@ describe('Settings draft and submission safeguards', () => {
     await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
     expect(screen.getByRole('button', { name: 'Save settings' })).toHaveProperty('disabled', false);
   });
+});
+
+it('keeps setup section tabs and connection repairs inside the existing task route', async () => {
+  const p = page();
+  window.history.replaceState(null, '', '#/users');
+  p.rerender(
+    <LocalWorkspaceRoute initial={{ page: 'settings', tab: 'accounts', subtab: 'permissions' }}>
+      <SettingsPage
+        {...p.props}
+        users={{ emby: [], jellyfin: [], errors: { emby: 'Synthetic connection outage' } }}
+        embedded
+      />
+    </LocalWorkspaceRoute>,
+  );
+  expect(screen.getByRole('tab', { name: 'Account defaults' }).getAttribute('aria-selected')).toBe(
+    'true',
+  );
+  fireEvent.click(screen.getByRole('tab', { name: 'Servers' }));
+  expect(window.location.hash).toBe('#/users');
+  fireEvent.click(screen.getByRole('button', { name: 'Check the saved connection' }));
+  expect(screen.getByRole('tab', { name: 'Emby' }).getAttribute('aria-selected')).toBe('true');
+  expect(window.location.hash).toBe('#/users');
 });

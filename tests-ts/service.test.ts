@@ -934,11 +934,11 @@ describe('account migration and subscription safety', () => {
   );
   it('does not reset a duplicate fresh account', async () => {
     const before = structuredClone(servers.users.jellyfin[1]);
-    const job = await finish(await service.createAccount('river'));
-    expect(job.status).toBe('failed');
+    await expect(service.createAccount('river')).rejects.toThrow('already exists');
+    expect(store.jobs()).toEqual([]);
     expect(servers.users.jellyfin[1]).toEqual(before);
   });
-  it('resumes only a tracked incomplete creation and applies the template once successful', async () => {
+  it('requires explicit recovery for a tracked incomplete creation and preserves its saved password', async () => {
     store.saveSettings({ ...store.settings(), password_length: 16 });
     let failing = true;
     service.clientFactory = (...args) => {
@@ -956,7 +956,13 @@ describe('account migration and subscription safety', () => {
     expect(savedPassword).toHaveLength(16);
     store.saveSettings({ ...store.settings(), password_length: 64 });
     failing = false;
-    const retry = await finish(await service.createAccount('casey'));
+    const jobsBeforeRecovery = store.jobs().length;
+    await expect(service.createAccount('casey')).rejects.toThrow('Recover account');
+    expect(store.jobs()).toHaveLength(jobsBeforeRecovery);
+    const recovery = await service.recoveryInfo('casey');
+    expect(recovery.eligible).toBe(true);
+    expect(recovery.target_user_id).toBeTruthy();
+    const retry = await finish(await service.recoverAccount('casey', recovery.target_user_id!));
     expect(retry.status).toBe('completed');
     expect(servers.users.jellyfin.filter((user) => user.Name === 'casey')).toHaveLength(1);
     const credentials = store.takeCredentials(retry.id);
@@ -1011,9 +1017,10 @@ describe('account migration and subscription safety', () => {
       client.setPassword = password;
       return client;
     };
-    const job = await finish(await service.createAccount('casey'));
-    expect(job.status).toBe('failed');
-    expect(job.results[0]?.error).toContain('must include {username}, {password} and {server_url}');
+    await expect(service.createAccount('casey')).rejects.toThrow(
+      'must include {username}, {password} and {server_url}',
+    );
+    expect(store.jobs()).toEqual([]);
     expect(create).not.toHaveBeenCalled();
     expect(password).not.toHaveBeenCalled();
     expect(store.account('casey')).toBeNull();
@@ -1029,7 +1036,8 @@ describe('account migration and subscription safety', () => {
       return client;
     };
     expect((await finish(await service.createAccount('casey'))).status).toBe('failed');
-    expect((await finish(await service.createAccount('casey'))).status).toBe('failed');
+    await expect(service.createAccount('casey')).rejects.toThrow('uncertain');
+    expect(store.jobs()).toHaveLength(1);
     expect(calls).toEqual(['casey']);
     expect(store.account('casey')?.status).toBe('uncertain');
   });

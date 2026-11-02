@@ -141,6 +141,26 @@ function dependencies() {
     if (path === '/api/account-roles/import')
       return { parameters, warnings: ['Synthetic import note'] };
     if (path === '/api/memberships') return { memberships: [membership] };
+    if (path === '/api/memberships/workflow/review') {
+      const body = options!.body as {
+        discord_user_id: string;
+        access_mode: string;
+        account_limit?: number;
+        tier_id?: string;
+        provision_jellyfin: boolean;
+      };
+      return {
+        ...body,
+        username: owner.username,
+        tier_id: body.tier_id || 'complimentary',
+        account_limit: body.account_limit || 1,
+        accounts: [],
+        warnings: [],
+        policy_only: true,
+        review_token: 'synthetic-draft-review',
+        expires_at: new Date(Date.now() + 300000).toISOString(),
+      };
+    }
     if (path === '/api/user-mappings') return { mappings: [] };
     if (path === '/api/user-directory') return { users: [] };
     if (path === '/api/discord/tag-roles')
@@ -237,7 +257,9 @@ describe('editor drafts across page unmount and refresh', () => {
     fireEvent.change(screen.getByLabelText('Complimentary account allowance'), {
       target: { value: '2' },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Review membership update' }));
+    const check = await screen.findByRole('button', { name: 'Review membership update' });
+    await waitFor(() => expect(check).toHaveProperty('disabled', false));
+    fireEvent.click(check);
     expect(screen.getByRole('dialog')).toBeTruthy();
     act(() => view.hide());
     act(() => view.show());
@@ -245,7 +267,11 @@ describe('editor drafts across page unmount and refresh', () => {
     expect(screen.getByLabelText('Access policy')).toHaveProperty('value', 'complimentary');
     expect(screen.getByLabelText('Complimentary account allowance')).toHaveProperty('value', '2');
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(p.requests.filter(({ options }) => options?.method)).toEqual([]);
+    expect(
+      p.requests.filter(
+        ({ path, options }) => options?.method && path !== '/api/memberships/workflow/review',
+      ),
+    ).toEqual([]);
     act(() => view.newSession());
     await screen.findByLabelText('Discord member');
     expect(screen.queryByRole('button', { name: 'Clear Discord member @Crew' })).toBeNull();

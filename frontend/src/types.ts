@@ -677,6 +677,29 @@ export interface DirectoryUser {
   family?: boolean;
   requires_review?: boolean;
 }
+export type WorkflowAction =
+  | 'create_account'
+  | 'migrate'
+  | 'migrate_saved'
+  | 'account_roles'
+  | 'account_mappings'
+  | 'discord_roles'
+  | 'identity_review'
+  | 'account_access_emby'
+  | 'account_access_jellyfin';
+export interface WorkflowBlocker {
+  code: string;
+  message: string;
+  route: { page: 'settings' | 'roles'; tab?: string; subtab?: string };
+}
+export interface WorkflowReadinessSnapshot {
+  checked_at: string;
+  actions: Record<
+    WorkflowAction,
+    { ready: boolean; blockers: WorkflowBlocker[]; warnings: string[] }
+  >;
+  sources: Record<'emby' | 'jellyfin', { configured: boolean; available: boolean }>;
+}
 export interface DiscordTagRole {
   id: string;
   name: string;

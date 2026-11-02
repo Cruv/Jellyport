@@ -5,6 +5,10 @@ import {
   useState,
   type Dispatch,
   type SetStateAction,
+  createContext,
+  createElement,
+  useContext,
+  type ReactNode,
 } from 'react';
 import type { Page } from './types';
 
@@ -47,6 +51,26 @@ const membershipSubtabs: Record<string, readonly string[]> = {
 };
 const routeEvent = 'jellyport:routechange';
 const skipAnchor = '#workspace-content';
+const LocalRouteContext = createContext<{
+  route: WorkspaceRoute;
+  navigate: (route: WorkspaceRoute) => void;
+} | null>(null);
+
+/** Setup opened within a task gets local tabs; the original task and URL stay intact. */
+export function LocalWorkspaceRoute({
+  initial,
+  children,
+}: {
+  initial: WorkspaceRoute;
+  children: ReactNode;
+}) {
+  const [route, setRoute] = useState(() => normalized(initial));
+  return createElement(
+    LocalRouteContext.Provider,
+    { value: { route, navigate: (next) => setRoute(normalized(next)) } },
+    children,
+  );
+}
 
 function normalized(route: WorkspaceRoute): WorkspaceRoute {
   // Preserve bookmarks from the former separate subscriptions and membership editors.
@@ -99,7 +123,12 @@ export function navigateWorkspace(
   window.history[options.replace ? 'replaceState' : 'pushState'](null, '', hash);
   window.dispatchEvent(new Event(routeEvent));
 }
+export function useWorkspaceNavigator() {
+  const local = useContext(LocalRouteContext);
+  return local?.navigate ?? navigateWorkspace;
+}
 function useRouteSnapshot(): WorkspaceRoute {
+  const local = useContext(LocalRouteContext);
   const [route, setRoute] = useState(() => parseWorkspaceRoute(window.location.hash));
   useEffect(() => {
     const update = () => {
@@ -128,18 +157,20 @@ function useRouteSnapshot(): WorkspaceRoute {
       window.removeEventListener(routeEvent, update);
     };
   }, []);
-  return route;
+  return local?.route ?? route;
 }
 export function useWorkspaceRoute(): WorkspaceRoute {
+  const local = useContext(LocalRouteContext);
   const route = useRouteSnapshot();
   useEffect(() => {
+    if (local) return;
     const hash = window.location.hash;
     if (
       hash !== skipAnchor &&
       workspaceRouteHash(parseWorkspaceRoute(hash)) === workspaceRouteHash(route)
     )
       navigateWorkspace(route, { replace: true });
-  }, [route]);
+  }, [route, local]);
   return route;
 }
 
@@ -149,6 +180,7 @@ export function useRouteTab(
   settingsSection?: string,
 ): [string, Dispatch<SetStateAction<string>>] {
   const route = useRouteSnapshot();
+  const local = useContext(LocalRouteContext);
   const allowed = settingsSection
     ? ((page === 'memberships' ? membershipSubtabs : settingsSubtabs)[settingsSection] ?? [])
     : (pageTabs[page] ?? []);
@@ -170,11 +202,13 @@ export function useRouteTab(
       if (!allowed.includes(target)) return;
       currentValue.current = target;
       setRemembered(target);
-      navigateWorkspace(
-        settingsSection ? { page, tab: settingsSection, subtab: target } : { page, tab: target },
-      );
+      const targetRoute = settingsSection
+        ? { page, tab: settingsSection, subtab: target }
+        : { page, tab: target };
+      if (local) local.navigate(targetRoute);
+      else navigateWorkspace(targetRoute);
     },
-    [page, settingsSection, allowed],
+    [page, settingsSection, allowed, local],
   );
   return [value, change];
 }

@@ -18,7 +18,9 @@ test.afterEach(async ({ page }, info) => {
 
 async function finishJob(admin: AdminFixture, response: Response) {
   expect(response.ok()).toBe(true);
-  const { id } = await response.json();
+  const value = await response.json();
+  const id = value.job?.id || value.id;
+  expect(id, 'The accepted account operation has a durable job.').toBeTruthy();
   await expect
     .poll(async () => (await (await admin.client.get(`/api/jobs/${id}`)).json()).status, {
       timeout: 15_000,
@@ -34,11 +36,18 @@ async function chooseMember(page: Page, username: string) {
 
 async function queueMembership(page: Page, admin: AdminFixture, tier: string) {
   await page.getByRole('combobox', { name: 'Membership tier', exact: true }).selectOption(tier);
-  await page.getByRole('button', { name: 'Review membership update', exact: true }).click();
+  const reviewAction = page.getByRole('button', { name: 'Review membership update', exact: true });
+  await expect(reviewAction).toBeEnabled();
+  await page.screenshot({ path: test.info().outputPath('membership-preflight-viewport.png') });
+  await reviewAction.click();
   const review = page.getByRole('dialog', { name: 'Review membership update', exact: true });
+  await expect(review).toBeVisible();
+  const notice = review.locator('.toast');
+  if (await notice.count()) await expect(notice).toHaveCSS('opacity', '1');
+  await page.screenshot({ path: test.info().outputPath('membership-review-viewport.png') });
   const accepted = page.waitForResponse(
     (response) =>
-      new URL(response.url()).pathname === '/api/memberships/provision' &&
+      new URL(response.url()).pathname === '/api/memberships/workflow/accept' &&
       response.request().method() === 'POST',
   );
   await review.getByRole('button', { name: 'Queue membership update', exact: true }).click();
@@ -315,7 +324,7 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   const notice = page.locator('.toast-region');
   await expect(notice).toHaveCount(1);
   await expect(notice).toContainText(
-    'Membership update queued. Follow account creation and access changes in Activity.',
+    'Membership update queued. Follow account changes in Activity.',
   );
   await expect(notice).not.toContainText('Access policy saved.');
   expect(await notice.evaluate((element) => getComputedStyle(element).position)).toBe('fixed');
@@ -430,10 +439,8 @@ test('a manually flagged Family account is preserved when a reviewed cancellatio
   await page.goto('/#/users');
   await page.getByRole('searchbox', { name: 'Search users', exact: true }).fill('crew_owner_3');
   await page.getByRole('button', { name: 'Manage crew_owner', exact: true }).click();
-  await page
-    .getByRole('button', { name: 'Family and owner notes for crew_owner', exact: true })
-    .click();
-  const profile = page.getByRole('dialog', { name: 'Family and owner notes', exact: true });
+  await page.getByRole('tab', { name: 'Family & notes', exact: true }).click();
+  const profile = page.getByRole('dialog', { name: 'Manage @crew_owner', exact: true });
   await profile
     .getByRole('combobox', { name: 'Media account', exact: true })
     .selectOption({ label: 'Jellyfin: crew_owner_3' });
@@ -579,15 +586,11 @@ test('an existing one-account owner can keep a three-slot allowance without prov
   ).not.toBeChecked();
   const submitted = page.waitForRequest(
     (request) =>
-      new URL(request.url()).pathname === '/api/memberships/provision' &&
+      new URL(request.url()).pathname === '/api/memberships/workflow/accept' &&
       request.method() === 'POST',
   );
   expect((await queueMembership(page, admin, 'galleon')).status).toBe('completed');
-  expect((await submitted).postDataJSON()).toMatchObject({
-    expected_account_limit: 3,
-    expected_usernames: ['crew_owner'],
-    provision_jellyfin: false,
-  });
+  expect((await submitted).postDataJSON()).toEqual({ review_token: expect.any(String) });
   expect(
     admin.app.jellyport.service.memberships.get(paidOwner, admin.app.jellyport.store.settings()),
   ).toMatchObject({ account_limit: 3, provision_jellyfin: false });

@@ -57,6 +57,7 @@ import {
   type SourceSnapshotStatus,
   type HistoryCleanupResult,
 } from './types';
+import { WorkflowProvider } from './WorkflowRequirements';
 
 const pages: Record<Page, { title: string; icon: string }> = {
   overview: { title: 'Overview', icon: 'grid' },
@@ -71,9 +72,9 @@ const pages: Record<Page, { title: string; icon: string }> = {
   settings: { title: 'Settings', icon: 'settings' },
 };
 const navigationGroups: { title: string; pages: Page[] }[] = [
-  { title: 'Workspace', pages: ['overview', 'users', 'migrate', 'accounts'] },
-  { title: 'Account management', pages: ['mappings', 'roles', 'memberships'] },
-  { title: 'System', pages: ['activity', 'settings'] },
+  { title: 'People & access', pages: ['users', 'memberships'] },
+  { title: 'Tasks', pages: ['overview', 'migrate', 'accounts', 'activity'] },
+  { title: 'Configuration', pages: ['roles', 'mappings', 'settings'] },
 ];
 
 function accountMessage(credential: Credential): string {
@@ -216,6 +217,11 @@ export default function App() {
   const [pollPaused, setPollPaused] = useState(false);
   const settingsSaveOwner = useRef<symbol | null>(null);
   const [settingsSavePending, setSettingsSavePending] = useState(false);
+  const [memberHandoff, setMemberHandoff] = useState<{
+    id: string;
+    username: string;
+    key: number;
+  }>();
   const notify = useCallback((text: string, error = false) => {
     const id = ++toastId.current;
     setToasts([{ id, message: text, error }]);
@@ -282,6 +288,7 @@ export default function App() {
     setOverview(null);
     setUsers(emptyUsers);
     setMappings([]);
+    setMemberHandoff(undefined);
     setSettings(null);
     settingsSaveOwner.current = null;
     setSettingsSavePending(false);
@@ -1118,6 +1125,14 @@ export default function App() {
         notify={notify}
         navigate={navigate}
         created={created}
+        onMigrate={(ids) => {
+          setSelected(new Set(ids));
+          navigate('migrate');
+        }}
+        onMembership={(member) => {
+          setMemberHandoff({ ...member, key: Date.now() });
+          navigate('memberships');
+        }}
       />
     );
   else if (page === 'memberships' && settings)
@@ -1135,6 +1150,10 @@ export default function App() {
         review={(event) => showDialog({ kind: 'event', event })}
         ignore={ignore}
         busy={busy.has('event')}
+        focusMember={memberHandoff}
+        onFocusConsumed={(key) =>
+          setMemberHandoff((current) => (current?.key === key ? undefined : current))
+        }
       />
     );
   else if (page === 'accounts' && overview && settings)
@@ -1184,189 +1203,199 @@ export default function App() {
     );
   else content = <Loading />;
   return (
-    <WorkspaceNoticeProvider notice={toasts.at(-1)} dismiss={() => setToasts([])}>
-      {booting ? (
-        <div className="boot-screen">
-          <span className="spinner" />
-          <span>Opening Jellyport…</span>
-        </div>
-      ) : !session?.authenticated ? (
-        <AuthScreen
-          session={session}
-          initialError={loginError}
-          api={api}
-          onSession={acceptSession}
-        />
-      ) : (
-        <WorkspaceDraftProvider key={authGeneration.current}>
-          <div className="shell">
-            <a
-              className="skip-link"
-              href="#workspace-content"
-              onClick={(event) => {
-                event.preventDefault();
-                const content = document.getElementById('workspace-content');
-                content?.focus();
-                content?.scrollIntoView?.({ block: 'start' });
-              }}
-            >
-              Skip to content
-            </a>
-            {mobileOpen && (
-              <button
-                className="nav-scrim"
-                aria-label="Close navigation"
-                onClick={() => setMobileOpen(false)}
-              />
-            )}
-            <aside
-              ref={navigation}
-              id="workspace-navigation"
-              className={`sidebar${mobileOpen ? ' mobile-open' : ''}`}
-              aria-label="Main navigation"
-            >
-              <div className="brand">
-                <span className="brand-icon">
-                  <Icon name="logo" />
-                </span>
-                <div>
-                  Jellyport<small>EMBY → JELLYFIN</small>
-                </div>
-              </div>
-              <nav className="nav">
-                {navigationGroups.map((group) => (
-                  <div className="nav-group" key={group.title}>
-                    <div className="nav-label">{group.title}</div>
-                    {group.pages.map((key) => {
-                      const value = pages[key];
-                      return (
-                        <button
-                          className={`nav-button${page === key ? ' active' : ''}`}
-                          aria-current={page === key ? 'page' : undefined}
-                          onClick={() => navigate(key)}
-                          key={key}
-                        >
-                          <Icon name={value.icon} />
-                          {value.title}
-                          {page === key && <span className="nav-dot" />}
-                        </button>
-                      );
-                    })}
-                  </div>
-                ))}
-              </nav>
-              <div className="sidebar-bottom">
-                <div className="operator-card">
-                  <div className="avatar">
-                    {(session.user?.name || 'Admin').slice(0, 2).toUpperCase()}
-                  </div>
-                  <div>
-                    <strong>{session.user?.name || 'Administrator'}</strong>
-                    <span>Jellyfin administrator</span>
-                  </div>
-                  <button
-                    className="icon-button"
-                    onClick={logout}
-                    disabled={busy.has('logout')}
-                    aria-label="Sign out"
-                    title="Sign out"
-                  >
-                    <Icon name="logout" />
-                  </button>
-                </div>
-                <div className="sidebar-note" aria-label="Jellyport version">
-                  v{appVersion}
-                </div>
-              </div>
-            </aside>
-            <main className="main" inert={mobileOpen && navigationDrawer}>
-              <header className="topbar">
-                <button
-                  ref={mobileToggle}
-                  className="icon-button mobile-menu"
-                  onClick={() => setMobileOpen((value) => !value)}
-                  aria-label="Toggle navigation"
-                  aria-expanded={mobileOpen}
-                  aria-controls="workspace-navigation"
-                >
-                  <Icon name="menu" />
-                </button>
-                <div className="breadcrumb">
-                  <span>Workspace</span>
-                  <span>/</span>
-                  <span>{pages[page].title}</span>
-                </div>
-                <div className="topbar-right">
-                  <span className="version-label">Emby → Jellyfin</span>
-                  <span className="operator-label">Admin workspace</span>
-                </div>
-              </header>
-              <div className="content" id="workspace-content" tabIndex={-1}>
-                {session.demo && (
-                  <div className="demo-banner">
-                    <Icon name="info" />
-                    Demo mode is active. Accounts, watch history, and Discord messages use sample
-                    data. Settings are read-only.
-                  </div>
-                )}
-                <WorkspaceNotice />
-                {page === 'migrate' && previewProgress && (
-                  <div className="setup-server preview-progress mb-17" role="status">
-                    <span>
-                      Preparing migration review… {previewProgress.processed} of{' '}
-                      {previewProgress.total} {previewProgress.total === 1 ? 'user' : 'users'}{' '}
-                      complete.
-                    </span>
-                    <button
-                      className="text-button preview-cancel"
-                      type="button"
-                      onClick={cancelPreview}
-                    >
-                      Cancel preview
-                    </button>
-                  </div>
-                )}
-                {pollPaused && hasActive && (
-                  <Callout warning title="Activity updates paused.">
-                    The last known operation status is shown. Refresh Activity to check whether work
-                    is still running before retrying an action.{' '}
-                    <button
-                      type="button"
-                      className="text-button"
-                      onClick={() => {
-                        if (page === 'activity') void load('activity', true);
-                        else navigate('activity');
-                      }}
-                    >
-                      Refresh Activity
-                    </button>
-                  </Callout>
-                )}
-                {content}
-              </div>
-            </main>
+    <WorkflowProvider
+      key={authGeneration.current}
+      api={api}
+      notify={notify}
+      enabled={!!session?.authenticated}
+      demo={!!session?.demo}
+      pendingSave={settingsSavePending}
+      onSettingsSaved={setSettings}
+    >
+      <WorkspaceNoticeProvider notice={toasts.at(-1)} dismiss={() => setToasts([])}>
+        {booting ? (
+          <div className="boot-screen">
+            <span className="spinner" />
+            <span>Opening Jellyport…</span>
           </div>
-        </WorkspaceDraftProvider>
-      )}
-      {session?.authenticated && dialog && (
-        <DialogContent
-          api={api}
-          dialog={dialog}
-          close={closeDialog}
-          startMigration={startMigration}
-          refreshPreview={refreshPreview}
-          reveal={reveal}
-          cancelJob={cancelJob}
-          showReveal={(jobId) => showDialog({ kind: 'reveal', jobId })}
-          clearReport={(job) => reviewHistory([job.id], false, job)}
-          cleanupHistory={cleanupHistory}
-          apply={apply}
-          busy={busy}
-          notify={notify}
-          templateUserId={settings?.template_user_id}
-        />
-      )}
-    </WorkspaceNoticeProvider>
+        ) : !session?.authenticated ? (
+          <AuthScreen
+            session={session}
+            initialError={loginError}
+            api={api}
+            onSession={acceptSession}
+          />
+        ) : (
+          <WorkspaceDraftProvider key={authGeneration.current}>
+            <div className="shell">
+              <a
+                className="skip-link"
+                href="#workspace-content"
+                onClick={(event) => {
+                  event.preventDefault();
+                  const content = document.getElementById('workspace-content');
+                  content?.focus();
+                  content?.scrollIntoView?.({ block: 'start' });
+                }}
+              >
+                Skip to content
+              </a>
+              {mobileOpen && (
+                <button
+                  className="nav-scrim"
+                  aria-label="Close navigation"
+                  onClick={() => setMobileOpen(false)}
+                />
+              )}
+              <aside
+                ref={navigation}
+                id="workspace-navigation"
+                className={`sidebar${mobileOpen ? ' mobile-open' : ''}`}
+                aria-label="Main navigation"
+              >
+                <div className="brand">
+                  <span className="brand-icon">
+                    <Icon name="logo" />
+                  </span>
+                  <div>
+                    Jellyport<small>EMBY → JELLYFIN</small>
+                  </div>
+                </div>
+                <nav className="nav">
+                  {navigationGroups.map((group) => (
+                    <div className="nav-group" key={group.title}>
+                      <div className="nav-label">{group.title}</div>
+                      {group.pages.map((key) => {
+                        const value = pages[key];
+                        return (
+                          <button
+                            className={`nav-button${page === key ? ' active' : ''}`}
+                            aria-current={page === key ? 'page' : undefined}
+                            onClick={() => navigate(key)}
+                            key={key}
+                          >
+                            <Icon name={value.icon} />
+                            {value.title}
+                            {page === key && <span className="nav-dot" />}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </nav>
+                <div className="sidebar-bottom">
+                  <div className="operator-card">
+                    <div className="avatar">
+                      {(session.user?.name || 'Admin').slice(0, 2).toUpperCase()}
+                    </div>
+                    <div>
+                      <strong>{session.user?.name || 'Administrator'}</strong>
+                      <span>Jellyfin administrator</span>
+                    </div>
+                    <button
+                      className="icon-button"
+                      onClick={logout}
+                      disabled={busy.has('logout')}
+                      aria-label="Sign out"
+                      title="Sign out"
+                    >
+                      <Icon name="logout" />
+                    </button>
+                  </div>
+                  <div className="sidebar-note" aria-label="Jellyport version">
+                    v{appVersion}
+                  </div>
+                </div>
+              </aside>
+              <main className="main" inert={mobileOpen && navigationDrawer}>
+                <header className="topbar">
+                  <button
+                    ref={mobileToggle}
+                    className="icon-button mobile-menu"
+                    onClick={() => setMobileOpen((value) => !value)}
+                    aria-label="Toggle navigation"
+                    aria-expanded={mobileOpen}
+                    aria-controls="workspace-navigation"
+                  >
+                    <Icon name="menu" />
+                  </button>
+                  <div className="breadcrumb">
+                    <span>Workspace</span>
+                    <span>/</span>
+                    <span>{pages[page].title}</span>
+                  </div>
+                  <div className="topbar-right">
+                    <span className="version-label">Emby → Jellyfin</span>
+                    <span className="operator-label">Admin workspace</span>
+                  </div>
+                </header>
+                <div className="content" id="workspace-content" tabIndex={-1}>
+                  {session.demo && (
+                    <div className="demo-banner">
+                      <Icon name="info" />
+                      Demo mode is active. Accounts, watch history, and Discord messages use sample
+                      data. Settings are read-only.
+                    </div>
+                  )}
+                  <WorkspaceNotice />
+                  {page === 'migrate' && previewProgress && (
+                    <div className="setup-server preview-progress mb-17" role="status">
+                      <span>
+                        Preparing migration review… {previewProgress.processed} of{' '}
+                        {previewProgress.total} {previewProgress.total === 1 ? 'user' : 'users'}{' '}
+                        complete.
+                      </span>
+                      <button
+                        className="text-button preview-cancel"
+                        type="button"
+                        onClick={cancelPreview}
+                      >
+                        Cancel preview
+                      </button>
+                    </div>
+                  )}
+                  {pollPaused && hasActive && (
+                    <Callout warning title="Activity updates paused.">
+                      The last known operation status is shown. Refresh Activity to check whether
+                      work is still running before retrying an action.{' '}
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={() => {
+                          if (page === 'activity') void load('activity', true);
+                          else navigate('activity');
+                        }}
+                      >
+                        Refresh Activity
+                      </button>
+                    </Callout>
+                  )}
+                  {content}
+                </div>
+              </main>
+            </div>
+          </WorkspaceDraftProvider>
+        )}
+        {session?.authenticated && dialog && (
+          <DialogContent
+            api={api}
+            dialog={dialog}
+            close={closeDialog}
+            startMigration={startMigration}
+            refreshPreview={refreshPreview}
+            reveal={reveal}
+            cancelJob={cancelJob}
+            showReveal={(jobId) => showDialog({ kind: 'reveal', jobId })}
+            clearReport={(job) => reviewHistory([job.id], false, job)}
+            cleanupHistory={cleanupHistory}
+            apply={apply}
+            busy={busy}
+            notify={notify}
+            templateUserId={settings?.template_user_id}
+          />
+        )}
+      </WorkspaceNoticeProvider>
+    </WorkflowProvider>
   );
 }
 

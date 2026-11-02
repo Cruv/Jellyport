@@ -1,10 +1,12 @@
 import { jobOutcome } from './migration-outcome';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
-import { Callout, Empty, Heading, Icon, JobsTable, Status, UserCell } from './components';
+import { Callout, Empty, Heading, Icon, JobsTable, Status, UserCell, Modal } from './components';
 import { ConnectionRows, UserWarnings } from './SettingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
+import WorkflowRequirements, { useWorkflowAction } from './WorkflowRequirements';
 import { Pagination, Tabs, TabPanel, usePagination } from './ui-layout';
-import { navigateWorkspace, useRouteTab } from './routing';
+import { navigateWorkspace, useRouteTab, LocalWorkspaceRoute } from './routing';
+import MembershipsPage from './MembershipsPage';
 import { useWorkspaceDraftState } from './workspace-drafts';
 import {
   activeJob,
@@ -123,6 +125,12 @@ export function OverviewPage({
           <div className="quick-actions">
             {[
               {
+                page: 'users' as Page,
+                icon: 'users',
+                title: 'Manage existing users',
+                text: 'Enable access, manage an owner, or update account details.',
+              },
+              {
                 page: 'migrate' as Page,
                 icon: 'migrate',
                 title: 'Migrate existing users',
@@ -205,6 +213,7 @@ export function MigratePage({
   busy: boolean;
   navigate: (page: Page) => void;
 }) {
+  const taskReadiness = useWorkflowAction(useSnapshots ? 'migrate_saved' : 'migrate');
   const filtered = users.emby.filter((user) =>
     user.Name.toLowerCase().includes(search.trim().toLowerCase()),
   );
@@ -226,7 +235,7 @@ export function MigratePage({
             id="preview-migration"
             className="btn btn-primary"
             onClick={preview}
-            disabled={!selected.size || selected.size > 100 || busy}
+            disabled={!taskReadiness.ready || !selected.size || selected.size > 100 || busy}
           >
             {busy ? <span className="spinner" /> : <Icon name="migrate" />}
             {busy
@@ -235,6 +244,7 @@ export function MigratePage({
           </button>
         }
       />
+      <WorkflowRequirements action={useSnapshots ? 'migrate_saved' : 'migrate'} />
       <div className="steps" aria-label="Migration steps">
         <span className="step active" aria-current="step">
           <span className="step-number">1</span>Select users
@@ -321,6 +331,7 @@ export function MigratePage({
                   aria-label="Select all visible Emby users"
                   checked={!!pagination.items.length && selectedVisible === pagination.items.length}
                   disabled={
+                    !taskReadiness.ready ||
                     busy ||
                     (selectedVisible < pagination.items.length &&
                       selected.size + pagination.items.length - selectedVisible > 100)
@@ -358,7 +369,11 @@ export function MigratePage({
                           type="checkbox"
                           aria-label={`Select ${user.Name}`}
                           checked={selected.has(user.Id)}
-                          disabled={busy || (!selected.has(user.Id) && selected.size >= 100)}
+                          disabled={
+                            !taskReadiness.ready ||
+                            busy ||
+                            (!selected.has(user.Id) && selected.size >= 100)
+                          }
                           onChange={(event) => {
                             const next = new Set(selected);
                             if (event.target.checked) next.add(user.Id);
@@ -479,6 +494,7 @@ export function AccountsPage({
   created: (job: Job) => void;
   navigate: (page: Page) => void;
 }) {
+  const taskReadiness = useWorkflowAction('create_account');
   const [busy, setBusy] = useState('');
   const [task, setTask] = useRouteTab('accounts');
   const [accountUsername, setAccountUsername] = useWorkspaceDraftState('accounts.username', '');
@@ -486,6 +502,58 @@ export function AccountsPage({
     'accounts.discord-member',
     null,
   );
+  const [manualRecipient, setManualRecipient] = useState('');
+  const [creationCheck, setCreationCheck] = useState<{ key: string; error?: string } | null>(null);
+  const [creationRetry, setCreationRetry] = useState(0);
+  const [recipientPolicy, setRecipientPolicy] = useState(false);
+  const effectiveUsername = accountMember?.username || accountUsername;
+  const effectiveRecipient = accountMember?.id || manualRecipient.trim();
+  const creationKey = JSON.stringify([effectiveUsername, effectiveRecipient, settings]);
+  useEffect(() => {
+    if (!taskReadiness.managed || !taskReadiness.ready || !effectiveUsername.trim()) {
+      setCreationCheck(null);
+      return;
+    }
+    const controller = new AbortController();
+    setCreationCheck(null);
+    const timer = setTimeout(() => {
+      void api<{ username: string; discord_user_id?: string; ready: boolean }>(
+        '/api/accounts/review',
+        {
+          method: 'POST',
+          body: {
+            username: effectiveUsername.trim(),
+            ...(effectiveRecipient ? { discord_user_id: effectiveRecipient } : {}),
+          },
+          signal: controller.signal,
+        },
+      )
+        .then((result) => {
+          if (!controller.signal.aborted) {
+            if (
+              !result.ready ||
+              result.username !== effectiveUsername.trim() ||
+              (result.discord_user_id || '') !== effectiveRecipient
+            )
+              throw new Error('The account review changed. Check it again.');
+            setCreationCheck({ key: creationKey });
+          }
+        })
+        .catch((reason: unknown) => {
+          if (!controller.signal.aborted)
+            setCreationCheck({
+              key: creationKey,
+              error: reason instanceof Error ? reason.message : 'The account could not be checked.',
+            });
+        });
+    }, 250);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [api, creationKey, creationRetry, taskReadiness.managed, taskReadiness.ready]);
+  const creationAllowed =
+    !taskReadiness.managed || (creationCheck?.key === creationKey && !creationCheck.error);
   const [recoveryUsername, setRecoveryUsername] = useWorkspaceDraftState(
     'accounts.recovery-username',
     '',
@@ -511,11 +579,12 @@ export function AccountsPage({
     };
   }, []);
   const ready =
+    taskReadiness.ready &&
     overview.connections.jellyfin.connected &&
     (settings.default_role_id || settings.template_user_id);
   async function create(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (busyRef.current) return;
+    if (busyRef.current || !creationAllowed || !taskReadiness.ready) return;
     const form = event.currentTarget;
     const values = new FormData(form);
     const username = String(values.get('username') || '').trim();
@@ -621,11 +690,46 @@ export function AccountsPage({
   }
   return (
     <div className="page-stack">
+      {recipientPolicy && accountMember && (
+        <Modal
+          title="Resolve recipient access"
+          description="Save this member’s access policy, then return to the account draft."
+          close={() => {
+            setRecipientPolicy(false);
+            setCreationRetry((value) => value + 1);
+          }}
+          footer={
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => {
+                setRecipientPolicy(false);
+                setCreationRetry((value) => value + 1);
+              }}
+            >
+              Return to account draft
+            </button>
+          }
+        >
+          <LocalWorkspaceRoute initial={{ page: 'memberships', tab: 'accounts', subtab: 'editor' }}>
+            <MembershipsPage
+              settings={settings}
+              api={api}
+              notify={notify}
+              created={created}
+              embedded
+              initialMember={{ id: accountMember.id, username: accountMember.username }}
+              handoffKey={1}
+            />
+          </LocalWorkspaceRoute>
+        </Modal>
+      )}
       <Heading
         title="Create account"
         description="Create a Jellyfin account with your saved defaults and a secure generated password."
       />
-      {!ready && (
+      <WorkflowRequirements action="create_account" />
+      {!ready && !taskReadiness.state && !taskReadiness.loading && !taskReadiness.error && (
         <Callout icon="warning" warning title="Finish your Jellyfin setup first.">
           Connect Jellyfin and choose a default account role or fallback template in{' '}
           <button
@@ -688,7 +792,8 @@ export function AccountsPage({
                   <input
                     id="account-username"
                     name="username"
-                    value={accountUsername}
+                    value={accountMember?.username || accountUsername}
+                    readOnly={!!accountMember}
                     onChange={(event) => setAccountUsername(event.target.value)}
                     placeholder="Enter a username"
                     required
@@ -723,12 +828,51 @@ export function AccountsPage({
                       : 'Connect your Discord bot in Settings to enable private account delivery.'}
                   </p>
                   <p className="section-note">
-                    Leave Discord blank for an independent, admin-managed account with no
-                    subscription requirement. For non-paying Discord members, save complimentary
-                    access in Memberships first.
+                    Discord delivery is optional. The recipient’s confirmed username is filled in
+                    automatically; independent accounts use the name you enter.
                   </p>
                 </div>
-                <ManualDiscordId id="account-manual-discord" disabled={!!busy || !!accountMember} />
+                <ManualDiscordId
+                  id="account-manual-discord"
+                  disabled={!!busy || !!accountMember}
+                  onValue={setManualRecipient}
+                />
+                {taskReadiness.managed &&
+                  effectiveUsername.trim() &&
+                  (creationCheck?.key !== creationKey ? (
+                    <p role="status">Checking account, recipient, and saved relationships…</p>
+                  ) : creationCheck.error ? (
+                    <Callout warning title="Resolve this before creating the account.">
+                      {creationCheck.error}{' '}
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={() => setCreationRetry((value) => value + 1)}
+                      >
+                        Check account again
+                      </button>{' '}
+                      <button
+                        type="button"
+                        className="text-button"
+                        onClick={() => navigate('users')}
+                      >
+                        Manage existing users
+                      </button>{' '}
+                      {accountMember && (
+                        <button
+                          type="button"
+                          className="text-button"
+                          onClick={() => setRecipientPolicy(true)}
+                        >
+                          Resolve recipient access here
+                        </button>
+                      )}
+                    </Callout>
+                  ) : (
+                    <p className="account-readiness-note">
+                      Account name and recipient checked. Existing relationships will be preserved.
+                    </p>
+                  ))}
                 <Callout
                   icon="key"
                   title="A password will be generated automatically."
@@ -738,7 +882,11 @@ export function AccountsPage({
                   operation will show the reason.
                 </Callout>
                 <div className="form-actions">
-                  <button type="submit" className="btn btn-primary" disabled={!ready || !!busy}>
+                  <button
+                    type="submit"
+                    className="btn btn-primary"
+                    disabled={!ready || !creationAllowed || !!busy}
+                  >
                     {busy === 'create' ? <span className="spinner" /> : <Icon name="userPlus" />}
                     {busy === 'create' ? 'Creating account…' : 'Create account'}
                   </button>
@@ -885,9 +1033,20 @@ export function AccountsPage({
     </div>
   );
 }
-function ManualDiscordId({ id, disabled }: { id: string; disabled: boolean }) {
+function ManualDiscordId({
+  id,
+  disabled,
+  onValue,
+}: {
+  id: string;
+  disabled: boolean;
+  onValue?: (value: string) => void;
+}) {
   const [value, setValue] = useWorkspaceDraftState(`${id}.draft`, '');
   const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    onValue?.(value);
+  }, [value, onValue]);
   useEffect(() => {
     const form = input.current?.form;
     const reset = () => setValue('');

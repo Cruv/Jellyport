@@ -1,7 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
-import IdentityReviewPanel, { StripeIdentityAccountReview } from './IdentityReviewPanel';
+import IdentityReviewPanel, {
+  MemberIdentityAccountReview,
+  StripeIdentityAccountReview,
+} from './IdentityReviewPanel';
 import type {
   IdentityReviewApplyResult,
   IdentityReviewRow,
@@ -114,7 +117,7 @@ describe('reviewed identity matching and access gaps', () => {
     expect(sessionStorage.length).toBe(0);
   });
 
-  it('lets an administrator explicitly approve 227 exact matches in one bounded, paginated review', async () => {
+  it('lets an administrator approve 227 exact media matches without silently confirming suggested billing identities', async () => {
     const value = directory(227);
     const p = page(value);
     await screen.findByText('1–25 of 227');
@@ -138,12 +141,17 @@ describe('reviewed identity matching and access gaps', () => {
     expect(request.selections[0]).toEqual({
       row_id: value.rows[0].id,
       discord_user_id: value.rows[0].member!.id,
-      stripe_customer_ids: ['cus_synthetic0'],
+      stripe_customer_ids: [],
       accounts: [{ kind: 'emby', id: 'emby_synthetic_0', slot: 1 }],
     });
     expect(
       request.selections.every((item: { accounts: { kind: string }[] }) =>
         item.accounts.every((account) => account.kind === 'emby'),
+      ),
+    ).toBe(true);
+    expect(
+      request.selections.every(
+        (item: { stripe_customer_ids: string[] }) => item.stripe_customer_ids.length === 0,
       ),
     ).toBe(true);
     expect(
@@ -381,7 +389,170 @@ describe('reviewed identity matching and access gaps', () => {
     await waitFor(() => expect(onApplied).toHaveBeenCalledOnce());
     expect(
       calls(api, '/api/identity-review/apply')[0][1]!.body.selections[0].stripe_customer_ids,
-    ).toEqual(['cus_synthetic0']);
+    ).toEqual([]);
+  });
+
+  it.each([false, true])(
+    'requires an explicit billing confirmation before including a new customer (confirmed=%s)',
+    async (confirmed) => {
+      const p = page();
+      const dialog = await openFirst();
+      const customer = within(dialog).getByRole('checkbox', {
+        name: 'Confirm Stripe customer Synthetic customer 0',
+      });
+      expect(customer).toHaveProperty('checked', false);
+      if (confirmed) fireEvent.click(customer);
+      fireEvent.click(
+        within(dialog).getByRole('button', { name: 'Approve identity & update roles' }),
+      );
+      await waitFor(() => expect(calls(p.api, '/api/identity-review/apply')).toHaveLength(1));
+      expect(
+        calls(p.api, '/api/identity-review/apply')[0][1]!.body.selections[0].stripe_customer_ids,
+      ).toEqual(confirmed ? ['cus_synthetic0'] : []);
+    },
+  );
+
+  it('reviews one explicitly selected differently named account for the chosen member without adopting other suggestions or billing', async () => {
+    const value = directory(2);
+    const api = vi.fn(
+      async <T,>(path: string) => (path === '/api/identity-review/apply' ? saved : value) as T,
+    ) as Api;
+    const onApplied = vi.fn();
+    render(
+      <MemberIdentityAccountReview
+        api={api}
+        notify={vi.fn()}
+        member={{
+          id: value.rows[1].member!.id,
+          username: 'synthetic.member1',
+          display_name: null,
+          nickname: null,
+          membership_active: null,
+        }}
+        initialAccounts={[{ kind: 'emby', id: 'emby_synthetic_0' }]}
+        onApplied={onApplied}
+        onCancel={vi.fn()}
+      />,
+    );
+    await screen.findByLabelText('Emby · synthetic.member0');
+    expect(screen.queryByLabelText('Emby · synthetic.member1')).toBeNull();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Approve identity & update roles' }));
+    await waitFor(() => expect(onApplied).toHaveBeenCalledOnce());
+    expect(calls(api, '/api/identity-review/apply')[0][1]!.body.selections[0]).toEqual({
+      row_id: value.rows[1].id,
+      discord_user_id: value.rows[1].member!.id,
+      stripe_customer_ids: [],
+      accounts: [{ kind: 'emby', id: 'emby_synthetic_0', slot: 1 }],
+    });
+  });
+
+  it('guards another confirmed owner before showing the scoped association approval', async () => {
+    const value = directory(2);
+    value.accounts[0].owner_discord_id = value.rows[0].member!.id;
+    const api = vi.fn(async <T,>() => value as T) as Api;
+    render(
+      <MemberIdentityAccountReview
+        api={api}
+        notify={vi.fn()}
+        member={{
+          id: value.rows[1].member!.id,
+          username: 'synthetic.member1',
+          display_name: null,
+          nickname: null,
+          membership_active: null,
+        }}
+        initialAccounts={[{ kind: 'emby', id: 'emby_synthetic_0' }]}
+        onApplied={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+    await screen.findByText('The selected account needs an identity correction');
+    expect(screen.queryByRole('button', { name: 'Approve identity & update roles' })).toBeNull();
+    expect(calls(api, '/api/identity-review/apply')).toHaveLength(0);
+  });
+
+  it('pauses a scoped owner review during setup repair without discarding account-slot choices or trapping Cancel', async () => {
+    const value = directory();
+    const api = vi.fn(
+      async <T,>(path: string) => (path === '/api/identity-review/apply' ? saved : value) as T,
+    ) as Api;
+    const onBusyChange = vi.fn();
+    const props = {
+      api,
+      notify: vi.fn(),
+      member: {
+        id: value.rows[0].member!.id,
+        username: 'synthetic.member0',
+        display_name: null,
+        nickname: null,
+        membership_active: null,
+      },
+      initialAccounts: [{ kind: 'emby' as const, id: 'emby_synthetic_0' }],
+      onApplied: vi.fn(),
+      onCancel: vi.fn(),
+      onBusyChange,
+    };
+    const view = render(<MemberIdentityAccountReview {...props} />);
+    const slot = await screen.findByLabelText('Account slot for Emby · synthetic.member0');
+    fireEvent.change(slot, { target: { value: '2' } });
+    view.rerender(<MemberIdentityAccountReview {...props} active={false} />);
+    expect(slot).toHaveProperty('value', '2');
+    expect(screen.getByRole('button', { name: 'Approve identity & update roles' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(screen.getByRole('button', { name: 'Cancel review' })).toHaveProperty('disabled', false);
+    expect(onBusyChange).toHaveBeenLastCalledWith(false);
+    expect(calls(api, '/api/identity-review/apply')).toHaveLength(0);
+    view.rerender(<MemberIdentityAccountReview {...props} active />);
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Approve identity & update roles' }),
+      ).toHaveProperty('disabled', false),
+    );
+    expect(screen.getByLabelText('Account slot for Emby · synthetic.member0')).toHaveProperty(
+      'value',
+      '2',
+    );
+  });
+
+  it('applies an explicit media-only correction to the chosen owner row without moving the original billing proposal', async () => {
+    const value = directory(2);
+    const next = value.rows[1].member!;
+    const p = page(
+      value,
+      {},
+      (async <T,>(path: string) =>
+        (path.startsWith('/api/discord/members?')
+          ? {
+              members: [{ ...next, display_name: null, nickname: null, membership_active: true }],
+              truncated: false,
+            }
+          : path === '/api/identity-review/apply'
+            ? saved
+            : value) as T) as Api,
+    );
+    const dialog = await openFirst();
+    fireEvent.click(
+      within(dialog).getByRole('button', { name: 'Clear Discord member @synthetic.member0' }),
+    );
+    fireEvent.change(within(dialog).getByRole('searchbox', { name: 'Discord member' }), {
+      target: { value: next.username },
+    });
+    fireEvent.click(
+      await within(dialog).findByRole('button', { name: `Select @${next.username}` }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole('button', { name: 'Approve identity & update roles' }),
+    );
+    await waitFor(() => expect(calls(p.api, '/api/identity-review/apply')).toHaveLength(1));
+    expect(calls(p.api, '/api/identity-review/apply')[0][1]!.body.selections[0]).toEqual({
+      row_id: value.rows[1].id,
+      discord_user_id: next.id,
+      stripe_customer_ids: [],
+      accounts: [{ kind: 'emby', id: 'emby_synthetic_0', slot: 1 }],
+    });
   });
 
   it('cancels a bulk review without saving and rejects duplicate same-server slots locally', async () => {

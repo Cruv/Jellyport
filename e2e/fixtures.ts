@@ -54,7 +54,16 @@ export const test = base.extend<{ mutations: string[] }, { demoSession: DemoSess
     const requests: string[] = [];
     page.on('request', (request) => {
       const path = new URL(request.url()).pathname;
-      if (path.startsWith('/api/') && !['GET', 'HEAD'].includes(request.method()))
+      // These bounded POST endpoints only prepare/recheck private workflow evidence.
+      // Durable access/identity endpoints remain recorded and asserted below.
+      const workflowRead =
+        request.method() === 'POST' &&
+        [
+          '/api/memberships/workflow/review',
+          '/api/workflow-readiness/refresh',
+          '/api/accounts/review',
+        ].includes(path);
+      if (path.startsWith('/api/') && !['GET', 'HEAD'].includes(request.method()) && !workflowRead)
         requests.push(`${request.method()} ${path}`);
     });
     await use(requests);

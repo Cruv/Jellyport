@@ -6,6 +6,7 @@ import { useWorkspaceRoute } from './routing';
 import { defaultMembershipTiers, type Api, type Settings } from './types';
 
 vi.mock('./IdentityReviewPanel', () => ({
+  MemberIdentityAccountReview: () => <section aria-label="Member identity review" />,
   default: ({ onApplied }: { onApplied?: () => void }) => (
     <section aria-label="Identity review">
       <h2>Identity links and access gaps</h2>
@@ -14,13 +15,25 @@ vi.mock('./IdentityReviewPanel', () => ({
   ),
 }));
 const settings = { membership_tiers: defaultMembershipTiers } as Settings;
-function page() {
-  const api = vi.fn(async (path: string) => {
+function page(focusMember?: { id: string; username: string; key: number }) {
+  const api = vi.fn(async (path: string, options?: { body?: unknown }) => {
     if (path === '/api/memberships') return { memberships: [] };
     if (path === '/api/user-mappings') return { mappings: [] };
+    if (path === '/api/memberships/workflow/review')
+      return {
+        ...(options?.body as object),
+        username: focusMember?.username,
+        account_limit: 1,
+        accounts: [],
+        warnings: [],
+        policy_only: true,
+        review_token: 'synthetic-review',
+        expires_at: new Date(Date.now() + 300000).toISOString(),
+      };
     throw new Error(`Unexpected request ${path}`);
   }) as Api;
   const review = vi.fn();
+  const onFocusConsumed = vi.fn();
   function Workspace() {
     useWorkspaceRoute();
     return (
@@ -45,11 +58,13 @@ function page() {
         review={review}
         ignore={vi.fn()}
         busy={false}
+        focusMember={focusMember}
+        onFocusConsumed={onFocusConsumed}
       />
     );
   }
   render(<Workspace />);
-  return { api, review };
+  return { api, review, onFocusConsumed };
 }
 afterEach(() => {
   cleanup();
@@ -100,5 +115,28 @@ describe('unified membership workspace', () => {
     expect(screen.getByRole('tab', { name: /^Events/ }).getAttribute('aria-selected')).toBe('true');
     expect(review).not.toHaveBeenCalled();
     expect(vi.mocked(api).mock.calls.every(([, options]) => !options?.method)).toBe(true);
+  });
+  it('continues the selected owner task directly in the member editor without exposing their identity in the route', async () => {
+    window.history.replaceState(null, '', '#/memberships');
+    const { api, onFocusConsumed } = page({
+      id: '123456789012345678',
+      username: 'Synthetic owner',
+      key: 1,
+    });
+    await waitFor(() =>
+      expect(screen.getByRole('tab', { name: 'Manage member' }).getAttribute('aria-selected')).toBe(
+        'true',
+      ),
+    );
+    expect(
+      screen.getByRole('tab', { name: 'Accounts & access' }).getAttribute('aria-selected'),
+    ).toBe('true');
+    expect(screen.getByRole('heading', { name: '@Synthetic owner' })).toBeTruthy();
+    expect(window.location.hash).toBe('#/memberships/accounts/editor');
+    expect(window.location.hash).not.toContain('123456789012345678');
+    expect(onFocusConsumed).toHaveBeenCalledExactlyOnceWith(1);
+    expect(
+      vi.mocked(api).mock.calls.some(([path]) => path.startsWith('/api/discord/members')),
+    ).toBe(false);
   });
 });

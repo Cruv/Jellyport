@@ -24,7 +24,17 @@ const playable = new Set([
   'AudioBook',
   'Trailer',
 ]);
-export type MigrationScope = 'complete' | 'watched_only';
+const favoritable = new Set([
+  ...playable,
+  'Series',
+  'Season',
+  'MusicAlbum',
+  'MusicArtist',
+  'Photo',
+  'PhotoAlbum',
+  'BoxSet',
+]);
+export type MigrationScope = 'complete' | 'watched_only' | 'played_favorites';
 const count = (value: unknown): number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 && value <= 2_147_483_647
     ? value
@@ -53,6 +63,15 @@ export function hasPersonalState(item: MediaItem): boolean {
   );
 }
 
+/** Relevant source state for the reviewed scope; never promote container completion. */
+export function hasMigrationState(item: MediaItem, scope: MigrationScope): boolean {
+  const played = playable.has(item.Type ?? '') && item.UserData?.Played === true;
+  if (scope === 'watched_only') return played;
+  if (scope === 'played_favorites')
+    return played || (favoritable.has(item.Type ?? '') && item.UserData?.IsFavorite === true);
+  return item.Type !== 'Playlist' && hasPersonalState(item);
+}
+
 /** Additive merge: no unwatch, no unfavorite, no summed counts, and ties favor Jellyfin. */
 export function mergeUserData(
   source: MediaItem,
@@ -66,6 +85,13 @@ export function mergeUserData(
     if (!playable.has(source.Type ?? '') || from.Played !== true || to.Played === true)
       return patch;
     patch.Played = true;
+    return patch;
+  }
+  if (scope === 'played_favorites') {
+    if (playable.has(source.Type ?? '') && from.Played === true && to.Played !== true)
+      patch.Played = true;
+    if (favoritable.has(source.Type ?? '') && from.IsFavorite === true && to.IsFavorite !== true)
+      patch.IsFavorite = true;
     return patch;
   }
   if (from.IsFavorite === true && to.IsFavorite !== true) patch.IsFavorite = true;
@@ -105,13 +131,7 @@ export function statePlan(
   preparedMatcher?: PreparedMatcher,
 ): MatchPlan {
   const match = preparedMatcher ?? createMatcher(target, settings.path_mappings);
-  return match(
-    source.filter((item) =>
-      scope === 'watched_only'
-        ? playable.has(item.Type ?? '') && item.UserData?.Played === true
-        : item.Type !== 'Playlist' && hasPersonalState(item),
-    ),
-  );
+  return match(source.filter((item) => hasMigrationState(item, scope)));
 }
 
 export function portableConfiguration(
@@ -243,7 +263,7 @@ export async function readMigrationSource(
   check();
   const items = savedItems;
   const result: SourceSnapshot = { user, items, playlists: [], warnings: [] };
-  if (scope === 'watched_only') return result;
+  if (scope !== 'complete') return result;
   if (!emby.playlists || !emby.playlistItems) {
     result.warnings.push('This source client cannot read playlists.');
     return result;
@@ -314,8 +334,10 @@ export async function migrateItemState(
   } = {},
 ): Promise<number> {
   const concurrency = options.concurrency ?? 6;
-  // Historical jobs and clients may still send "complete". The public migration
-  // writer always transfers only additive played flags, irrespective of that value.
+  // Historical jobs and clients may still send "complete". Only an explicit new
+  // scope authorizes favorites; never broaden an older reviewed played-only job.
+  const scope =
+    options.migration_scope === 'played_favorites' ? 'played_favorites' : 'watched_only';
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 6)
     throw new ServiceError('Migration concurrency must be between 1 and 6.');
   // Every worker must yield before an already-merged history can starve a pending
@@ -329,7 +351,9 @@ export async function migrateItemState(
     stopped();
     migrationWarning(
       details,
-      'Jellyfin partial user-data support could not be verified. Watched flags were not changed.',
+      scope === 'played_favorites'
+        ? 'Jellyfin partial user-data support could not be verified. Played and favorite flags were not changed.'
+        : 'Jellyfin partial user-data support could not be verified. Watched flags were not changed.',
     );
   }
   let applied = 0;
@@ -343,6 +367,7 @@ export async function migrateItemState(
   });
   let inFlight = 0;
   const confirmedPlayed = new Set<string>();
+  const confirmedFavorites = new Set<string>();
   const attemptedTargets = new Set<string>();
   let processed = 0;
   let reportedUpdated = 0;
@@ -363,31 +388,47 @@ export async function migrateItemState(
     }
   };
   guard();
-  const apply = async (match: MatchPlan['matches'][number]): Promise<boolean> => {
+  const apply = async (
+    match: MatchPlan['matches'][number],
+    combined?: MediaUserDataPatch,
+  ): Promise<boolean> => {
     guard();
     try {
-      if (!playable.has(match.source.Type ?? '') || match.source.UserData?.Played !== true)
-        return false;
+      if (!hasMigrationState(match.source, scope)) return false;
       const target = { ...match.target };
       if (confirmedPlayed.has(target.Id)) target.UserData = { ...target.UserData, Played: true };
-      const patch = mergeUserData(match.source, target, 'watched_only');
+      if (confirmedFavorites.has(target.Id))
+        target.UserData = { ...target.UserData, IsFavorite: true };
+      const patch = combined
+        ? {
+            ...(combined.Played === true && target.UserData?.Played !== true
+              ? { Played: true }
+              : {}),
+            ...(combined.IsFavorite === true && target.UserData?.IsFavorite !== true
+              ? { IsFavorite: true }
+              : {}),
+          }
+        : mergeUserData(match.source, target, scope);
       // The access-scoped candidate batch supplied fresh flags. Setting only true is
       // additive and idempotent, so individual chronology reads are unnecessary.
       // The caller independently re-reads all matched flags after workers drain.
       if (!Object.keys(patch).length) {
-        confirmedPlayed.add(target.Id);
+        if (target.UserData?.Played === true) confirmedPlayed.add(target.Id);
+        if (target.UserData?.IsFavorite === true) confirmedFavorites.add(target.Id);
         options.expectation?.(target, {}, []);
         return false;
       }
       const supported = capabilities.userData && !!jellyfin.updateUserData;
-      options.expectation?.(target, patch, supported ? [] : ['Played']);
+      options.expectation?.(target, patch, supported ? [] : Object.keys(patch));
       if (!supported)
         throw new ServiceError(
-          'Watched-flag updates require Jellyfin’s partial user-data API. Legacy watched endpoints were not used because they can change resume positions, dates and counts.',
+          scope === 'played_favorites'
+            ? 'Played and favorite updates require Jellyfin’s partial user-data API. Legacy endpoints were not used because they can change unrelated personal data.'
+            : 'Watched-flag updates require Jellyfin’s partial user-data API. Legacy watched endpoints were not used because they can change resume positions, dates and counts.',
         );
       if (attemptedTargets.has(target.Id))
         throw new ServiceError(
-          'An earlier played-flag update for this destination had an unverified outcome. No duplicate mutation was sent.',
+          'An earlier personal-flag update for this destination had an unverified outcome. No duplicate mutation was sent.',
         );
       guard();
       try {
@@ -403,7 +444,7 @@ export async function migrateItemState(
       inFlight++;
       metrics.peak_in_flight = Math.max(metrics.peak_in_flight, inFlight);
       try {
-        await jellyfin.updateUserData!(userId, target.Id, { Played: true });
+        await jellyfin.updateUserData!(userId, target.Id, patch);
         metrics.succeeded++;
       } catch (error) {
         metrics.failed++;
@@ -414,9 +455,12 @@ export async function migrateItemState(
         metrics.cumulative_ms += elapsed;
         metrics.max_ms = Math.max(metrics.max_ms, elapsed);
       }
-      confirmedPlayed.add(target.Id);
+      if (target.UserData?.Played === true || patch.Played === true) confirmedPlayed.add(target.Id);
+      if (target.UserData?.IsFavorite === true || patch.IsFavorite === true)
+        confirmedFavorites.add(target.Id);
       applied++;
       details.items_updated++;
+      if (patch.IsFavorite === true) details.favorites++;
       saved();
       return true;
     } catch (error) {
@@ -457,9 +501,24 @@ export async function migrateItemState(
       while (!fatal) {
         const group = groups[next++];
         if (!group) return;
+        let combined: MediaUserDataPatch | undefined;
+        if (scope === 'played_favorites') {
+          combined = {};
+          for (let index = 0; index < group.length; index++) {
+            const source = group[index]!.source;
+            if (playable.has(source.Type ?? '') && source.UserData?.Played === true)
+              combined.Played = true;
+            if (favoritable.has(source.Type ?? '') && source.UserData?.IsFavorite === true)
+              combined.IsFavorite = true;
+            if (index > 0 && index % yieldInterval === 0) {
+              await delay(0);
+              guard();
+            }
+          }
+        }
         for (const match of group) {
           if (fatal) return;
-          const changed = await apply(match);
+          const changed = await apply(match, combined);
           processed++;
           if (changed) reportedUpdated++;
           options.progress?.(processed, plan.matches.length, reportedUpdated);

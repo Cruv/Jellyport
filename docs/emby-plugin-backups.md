@@ -66,11 +66,15 @@ Backup creation itself still consumes Emby resources; it was not load-tested her
 
 The verified database layout includes played flags and matching metadata (provider
 IDs, series/episode numbering and paths). It can also contain counts, dates,
-favorites, resume ticks and ratings. Jellyport migrates **played flags only**; those
-other fields are not transferred. Existing broader encrypted projections remain
-readable for compatibility. Mid-episode and mid-movie positions are not supported.
-An unplayed source never clears a Jellyfin played flag or any unrelated personal
-state.
+favorites, resume ticks and ratings. New migrations transfer **played flags and
+favorites** for supported, confidently matched media, including unwatched
+favorites and verified containers such as series and seasons. Existing validated
+encrypted projections already retain favorite state and can be reused without a
+new import solely for this feature. Counts, dates, resume ticks and ratings remain
+untransferred. Mid-episode and mid-movie positions are not supported. Source
+unplayed or non-favorite values never clear Jellyfin watched items, favorites or
+unrelated personal state. Unsupported database type codes remain reported rather
+than guessed.
 
 Supported upgraded column declarations and composite unique indexes are validated
 without arbitrary schema coercion. Invalid display names are omitted and reported

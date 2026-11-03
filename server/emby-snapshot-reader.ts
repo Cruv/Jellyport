@@ -442,7 +442,7 @@ export function readSnapshotHistory(
   scope: MigrationScope = 'complete',
   limits: { maxItems?: number; maxBytes?: number } = {},
 ): SnapshotHistoryResult {
-  if (!['complete', 'watched_only'].includes(scope))
+  if (!['complete', 'watched_only', 'played_favorites'].includes(scope))
     throw new ServiceError('Choose a valid migration scope.');
   if (
     !/^[a-f0-9]{32}$/i.test(publicUserId) ||
@@ -458,19 +458,29 @@ export function readSnapshotHistory(
   return withDatabase(path, (database) => {
     validateLibrary(database);
     const canRecover = recoveredHistory(database);
-    // A watched-only read needs identity metadata and one boolean. Do not fetch or
-    // validate excluded personal state: a bad old timestamp cannot invalidate a flag.
+    // Limited reads need identity metadata and only their requested booleans. Do
+    // not fetch or validate unrelated state: an old bad timestamp cannot invalidate
+    // a played flag or favorite. Keep the full partial-index predicate explicit so
+    // existing projections retain indexed per-user lookups in the new scope.
+    const stateFilter =
+      scope === 'watched_only'
+        ? 'played=1'
+        : scope === 'played_favorites'
+          ? `(${personalState}) AND (played=1 OR isFavorite=1)`
+          : `(${personalState})`;
+    const recoveredFilter = scope === 'played_favorites' ? stateFilter : 'ud.played=1';
     const select = `
       SELECT m.Id,m.type,substr(m.Path,1,8193) AS Path,substr(m.Name,1,1025) AS Name,
         substr(m.ProviderIds,1,16385) AS ProviderIds,m.SeriesId,m.IndexNumber,
         m.ParentIndexNumber,m.IndexNumberEnd,
         substr(s.ProviderIds,1,16385) AS SeriesProviderIds,
         substr(s.Name,1,1025) AS SeriesName,ud.played
+        ${scope === 'played_favorites' ? ',ud.isFavorite' : ''}
         ${scope === 'complete' ? ',m.RunTimeTicks,ud.playCount,ud.isFavorite,ud.playbackPositionTicks,ud.LastPlayedDateInt,ud.rating' : ''}`;
     const query = database.prepare(`${select}
       FROM UserDatas ud CROSS JOIN MediaItems m ON m.UserDataKeyId=ud.UserDataKeyId
       LEFT JOIN MediaItems s ON s.Id=m.SeriesId AND s.type=6
-      WHERE ud.userId=? AND ${scope === 'watched_only' ? 'played=1' : `(${personalState})`}
+      WHERE ud.userId=? AND ${stateFilter}
       LIMIT ?`);
     query.setReadBigInts(true);
     const items: MediaItem[] = [];
@@ -494,8 +504,17 @@ export function readSnapshotHistory(
         diagnostics.unsupported_state_items++;
         return;
       }
-      if ((scope === 'watched_only' || recovered) && !playableTypes.has(type)) return;
-      const data: MediaUserDataPatch = { Played: flag(row.played) };
+      if (
+        (scope === 'watched_only' || (recovered && scope !== 'played_favorites')) &&
+        !playableTypes.has(type)
+      )
+        return;
+      const favorite = scope === 'played_favorites' && flag(row.isFavorite);
+      if (scope === 'played_favorites' && !playableTypes.has(type) && !favorite) return;
+      const data: MediaUserDataPatch = {
+        Played: scope === 'played_favorites' && !playableTypes.has(type) ? false : flag(row.played),
+        ...(scope === 'played_favorites' ? { IsFavorite: favorite } : {}),
+      };
       if (scope === 'complete' && !recovered) {
         data.PlayCount = integer(row.playCount, 0, 2_147_483_647);
         data.IsFavorite = flag(row.isFavorite);
@@ -526,7 +545,8 @@ export function readSnapshotHistory(
         diagnostics.recovered_orphan_state_items!++;
         const previous = accepted.get(item.Id);
         if (previous) {
-          previous.UserData!.Played = true;
+          if (data.Played === true) previous.UserData!.Played = true;
+          if (data.IsFavorite === true) previous.UserData!.IsFavorite = true;
           return;
         }
       }
@@ -570,7 +590,7 @@ export function readSnapshotHistory(
         FROM UserDatas ud CROSS JOIN JellyportRecoveredHistory r ON r.UserDataKeyId=ud.UserDataKeyId
         CROSS JOIN MediaItems m ON m.Id=r.ItemId
         LEFT JOIN MediaItems s ON s.Id=m.SeriesId AND s.type=6
-        WHERE ud.userId=? AND ud.played=1
+        WHERE ud.userId=? AND ${recoveredFilter}
           AND NOT EXISTS (SELECT 1 FROM MediaItems native WHERE native.UserDataKeyId=ud.UserDataKeyId)
         LIMIT ?`);
       recovered.setReadBigInts(true);
@@ -581,11 +601,11 @@ export function readSnapshotHistory(
     // lookups use projection indexes; iteration/limit keep this work bounded.
     const orphans = database.prepare(`
       SELECT 1 FROM UserDatas ud
-      WHERE ud.userId=? AND ${scope === 'watched_only' ? 'played=1' : `(${personalState})`}
+      WHERE ud.userId=? AND ${stateFilter}
         AND NOT EXISTS (SELECT 1 FROM MediaItems m WHERE m.UserDataKeyId=ud.UserDataKeyId)
         ${
           canRecover
-            ? `AND NOT (ud.played=1 AND EXISTS (SELECT 1 FROM JellyportRecoveredHistory r
+            ? `AND NOT ((${recoveredFilter}) AND EXISTS (SELECT 1 FROM JellyportRecoveredHistory r
           JOIN MediaItems m ON m.Id=r.ItemId WHERE r.UserDataKeyId=ud.UserDataKeyId))`
             : ''
         }

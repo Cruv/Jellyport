@@ -231,6 +231,8 @@ export interface JobResult {
   source_snapshot?: SourceSnapshotMetadata;
   username?: string;
   source_username?: string;
+  source_played?: number;
+  source_favorites?: number;
   cloned_from_user_id?: string;
   cloned_from_username?: string;
   mapping_id?: string;
@@ -312,8 +314,8 @@ export interface JobProgress {
   catalog_last_page_ms?: number;
   catalog_cache_hit?: boolean;
 }
-export type MigrationScope = 'watched_only';
-/** Older recorded jobs and API responses may still describe the previous broader scope. */
+export type MigrationScope = 'played_favorites' | 'watched_only';
+/** Older recorded jobs and approvals retain their original transfer scope. */
 export type HistoricalMigrationScope = MigrationScope | 'complete';
 /** Complete describes database capture contents, not the fields a migration imports. */
 export type SnapshotCaptureScope = 'complete' | 'watched_only';

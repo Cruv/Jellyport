@@ -447,6 +447,55 @@ describe('playback-safe catalog and explicit-ID state reads', () => {
     }
   });
 
+  it('reads played and favorite flags together by bounded explicit IDs without counts, dates or recursive filtering', async () => {
+    const values = catalog(6);
+    values[1]!.Type = 'Series';
+    values[2]!.Type = 'Photo';
+    values[4]!.Type = 'Season';
+    values[5]!.Type = 'Playlist';
+    const states = [
+      { Played: true, IsFavorite: false },
+      { Played: false, IsFavorite: true },
+      { IsFavorite: true },
+      { Played: false, IsFavorite: false },
+      { Played: true, IsFavorite: false },
+      { Played: true, IsFavorite: true },
+    ];
+    const requests: URL[] = [];
+    const client = new MediaClient('http://emby.test', 'fixture-key', 'emby', {
+      transport: async (address) => {
+        const url = new URL(address);
+        requests.push(url);
+        expect(url.searchParams.get('Ids')).toBe(values.map((item) => item.Id).join(','));
+        expect(url.searchParams.get('EnableUserData')).toBe('true');
+        expect(url.searchParams.get('EnableTotalRecordCount')).toBe('false');
+        for (const field of ['Recursive', 'SortBy', 'IsPlayed', 'Filters', 'Fields'])
+          expect(url.searchParams.has(field)).toBe(false);
+        return json({
+          Items: values.map((item, index) => ({
+            Id: item.Id,
+            UserData: {
+              ...states[index],
+              PlaybackPositionTicks: 100,
+              PlayCount: 10,
+              LastPlayedDate: '2026-10-15T03:00:00Z',
+              Likes: true,
+              Rating: 8,
+            },
+          })),
+        });
+      },
+    });
+    try {
+      const items = await client.migrationState('alice', values, 'played_favorites');
+      expect(requests).toHaveLength(1);
+      expect(items.map((item) => item.Id)).toEqual(['id-0', 'id-1', 'id-2']);
+      expect(items.map((item) => item.UserData)).toEqual(states.slice(0, 3));
+    } finally {
+      await client.close();
+    }
+  });
+
   it.each([
     { Id: 'outside', UserData: { Played: true } },
     { Id: 'id-0' },

@@ -540,8 +540,8 @@ describe('account migration and subscription safety', () => {
     expect(servers.played['j-river']).toEqual(new Set(['1', '2', '3']));
     expect(store.takeCredentials(job.id)).toEqual([]);
   });
-  it.each([undefined, 'complete', 'watched_only'] as const)(
-    'normalizes scope %s to played flags and preserves all unrelated destination data',
+  it.each(['complete', 'watched_only'] as const)(
+    'retains explicit legacy scope %s and preserves all unrelated destination data',
     async (requestedScope) => {
       servers.userData['e-river'] = {
         '2': {
@@ -770,10 +770,10 @@ describe('account migration and subscription safety', () => {
     };
     await expect(
       service.preview(['e-river'], { migration_scope: 'unknown' as never }),
-    ).rejects.toThrow('Only watched-status migration');
+    ).rejects.toThrow('Choose played-status and favorites migration');
     await expect(
       service.migrateUsers(['e-river'], {}, undefined, 'unknown' as never),
-    ).rejects.toThrow('Only watched-status migration');
+    ).rejects.toThrow('Choose played-status and favorites migration');
     expect(reads).not.toHaveBeenCalled();
     expect(store.jobs()).toEqual([]);
   });
@@ -1678,7 +1678,7 @@ describe('account migration and subscription safety', () => {
       store.settings(),
     );
   }
-  it('imports only played flags while excluding resume, favorites, dates, counts and container-only state', async () => {
+  it('legacy played-only scope imports only played flags while excluding resume, favorites, dates, counts and container-only state', async () => {
     servers.media.push(
       { Id: 'series', Type: 'Series', Name: 'Continuing show', ProviderIds: { Tvdb: '100' } },
       {
@@ -1702,10 +1702,10 @@ describe('account migration and subscription safety', () => {
       series: { IsFavorite: true },
       season: { IsFavorite: true },
     };
-    const preview = await service.preview(['e-sam']);
+    const preview = await service.preview(['e-sam'], { migration_scope: 'watched_only' });
     expect(preview.users[0]?.stats).toBeNull();
     expect(preview.users[0]?.history_deferred).toBe(true);
-    const job = await finish(await service.migrateUsers(['e-sam']));
+    const job = await finish(await service.migrateUsers(['e-sam'], {}, undefined, 'watched_only'));
     expect(job.results[0]).toMatchObject({
       source_items: 1,
       source_played: 1,
@@ -1726,7 +1726,9 @@ describe('account migration and subscription safety', () => {
       ratings: 0,
       failed_items: 0,
     });
-    const repeat = await finish(await service.migrateUsers(['e-sam']));
+    const repeat = await finish(
+      await service.migrateUsers(['e-sam'], {}, undefined, 'watched_only'),
+    );
     expect(repeat.results[0]?.applied).toBe(0);
     expect(repeat.results[0]?.data?.items_updated).toBe(0);
   });

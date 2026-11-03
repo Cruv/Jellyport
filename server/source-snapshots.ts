@@ -240,6 +240,9 @@ export class SourceSnapshots {
       source_server_version: value.binding.version,
       source_user_id: userId,
       source_username: username,
+      // Capture requests never trim UserDatas by migration scope. Existing
+      // allowlisted projections retain favorites, including favorite-only rows;
+      // readers choose played-only or played-and-favorites after selection.
       scope: 'complete',
       started_at: value.started_at,
       finished_at: value.finished_at,

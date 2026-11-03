@@ -79,9 +79,32 @@ describe('large local snapshot histories', () => {
       expect(
         readSnapshotItems(projected, Object.keys(identities)[0]!, identities, 'watched_only'),
       ).toHaveLength(83);
+      const favoritesStart = performance.now();
+      let favoriteScopeItems = 0;
+      for (const id of Object.keys(identities)) {
+        const items = readSnapshotItems(projected, id, identities, 'played_favorites');
+        expect(items).toHaveLength(167);
+        expect(items.filter((item) => item.UserData?.Played === true)).toHaveLength(83);
+        expect(items.filter((item) => item.UserData?.IsFavorite === true)).toHaveLength(84);
+        expect(items[0]!.Id).toBe('95001');
+        expect(items.at(-1)!.Id).toBe('99981');
+        expect(
+          items.every(
+            (item) => Object.keys(item.UserData!).sort().join(',') === 'IsFavorite,Played',
+          ),
+        ).toBe(true);
+        favoriteScopeItems += items.length;
+      }
+      const favoritesReadsMs = performance.now() - favoritesStart;
+      expect(favoriteScopeItems).toBe(16_700);
       // Reject size overruns rather than truncating/migrating partial history.
       expect(() =>
         readSnapshotItems(projected, Object.keys(identities)[0]!, identities, 'complete', {
+          maxItems: 100,
+        }),
+      ).toThrow('history size');
+      expect(() =>
+        readSnapshotItems(projected, Object.keys(identities)[0]!, identities, 'played_favorites', {
           maxItems: 100,
         }),
       ).toThrow('history size');
@@ -101,6 +124,8 @@ describe('large local snapshot histories', () => {
           returned_items: totalItems,
           projection_ms: Math.round(projectionMs),
           history_reads_ms: Math.round(readsMs),
+          played_favorite_items: favoriteScopeItems,
+          played_favorite_reads_ms: Math.round(favoritesReadsMs),
         }),
       );
     } finally {

@@ -490,7 +490,7 @@ export default function MigrationPreviewDialog({
   return (
     <Modal
       title="Review your migration"
-      description={`${users.length} ${users.length === 1 ? 'account' : 'accounts'} selected · played status only`}
+      description={`${users.length} ${users.length === 1 ? 'account' : 'accounts'} selected · ${review.preview.migration_scope === 'played_favorites' ? 'played status and favorites' : 'played status only'}`}
       wide
       close={close}
       footer={
@@ -912,10 +912,23 @@ export default function MigrationPreviewDialog({
         {step === 3 && (
           <div className="form-stack">
             <Callout icon="shield" title="Preview before you move.">
-              Played flags from either server are preserved. Only played or unplayed status is
-              migrated; resume positions, playback dates, play counts, favorites, playlists,
-              ratings, profile images, and preferences are not imported. Existing Jellyfin personal
-              state stays unchanged. New accounts still use your account role or template defaults.
+              {review.preview.migration_scope === 'played_favorites' ? (
+                <>
+                  Played flags and favorites from either server are preserved. Matched Emby
+                  favorites are added even when they have not been watched. Resume positions,
+                  playback dates, play counts, playlists, ratings, profile images, and preferences
+                  are not imported. Existing Jellyfin progress and other personal state stay
+                  unchanged.
+                </>
+              ) : (
+                <>
+                  Played flags from either server are preserved. This older review migrates played
+                  status only; favorites, resume positions, playback dates, play counts, playlists,
+                  ratings, profile images, and preferences are not imported. Existing Jellyfin
+                  personal state stays unchanged.
+                </>
+              )}{' '}
+              New accounts still use your account role or template defaults.
             </Callout>
             {review.preview.source_snapshot_ids && (
               <Callout title="Saved Emby data selected.">
@@ -996,6 +1009,13 @@ export default function MigrationPreviewDialog({
                               <strong>{num(user.stats.source_played)}</strong>
                               <span>Played in Emby</span>
                             </div>
+                            {review.preview.migration_scope === 'played_favorites' &&
+                              user.stats.source_favorites !== undefined && (
+                                <div className="preview-stat">
+                                  <strong>{num(user.stats.source_favorites)}</strong>
+                                  <span>Favorites in Emby</span>
+                                </div>
+                              )}
                             <div className="preview-stat">
                               <strong>{num(user.stats.matched)}</strong>
                               <span>Matched to Jellyfin</span>
@@ -1016,8 +1036,12 @@ export default function MigrationPreviewDialog({
                       ) : (
                         <Callout title="History details deferred">
                           This lightweight review checks accounts without scanning their history.
-                          Matching and played flags are read after approval. Counts and item issues
-                          will appear in the migration results.
+                          Matching and{' '}
+                          {review.preview.migration_scope === 'played_favorites'
+                            ? 'played flags and favorites'
+                            : 'played flags'}{' '}
+                          are read after approval. Counts and item issues will appear in the
+                          migration results.
                         </Callout>
                       )}
                     </details>

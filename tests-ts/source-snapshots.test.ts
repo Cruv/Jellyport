@@ -295,6 +295,33 @@ it.each<Record<string, number>>([
   },
 );
 
+it('reuses complete captures for favorites even with a legacy watched-only schedule', async () => {
+  const f = await fixture();
+  const config = (await f.manager.status()).config;
+  await f.manager.configure({
+    ...config,
+    scope: 'watched_only',
+    expected_revision: config.revision,
+  });
+  const request = await f.request();
+  expect(request).not.toHaveProperty('scope');
+  await f.finish(request);
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server');
+  expect(selected.metadata.scope).toBe('complete');
+  const favorite = {
+    Id: 'favorite-only-series',
+    Type: 'Series',
+    UserData: { Played: false, IsFavorite: true },
+  };
+  worker.mockResolvedValueOnce([favorite]);
+  expect(await f.manager.items(selected, userId, 'played_favorites')).toEqual([favorite]);
+  expect(worker.mock.calls[0][0]).toMatchObject({
+    operation: 'read',
+    user_id: userId,
+    scope: 'played_favorites',
+  });
+});
+
 it('keeps per-user history diagnostics on that read instead of the shared decrypted database cache', async () => {
   const f = await fixture();
   await f.complete({ identities: { [userId]: 7, [otherUserId]: 8 } });

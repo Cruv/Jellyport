@@ -733,7 +733,7 @@ export default function App() {
           method: 'POST',
           body: {
             source_user_ids: sourceUserIds,
-            migration_scope: 'watched_only',
+            migration_scope: 'played_favorites',
             ...(savedSource ? { use_snapshots: true } : {}),
           },
           // Receive the task ID even if the user leaves while this short request is in flight.
@@ -781,8 +781,11 @@ export default function App() {
           reviewElapsedMs: task.elapsed_ms,
           preview: {
             ...task.preview,
-            // An older preview cannot expand the scope of the explicit flags-only approval.
-            migration_scope: 'watched_only',
+            // Preserve an older review's played-only approval; favorites require a current review.
+            migration_scope:
+              task.preview.migration_scope === 'played_favorites'
+                ? 'played_favorites'
+                : 'watched_only',
             ...(task.preview.source_snapshot_ids
               ? { source_snapshot_ids: { ...task.preview.source_snapshot_ids } }
               : {}),
@@ -849,7 +852,10 @@ export default function App() {
         body: {
           source_user_ids: ids,
           preview_id: dialog.previewId,
-          migration_scope: 'watched_only',
+          migration_scope:
+            dialog.preview.migration_scope === 'played_favorites'
+              ? 'played_favorites'
+              : 'watched_only',
           ...(dialog.preview.source_snapshot_ids
             ? { source_snapshot_ids: dialog.preview.source_snapshot_ids }
             : {}),
@@ -1631,11 +1637,11 @@ function DialogContent({
     const cloneJob = job.kind === 'clone';
     const historicalMigration =
       migrationJob &&
-      (job.migration_scope !== 'watched_only' ||
+      (!['watched_only', 'played_favorites'].includes(job.migration_scope ?? '') ||
         job.results?.some(
           ({ data }) =>
             data &&
-            (data.favorites ||
+            ((job.migration_scope !== 'played_favorites' && data.favorites) ||
               data.resume_positions ||
               data.play_counts ||
               data.last_played_dates ||
@@ -1661,9 +1667,11 @@ function DialogContent({
         description={
           cloneJob
             ? 'New independent accounts with copied settings and played flags. The source account is preserved.'
-            : job.migration_scope === 'watched_only'
-              ? 'Played-status migration. Review matching coverage and verified transfers.'
-              : 'Follow account changes and review delivery results.'
+            : job.migration_scope === 'played_favorites'
+              ? 'Played-status and favorites migration. Review matching coverage and verified transfers.'
+              : job.migration_scope === 'watched_only'
+                ? 'Played-status migration. Review matching coverage and verified transfers.'
+                : 'Follow account changes and review delivery results.'
         }
         close={close}
         footer={
@@ -1707,8 +1715,8 @@ function DialogContent({
         </div>
         {historicalMigration && (
           <Callout icon="info" title="Historical migration">
-            This job used an earlier migration scope. Its recorded results may include personal data
-            that current migrations no longer import.
+            This job used an earlier migration scope. Its recorded field counts describe that run;
+            new migrations merge played status and favorites only.
           </Callout>
         )}
         <JobProgressDetails job={job} />
@@ -1867,9 +1875,16 @@ function DialogContent({
               )}
               {result.matched !== undefined && <span>{num(result.matched)} matched</span>}
               {result.applied !== undefined && (
-                <span className="mint">{num(result.applied)} played updates</span>
+                <span className="mint">
+                  {num(result.applied)}{' '}
+                  {job.migration_scope === 'played_favorites' ? 'item updates' : 'played updates'}
+                </span>
               )}
               {!!result.already_played && <span>{num(result.already_played)} already played</span>}
+              {job.migration_scope === 'played_favorites' &&
+                result.source_favorites !== undefined && (
+                  <span>{num(result.source_favorites)} source favorites</span>
+                )}
               {!!result.unmatched && <span>{num(result.unmatched)} unmatched</span>}
               {!!result.ambiguous && <span>{num(result.ambiguous)} ambiguous</span>}
               {result.data && (
@@ -1878,7 +1893,12 @@ function DialogContent({
                   {!!result.data.failed_items && (
                     <span>{num(result.data.failed_items)} failed updates</span>
                   )}
-                  {!!result.data.favorites && <span>{num(result.data.favorites)} favorites</span>}
+                  {!!result.data.favorites && (
+                    <span>
+                      {num(result.data.favorites)}{' '}
+                      {job.migration_scope === 'played_favorites' ? 'favorites added' : 'favorites'}
+                    </span>
+                  )}
                   {!!result.data.resume_positions && (
                     <span>{num(result.data.resume_positions)} resume positions</span>
                   )}
@@ -1907,7 +1927,10 @@ function DialogContent({
             </div>
             {result.data?.write_metrics && (
               <p className="subtle text-small">
-                Played-status write requests: {num(result.data.write_metrics.attempts)} attempted ·{' '}
+                {job.migration_scope === 'played_favorites'
+                  ? 'Played-status and favorites'
+                  : 'Played-status'}{' '}
+                write requests: {num(result.data.write_metrics.attempts)} attempted ·{' '}
                 {num(result.data.write_metrics.succeeded)} succeeded ·{' '}
                 {num(result.data.write_metrics.failed)} failed · peak{' '}
                 {num(result.data.write_metrics.peak_in_flight)} in flight. Cumulative request time:{' '}
@@ -1950,12 +1973,25 @@ function DialogContent({
             )}
             {result.data?.verification && (
               <p className="subtle text-small">
-                Independent {job.migration_scope === 'watched_only' ? 'played-status' : 'history'}{' '}
+                Independent{' '}
+                {job.migration_scope === 'played_favorites'
+                  ? 'played-status and favorites'
+                  : job.migration_scope === 'watched_only'
+                    ? 'played-status'
+                    : 'history'}{' '}
                 verification: {num(result.data.verification.verified)} verified ·{' '}
-                {num(result.data.verification.preserved_newer)} newer Jellyfin activity preserved ·{' '}
+                {job.migration_scope !== 'played_favorites' && (
+                  <>
+                    {num(result.data.verification.preserved_newer)} newer Jellyfin activity
+                    preserved ·{' '}
+                  </>
+                )}
                 {num(result.data.verification.missing)} missing ·{' '}
                 {num(result.data.verification.mismatched)} mismatched ·{' '}
                 {num(result.data.verification.unsupported_fields)} unsupported fields.
+                {job.migration_scope === 'played_favorites' && (
+                  <> Existing Jellyfin playback progress and other personal fields are preserved.</>
+                )}
               </p>
             )}
             {result.data?.warnings.map((warning, index) => (

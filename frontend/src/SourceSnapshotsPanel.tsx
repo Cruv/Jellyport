@@ -104,8 +104,8 @@ export default function SourceSnapshotsPanel({
                   : 'Emby can keep running while a consistent SQLite online backup is captured.'}
               </>
             )}{' '}
-            This avoids a full library scan through Emby’s API. Migrations use only played flags
-            from the captured database.
+            This avoids a full library scan through Emby’s API. Migrations use played flags and
+            favorites from the captured database.
           </p>
         </details>
         {hasPluginBackups && (

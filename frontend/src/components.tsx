@@ -317,10 +317,13 @@ export function JobsTable({
             <tr key={job.id}>
               <td data-label="Operation">
                 <strong>
-                  {job.migration_scope === 'watched_only' &&
+                  {job.migration_scope === 'played_favorites' &&
                   ['migrate', 'migration'].includes(job.kind)
-                    ? 'Played-status migration'
-                    : names[job.kind] || job.kind || 'Account operation'}
+                    ? 'Played-status and favorites migration'
+                    : job.migration_scope === 'watched_only' &&
+                        ['migrate', 'migration'].includes(job.kind)
+                      ? 'Played-status migration'
+                      : names[job.kind] || job.kind || 'Account operation'}
                 </strong>
                 <small>
                   {job.results
@@ -681,22 +684,30 @@ export function JobProgressDetails({ job }: { job: Job }) {
   const progress = typeof job.progress === 'object' ? job.progress : undefined;
   const running = activeJob(job);
   const elapsed = jobElapsed(job);
+  const playedFavorites = job.migration_scope === 'played_favorites';
+  const playedOnly = job.kind === 'clone' || job.migration_scope === 'watched_only';
   const phases = {
-    reading_source:
-      job.migration_scope === 'watched_only' ? 'Reading Emby played flags' : 'Reading Emby library',
+    reading_source: playedFavorites
+      ? 'Reading Emby played flags and favorites'
+      : playedOnly
+        ? 'Reading Emby played flags'
+        : 'Reading Emby library',
     preparing_account: 'Preparing Jellyfin account',
     indexing_target: 'Preparing shared Jellyfin matching index',
-    reading_target:
-      job.migration_scope === 'watched_only'
+    reading_target: playedFavorites
+      ? 'Reading Jellyfin played status and favorites'
+      : playedOnly
         ? 'Reading Jellyfin played status'
         : 'Reading Jellyfin account history',
     matching: 'Matching media identities',
-    verifying_history:
-      job.migration_scope === 'watched_only'
+    verifying_history: playedFavorites
+      ? 'Verifying Jellyfin played status and favorites'
+      : playedOnly
         ? 'Verifying Jellyfin played status'
         : 'Verifying Jellyfin watch history',
-    transferring_history:
-      job.migration_scope === 'watched_only'
+    transferring_history: playedFavorites
+      ? 'Migrating played status and favorites'
+      : playedOnly
         ? 'Migrating watched status'
         : 'Migrating watch history and favorites',
     transferring_playlists: 'Migrating playlists',

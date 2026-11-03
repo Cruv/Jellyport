@@ -39,7 +39,7 @@ test('creates an independent account and reveals its credentials only on request
   await expect(page.getByRole('table')).toContainText(username);
 });
 
-test('explicit approval runs a played-only migration through the real demo backend', async ({
+test('explicit approval runs a played-status and favorites migration through the real demo backend', async ({
   page,
   mutations,
 }) => {
@@ -63,14 +63,14 @@ test('explicit approval runs a played-only migration through the real demo backe
   const { id } = await response.json();
   const details = page.getByRole('dialog', { name: 'Migration details' });
   await expect(details).toBeVisible();
-  await expect(details).toContainText('Independent played-status verification', {
+  await expect(details).toContainText('Independent played-status and favorites verification', {
     timeout: 15_000,
   });
   await expect
     .poll(async () => (await (await page.request.get(`/api/jobs/${id}`)).json()).status)
     .toBe('completed');
   const job = await (await page.request.get(`/api/jobs/${id}`)).json();
-  expect(job.migration_scope).toBe('watched_only');
+  expect(job.migration_scope).toBe('played_favorites');
   expect(job.results).toHaveLength(1);
   const result = job.results[0];
   expect(result.username).toBe('river');

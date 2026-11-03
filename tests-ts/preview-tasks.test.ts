@@ -9,23 +9,25 @@ const flush = async () => {
 };
 afterEach(() => vi.useRealTimers());
 
-it.each([undefined, 'complete', 'watched_only'] as const)(
-  'narrows selected migration scope %s to watched-only in its isolated runner',
+it.each([undefined, 'complete', 'watched_only', 'played_favorites'] as const)(
+  'retains the selected migration scope %s in its isolated runner',
   async (scope) => {
     const run = vi.fn(async (_ids: string[], controls: { migration_scope: MigrationScope }) => ({
       scope: controls.migration_scope,
     }));
     const tasks = new PreviewTasks(run);
     try {
+      const expected =
+        scope === undefined || scope === 'played_favorites' ? 'played_favorites' : 'watched_only';
       const task = tasks.start('owner', 'config', ['source'], scope);
       expect(run).not.toHaveBeenCalled();
       await flush();
       expect(run).toHaveBeenCalledWith(
         ['source'],
-        expect.objectContaining({ migration_scope: 'watched_only' }),
+        expect.objectContaining({ migration_scope: expected }),
       );
       expect(tasks.get('owner', 'config', task.id)?.preview).toEqual({
-        scope: 'watched_only',
+        scope: expected,
       });
       expect(tasks.get('other-owner', 'config', task.id)).toBeUndefined();
       expect(tasks.cancel('other-owner', task.id)).toBe(false);

@@ -22,6 +22,7 @@ import { resolve } from 'node:path';
 import { Store } from './store.js';
 import {
   Service,
+  migrationScope,
   type ReviewedHouseholdAccount,
   type ReviewedMigrationMembership,
   type ReviewedMigrationTarget,
@@ -145,7 +146,7 @@ const migrationSchema = {
   properties: {
     preview_id: snapshotId,
     source_user_ids: { type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: id },
-    migration_scope: { type: 'string', enum: ['complete', 'watched_only'] },
+    migration_scope: { type: 'string', enum: ['complete', 'watched_only', 'played_favorites'] },
     use_snapshots: { type: 'boolean' },
     source_snapshot_ids: {
       type: 'object',
@@ -1150,7 +1151,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             request.cookies[COOKIE]!,
             previewContext(),
             request.body.source_user_ids,
-            'watched_only',
+            migrationScope(request.body.migration_scope),
             request.body.use_snapshots ?? false,
           ),
         );
@@ -1532,6 +1533,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             'This migration review changed or was canceled. Prepare a new review.',
           );
       };
+      let acceptedScope = migrationScope(request.body.migration_scope);
       let mappingRevisions = request.body.mapping_revisions;
       let previewTiming;
       if (request.body.preview_id) {
@@ -1545,6 +1547,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             'This migration review expired or is unavailable. Prepare a new review.',
           );
         const preview = reviewed.preview;
+        const reviewedScope = migrationScope(preview.migration_scope, 'watched_only');
+        if (request.body.migration_scope !== undefined && acceptedScope !== reviewedScope)
+          throw new ServiceError(
+            'The migration scope differs from this review. Prepare a new review.',
+          );
+        acceptedScope = reviewedScope;
         const exactRecord = (
           expected: Record<string, string | null> | undefined,
           actual: Record<string, string | null> | undefined,
@@ -1584,7 +1592,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           request.body.source_user_ids,
           request.body.discord_recipients,
           mappingRevisions,
-          'watched_only',
+          acceptedScope,
           request.body.source_snapshot_ids,
           previewTiming,
           reviewed?.preview?.history_only_targets,

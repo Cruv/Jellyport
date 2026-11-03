@@ -208,7 +208,7 @@ describe('playback-conscious migration orchestration', () => {
     expect(catalogReads).toHaveBeenCalledTimes(1);
     expect(stateReads.map((call) => call.id)).toEqual(['e-river', 'e-sam']);
     expect(
-      stateReads.every((call) => call.scope === 'watched_only' && call.catalog === catalog),
+      stateReads.every((call) => call.scope === 'played_favorites' && call.catalog === catalog),
     ).toBe(true);
     expect(catalog!.every((item) => !Object.hasOwn(item, 'UserData'))).toBe(true);
     expect(Object.isFrozen(catalog)).toBe(true);
@@ -226,7 +226,7 @@ describe('playback-conscious migration orchestration', () => {
     });
     expect(servers.played['j-river']!.has('1')).toBe(true);
     const sam = servers.users.jellyfin.find((user) => user.Name === 'sam')!;
-    expect(servers.userData[sam.Id]?.['2']).toEqual({ Played: true });
+    expect(servers.userData[sam.Id]?.['2']).toEqual({ Played: true, IsFavorite: true });
 
     // A separate job refreshes the expired metadata once, then the next job shares it.
     expect((await finish(await service.migrateUsers(['e-river']))).status).toBe('completed');

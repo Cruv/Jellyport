@@ -1,11 +1,13 @@
 # Migration workload and playback safety
 
-Current migration transfers **played / unplayed flags only**. It never clears an
-existing Jellyfin played flag and does not import resume positions, counts, dates,
-favorites, ratings, playlists, source preferences or profile images. Backup
-projections may retain broader fields for format compatibility; only matching
-metadata and played flags drive the current transfer. Historical investigations
-and measurements below retain their original inputs and limitations.
+Current migration transfers **played status and favorites**. It only adds positive
+flags and never clears existing Jellyfin watched items or favorites. Resume
+positions, counts, dates, ratings, playlists, source preferences and profile images
+remain untouched. Existing validated backup projections retain the favorite fields
+needed by this scope. Matching, batching, concurrency and cancellation limits remain
+in force. Favorites can add matching/read/write work; the dated played-only timings
+below do not establish production timings for favorite transfer. Historical
+investigations and measurements retain their original inputs and limitations.
 
 ## Played-only production trials — 2026-10-16
 
@@ -184,7 +186,7 @@ An approved live migration separates two kinds of source information:
    again for each preview and account.
 2. **Fresh account state.** For each account, `/Users/{id}/Items` reads explicit
    batches of catalog `Ids`. These requests omit recursive enumeration, media-type
-   filtering, name sorting and total counts. They request user state; only played playable items are retained for migration. The API may omit deleted or inaccessible
+   filtering, name sorting and total counts. They request user state; played playable items and supported favorites are retained for migration. The API may omit deleted or inaccessible
    IDs. Unexpected or repeated IDs and changed item types fail the read.
 
 The in-process metadata cache is bound to the source URL, API key, server identity
@@ -424,7 +426,7 @@ discards the partial index. These destination limits do not relax Emby's separat
 five-second deadline or source governor. Explicit-ID account reads retain their
 30-second deadline and at most three attempts for HTTP 429/503, with each retry
 delay capped at two seconds. Reads do not fan out. That release kept a four-worker ceiling for independent destination item
-transfers. Current played-only writes use at most six workers; account jobs remain
+transfers. Current played/favorite writes use at most six workers; account jobs remain
 serialized and no mutation is retried automatically. Cold collection
 still costs database work; sharing it removes repeated per-account work.
 
@@ -439,15 +441,15 @@ fallback to a full per-user destination crawl when a bound or validation fails.
 and its [watched-state model](https://github.com/luigi311/JellyPlex-Watched/blob/1741166ee439a97d936a0e3a3d39fec4500dd757/src/watched.py#L39)
 inform the separation of reusable matching metadata from account activity. That
 project still enumerates destination libraries; it is not a drop-in solution to
-this bottleneck. Jellyport now limits transfer to played flags; resume filters and
+this bottleneck. Jellyport now limits transfer to played and favorite flags; resume filters and
 other personal-state transfer are outside its scope. Any future filtered-query
 optimization still needs behavior checks for identity, access and pagination.
 
 ## Historical complete-state filter investigation
 
 This section records the earlier broad-state design. Current migration uses played
-flags only; the observations remain evidence about API behavior, not a claim that
-counts, dates, favorites or resume positions are still migrated.
+and favorite flags only; the observations remain evidence about API behavior, not
+a claim that counts, dates or resume positions are still migrated.
 
 The API behavior was checked using an isolated official Emby 4.10.1.0 container,
 synthetic accounts, and twenty synthetic movies. No production server was used.

@@ -153,7 +153,7 @@ describe('reviewed manual migration account slots', () => {
       ids,
       Object.fromEntries(ids.map((id) => [id, owner])),
       { [ids[0]!]: null, [ids[1]!]: null },
-      'watched_only',
+      'played_favorites',
       undefined,
       expect.objectContaining({ preview_id: review.id }),
       undefined,

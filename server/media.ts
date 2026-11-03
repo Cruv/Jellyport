@@ -89,7 +89,7 @@ export interface MediaAPI {
   migrationState?(
     userId: string,
     catalog: MediaItem[],
-    scope?: 'complete' | 'watched_only',
+    scope?: 'complete' | 'watched_only' | 'played_favorites',
   ): Promise<MediaItem[]>;
   /** Fresh, access-scoped destination data for matched catalog candidates only. */
   destinationItems?(userId: string, candidates: MediaItem[]): Promise<MediaItem[]>;
@@ -185,6 +185,7 @@ const playableTypes = new Set([
 ]);
 const MIGRATION_ITEM_TYPES =
   'Movie,Episode,Series,Season,Audio,MusicAlbum,MusicArtist,MusicVideo,Video,Book,AudioBook,Photo,PhotoAlbum,BoxSet,Trailer';
+const favoriteTypes = new Set(MIGRATION_ITEM_TYPES.split(','));
 const PLAYLIST_MEDIA_TYPES = new Set(['Audio', 'Video', 'Photo', 'Book']);
 
 function itemIdentifier(value: unknown): value is string {
@@ -1070,7 +1071,7 @@ export class MediaClient implements MediaAPI {
   async migrationState(
     userId: string,
     catalog: MediaItem[],
-    scope: 'complete' | 'watched_only' = 'complete',
+    scope: 'complete' | 'watched_only' | 'played_favorites' = 'complete',
   ): Promise<MediaItem[]> {
     if (this.kind !== 'emby')
       throw new MediaError('Explicit migration-state reads are verified only for Emby sources.');
@@ -1078,7 +1079,7 @@ export class MediaClient implements MediaAPI {
     if (
       !Array.isArray(catalog) ||
       catalog.length > MAX_CATALOG_ITEMS ||
-      !['complete', 'watched_only'].includes(scope)
+      !['complete', 'watched_only', 'played_favorites'].includes(scope)
     )
       throw new MediaError('Invalid migration state catalog.');
     const seenCatalog = new Set<string>();
@@ -1114,7 +1115,9 @@ export class MediaClient implements MediaAPI {
           EnableUserData: 'true',
           EnableImages: 'false',
           EnableTotalRecordCount: 'false',
-          ...(this.kind === 'emby' ? { Fields: 'UserDataPlayCount,UserDataLastPlayedDate' } : {}),
+          ...(scope !== 'played_favorites'
+            ? { Fields: 'UserDataPlayCount,UserDataLastPlayedDate' }
+            : {}),
           StartIndex: start,
           Limit: batch.length,
         });
@@ -1144,10 +1147,26 @@ export class MediaClient implements MediaAPI {
           if (
             scope === 'watched_only'
               ? !playableTypes.has(item.Type ?? '') || state.Played !== true
-              : !personalState(item)
+              : scope === 'played_favorites'
+                ? !(
+                    (playableTypes.has(item.Type ?? '') && state.Played === true) ||
+                    (favoriteTypes.has(item.Type ?? '') && state.IsFavorite === true)
+                  )
+                : !personalState(item)
           )
             continue;
-          const projected = { ...projectCatalogItem(metadata), UserData: state };
+          const projected = {
+            ...projectCatalogItem(metadata),
+            UserData:
+              scope === 'played_favorites'
+                ? {
+                    ...(typeof state.Played === 'boolean' ? { Played: state.Played } : {}),
+                    ...(typeof state.IsFavorite === 'boolean'
+                      ? { IsFavorite: state.IsFavorite }
+                      : {}),
+                  }
+                : state,
+          };
           retainedBytes += Buffer.byteLength(JSON.stringify(projected));
           if (
             items.length >= MAX_MIGRATION_STATE_ITEMS ||

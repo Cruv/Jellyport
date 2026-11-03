@@ -25,6 +25,7 @@ import {
 import {
   readMigrationSource,
   statePlan,
+  hasMigrationState,
   migrateItemState,
   migrationDetails,
   migrationWarning,
@@ -524,11 +525,17 @@ export interface ReviewedMigrationTarget {
 export function now(): string {
   return new Date().toISOString();
 }
-function migrationScope(value: unknown): MigrationScope {
-  // Accept old persisted/API selections without allowing their former broad writes.
-  if (value === undefined || value === 'complete' || value === 'watched_only')
-    return 'watched_only';
-  throw new ServiceError('Only watched-status migration is supported.');
+export function migrationScope(
+  value: unknown,
+  defaultScope: 'watched_only' | 'played_favorites' = 'played_favorites',
+): MigrationScope {
+  if (value === undefined) return defaultScope;
+  // Explicit legacy requests retain the scope their administrator approved.
+  if (value === 'complete' || value === 'watched_only') return 'watched_only';
+  if (value === 'played_favorites') return value;
+  throw new ServiceError(
+    'Choose played-status and favorites migration or legacy played-only migration.',
+  );
 }
 export function validateUsername(username: string): string {
   if (
@@ -885,10 +892,17 @@ export class Service {
         ambiguous: plan.ambiguous.length,
         already_played: plan.matches.filter(
           (match) =>
-            match.source.UserData?.Played === true && match.target.UserData?.Played === true,
+            playable.has(match.source.Type ?? '') &&
+            match.source.UserData?.Played === true &&
+            match.target.UserData?.Played === true,
         ).length,
         source_items: plan.matches.length + plan.unmatched.length + plan.ambiguous.length,
-        source_favorites: 0,
+        source_favorites:
+          scope === 'played_favorites'
+            ? source.filter(
+                (item) => hasMigrationState(item, scope) && item.UserData?.IsFavorite === true,
+              ).length
+            : 0,
         source_resume: 0,
         source_playlists: 0,
       },
@@ -1364,12 +1378,12 @@ export class Service {
               owner_search: sourceUser.Name,
               warnings: [
                 snapshot
-                  ? 'Saved history is available. Preview checks account identity and backup freshness only. Exact watched-status counts and matching details are deferred until approval; results report unmatched and ambiguous items. Approval uses this backup generation and a shared Jellyfin matching catalog.'
-                  : 'Live preview checks account identity only. Played flags and matching details are read after approval; results report unmatched and ambiguous items. Shared matching catalogs are reused during the job, so library changes after collection require another migration.',
+                  ? `Saved history is available. Preview checks account identity and backup freshness only. Exact ${scope === 'played_favorites' ? 'played-status and favorites' : 'watched-status'} counts and matching details are deferred until approval; results report unmatched and ambiguous items. Approval uses this backup generation and a shared Jellyfin matching catalog.`
+                  : `Live preview checks account identity only. ${scope === 'played_favorites' ? 'Played flags, favorites' : 'Played flags'} and matching details are read after approval; results report unmatched and ambiguous items. Shared matching catalogs are reused during the job, so library changes after collection require another migration.`,
                 ...(snapshot ? snapshotHistoryWarnings(snapshot.diagnostics) : []),
                 ...(historyOnly
                   ? [
-                      'History only: this existing protected account receives additive played flags. Password, permissions, roles, ownership and Discord delivery are preserved.',
+                      `History only: this existing protected account receives additive ${scope === 'played_favorites' ? 'played and favorite' : 'played'} flags. Password, permissions, roles, ownership and Discord delivery are preserved.`,
                     ]
                   : []),
                 ...(!target && template.accountRole
@@ -4623,6 +4637,13 @@ export class Service {
         ? { ...request, migration_scope: migrationScope(request.migration_scope) }
         : request,
     );
+    const scopes = new Set(
+      requests
+        .filter((request) => request.source_user_id)
+        .map((request) => request.migration_scope!),
+    );
+    if (scopes.size > 1) throw new ServiceError('A migration job cannot mix reviewed scopes.');
+    const scope = [...scopes][0];
     const timestamp = now();
     const job: Job = {
       id: randomUUID().replaceAll('-', ''),
@@ -4642,7 +4663,7 @@ export class Service {
             ),
           }
         : {}),
-      ...(kind === 'migrate' ? { migration_scope: 'watched_only' } : {}),
+      ...(scope ? { migration_scope: scope } : {}),
       ...(kind === 'membership'
         ? { membership_discord_user_id: requests[0]?.discord_user_id ?? undefined }
         : {}),
@@ -5463,7 +5484,7 @@ export class Service {
           (timing.phase_ms[previousPhase] ?? 0) + time - phaseStarted;
       phaseStarted = time;
     };
-    const scope = migrationScope(request.migration_scope);
+    const scope = migrationScope(request.migration_scope, 'watched_only');
     let source: SourceSnapshot | null = null;
     let savedMetadata: SnapshotMetadata | undefined;
     // Register only warnings produced at explicitly informational callsites. Any
@@ -6524,14 +6545,19 @@ export class Service {
     this.save(job);
     let releaseSnapshots: (() => Promise<void>) | undefined;
     try {
-      // Durable jobs from older releases may still request "complete". Narrow them
-      // before any source extraction or account mutation and report the actual scope.
+      // Older durable jobs must not acquire favorites that were never approved.
       requests = requests.map((request) =>
         request.source_user_id
-          ? { ...request, migration_scope: migrationScope(request.migration_scope) }
+          ? { ...request, migration_scope: migrationScope(request.migration_scope, 'watched_only') }
           : request,
       );
-      if (job.kind === 'migrate') job.migration_scope = 'watched_only';
+      const scopes = new Set(
+        requests
+          .filter((request) => request.source_user_id)
+          .map((request) => request.migration_scope!),
+      );
+      if (scopes.size > 1) throw new ServiceError('A migration job cannot mix reviewed scopes.');
+      if (scopes.size) job.migration_scope = [...scopes][0]!;
       this.save(job);
       this.checkJobStopped(job);
       this.assertConnections(settings);

@@ -473,7 +473,7 @@ describe('Saved Emby database capture settings', () => {
     expect(screen.getByLabelText('Enable daily database capture')).toHaveProperty('checked', false);
     expect(screen.getByLabelText('Time zone')).toHaveProperty('value', 'UTC');
     expect(
-      screen.getByText(/Migrations use only played flags from the captured database/),
+      screen.getByText(/Migrations use played flags and favorites from the captured database/),
     ).toBeTruthy();
     fireEvent.click(screen.getByLabelText('Enable daily database capture'));
     fireEvent.change(time, { target: { value: '04:15' } });

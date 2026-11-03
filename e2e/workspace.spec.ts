@@ -28,11 +28,11 @@ for (const name of pages) {
       const help = page.locator('summary').filter({ hasText: /^What is migrated$/ });
       await expect(help).toBeVisible();
       await expect(
-        page.getByText('Only played or unplayed status is migrated.', { exact: false }),
+        page.getByText('Played status and favorites are merged from Emby.', { exact: false }),
       ).toBeHidden();
       await help.click();
       await expect(
-        page.getByText('Only played or unplayed status is migrated.', { exact: false }),
+        page.getByText('Played status and favorites are merged from Emby.', { exact: false }),
       ).toBeVisible();
       await expect(page.getByRole('checkbox', { name: 'Use saved Emby snapshot' })).toBeVisible();
     }

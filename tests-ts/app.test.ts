@@ -354,11 +354,12 @@ it.each(['complete', 'watched_only'] as const)(
   },
 );
 it.each([
-  [undefined, 'watched_only'],
+  [undefined, 'played_favorites'],
+  ['played_favorites', 'played_favorites'],
   ['complete', 'watched_only'],
   ['watched_only', 'watched_only'],
 ] as const)(
-  'normalizes incoming scope %s to watched-only for asynchronous preview and queued migration',
+  'normalizes incoming scope %s for asynchronous preview and queued migration',
   async (scope, expected) => {
     const app = await setup();
     const headers = await login(app);
@@ -485,7 +486,7 @@ it('passes protected-account pins only from the session-owned review and rejects
     ['e-alex'],
     undefined,
     { 'e-alex': null },
-    'watched_only',
+    'played_favorites',
     undefined,
     expect.objectContaining({ preview_id: review.id }),
     { 'e-alex': pin },
@@ -538,7 +539,7 @@ it('passes household ownership only from its session-owned review and rejects cl
     ['e-alex'],
     undefined,
     { 'e-alex': null },
-    'watched_only',
+    'played_favorites',
     undefined,
     expect.objectContaining({ preview_id: review.id }),
     undefined,

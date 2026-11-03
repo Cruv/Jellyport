@@ -145,6 +145,66 @@ const migrate = (
   );
 
 describe('conservative migration merge policy', () => {
+  it('matches played media and favorites including unwatched containers without importing other state', () => {
+    const source = [
+      media('watched-movie', { Played: true }),
+      media('favorite-movie', { Played: false, IsFavorite: true }),
+      media('favorite-show', { Played: true, IsFavorite: true }, 'Series'),
+      media('favorite-album', { IsFavorite: true }, 'MusicAlbum'),
+      media('resume-only', { PlaybackPositionTicks: 20 }),
+      media('container-only', { Played: true }, 'Season'),
+      media('playlist', { IsFavorite: true }, 'Playlist'),
+      media('unsupported', { IsFavorite: true }, 'Unknown'),
+    ];
+    const target = source.map((item) => ({ ...item, Id: `target-${item.Id}`, UserData: {} }));
+    expect(
+      statePlan(source, target, settings, 'played_favorites').matches.map(
+        (match) => match.source.Id,
+      ),
+    ).toEqual(['watched-movie', 'favorite-movie', 'favorite-show', 'favorite-album']);
+  });
+
+  it('merges only positive played and favorite flags in the new scope', () => {
+    const source = media('source', {
+      Played: true,
+      IsFavorite: true,
+      PlaybackPositionTicks: 20,
+      PlayCount: 99,
+      LastPlayedDate: newDate,
+      Likes: true,
+      Rating: 8,
+    });
+    const target = media('target', {
+      Played: false,
+      IsFavorite: false,
+      PlaybackPositionTicks: 50,
+      PlayCount: 2,
+      LastPlayedDate: oldDate,
+    });
+    expect(mergeUserData(source, target, 'played_favorites')).toEqual({
+      Played: true,
+      IsFavorite: true,
+    });
+    expect(
+      mergeUserData(
+        source,
+        { ...target, UserData: { Played: true, IsFavorite: true } },
+        'played_favorites',
+      ),
+    ).toEqual({});
+    expect(
+      mergeUserData(
+        { ...source, UserData: { Played: false, IsFavorite: false } },
+        target,
+        'played_favorites',
+      ),
+    ).toEqual({});
+    expect(mergeUserData({ ...source, Type: 'Series' }, target, 'played_favorites')).toEqual({
+      IsFavorite: true,
+    });
+    expect(mergeUserData({ ...source, Type: 'Playlist' }, target, 'played_favorites')).toEqual({});
+  });
+
   it('limits watched-only matching to played playable items without changing complete mode', () => {
     const source = [
       media('watched-movie', { Played: true }),

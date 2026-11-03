@@ -163,7 +163,7 @@ assert.equal(previewTask.status, 'ready', 'Background history matching must fini
 assert.deepEqual(previewTask.progress, { processed: 3, total: 3 });
 const preview = previewTask.preview;
 assert.equal(preview.mode, 'merge');
-assert.equal(preview.migration_scope, 'watched_only');
+assert.equal(preview.migration_scope, 'played_favorites');
 assert.equal(preview.users.length, 3);
 assert(
   preview.users.every((user) => user.history_deferred === true && user.stats === null),
@@ -274,6 +274,26 @@ assert.equal(quickFinished.results[0].data.verification.verified, 2);
 assert.equal(quickFinished.results[0].data.verification.missing, 0);
 assert.equal(quickFinished.results[0].data.verification.mismatched, 0);
 assert.equal((await request(`/api/jobs/${quick.id}/credentials`, 'POST')).credentials.length, 0);
+// A fresh default request includes favorites while remaining an idempotent merge.
+const favoritesJob = await request('/api/migrations', 'POST', { source_user_ids: ['e-river'] });
+let favoritesFinished;
+for (let attempt = 0; attempt < 100; attempt++) {
+  favoritesFinished = await request(`/api/jobs/${favoritesJob.id}`);
+  if (!['queued', 'running'].includes(favoritesFinished.status)) break;
+  await delay(100);
+}
+assert.equal(favoritesFinished.status, 'completed');
+assert.equal(favoritesFinished.migration_scope, 'played_favorites');
+assert.equal(favoritesFinished.results[0].applied, 0, 'Default merges must skip existing flags.');
+assert.equal(favoritesFinished.results[0].data.favorites, 0);
+assert.equal(favoritesFinished.results[0].data.resume_positions, 0);
+assert.equal(favoritesFinished.results[0].data.verification.checked, 2);
+assert.equal(favoritesFinished.results[0].data.verification.verified, 2);
+assert.equal(favoritesFinished.results[0].data.verification.mismatched, 0);
+assert.equal(
+  (await request(`/api/jobs/${favoritesJob.id}/credentials`, 'POST')).credentials.length,
+  0,
+);
 await request('/api/logout', 'POST');
 assert.equal(
   (
@@ -294,5 +314,5 @@ assert.equal(
   401,
 );
 console.log(
-  'Container smoke passed: React assets, authentication/CSRF, private history review, played-state bulk migration and independent readback, normalized legacy scope, no-op reruns, preserved accounts, and one-time credentials.',
+  'Container smoke passed: React assets, authentication/CSRF, private history review, played/favorites default and independent readback, normalized legacy scope, no-op reruns, preserved accounts, and one-time credentials.',
 );

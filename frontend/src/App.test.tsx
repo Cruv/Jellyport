@@ -2271,7 +2271,7 @@ describe('React account safeguards', () => {
           requests.find((request) => request.path === '/api/migrations/preview')?.options?.body,
         ),
       ).migration_scope,
-    ).toBe('watched_only');
+    ).toBe('played_favorites');
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.getByRole('button', { name: 'Preparing review…' })).toHaveProperty(
       'disabled',
@@ -2356,7 +2356,7 @@ describe('React account safeguards', () => {
     const preview = requests.find((request) => request.path === '/api/migrations/preview')!;
     expect(JSON.parse(String(preview.options?.body))).toEqual({
       source_user_ids: ['e-alex', 'e-river'],
-      migration_scope: 'watched_only',
+      migration_scope: 'played_favorites',
     });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
     await waitFor(() =>
@@ -2369,6 +2369,59 @@ describe('React account safeguards', () => {
       migration_scope: 'watched_only',
       discord_recipients: {},
     });
+  });
+
+  it('reviews and approves favorites only when the served review includes them', async () => {
+    prepareRunningPreview();
+    responses['/api/migrations/preview'] = {
+      ...readyPreviewTask,
+      preview: {
+        ...readyPreviewTask.preview,
+        migration_scope: 'played_favorites',
+        users: readyPreviewTask.preview.users.map((user) => ({
+          ...user,
+          stats: { source_played: 20, source_favorites: 3, matched: 22 },
+        })),
+      },
+    };
+    responses['/api/migrations'] = { ...job, kind: 'migrate', migration_scope: 'played_favorites' };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Migrate users' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Preview migration (2)' }));
+    const dialog = await screen.findByRole('dialog');
+    await finishMigrationWizard(dialog);
+    expect(
+      within(dialog).getByText('2 accounts selected · played status and favorites'),
+    ).toBeTruthy();
+    expect(within(dialog).getAllByText('Favorites in Emby')).toHaveLength(2);
+    expect(
+      within(dialog).getByText(
+        /Matched Emby favorites are added even when they have not been watched/,
+      ),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /Existing Jellyfin progress and other personal state stay unchanged/,
+      ),
+    ).toBeTruthy();
+    expect(requests.some((request) => request.path === '/api/migrations')).toBe(false);
+    expect(
+      JSON.parse(
+        String(
+          requests.find((request) => request.path === '/api/migrations/preview')?.options?.body,
+        ),
+      ).migration_scope,
+    ).toBe('played_favorites');
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Start migration' }));
+    await waitFor(() =>
+      expect(requests.some((request) => request.path === '/api/migrations')).toBe(true),
+    );
+    expect(
+      JSON.parse(
+        String(requests.find((request) => request.path === '/api/migrations')?.options?.body),
+      ).migration_scope,
+    ).toBe('played_favorites');
   });
 
   it.each([undefined, 'complete'] as const)(
@@ -3173,6 +3226,60 @@ describe('React account safeguards', () => {
     expect(within(dialog).queryByText(/playlists created/)).toBeNull();
     expect(within(dialog).queryByText(/resume positions/)).toBeNull();
     expect(within(dialog).queryByText(/favorites/)).toBeNull();
+  });
+  it('reports current favorite additions without labeling the job as a broader historical migration', async () => {
+    responses['/api/jobs/job-1'] = {
+      ...job,
+      kind: 'migrate',
+      migration_scope: 'played_favorites',
+      results: [
+        {
+          username: 'alex',
+          status: 'completed',
+          applied: 2,
+          source_favorites: 3,
+          data: {
+            ...emptyPlayedDetails,
+            items_updated: 2,
+            favorites: 2,
+            write_metrics: {
+              attempts: 2,
+              succeeded: 2,
+              failed: 0,
+              cumulative_ms: 20,
+              max_ms: 10,
+              peak_in_flight: 2,
+            },
+            verification: {
+              checked: 3,
+              verified: 3,
+              preserved_newer: 0,
+              missing: 0,
+              mismatched: 0,
+              unsupported_fields: 0,
+            },
+          },
+        },
+      ],
+    };
+    const dialog = await openJob();
+    expect(within(dialog).getByText('2 item updates')).toBeTruthy();
+    expect(within(dialog).getByText('3 source favorites')).toBeTruthy();
+    expect(within(dialog).getByText('2 favorites added')).toBeTruthy();
+    expect(
+      within(dialog).getByText(/Played-status and favorites write requests: 2 attempted/),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(/Independent played-status and favorites verification: 3 verified/),
+    ).toBeTruthy();
+    expect(
+      within(dialog).getByText(
+        /Existing Jellyfin playback progress and other personal fields are preserved/,
+      ),
+    ).toBeTruthy();
+    expect(within(dialog).queryByText(/newer Jellyfin activity preserved/)).toBeNull();
+    expect(within(dialog).queryByText('Historical migration')).toBeNull();
+    expect(within(dialog).queryByText(/resume positions/)).toBeNull();
   });
   it('shows normal completed status while keeping matching coverage and historical differences visible', async () => {
     const completed = verifiedHistoryMigration();

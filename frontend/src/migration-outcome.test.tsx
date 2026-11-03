@@ -428,7 +428,7 @@ describe('migration coverage presentation', () => {
     const view = render(
       <MigrationCoverage result={{ ...result(), matched: 0, unmatched: 0, ambiguous: 0 }} />,
     );
-    expect(screen.getByText('No identifiable played items')).toBeTruthy();
+    expect(screen.getByText('No identifiable source items')).toBeTruthy();
     expect(screen.queryByText(/100.0%/)).toBeNull();
     view.rerender(<MigrationCoverage result={{ status: 'partial' }} />);
     expect(screen.getByText('Matching coverage unavailable')).toBeTruthy();
@@ -437,7 +437,7 @@ describe('migration coverage presentation', () => {
       <MigrationCoverage result={{ status: 'running', matched: 0, unmatched: 0, ambiguous: 0 }} />,
     );
     expect(screen.getByText('Matching coverage pending')).toBeTruthy();
-    expect(screen.queryByText('No identifiable played items')).toBeNull();
+    expect(screen.queryByText('No identifiable source items')).toBeNull();
   });
 
   it('does not interpret the source count from an unknown proof version', () => {

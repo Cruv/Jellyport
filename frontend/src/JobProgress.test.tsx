@@ -102,6 +102,37 @@ describe('Migration item progress and timing', () => {
     );
     expect(screen.getByText(label, { exact: false })).toBeTruthy();
   });
+  it.each([
+    ['reading_source', 'Reading Emby played flags and favorites'],
+    ['reading_target', 'Reading Jellyfin played status and favorites'],
+    ['transferring_history', 'Migrating played status and favorites'],
+    ['verifying_history', 'Verifying Jellyfin played status and favorites'],
+  ] as const)('labels current %s work as played status and favorites', (phase, label) => {
+    render(
+      <JobProgressDetails
+        job={{
+          ...running,
+          migration_scope: 'played_favorites',
+          progress: { phase, processed: 0, total: 1 },
+        }}
+      />,
+    );
+    expect(screen.getByText(label, { exact: false })).toBeTruthy();
+    expect(screen.queryByText('Migrating watch history and favorites')).toBeNull();
+  });
+  it('keeps account cloning progress played-only', () => {
+    render(
+      <JobProgressDetails
+        job={{
+          ...running,
+          kind: 'clone',
+          progress: { phase: 'transferring_history', processed: 0, total: 1 },
+        }}
+      />,
+    );
+    expect(screen.getByText(/Migrating watched status/)).toBeTruthy();
+    expect(screen.queryByText(/favorites/)).toBeNull();
+  });
   it('separates account progress from checked and updated history items', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-08T12:19:24Z'));

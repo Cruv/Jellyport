@@ -5,12 +5,14 @@ findings retain the dates and inputs of those checks; they are not current scan
 results. Current verification and publication procedures are in
 [development](development.md).
 
-The current migration scope has since narrowed to played flags only. It uses modern
-partial-field writes and independent played-state readback, preserving unrelated
-destination values. Resume, counts, dates, favorites, playlists, Emby preferences
-and images are no longer transferred. Legacy broad-scope request/job values are
-normalized to played-only; legacy watched endpoints are not used. Older versioned
-sections below describe historical behavior and their original review evidence.
+The current migration scope is played and favorite flags only. It uses modern
+partial-field positive writes and independent flag readback, preserving unrelated
+destination values. Resume, counts, dates, ratings, playlists, Emby preferences and
+images are not transferred. New requests default to this limited scope; explicit
+legacy played-only requests and already-approved jobs keep their original scope.
+Legacy `complete` requests normalize to played-only, and legacy watched endpoints
+are not used. Older versioned sections below describe historical behavior and their
+original review evidence.
 
 This review covers Jellyport's TypeScript server, React interface, Jellyfin authentication and first-run setup, persistence, account and Discord ownership checks, Docker configuration, dependencies, and GitHub release workflows. It includes the hardening changes described below.
 

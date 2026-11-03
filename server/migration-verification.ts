@@ -3,7 +3,8 @@ import { isObject, projectCatalogItem, type MediaItem, type MediaUserDataPatch }
 import type { MigrationScope } from './migration.js';
 
 export const USER_DATA_FIELDS = ['Played'] as const;
-export type UserDataField = (typeof USER_DATA_FIELDS)[number];
+export const FAVORITE_USER_DATA_FIELDS = ['Played', 'IsFavorite'] as const;
+export type UserDataField = (typeof FAVORITE_USER_DATA_FIELDS)[number];
 
 export interface VerificationExpectation {
   /** Matching identity only: no personal state, labels, or unrelated server DTO fields. */
@@ -54,7 +55,7 @@ function identity(item: MediaItem): string {
 }
 
 /**
- * Capture the intended played flag before mutation, including already-merged matches.
+ * Capture the intended positive flags before mutation, including already-merged matches.
  * A caller serializing multiple source editions for one target must retain earlier
  * expectations too: a later fresh read could otherwise conceal an ignored write.
  * Read each target once during verification and evaluate every expectation for it.
@@ -62,24 +63,25 @@ function identity(item: MediaItem): string {
 export function captureExpectation(
   target: MediaItem,
   patch: MediaUserDataPatch,
-  _scope: MigrationScope = 'watched_only',
+  scope: MigrationScope = 'watched_only',
 ): VerificationExpectation {
   if (!isObject(patch) || Object.keys(patch).length > 64)
     throw new ServiceError('Invalid migration verification patch.');
   const item = identityItem(target);
   const state: MediaUserDataPatch = {};
   const unsupported = new Set<string>();
-  // Scope strings survive in stored jobs for compatibility, but verification now
-  // proves only played flags. It never adopts other personal fields from a snapshot.
+  const fields = scope === 'played_favorites' ? FAVORITE_USER_DATA_FIELDS : USER_DATA_FIELDS;
+  // Old reviewed jobs remain played-only. Other snapshot fields cannot become
+  // verification evidence merely because a newer importer retained them.
   for (const [key, value] of Object.entries(patch)) {
-    if (key !== 'Played') {
+    if (!(fields as readonly string[]).includes(key)) {
       unsupported.add(fieldName(key));
       continue;
     }
     if (value !== undefined && value !== null && fieldValue(value) === undefined)
       throw new ServiceError('Invalid migration verification patch.');
   }
-  for (const field of USER_DATA_FIELDS) {
+  for (const field of fields) {
     const previous = fieldValue(target.UserData?.[field]);
     const intended = fieldValue(patch[field]);
     const value = intended ?? previous;
@@ -98,7 +100,9 @@ export function evaluateExpectation(
   observed?: MediaItem,
 ): VerificationEvaluation {
   const unsupported = [...new Set((expectation.unsupported_fields ?? []).map(fieldName))];
-  const fields = USER_DATA_FIELDS.filter((field) => expectation.state[field] !== undefined);
+  const fields = FAVORITE_USER_DATA_FIELDS.filter(
+    (field) => expectation.state[field] !== undefined,
+  );
   if (!observed || !isObject(observed.UserData))
     return { status: 'missing', fields, unsupported_fields: unsupported };
   try {
@@ -121,7 +125,7 @@ export function evaluateExpectation(
   for (const field of fields) {
     const expected = fieldValue(expectation.state[field]);
     const actual = fieldValue(observed.UserData[field]);
-    // Additive migration never undoes a watched flag added by Jellyfin.
+    // Additive migration never undoes a watched or favorite flag added by Jellyfin.
     if (typeof actual !== 'boolean' || (expected === true && actual !== true))
       mismatches.push(field);
   }

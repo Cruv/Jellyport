@@ -29,6 +29,32 @@ const item = (
 });
 
 describe('watched-flag expectations', () => {
+  it('captures only played and favorite state when the reviewed scope includes favorites', () => {
+    const expected = captureExpectation(item(personal), {}, 'played_favorites');
+    expect(expected.state).toEqual({ Played: true, IsFavorite: true });
+    expect(expected.unsupported_fields).toBeUndefined();
+    expect(
+      captureExpectation(
+        item({ Played: false, IsFavorite: false }),
+        { IsFavorite: true },
+        'played_favorites',
+      ).state,
+    ).toEqual({ Played: false, IsFavorite: true });
+    const excluded = captureExpectation(
+      item(personal),
+      { PlaybackPositionTicks: 20, Likes: false },
+      'played_favorites',
+    );
+    expect(excluded.unsupported_fields).toEqual(['PlaybackPositionTicks', 'Likes']);
+    expect(excluded.state).toEqual({ Played: true, IsFavorite: true });
+  });
+
+  it.each(['true', 1, {}, []])('rejects malformed intended favorite state (%j)', (IsFavorite) => {
+    expect(() =>
+      captureExpectation(item(), { IsFavorite } as MediaUserDataPatch, 'played_favorites'),
+    ).toThrow(ServiceError);
+  });
+
   it.each([undefined, 'watched_only', 'complete'] as const)(
     'captures only Played even for legacy scope %s',
     (scope) => {
@@ -94,6 +120,39 @@ describe('watched-flag expectations', () => {
 });
 
 describe('independent watched-flag readback', () => {
+  it('detects an ignored favorite even when played state was applied successfully', () => {
+    const expected = captureExpectation(
+      item({ Played: false, IsFavorite: false }),
+      { Played: true, IsFavorite: true },
+      'played_favorites',
+    );
+    expect(evaluateExpectation(expected, item({ Played: true, IsFavorite: false }))).toEqual({
+      status: 'mismatch',
+      fields: ['IsFavorite'],
+      unsupported_fields: [],
+    });
+  });
+
+  it('independently checks a favorite-only container and preserves newly added Jellyfin flags', () => {
+    const target = item({ IsFavorite: false }, { Type: 'Series' });
+    const favorite = captureExpectation(target, { IsFavorite: true }, 'played_favorites');
+    expect(
+      evaluateExpectation(favorite, { ...target, UserData: { IsFavorite: true } }).status,
+    ).toBe('verified');
+    expect(evaluateExpectation(favorite, { ...target, UserData: {} })).toMatchObject({
+      status: 'mismatch',
+      fields: ['IsFavorite'],
+    });
+    const unchanged = captureExpectation(
+      item({ Played: false, IsFavorite: false }),
+      {},
+      'played_favorites',
+    );
+    expect(evaluateExpectation(unchanged, item({ Played: true, IsFavorite: true })).status).toBe(
+      'verified',
+    );
+  });
+
   it('detects a silently ignored flag after an acknowledged write', () => {
     const expected = captureExpectation(item({ Played: false }), { Played: true });
     expect(evaluateExpectation(expected, item({ Played: false }))).toEqual({

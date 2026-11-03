@@ -289,6 +289,84 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
     expect(readSnapshotItems(f.path, bob, identities, 'watched_only')).toEqual([]);
   });
 
+  it('reads played flags and favorite-only playable and container items from existing projections', () => {
+    const f = fixture();
+    f.state(14, 2, { played: 1, isFavorite: 1 });
+    f.item(20, 5, 30, { Name: 'Unwatched favorite' });
+    f.state(30, 2, { isFavorite: 1 });
+    f.item(21, 9, 31, { Name: 'Derived collection state' });
+    f.state(31, 2, { played: 1 });
+    f.item(22, 5, 32, { Name: 'Count-only history' });
+    f.state(32, 2, { playCount: 4 });
+    f.database.close();
+    const projected = join(f.directory, 'existing-complete-projection.db');
+    projectLibrary(f.path, projected);
+    const history = readSnapshotHistory(projected, alice, identities, 'played_favorites');
+    expect(history.items.map((item) => [item.Id, item.Type, item.UserData])).toEqual([
+      ['10', 'Movie', { Played: true, IsFavorite: true }],
+      ['11', 'Series', { Played: false, IsFavorite: true }],
+      ['12', 'Season', { Played: false, IsFavorite: true }],
+      ['13', 'Episode', { Played: true, IsFavorite: false }],
+      ['20', 'Movie', { Played: false, IsFavorite: true }],
+    ]);
+    expect(history.items.every((item) => !Object.hasOwn(item, 'RunTimeTicks'))).toBe(true);
+    expect(readSnapshotItems(projected, bob, identities, 'played_favorites')).toEqual([]);
+    // Existing approvals still read exactly their original played-only data.
+    expect(
+      readSnapshotItems(projected, alice, identities, 'watched_only').map((item) => item.Id),
+    ).toEqual(['10', '13']);
+  });
+
+  it.each([
+    ['LastPlayedDateInt', -1],
+    ['playCount', -1],
+    ['playbackPositionTicks', -1],
+    ['rating', 11],
+  ] as const)('ignores excluded %s=%s when reading played flags and favorites', (field, value) => {
+    const f = fixture();
+    f.database
+      .prepare(`UPDATE UserDatas SET ${field}=? WHERE UserDataKeyId=8 AND userId=2`)
+      .run(value);
+    f.database.exec('UPDATE MediaItems SET RunTimeTicks=-1 WHERE Id=10');
+    f.database.close();
+    const history = readSnapshotHistory(f.path, alice, identities, 'played_favorites');
+    expect(history.items.find((item) => item.Id === '10')?.UserData).toEqual({
+      Played: true,
+      IsFavorite: true,
+    });
+    expect(history.diagnostics.invalid_resume_positions).toBe(0);
+  });
+
+  it('rejects an invalid required favorite flag instead of silently dropping source favorites', () => {
+    const f = fixture();
+    f.database.exec('UPDATE UserDatas SET isFavorite=2 WHERE UserDataKeyId=8 AND userId=2');
+    f.database.close();
+    expect(() => readSnapshotItems(f.path, alice, identities, 'played_favorites')).toThrow(
+      'invalid format',
+    );
+    expect(readSnapshotItems(f.path, alice, identities, 'watched_only')).toHaveLength(2);
+  });
+
+  it('rejects captures without the required favorite column before returning partial history', () => {
+    const f = fixture();
+    f.database.exec('ALTER TABLE UserDatas DROP COLUMN isFavorite');
+    f.database.close();
+    expect(() => readSnapshotItems(f.path, alice, identities, 'played_favorites')).toThrow(
+      'invalid format',
+    );
+  });
+
+  it('bounds favorite-only rows and bytes without reading excluded state', () => {
+    const f = fixture();
+    f.database.close();
+    expect(() =>
+      readSnapshotItems(f.path, alice, identities, 'played_favorites', { maxItems: 2 }),
+    ).toThrow('history size');
+    expect(() =>
+      readSnapshotItems(f.path, alice, identities, 'played_favorites', { maxBytes: 100 }),
+    ).toThrow('history size');
+  });
+
   it.each([
     ['LastPlayedDateInt', -1],
     ['LastPlayedDateInt', 9_223_372_036_854_775_807n],
@@ -491,7 +569,7 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
     projected.close();
   });
 
-  it.each(['complete', 'watched_only'] as const)(
+  it.each(['complete', 'watched_only', 'played_favorites'] as const)(
     'uses indexed per-user lookups without a catalog scan or SQL sort in %s mode',
     (scope) => {
       const f = fixture();
@@ -783,6 +861,48 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
       expect(bytes.includes(Buffer.from(key))).toBe(false);
       expect(bytes.includes(guid)).toBe(false);
     }
+  });
+
+  it('merges recovered favorites and played flags only for verified identities in the new scope', () => {
+    const f = fixture();
+    f.database
+      .prepare('UPDATE MediaItems SET guid=? WHERE Id=10')
+      .run(Buffer.from('67452301ab89efcd0123456789abcdef', 'hex'));
+    f.database
+      .prepare('UPDATE MediaItems SET guid=? WHERE Id=11')
+      .run(Buffer.from('78563412bc9af0de123456789abcdef0', 'hex'));
+    f.database.exec(
+      'UPDATE UserDatas SET played=0,isFavorite=0 WHERE userId=2 AND UserDataKeyId IN (8,13)',
+    );
+    for (const [id, key, state] of [
+      [900, '01234567-89ab-cdef-0123-456789abcdef', { isFavorite: 1 }],
+      [901, '0123456789abcdef0123456789abcdef', { played: 1 }],
+      [902, '12345678-9abc-def0-1234-56789abcdef0', { isFavorite: 1 }],
+      [903, 'unverified-history-key', { isFavorite: 1 }],
+    ] as const) {
+      f.database.prepare('INSERT INTO UserDataKeys2 VALUES (?,?)').run(id, key);
+      f.state(id, 2, { ...state, playCount: -1, LastPlayedDateInt: -1, rating: 100 });
+    }
+    f.database.close();
+    const projected = join(f.directory, 'recovered-favorites.db');
+    projectLibrary(f.path, projected);
+    const history = readSnapshotHistory(projected, alice, identities, 'played_favorites');
+    expect(history.items.map((item) => [item.Id, item.UserData])).toEqual([
+      ['10', { Played: true, IsFavorite: true }],
+      ['11', { Played: false, IsFavorite: true }],
+      ['13', { Played: true, IsFavorite: false }],
+    ]);
+    expect(history.diagnostics).toMatchObject({
+      recovered_orphan_state_items: 3,
+      orphan_state_items: 1,
+      invalid_resume_positions: 0,
+    });
+    expect(
+      readSnapshotItems(projected, alice, identities, 'watched_only').map((item) => item.Id),
+    ).toEqual(['10', '13']);
+    expect(() =>
+      readSnapshotHistory(projected, alice, identities, 'played_favorites', { maxItems: 2 }),
+    ).toThrow('history size');
   });
 
   it('keeps legacy projections readable without inventing recovery identities', () => {

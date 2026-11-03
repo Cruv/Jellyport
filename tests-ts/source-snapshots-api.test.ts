@@ -267,19 +267,23 @@ it('keeps demonstration snapshot status readable and refuses every real mutation
 
 it.each(
   [undefined, false, true].flatMap((useSnapshots) =>
-    [undefined, 'complete', 'watched_only'].map((migrationScope) => ({
+    [undefined, 'complete', 'watched_only', 'played_favorites'].map((migrationScope) => ({
       useSnapshots,
       migrationScope,
     })),
   ),
 )(
-  'narrows preview scope $migrationScope with snapshot selection $useSnapshots to watched-only',
+  'preserves preview scope $migrationScope with snapshot selection $useSnapshots',
   async ({ useSnapshots, migrationScope }) => {
+    const expected =
+      migrationScope === undefined || migrationScope === 'played_favorites'
+        ? 'played_favorites'
+        : 'watched_only';
     const { app, headers } = await setup();
     const preview = vi.spyOn(app.jellyport.service, 'preview').mockResolvedValue({
       users: [],
       mode: 'merge',
-      migration_scope: 'watched_only',
+      migration_scope: expected,
     });
     const started = await app.inject({
       method: 'POST',
@@ -296,16 +300,20 @@ it.each(
     expect(preview).toHaveBeenCalledWith(
       ['fixture-source'],
       expect.objectContaining({
-        migration_scope: 'watched_only',
+        migration_scope: expected,
         use_snapshots: useSnapshots ?? false,
       }),
     );
   },
 );
 
-it.each([undefined, 'complete', 'watched_only'] as const)(
-  'forwards approved snapshot generations with legacy scope %s narrowed to watched-only',
+it.each([undefined, 'complete', 'watched_only', 'played_favorites'] as const)(
+  'forwards approved snapshot generations with scope %s',
   async (migrationScope) => {
+    const expected =
+      migrationScope === undefined || migrationScope === 'played_favorites'
+        ? 'played_favorites'
+        : 'watched_only';
     const { app, headers } = await setup();
     const migrate = vi.spyOn(app.jellyport.service, 'migrateUsers').mockResolvedValue({
       id: 'fixture-job',
@@ -339,7 +347,7 @@ it.each([undefined, 'complete', 'watched_only'] as const)(
       ['fixture-source-a', 'fixture-source-b'],
       discord_recipients,
       mapping_revisions,
-      'watched_only',
+      expected,
       source_snapshot_ids,
       undefined,
       undefined,
@@ -719,3 +727,55 @@ it('keeps the Jellyfin schedule readable in demo mode but never enables a real s
   expect(response.statusCode).toBe(400);
   expect((await app.jellyport.service.destinationSnapshots.status()).config.enabled).toBe(false);
 });
+
+it.each(['watched_only', 'played_favorites'] as const)(
+  'binds accepted work to reviewed scope %s and rejects scope changes',
+  async (scope) => {
+    const { app, headers } = await setup();
+    vi.spyOn(app.jellyport.service, 'preview').mockResolvedValue({
+      users: [{ source_user_id: 'fixture-source', mapping_revision: null }] as never,
+      mode: 'merge',
+      migration_scope: scope,
+    });
+    const migrate = vi
+      .spyOn(app.jellyport.service, 'migrateUsers')
+      .mockResolvedValue({ id: 'scoped-job' } as never);
+    const started = await app.inject({
+      method: 'POST',
+      url: '/api/migrations/preview',
+      headers,
+      payload: { source_user_ids: ['fixture-source'], migration_scope: scope },
+    });
+    expect(started.statusCode).toBe(202);
+    const id = started.json().id;
+    await vi.waitFor(async () => {
+      const result = await app.inject({
+        method: 'GET',
+        url: `/api/migrations/preview/${id}`,
+        headers,
+      });
+      expect(result.json().status).toBe('ready');
+    });
+    const changed = await app.inject({
+      method: 'POST',
+      url: '/api/migrations',
+      headers,
+      payload: {
+        preview_id: id,
+        source_user_ids: ['fixture-source'],
+        migration_scope: scope === 'watched_only' ? 'played_favorites' : 'watched_only',
+      },
+    });
+    expect(changed.statusCode).toBe(400);
+    expect(changed.json().detail).toContain('scope differs');
+    expect(migrate).not.toHaveBeenCalled();
+    const accepted = await app.inject({
+      method: 'POST',
+      url: '/api/migrations',
+      headers,
+      payload: { preview_id: id, source_user_ids: ['fixture-source'] },
+    });
+    expect(accepted.statusCode).toBe(202);
+    expect(migrate.mock.calls[0]?.[3]).toBe(scope);
+  },
+);

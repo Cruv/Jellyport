@@ -134,7 +134,7 @@ export function OverviewPage({
                 page: 'migrate' as Page,
                 icon: 'migrate',
                 title: 'Migrate existing users',
-                text: 'Bring played status into Jellyfin.',
+                text: 'Bring played status and favorites into Jellyfin.',
               },
               {
                 page: 'accounts' as Page,
@@ -183,7 +183,8 @@ export function OverviewPage({
         <span className={`status ${ready ? 'good' : ''}`}>
           {ready ? 'Servers are ready' : 'Configure servers to begin'}
         </span>{' '}
-        Migration reviews protect existing Jellyfin activity before any played flags are added.
+        Migration reviews protect existing Jellyfin activity before played flags or favorites are
+        added.
       </p>
     </div>
   );
@@ -229,7 +230,7 @@ export function MigratePage({
     <div className="page-stack">
       <Heading
         title="Migrate users"
-        description="Select Emby accounts, review the migration, and add their played status to Jellyfin."
+        description="Select Emby accounts, review the migration, and add their played status and favorites to Jellyfin."
         actions={
           <button
             id="preview-migration"
@@ -453,8 +454,9 @@ export function MigratePage({
           <summary>What is migrated</summary>
           <div className="help-body form-stack">
             <p>
-              Only played or unplayed status is migrated. Existing Jellyfin resume positions and
-              other personal state stay unchanged.
+              Played status and favorites are merged from Emby. Existing Jellyfin watched items and
+              favorites are kept. Resume positions, playback dates, counts and other personal state
+              stay unchanged.
             </p>
             <p>
               New accounts use saved defaults and receive a generated password. Existing accounts
@@ -463,8 +465,8 @@ export function MigratePage({
             </p>
             <p>
               Previews check accounts and backup freshness without scanning libraries; matching and
-              played flags are read only after approval. Migrations pause between source requests to
-              protect playback. File copies provide best-effort saved history.
+              played flags and favorites are read only after approval. Migrations pause between
+              source requests to protect playback. File copies provide best-effort saved history.
             </p>
             <p>
               Set username exceptions in{' '}

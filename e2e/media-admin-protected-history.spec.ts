@@ -47,7 +47,7 @@ function accountRecords(imports: ImportFixture) {
 }
 
 for (const protection of ['administrator', 'template'] as const) {
-  test(`reviewed ${protection} migration merges only played flags into the pinned existing account`, async ({
+  test(`reviewed ${protection} migration merges played status and favorites into the pinned existing account`, async ({
     page,
     imports,
   }, info) => {
@@ -135,7 +135,7 @@ for (const protection of ['administrator', 'template'] as const) {
     expect(acceptedMigrations).toEqual([
       expect.objectContaining({
         source_user_ids: [sourceMember],
-        migration_scope: 'watched_only',
+        migration_scope: 'played_favorites',
         source_snapshot_ids: { [sourceMember]: expect.any(String) },
         discord_recipients: {},
       }),

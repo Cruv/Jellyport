@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { MediaError } from './errors.js';
 import { caseFold } from './matching.js';
+import { hasMigrationState, type MigrationScope } from './migration.js';
 import type {
   ClientFactory,
   JsonObject,
@@ -197,11 +198,11 @@ export class DemoClient implements MediaAPI {
   async migrationState(
     userId: string,
     catalog: MediaItem[],
-    scope: 'complete' | 'watched_only',
+    scope: MigrationScope,
   ): Promise<MediaItem[]> {
     const ids = new Set(catalog.map((item) => item.Id));
     return (await this.migrationItems(userId)).filter(
-      (item) => ids.has(item.Id) && (scope !== 'watched_only' || item.UserData?.Played === true),
+      (item) => ids.has(item.Id) && hasMigrationState(item, scope),
     );
   }
   async migrationCapabilities() {

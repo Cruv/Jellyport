@@ -1,10 +1,10 @@
 import { mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
-import { utimesSync } from 'node:fs';
+import { openSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { crc32, deflateRawSync } from 'node:zlib';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { importJellyfinBackupCatalog } from '../server/jellyfin-backup-reader.js';
 import {
   buildJellyfinCatalogIndex,
@@ -12,6 +12,11 @@ import {
 } from '../server/jellyfin-catalog-index.js';
 import { jellyfinLibraryConfigHash } from '../server/jellyfin-library-membership.js';
 import type { JellyfinBackupProgress } from '../server/jellyfin-backup-reader.js';
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, openSync: vi.fn(actual.openSync) };
+});
 
 const temporary: string[] = [];
 afterEach(async () => {
@@ -143,6 +148,30 @@ function projected(output: string) {
 }
 
 describe('Jellyfin backup catalog reader', () => {
+  it('reports a changed backup when metadata changes between its initial stat and opened descriptor', async () => {
+    const source = await fixture([item(1)]);
+    const initial = await stat(source.archive);
+    const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const open = vi.mocked(openSync);
+    open.mockClear();
+    open.mockImplementationOnce((...args) => {
+      const fd = actual.openSync(...args);
+      utimesSync(source.archive, initial.atime, new Date(initial.mtimeMs + 1000));
+      return fd;
+    });
+    try {
+      await expect(
+        importJellyfinBackupCatalog(source.archive, source.output),
+      ).rejects.toMatchObject({
+        error_code: 'backup_changed',
+      });
+      expect(open).toHaveBeenCalledOnce();
+      await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      open.mockReset().mockImplementation(actual.openSync);
+    }
+  });
+
   it.each([
     ['12.2.0', '12.2.0.0'],
     ['12.2.0.0', '12.2.0.0'],

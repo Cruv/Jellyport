@@ -540,7 +540,8 @@ export async function importJellyfinBackupCatalog(
     )
       throw invalid();
     fd = openSync(archivePath, constants.O_RDONLY | constants.O_NOFOLLOW);
-    if (!unchanged(initial, fstatSync(fd, { bigint: true }))) throw invalid();
+    if (!unchanged(initial, fstatSync(fd, { bigint: true })))
+      throw new DestinationCatalogError('backup_changed');
     zip = await fromFdPromise(fd, {
       autoClose: false,
       lazyEntries: true,

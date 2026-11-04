@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import { Callout, Icon, Issues, Modal, SourceSnapshotNote, UserCell } from './components';
 import { Pagination, usePagination } from './ui-layout';
@@ -1401,7 +1401,9 @@ function BillingPanel({
     check(complimentaryMode ? undefined : selectedBilling(), selectedComplimentary());
     return true;
   };
-  useEffect(() => {
+  // Bind the action during commit so an enabled Next button cannot invoke the
+  // previous loading state's callback before passive effects have run.
+  useLayoutEffect(() => {
     const action = () => continueBilling(true);
     continueAction.current = action;
     return () => {

@@ -292,7 +292,7 @@ export default function MigrationPreviewDialog({
   const heading = useRef<HTMLHeadingElement>(null);
   const previousStep = useRef(step);
   const billingContinue = useRef<(() => boolean) | null>(null);
-  const advanceFromBilling = useRef(false);
+  const advanceFromBilling = useRef<{ owner: string; requireVerified: boolean } | null>(null);
   const ownerGroups = new Map<string, OwnerGroup>();
   for (const user of users) {
     if (user.history_only) continue;
@@ -396,8 +396,23 @@ export default function MigrationPreviewDialog({
     accountGroups.find((group) => group.id === activeOwner) || accountGroups[0];
 
   useEffect(() => {
-    if (step === 1 && advanceFromBilling.current && !billingBlocked) {
-      advanceFromBilling.current = false;
+    const intent = advanceFromBilling.current;
+    if (step !== 1 || !intent) return;
+    const result = memberships.states[intent.owner];
+    if (!result || result.loading) return;
+    advanceFromBilling.current = null;
+    if (
+      !ownerReady(intent.owner) ||
+      (intent.requireVerified &&
+        (!result.value || !['active', 'complimentary'].includes(result.value.status)))
+    )
+      return;
+    const unresolved = groups.find((group) => !ownerReady(group.id));
+    if (unresolved) {
+      setActiveOwner(unresolved.id);
+      heading.current?.focus();
+      heading.current?.closest('.modal-body')?.scrollTo?.({ top: 0 });
+    } else {
       suggestSlots();
       setStep(2);
     }
@@ -519,7 +534,10 @@ export default function MigrationPreviewDialog({
         setActiveOwner(unresolved.id);
         return;
       }
-      advanceFromBilling.current = billingContinue.current?.() ?? false;
+      advanceFromBilling.current =
+        billingContinue.current?.() && currentOwner
+          ? { owner: currentOwner.id, requireVerified: false }
+          : null;
       return;
     }
     if (step === 1 && !billingBlocked) {
@@ -530,7 +548,7 @@ export default function MigrationPreviewDialog({
     if (step === 2 && !accountsBlocked) setStep(3);
   }
   function back() {
-    advanceFromBilling.current = false;
+    advanceFromBilling.current = null;
     setStep(step === 3 ? (protectedOnly ? 3 : 2) : step === 2 && !groups.length ? 0 : step - 1);
   }
   function targetName(user: PreviewUser) {
@@ -861,7 +879,7 @@ export default function MigrationPreviewDialog({
               groups={groups}
               selected={currentOwner.id}
               change={(id) => {
-                advanceFromBilling.current = false;
+                advanceFromBilling.current = null;
                 setActiveOwner(id);
               }}
               disabled={pending}
@@ -884,11 +902,14 @@ export default function MigrationPreviewDialog({
               continueAction={billingContinue}
               capacityIssue={capacityIssue}
               update={(draft, changed = false) => {
-                if (changed) advanceFromBilling.current = false;
+                if (changed) advanceFromBilling.current = null;
                 setBillingDrafts((current) => ({ ...current, [currentOwner.id]: draft }));
                 if (changed) setDirtyBilling((current) => new Set(current).add(currentOwner.id));
               }}
-              check={(billing, complimentary) => {
+              check={(billing, complimentary, continueAfterCheck = false) => {
+                advanceFromBilling.current = continueAfterCheck
+                  ? { owner: currentOwner.id, requireVerified: true }
+                  : null;
                 setDirtyBilling((current) => {
                   const next = new Set(current);
                   next.delete(currentOwner.id);
@@ -1290,11 +1311,17 @@ function BillingPanel({
   continueAction: { current: (() => boolean) | null };
   capacityIssue?: string;
   update: (value: BillingDraft, changed?: boolean) => void;
-  check: (value?: MigrationBillingSelection, complimentary?: { account_limit: number }) => void;
+  check: (
+    value?: MigrationBillingSelection,
+    complimentary?: { account_limit: number },
+    continueAfterCheck?: boolean,
+  ) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [loading, setLoading] = useState(false);
   const [validationAttempted, setValidationAttempted] = useState(false);
+  const [inlineAttempt, setInlineAttempt] = useState(false);
+  const inlineResult = useRef<HTMLDivElement>(null);
   const request = useRef<AbortController | null>(null);
   const currentDraft = useRef(draft);
   currentDraft.current = draft;
@@ -1413,6 +1440,13 @@ function BillingPanel({
   const recheck = () => {
     continueBilling();
   };
+  useEffect(() => {
+    if (dirty) setInlineAttempt(false);
+    if (inlineAttempt && !checking && !dirty && (!ready || capacityIssue || state?.error)) {
+      inlineResult.current?.scrollIntoView?.({ block: 'center' });
+      inlineResult.current?.focus();
+    }
+  }, [inlineAttempt, checking, dirty, ready, capacityIssue, state]);
   return (
     <div className="form-stack">
       {!state || state.loading ? (
@@ -1621,18 +1655,33 @@ function BillingPanel({
                 type="button"
                 className="btn"
                 disabled={checking || !canCheck}
-                onClick={() =>
-                  check({
-                    customer_ids: draft.ids,
-                    price_tiers: unmapped.map((price) => ({
-                      price_id: price.price_id,
-                      tier_id: draft.prices[price.price_id],
-                    })),
-                  })
-                }
+                onClick={() => {
+                  setEditing(true);
+                  setInlineAttempt(true);
+                  check(selectedBilling(), undefined, true);
+                }}
               >
                 {checking ? 'Checking membership…' : 'Confirm billing & check membership'}
               </button>
+              {inlineAttempt && !dirty && (
+                <div
+                  ref={inlineResult}
+                  role="status"
+                  aria-label="Billing confirmation result"
+                  tabIndex={-1}
+                  className={
+                    !checking && (!ready || capacityIssue || state?.error)
+                      ? 'error-block'
+                      : 'subtle text-small'
+                  }
+                >
+                  {checking
+                    ? 'Checking current Stripe subscriptions and paid invoices…'
+                    : capacityIssue ||
+                      state?.error ||
+                      (state?.value && `${membershipTitle(state.value)}: ${state.value.message}`)}
+                </div>
+              )}
             </div>
           )}
           <div className="field">

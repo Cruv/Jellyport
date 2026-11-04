@@ -626,7 +626,7 @@ export class StripeIntegration {
       last_sync: inventory.observed,
       available: inventory.available && !this.stopped,
       message: inventory.available
-        ? 'Choose the Stripe customer whose subscription belongs to this Discord owner. Suggestions require your approval.'
+        ? 'Choose the Stripe customer whose subscription belongs to this Discord owner. Customers with only canceled or expired subscriptions are hidden. Suggestions require your approval.'
         : 'Refresh the billing customer list here before choosing a customer.',
     };
     if (!result.available || !inventory.snapshot) return result;
@@ -675,6 +675,13 @@ export class StripeIntegration {
         ...customer,
         subscription_statuses: [...statuses.get(customer.id)!].sort(),
       }))
+      // Hide ended-only choices, retaining all history and price evidence for
+      // mixed customers and for the independent live membership verification.
+      .filter((customer) =>
+        customer.subscription_statuses.some(
+          (status) => status !== 'canceled' && status !== 'incomplete_expired',
+        ),
+      )
       .filter(
         (customer) =>
           !search ||

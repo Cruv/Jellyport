@@ -403,7 +403,9 @@ test('one wizard reviews a missing Stripe identity, price mapping, account slots
   expect(store.linksForMember(paidOwner)).toEqual([]);
   expect(admin.writes).toEqual([]);
   expect(accepted).toEqual([]);
-  await review.getByRole('button', { name: 'Next: Accounts', exact: true }).click();
+  await expect(
+    review.getByRole('heading', { name: 'Confirm accounts & slots', exact: true }),
+  ).toBeVisible();
   const target = review.getByRole('combobox', {
     name: 'Jellyfin destination for alex',
     exact: true,

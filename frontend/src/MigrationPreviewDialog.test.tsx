@@ -340,9 +340,13 @@ describe('migration setup wizard', () => {
       before,
     );
   });
-  it.each(['Back', 'another member'])(
-    'does not auto-advance after navigating to %s during billing verification',
-    async (destination) => {
+  it.each(
+    ['footer', 'inline'].flatMap((action) =>
+      ['Back', 'another member'].map((destination) => ({ action, destination })),
+    ),
+  )(
+    'does not auto-advance after navigating to $destination during $action billing verification',
+    async ({ action, destination }) => {
       const fallback = fixtureApi();
       let resolveBilling!: (value: MigrationOwnerMembership) => void;
       const api = vi.fn(async (path, options) => {
@@ -385,7 +389,11 @@ describe('migration setup wizard', () => {
       fireEvent.click(
         screen.getByLabelText('I confirm these Stripe customers belong to @first_owner'),
       );
-      fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
+      fireEvent.click(
+        screen.getByRole('button', {
+          name: action === 'inline' ? 'Confirm billing & check membership' : 'Next: Accounts',
+        }),
+      );
       expect(resolveBilling).toBeTypeOf('function');
       if (destination === 'Back') fireEvent.click(screen.getByRole('button', { name: 'Back' }));
       else
@@ -768,7 +776,7 @@ describe('migration setup wizard', () => {
         price_tiers: [{ price_id: 'price_crew', tier_id: 'galleon' }],
       },
     });
-    fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
+    await screen.findByRole('heading', { name: 'Confirm accounts & slots' });
     review();
     expect(screen.getByText(/Link Stripe customer: Synthetic Crew/)).toBeTruthy();
     expect(screen.getByText(/This price mapping applies globally/)).toBeTruthy();
@@ -782,6 +790,131 @@ describe('migration setup wizard', () => {
     expect(startMigration).not.toHaveBeenCalled();
     fireEvent.submit(form);
     expect(startMigration).toHaveBeenCalledTimes(1);
+  });
+  it('keeps inline billing verification visible until fresh proof advances to Accounts', async () => {
+    const fallback = fixtureApi();
+    let resolveBilling!: (value: MigrationOwnerMembership) => void;
+    const api = vi.fn(async (path, options) => {
+      if (path.endsWith('/membership')) {
+        if ((options?.body as { billing?: unknown }).billing)
+          return new Promise<MigrationOwnerMembership>((resolve) => {
+            resolveBilling = resolve;
+          });
+        return entitlement(owner, { status: 'unlinked', allowed_slots: [] });
+      }
+      return fallback(path, options);
+    }) as Api;
+    const { form, startMigration } = setup(rows, api);
+    assign();
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Billing' }));
+    await screen.findByRole('checkbox', { name: 'Stripe customer Synthetic Crew' });
+    chooseCustomer();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm billing & check membership' }));
+    expect(screen.getByRole('status', { name: 'Billing confirmation result' }).textContent).toBe(
+      'Checking current Stripe subscriptions and paid invoices…',
+    );
+    expect(screen.getByRole('button', { name: 'Checking membership…' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(new FormData(form).has(`membership-review-${owner}`)).toBe(false);
+    expect(screen.getByRole('heading', { name: 'Confirm membership & billing' })).toBeTruthy();
+    await act(async () =>
+      resolveBilling(entitlement(owner, { review_token: 'fresh-inline-proof' })),
+    );
+    await screen.findByRole('heading', { name: 'Confirm accounts & slots' });
+    expect(new FormData(form).get(`membership-review-${owner}`)).toBe('fresh-inline-proof');
+    expect(startMigration).not.toHaveBeenCalled();
+  });
+  it.each(['inactive', 'unavailable', 'unlinked', 'insufficient', 'request error'] as const)(
+    'shows and focuses the inline %s result without advancing or starting a migration',
+    async (outcome) => {
+      const fallback = fixtureApi();
+      let resolveBilling!: (value: MigrationOwnerMembership) => void;
+      let rejectBilling!: (error: Error) => void;
+      const api = vi.fn(async (path, options) => {
+        if (path.endsWith('/membership')) {
+          if ((options?.body as { billing?: unknown }).billing)
+            return new Promise<MigrationOwnerMembership>((resolve, reject) => {
+              resolveBilling = resolve;
+              rejectBilling = reject;
+            });
+          return entitlement(owner, { status: 'unlinked', allowed_slots: [] });
+        }
+        return fallback(path, options);
+      }) as Api;
+      // One unlinked account may otherwise use the administrator migration
+      // allowance. An explicit paid confirmation still needs an active result.
+      const { startMigration } = setup(outcome === 'unlinked' ? [rows[0]] : rows, api);
+      assign();
+      fireEvent.click(screen.getByRole('button', { name: 'Next: Billing' }));
+      await screen.findByRole('checkbox', { name: 'Stripe customer Synthetic Crew' });
+      chooseCustomer();
+      fireEvent.click(screen.getByRole('button', { name: 'Confirm billing & check membership' }));
+      const message =
+        outcome === 'insufficient'
+          ? 'This membership covers 1 account, but 2 accounts are selected'
+          : outcome === 'request error'
+            ? 'The billing connection could not be reached.'
+            : `Synthetic ${outcome} membership requires review.`;
+      await act(async () => {
+        if (outcome === 'request error') rejectBilling(new Error(message));
+        else
+          resolveBilling(
+            entitlement(owner, {
+              status: outcome === 'insufficient' ? 'active' : outcome,
+              tier_name: 'Sloop',
+              account_limit: 1,
+              allowed_slots: outcome === 'insufficient' || outcome === 'unlinked' ? [1] : [],
+              message,
+            }),
+          );
+      });
+      const result = screen.getByRole('status', { name: 'Billing confirmation result' });
+      expect(result.textContent).toContain(message);
+      expect(document.activeElement).toBe(result);
+      expect(screen.getByRole('heading', { name: 'Confirm membership & billing' })).toBeTruthy();
+      expect(screen.queryByRole('heading', { name: 'Confirm accounts & slots' })).toBeNull();
+      expect(
+        screen.getByRole('button', { name: 'Confirm billing & check membership' }),
+      ).toHaveProperty('disabled', false);
+      expect(startMigration).not.toHaveBeenCalled();
+    },
+  );
+  it('moves inline billing success to the next unresolved member before Accounts', async () => {
+    const fallback = fixtureApi();
+    const api = vi.fn(async (path, options) => {
+      if (path.endsWith('/membership')) {
+        const body = options?.body as { discord_user_id: string; billing?: unknown };
+        return body.billing
+          ? entitlement(body.discord_user_id)
+          : entitlement(body.discord_user_id, { status: 'unlinked', allowed_slots: [] });
+      }
+      return fallback(path, options);
+    }) as Api;
+    const { startMigration } = setup(
+      [
+        { ...rows[0], discord_user_id: owner, discord_username: owner, owner_basis: 'approved' },
+        { ...rows[1], discord_user_id: other, discord_username: other, owner_basis: 'approved' },
+      ],
+      api,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Billing' }));
+    await screen.findByRole('checkbox', { name: 'Stripe customer Synthetic Crew' });
+    chooseCustomer();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm billing & check membership' }));
+    await waitFor(() =>
+      expect(screen.getByLabelText('Member to review')).toHaveProperty('value', other),
+    );
+    expect(screen.getByRole('heading', { name: 'Confirm membership & billing' })).toBeTruthy();
+    expect(document.activeElement).toBe(
+      screen.getByRole('heading', { name: 'Confirm membership & billing' }),
+    );
+    expect(screen.queryByRole('heading', { name: 'Confirm accounts & slots' })).toBeNull();
+    expect(
+      screen.getByText('1 of 2 members ready. Review each member before continuing.'),
+    ).toBeTruthy();
+    expect(startMigration).not.toHaveBeenCalled();
   });
   it('keeps known customer links and price mappings confirmed and blocks customers belonging to someone else', async () => {
     const fallback = fixtureApi();

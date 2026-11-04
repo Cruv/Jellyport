@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import { Callout, Icon, Issues, Modal, SourceSnapshotNote, UserCell } from './components';
+import { Pagination, usePagination } from './ui-layout';
 import {
   num,
   type Api,
@@ -183,6 +184,40 @@ const emptyBilling = (): BillingDraft => ({
   confirmed: false,
   known: {},
 });
+function billingRequirements(draft: BillingDraft, owner: string) {
+  const customers = [...new Set(draft.ids)].map((id) => draft.known[id]).filter(Boolean);
+  const newLinks = customers.filter((customer) => !customer.linked_discord_id);
+  const prices = new Map<string, BillingCustomer['prices'][number]>();
+  for (const customer of customers)
+    for (const price of customer.prices) prices.set(price.price_id, price);
+  const unmapped = [...prices.values()].filter((price) => !price.tier_id);
+  const missingTier = unmapped.find((price) => !draft.prices[price.price_id]);
+  const issue =
+    draft.mode === 'complimentary'
+      ? !draft.complimentaryConfirmed
+        ? {
+            message: 'Confirm administrator-managed complimentary access to continue.',
+            id: `billing-complimentary-${owner}`,
+          }
+        : null
+      : !customers.length
+        ? {
+            message: 'Choose the Stripe customer whose subscription belongs to this member.',
+            id: `billing-search-${owner}`,
+          }
+        : newLinks.length && !draft.confirmed
+          ? {
+              message: 'Confirm that the selected Stripe customers belong to this Discord member.',
+              id: `billing-owner-confirm-${owner}`,
+            }
+          : missingTier
+            ? {
+                message: `Choose a membership tier for ${missingTier.name || missingTier.price_id}.`,
+                id: `billing-tier-${owner}-${missingTier.price_id}`,
+              }
+            : null;
+  return { customers, newLinks, prices, unmapped, issue };
+}
 type TargetDraft = {
   id: string;
   value?: MigrationAccountReview;
@@ -190,6 +225,23 @@ type TargetDraft = {
   error?: string;
 };
 type OwnerGroup = { id: string; label: string; users: PreviewUser[] };
+function membershipSlotIssue(
+  group: OwnerGroup,
+  membership: MigrationOwnerMembership,
+  selections: Record<string, Selection>,
+) {
+  if (!['active', 'complimentary'].includes(membership.status)) return undefined;
+  const count = membership.allowed_slots.length;
+  if (group.users.length > count)
+    return `This membership covers ${count} ${count === 1 ? 'account' : 'accounts'}, but ${group.users.length} accounts are selected. Review the customer or tier, or migrate fewer accounts.`;
+  const uncovered = group.users.find(
+    (user) =>
+      lockedOwner(user) && !membership.allowed_slots.includes(selections[user.source_user_id].slot),
+  );
+  if (uncovered)
+    return `The confirmed account ${uncovered.username} uses slot ${selections[uncovered.source_user_id].slot}, which this membership does not cover. Review this member’s tier; existing assignments stay unchanged.`;
+  return undefined;
+}
 
 export default function MigrationPreviewDialog({
   review,
@@ -239,6 +291,8 @@ export default function MigrationPreviewDialog({
   const targetVersions = useRef(new Map<string, number>());
   const heading = useRef<HTMLHeadingElement>(null);
   const previousStep = useRef(step);
+  const billingContinue = useRef<(() => boolean) | null>(null);
+  const advanceFromBilling = useRef(false);
   const ownerGroups = new Map<string, OwnerGroup>();
   for (const user of users) {
     if (user.history_only) continue;
@@ -250,6 +304,7 @@ export default function MigrationPreviewDialog({
     ownerGroups.set(id, group);
   }
   const groups = [...ownerGroups.values()];
+  const pendingOwnerSelection = chosen.size > 0 && !!(batchMember || batchManual.trim());
   const currentOwner = groups.find((group) => group.id === activeOwner) || groups[0];
   const memberships = useOwnerMemberships(
     api,
@@ -259,8 +314,27 @@ export default function MigrationPreviewDialog({
   const ownerReady = (id: string) =>
     !!memberships.states[id]?.value &&
     !dirtyBilling.has(id) &&
-    !!memberships.states[id].value?.allowed_slots.length;
+    !!memberships.states[id].value?.allowed_slots.length &&
+    (ownerGroups.get(id)?.users.length || 0) <=
+      memberships.states[id].value!.allowed_slots.length &&
+    (ownerGroups.get(id)?.users || []).every(
+      (user) =>
+        !lockedOwner(user) ||
+        memberships.states[id].value!.allowed_slots.includes(selections[user.source_user_id].slot),
+    );
   const billingBlocked = groups.some((group) => !ownerReady(group.id));
+  const currentMembership = currentOwner && memberships.states[currentOwner.id];
+  const capacityIssue =
+    currentOwner && currentMembership?.value && !dirtyBilling.has(currentOwner.id)
+      ? membershipSlotIssue(currentOwner, currentMembership.value, selections)
+      : undefined;
+  const billingCanRepair =
+    (!!currentOwner && ownerReady(currentOwner.id)) ||
+    (!!currentMembership?.value &&
+      !(
+        currentMembership.value.source === 'saved' &&
+        currentMembership.value.existing_member !== null
+      ));
   const conflicts: Record<string, string> = {};
   for (const group of groups) {
     const seen = new Map<number, string>();
@@ -322,6 +396,14 @@ export default function MigrationPreviewDialog({
     accountGroups.find((group) => group.id === activeOwner) || accountGroups[0];
 
   useEffect(() => {
+    if (step === 1 && advanceFromBilling.current && !billingBlocked) {
+      advanceFromBilling.current = false;
+      suggestSlots();
+      setStep(2);
+    }
+  }, [step, billingBlocked, memberships.states]);
+
+  useEffect(() => {
     if (previousStep.current === step) return;
     previousStep.current = step;
     heading.current?.focus();
@@ -359,11 +441,11 @@ export default function MigrationPreviewDialog({
     return () => controller.abort();
   }, [api, step, protectedOnly, directoryVersion, templateUserId]);
 
-  function assignOwner(independent = false) {
-    const id = independent ? '' : batchMember?.id || batchManual.trim();
+  function assignOwner(independent = false, member = batchMember, manual = batchManual) {
+    const id = independent ? '' : member?.id || manual.trim();
     if (!independent && !/^[0-9]{15,22}$/.test(id)) {
       setOwnerError('Select a Discord member before assigning these accounts.');
-      return;
+      return false;
     }
     setOwnerError('');
     setSelections((current) => {
@@ -372,8 +454,8 @@ export default function MigrationPreviewDialog({
         if (!chosen.has(user.source_user_id) || user.history_only || lockedOwner(user)) continue;
         const old = current[user.source_user_id];
         next[user.source_user_id] = {
-          member: independent ? null : batchMember,
-          manual: independent || batchMember ? '' : id,
+          member: independent ? null : member,
+          manual: independent || member ? '' : id,
           slot: old.slot,
           slotEdited:
             (!ownerId(old) && !!user.mapping_id) || ownerId(old) === id ? old.slotEdited : false,
@@ -381,6 +463,11 @@ export default function MigrationPreviewDialog({
       }
       return next;
     });
+    if (independent) {
+      setBatchMember(null);
+      setBatchManual('');
+    }
+    return true;
   }
   function suggestSlots() {
     setSelections((current) => {
@@ -422,7 +509,17 @@ export default function MigrationPreviewDialog({
   }
   function next() {
     if (step === 0) {
-      setStep(groups.length ? 1 : 2);
+      if (pendingOwnerSelection && !assignOwner()) return;
+      setStep(groups.length || pendingOwnerSelection ? 1 : 2);
+      return;
+    }
+    if (step === 1 && billingBlocked) {
+      const unresolved = groups.find((group) => !ownerReady(group.id));
+      if (unresolved && unresolved.id !== currentOwner?.id) {
+        setActiveOwner(unresolved.id);
+        return;
+      }
+      advanceFromBilling.current = billingContinue.current?.() ?? false;
       return;
     }
     if (step === 1 && !billingBlocked) {
@@ -433,6 +530,7 @@ export default function MigrationPreviewDialog({
     if (step === 2 && !accountsBlocked) setStep(3);
   }
   function back() {
+    advanceFromBilling.current = false;
     setStep(step === 3 ? (protectedOnly ? 3 : 2) : step === 2 && !groups.length ? 0 : step - 1);
   }
   function targetName(user: PreviewUser) {
@@ -495,6 +593,21 @@ export default function MigrationPreviewDialog({
       close={close}
       footer={
         <>
+          {step === 1 && billingBlocked && (
+            <p id="migration-billing-next-help" className="wizard-next-help" role="status">
+              {currentMembership?.loading
+                ? 'Checking membership…'
+                : currentMembership?.error ||
+                  capacityIssue ||
+                  (billingCanRepair && currentOwner
+                    ? billingRequirements(
+                        billingDrafts[currentOwner.id] || emptyBilling(),
+                        currentOwner.id,
+                      ).issue?.message || 'Next verifies billing before continuing.'
+                    : currentMembership?.value?.message ||
+                      'Review this member’s billing before continuing.')}
+            </p>
+          )}
           <button type="button" className="btn btn-quiet" onClick={close} disabled={pending}>
             Cancel
           </button>
@@ -509,14 +622,20 @@ export default function MigrationPreviewDialog({
               type="button"
               className="btn btn-primary"
               disabled={
-                pending || (step === 1 && billingBlocked) || (step === 2 && accountsBlocked)
+                pending ||
+                (step === 1 && billingBlocked && !billingCanRepair) ||
+                (step === 2 && accountsBlocked)
+              }
+              aria-describedby={
+                step === 1 && billingBlocked ? 'migration-billing-next-help' : undefined
               }
               onClick={(event) => {
                 event.preventDefault();
                 next();
               }}
             >
-              Next: {phaseLabels[step === 0 && !groups.length ? 2 : step + 1]}
+              Next:{' '}
+              {phaseLabels[step === 0 && !groups.length && !pendingOwnerSelection ? 2 : step + 1]}
             </button>
           ) : (
             <button
@@ -601,43 +720,61 @@ export default function MigrationPreviewDialog({
         {step === 0 && (
           <div className="form-stack">
             <p className="subtle">
-              Choose the accounts belonging to one person, then assign their Discord owner once.
-              Differently named accounts can share an owner. Independent accounts can stay without
-              Discord.
+              All {users.length} accounts are included in this migration. Select the accounts that
+              need an owner, then choose their Discord member. Next applies that choice. Confirmed
+              owners stay unchanged; independent accounts can stay without Discord.
             </p>
             <div className="migration-account-list">
-              {users.map((user) => (
-                <label key={user.source_user_id} className="migration-account-choice">
-                  <input
-                    type="checkbox"
-                    aria-label={`Assign ${user.username}`}
-                    checked={chosen.has(user.source_user_id)}
-                    disabled={pending || user.history_only || lockedOwner(user)}
-                    onChange={(event) =>
-                      setChosen((current) => {
-                        const next = new Set(current);
-                        event.target.checked
-                          ? next.add(user.source_user_id)
-                          : next.delete(user.source_user_id);
-                        return next;
-                      })
-                    }
-                  />
-                  <span>
-                    <strong>{user.source_username || user.username}</strong>
-                    {user.source_username && user.source_username !== user.username && (
-                      <small>Jellyfin: {user.username}</small>
-                    )}
-                    <small>
-                      {user.history_only
-                        ? 'Protected · watch history only'
-                        : ownerId(selections[user.source_user_id])
-                          ? `@${selections[user.source_user_id].member?.username || ownerId(selections[user.source_user_id])}${lockedOwner(user) ? ' · confirmed owner' : ''}`
-                          : 'Independent · no Discord owner'}
-                    </small>
-                  </span>
-                </label>
-              ))}
+              {users.map((user) =>
+                user.history_only || lockedOwner(user) ? (
+                  <div
+                    key={user.source_user_id}
+                    className="migration-account-choice migration-account-fixed"
+                  >
+                    <Icon name="shield" />
+                    <span>
+                      <strong>{user.source_username || user.username}</strong>
+                      <small>
+                        {user.history_only
+                          ? 'Protected · watch history only. Included in this migration.'
+                          : `Confirmed owner · @${selections[user.source_user_id].member?.username || ownerId(selections[user.source_user_id])}. Included in this migration.`}
+                      </small>
+                    </span>
+                  </div>
+                ) : (
+                  <label key={user.source_user_id} className="migration-account-choice">
+                    <input
+                      type="checkbox"
+                      className="checkbox"
+                      aria-label={`Assign ${user.username}`}
+                      checked={chosen.has(user.source_user_id)}
+                      disabled={pending}
+                      onChange={(event) =>
+                        setChosen((current) => {
+                          const next = new Set(current);
+                          event.target.checked
+                            ? next.add(user.source_user_id)
+                            : next.delete(user.source_user_id);
+                          return next;
+                        })
+                      }
+                    />
+                    <span>
+                      <strong>{user.source_username || user.username}</strong>
+                      {user.source_username && user.source_username !== user.username && (
+                        <small>Jellyfin: {user.username}</small>
+                      )}
+                      <small>
+                        {user.history_only
+                          ? 'Protected · watch history only'
+                          : ownerId(selections[user.source_user_id])
+                            ? `@${selections[user.source_user_id].member?.username || ownerId(selections[user.source_user_id])}${lockedOwner(user) ? ' · confirmed owner' : ''}`
+                            : 'Independent · no Discord owner'}
+                      </small>
+                    </span>
+                  </label>
+                ),
+              )}
             </div>
             <DiscordMemberPicker
               api={api}
@@ -651,6 +788,12 @@ export default function MigrationPreviewDialog({
               showMembershipStatus={false}
               disabled={pending || chosen.size === 0}
             />
+            {!!chosen.size && (batchMember || batchManual.trim()) && (
+              <p className="subtle text-small" role="status">
+                Next assigns @{batchMember?.username || batchManual.trim()} to {chosen.size}{' '}
+                selected {chosen.size === 1 ? 'account' : 'accounts'}.
+              </p>
+            )}
             <details>
               <summary>Advanced Discord details</summary>
               <label className="field">
@@ -695,20 +838,18 @@ export default function MigrationPreviewDialog({
                 <button
                   type="button"
                   className="text-button"
-                  disabled={pending || group.users.every(lockedOwner)}
+                  disabled={pending || !chosen.size}
                   onClick={() => {
-                    setChosen(
-                      new Set(
-                        group.users
-                          .filter((user) => !lockedOwner(user))
-                          .map((user) => user.source_user_id),
-                      ),
-                    );
                     setBatchMember(selections[group.users[0].source_user_id].member);
                     setBatchManual(selections[group.users[0].source_user_id].manual);
+                    assignOwner(
+                      false,
+                      selections[group.users[0].source_user_id].member,
+                      selections[group.users[0].source_user_id].manual,
+                    );
                   }}
                 >
-                  Select accounts for @{group.label}
+                  Use @{group.label} for selected accounts
                 </button>
               </div>
             ))}
@@ -719,7 +860,10 @@ export default function MigrationPreviewDialog({
             <GroupPicker
               groups={groups}
               selected={currentOwner.id}
-              change={setActiveOwner}
+              change={(id) => {
+                advanceFromBilling.current = false;
+                setActiveOwner(id);
+              }}
               disabled={pending}
               label="Member to review"
             />
@@ -737,7 +881,10 @@ export default function MigrationPreviewDialog({
               draft={billingDrafts[currentOwner.id] || emptyBilling()}
               pending={pending}
               dirty={dirtyBilling.has(currentOwner.id)}
+              continueAction={billingContinue}
+              capacityIssue={capacityIssue}
               update={(draft, changed = false) => {
+                if (changed) advanceFromBilling.current = false;
                 setBillingDrafts((current) => ({ ...current, [currentOwner.id]: draft }));
                 if (changed) setDirtyBilling((current) => new Set(current).add(currentOwner.id));
               }}
@@ -1128,6 +1275,8 @@ function BillingPanel({
   draft,
   pending,
   dirty,
+  continueAction,
+  capacityIssue,
   update,
   check,
 }: {
@@ -1138,11 +1287,14 @@ function BillingPanel({
   draft: BillingDraft;
   pending: boolean;
   dirty: boolean;
+  continueAction: { current: (() => boolean) | null };
+  capacityIssue?: string;
   update: (value: BillingDraft, changed?: boolean) => void;
   check: (value?: MigrationBillingSelection, complimentary?: { account_limit: number }) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [validationAttempted, setValidationAttempted] = useState(false);
   const request = useRef<AbortController | null>(null);
   const currentDraft = useRef(draft);
   currentDraft.current = draft;
@@ -1203,16 +1355,19 @@ function BillingPanel({
     if (showEditor && !draft.inventory && !loading && !draft.error) load();
   }, [showEditor, draft.inventory, draft.error, loading, load]);
   useEffect(() => () => request.current?.abort(), []);
-  const selectedCustomers = draft.ids.map((id) => draft.known[id]).filter(Boolean);
-  const newLinks = selectedCustomers.filter((customer) => !customer.linked_discord_id);
-  const prices = new Map<string, BillingCustomer['prices'][number]>();
-  for (const customer of selectedCustomers)
-    for (const price of customer.prices) prices.set(price.price_id, price);
-  const unmapped = [...prices.values()].filter((price) => !price.tier_id);
-  const canCheck =
-    selectedCustomers.length > 0 &&
-    (!newLinks.length || draft.confirmed) &&
-    unmapped.every((price) => !!draft.prices[price.price_id]);
+  const {
+    customers: selectedCustomers,
+    newLinks,
+    prices,
+    unmapped,
+    issue,
+  } = billingRequirements(draft, group.id);
+  const canCheck = !issue;
+  const customerPages = usePagination(
+    draft.inventory?.customers || [],
+    5,
+    JSON.stringify([group.id, draft.inventory?.customers.map((customer) => customer.id)]),
+  );
   const selectedBilling = (): MigrationBillingSelection | undefined =>
     canCheck
       ? {
@@ -1227,9 +1382,35 @@ function BillingPanel({
     complimentaryMode && draft.complimentaryConfirmed
       ? { account_limit: draft.complimentaryLimit || 1 }
       : undefined;
-  const recheck = () =>
+  const continueBilling = (requireChoices = false) => {
+    if (checking) return false;
+    if (requireChoices && capacityIssue && !dirty) {
+      const status = document.getElementById(`billing-membership-status-${group.id}`);
+      status?.scrollIntoView?.({ block: 'center' });
+      status?.focus();
+      return false;
+    }
+    if (issue && (dirty || (requireChoices && showEditor) || complimentaryMode)) {
+      setValidationAttempted(true);
+      const control = document.getElementById(issue.id);
+      control?.scrollIntoView?.({ block: 'center' });
+      control?.focus();
+      return false;
+    }
+    setValidationAttempted(false);
     check(complimentaryMode ? undefined : selectedBilling(), selectedComplimentary());
-  const invalidDraft = dirty && (complimentaryMode ? !draft.complimentaryConfirmed : !canCheck);
+    return true;
+  };
+  useEffect(() => {
+    const action = () => continueBilling(true);
+    continueAction.current = action;
+    return () => {
+      if (continueAction.current === action) continueAction.current = null;
+    };
+  });
+  const recheck = () => {
+    continueBilling();
+  };
   return (
     <div className="form-stack">
       {!state || state.loading ? (
@@ -1239,33 +1420,36 @@ function BillingPanel({
       ) : state.error ? (
         <Callout warning title="Membership could not be checked">
           <p>{state.error}</p>
-          <button
-            type="button"
-            className="btn"
-            disabled={pending || invalidDraft}
-            onClick={recheck}
-          >
+          <button type="button" className="btn" disabled={pending} onClick={recheck}>
             Check membership again for {group.label}
           </button>
         </Callout>
       ) : (
         state.value && (
-          <Callout title={membershipTitle(state.value)} warning={!ready}>
-            <p>{state.value.message}</p>
-            {dirty && <p>Billing choices changed. Check membership again before continuing.</p>}
-            {state.value.billing_changes && (
-              <BillingChanges changes={state.value.billing_changes} />
-            )}
-            <button
-              type="button"
-              className="text-button"
-              disabled={checking || invalidDraft}
-              onClick={recheck}
-            >
-              Check membership again for {group.label}
-            </button>
-          </Callout>
+          <div id={`billing-membership-status-${group.id}`} tabIndex={-1}>
+            <Callout title={membershipTitle(state.value)} warning={!ready || !!capacityIssue}>
+              <p>{state.value.message}</p>
+              {capacityIssue && <p role="alert">{capacityIssue}</p>}
+              {dirty && (
+                <p>
+                  {issue?.message ||
+                    'Billing choices are ready. Next verifies them before continuing.'}
+                </p>
+              )}
+              {state.value.billing_changes && (
+                <BillingChanges changes={state.value.billing_changes} />
+              )}
+              <button type="button" className="text-button" disabled={checking} onClick={recheck}>
+                Check membership again for {group.label}
+              </button>
+            </Callout>
+          </div>
         )
+      )}
+      {validationAttempted && issue && (
+        <p className="error-block" role="alert">
+          {issue.message}
+        </p>
       )}
       {state?.value?.existing_member === null && !localPolicy && (
         <label className="field">
@@ -1324,6 +1508,8 @@ function BillingPanel({
           <label className="check-label">
             <input
               type="checkbox"
+              className="checkbox"
+              id={`billing-complimentary-${group.id}`}
               disabled={checking}
               checked={!!draft.complimentaryConfirmed}
               onChange={(event) =>
@@ -1362,6 +1548,91 @@ function BillingPanel({
             Suggestions are identity hints. Confirm the customer yourself; Discord roles do not
             prove payment. No link or price mapping is saved until the final migration approval.
           </p>
+          {selectedCustomers.length > 0 && (
+            <div className="form-stack billing-selected-review">
+              <h4>Review selected customers ({selectedCustomers.length})</h4>
+              <ul className="billing-selected-customers">
+                {selectedCustomers.map((customer) => (
+                  <li key={customer.id}>
+                    <strong>{customer.name || customer.email || customer.id}</strong>
+                    <small>{customer.id}</small>
+                  </li>
+                ))}
+              </ul>
+              {newLinks.length > 0 && (
+                <label className="check-label">
+                  <input
+                    type="checkbox"
+                    className="checkbox"
+                    id={`billing-owner-confirm-${group.id}`}
+                    checked={draft.confirmed}
+                    disabled={checking}
+                    onChange={(event) =>
+                      update({ ...draft, confirmed: event.target.checked }, true)
+                    }
+                  />
+                  I confirm these Stripe customers belong to @{group.label}
+                </label>
+              )}
+              {[...prices.values()].map((price) =>
+                price.tier_id ? (
+                  <p className="subtle text-small" key={price.price_id}>
+                    {price.name || price.price_id} ·{' '}
+                    {draft.inventory?.tiers.find((tier) => tier.id === price.tier_id)?.name ||
+                      price.tier_id}{' '}
+                    (configured)
+                  </p>
+                ) : (
+                  <label className="field" key={price.price_id}>
+                    Membership tier for {price.name || price.price_id}
+                    <select
+                      id={`billing-tier-${group.id}-${price.price_id}`}
+                      aria-label={`Membership tier for ${price.name || price.price_id}`}
+                      value={draft.prices[price.price_id] || ''}
+                      disabled={checking}
+                      onChange={(event) =>
+                        update(
+                          {
+                            ...draft,
+                            prices: { ...draft.prices, [price.price_id]: event.target.value },
+                          },
+                          true,
+                        )
+                      }
+                    >
+                      <option value="">Choose a configured tier</option>
+                      {draft.inventory?.tiers.map((tier) => (
+                        <option key={tier.id} value={tier.id}>
+                          {tier.name} · {tier.account_limit}{' '}
+                          {tier.account_limit === 1 ? 'account' : 'accounts'}
+                        </option>
+                      ))}
+                    </select>
+                    <small>
+                      Mapping this Stripe price applies globally, including other customers using
+                      this price.
+                    </small>
+                  </label>
+                ),
+              )}
+              <button
+                type="button"
+                className="btn"
+                disabled={checking || !canCheck}
+                onClick={() =>
+                  check({
+                    customer_ids: draft.ids,
+                    price_tiers: unmapped.map((price) => ({
+                      price_id: price.price_id,
+                      tier_id: draft.prices[price.price_id],
+                    })),
+                  })
+                }
+              >
+                {checking ? 'Checking membership…' : 'Confirm billing & check membership'}
+              </button>
+            </div>
+          )}
           <div className="field">
             <label htmlFor={`billing-search-${group.id}`}>Search Stripe customers</label>
             <div className="discord-picker-search">
@@ -1399,22 +1670,24 @@ function BillingPanel({
           {draft.inventory?.message && (
             <p className="subtle text-small">{draft.inventory.message}</p>
           )}
-          {draft.inventory?.customers.map((customer) => {
+          {customerPages.items.map((customer) => {
             const otherOwner =
               !!customer.linked_discord_id && customer.linked_discord_id !== group.id;
             return (
               <label key={customer.id} className="migration-account-choice">
                 <input
                   type="checkbox"
+                  className="checkbox"
                   checked={draft.ids.includes(customer.id)}
                   disabled={checking || otherOwner || customer.linked_discord_id === group.id}
                   aria-label={`Stripe customer ${customer.name || customer.email || customer.id}`}
+                  aria-describedby={`billing-customer-${group.id}-${customer.id}`}
                   onChange={(event) =>
                     update(
                       {
                         ...draft,
                         ids: event.target.checked
-                          ? [...draft.ids, customer.id]
+                          ? [...new Set([...draft.ids, customer.id])]
                           : draft.ids.filter((id) => id !== customer.id),
                         confirmed: false,
                       },
@@ -1422,9 +1695,16 @@ function BillingPanel({
                     )
                   }
                 />
-                <span>
+                <span id={`billing-customer-${group.id}-${customer.id}`}>
                   <strong>{customer.name || customer.email || customer.id}</strong>
                   {customer.name && customer.email && <small>{customer.email}</small>}
+                  <small>{customer.id}</small>
+                  {customer.subscription_statuses?.length ? (
+                    <small>
+                      Stripe status: {customer.subscription_statuses.join(', ')} ·{' '}
+                      {customer.subscription_count} subscriptions
+                    </small>
+                  ) : null}
                   <small>
                     {otherOwner
                       ? `Already linked to @${customer.linked_username || customer.linked_discord_id}`
@@ -1441,6 +1721,15 @@ function BillingPanel({
               </label>
             );
           })}
+          {!!draft.inventory?.customers.length && (
+            <Pagination
+              label="Stripe customer results"
+              page={customerPages.page}
+              total={customerPages.total}
+              pageSize={customerPages.pageSize}
+              onPageChange={customerPages.setPage}
+            />
+          )}
           {draft.inventory?.next_cursor && (
             <button
               type="button"
@@ -1450,85 +1739,6 @@ function BillingPanel({
             >
               More customers
             </button>
-          )}
-          {selectedCustomers.length > 0 && (
-            <div className="form-stack">
-              <p className="subtle text-small">
-                Selected:{' '}
-                {selectedCustomers
-                  .map((customer) => customer.name || customer.email || customer.id)
-                  .join(', ')}
-              </p>
-              {[...prices.values()].map((price) =>
-                price.tier_id ? (
-                  <p className="subtle text-small" key={price.price_id}>
-                    {price.name || price.price_id} ·{' '}
-                    {draft.inventory?.tiers.find((tier) => tier.id === price.tier_id)?.name ||
-                      price.tier_id}{' '}
-                    (configured)
-                  </p>
-                ) : (
-                  <label className="field" key={price.price_id}>
-                    Membership tier for {price.name || price.price_id}
-                    <select
-                      aria-label={`Membership tier for ${price.name || price.price_id}`}
-                      value={draft.prices[price.price_id] || ''}
-                      disabled={checking}
-                      onChange={(event) =>
-                        update(
-                          {
-                            ...draft,
-                            prices: { ...draft.prices, [price.price_id]: event.target.value },
-                          },
-                          true,
-                        )
-                      }
-                    >
-                      <option value="">Choose a configured tier</option>
-                      {draft.inventory?.tiers.map((tier) => (
-                        <option key={tier.id} value={tier.id}>
-                          {tier.name} · {tier.account_limit}{' '}
-                          {tier.account_limit === 1 ? 'account' : 'accounts'}
-                        </option>
-                      ))}
-                    </select>
-                    <small>
-                      Mapping this Stripe price applies globally, including other customers using
-                      this price.
-                    </small>
-                  </label>
-                ),
-              )}
-              {newLinks.length > 0 && (
-                <label className="check-label">
-                  <input
-                    type="checkbox"
-                    checked={draft.confirmed}
-                    disabled={checking}
-                    onChange={(event) =>
-                      update({ ...draft, confirmed: event.target.checked }, true)
-                    }
-                  />
-                  I confirm these Stripe customers belong to @{group.label}
-                </label>
-              )}
-              <button
-                type="button"
-                className="btn"
-                disabled={checking || !canCheck}
-                onClick={() =>
-                  check({
-                    customer_ids: draft.ids,
-                    price_tiers: unmapped.map((price) => ({
-                      price_id: price.price_id,
-                      tier_id: draft.prices[price.price_id],
-                    })),
-                  })
-                }
-              >
-                {checking ? 'Checking membership…' : 'Confirm billing & check membership'}
-              </button>
-            </div>
           )}
         </section>
       )}

@@ -450,6 +450,8 @@ describe('inline migration billing relationship drafts', () => {
           email: 'crew@example.invalid',
           linked_discord_id: null,
           suggested: true,
+          subscription_count: 1,
+          subscription_statuses: ['active'],
           prices: [{ price_id: 'price_member', name: 'Synthetic Crew Plan', tier_id: null }],
         },
       ],
@@ -458,6 +460,45 @@ describe('inline migration billing relationship drafts', () => {
     expect(f.integration.subscriptions()[0]!.linked_discord_id).toBeNull();
     expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
     expect(f.customerRead).not.toHaveBeenCalled();
+    expect(f.snapshot).not.toHaveBeenCalled();
+  });
+  it('distinguishes same-name and same-email customer records with cached subscription summaries without approving either', async () => {
+    const f = await draftFixture();
+    const identity = {
+      customer_name: 'Synthetic Crew Owner',
+      customer_email: 'crew@example.invalid',
+    };
+    f.data.subscriptions.push(
+      { ...subscription('cus_member', 'prior'), ...identity, status: 'canceled' },
+      { ...subscription('cus_member', 'replacement'), ...identity },
+      { ...subscription('cus_old', 'old'), ...identity, status: 'canceled' },
+    );
+    await f.integration.sync();
+    f.snapshot.mockClear();
+    const changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
+    const result = f.integration.searchMigrationCustomers(owner, 'crew@example.invalid');
+    expect(result.customers).toHaveLength(2);
+    expect(result.customers.map((customer) => customer.id).sort()).toEqual([
+      'cus_member',
+      'cus_old',
+    ]);
+    expect(result.customers.find((customer) => customer.id === 'cus_member')).toMatchObject({
+      name: identity.customer_name,
+      email: identity.customer_email,
+      subscription_count: 3,
+      subscription_statuses: ['active', 'canceled'],
+    });
+    expect(result.customers.find((customer) => customer.id === 'cus_old')).toMatchObject({
+      name: identity.customer_name,
+      email: identity.customer_email,
+      subscription_count: 1,
+      subscription_statuses: ['canceled'],
+    });
+    expect(result.customers.every((customer) => customer.linked_discord_id === null)).toBe(true);
+    expect(f.integration.status().linked_customer_count).toBe(0);
+    expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
+    expect(f.customerRead).not.toHaveBeenCalled();
+    expect(f.invoiceRead).not.toHaveBeenCalled();
     expect(f.snapshot).not.toHaveBeenCalled();
   });
   it('paginates the local inventory in bounded, context-specific pages', async () => {

@@ -165,6 +165,205 @@ function chooseCustomer() {
 }
 
 describe('migration setup wizard', () => {
+  it('applies the pending owner on Next while retaining a confirmed second account and slot', async () => {
+    const { form } = setup(
+      [
+        { ...rows[0], username: 'media_crew' },
+        {
+          ...rows[1],
+          username: 'media_crew_2',
+          discord_user_id: owner,
+          discord_username: 'crew_owner',
+          membership_slot: 2,
+          owner_basis: 'approved',
+        },
+      ],
+      fixtureApi(
+        entitlement(owner, { account_limit: 2, allowed_slots: [1, 2], tier_name: 'Brigantine' }),
+      ),
+    );
+    expect(screen.queryByRole('checkbox', { name: 'Assign media_crew_2' })).toBeNull();
+    expect(
+      screen.getByText('Confirmed owner · @crew_owner. Included in this migration.'),
+    ).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Discord owner'), { target: { value: 'crew_owner' } });
+    fireEvent.click(await screen.findByRole('button', { name: 'Select @crew_owner' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Billing' }));
+    await screen.findByText('Brigantine · 2 accounts');
+    expect(screen.getByText(/media_crew, media_crew_2 · 2 selected accounts/)).toBeTruthy();
+    expect(new FormData(form).get('source-a')).toBe(owner);
+    expect(new FormData(form).get('source-b')).toBe(owner);
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
+    expect(screen.getByLabelText('Membership account slot for media_crew')).toHaveProperty(
+      'value',
+      '1',
+    );
+    expect(screen.getByLabelText('Membership account slot for media_crew_2')).toHaveProperty(
+      'value',
+      '2',
+    );
+    expect(screen.getByLabelText('Membership account slot for media_crew_2')).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(new FormData(form).has('slot-source-b')).toBe(false);
+  });
+  it('keeps an explicitly independent choice when Next is pressed after choosing an owner', () => {
+    const { form, api } = setup([rows[0]]);
+    fireEvent.change(screen.getByLabelText('Discord owner ID'), { target: { value: owner } });
+    fireEvent.click(screen.getByRole('button', { name: 'Keep selected accounts independent' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
+    expect(screen.getByRole('heading', { name: 'Confirm accounts & slots' })).toBeTruthy();
+    expect(new FormData(form).get('source-a')).toBe('');
+    expect(vi.mocked(api).mock.calls.some(([path]) => path.endsWith('/membership'))).toBe(false);
+  });
+  it('guides missing billing choices and verifies both distinct customer IDs before advancing', async () => {
+    const data = structuredClone(inventory);
+    data.customers.push({ ...data.customers[0], id: 'cus_crew_history' });
+    const fallback = fixtureApi();
+    const api = vi.fn(async (path, options) => {
+      if (path.endsWith('/billing')) return data;
+      if (path.endsWith('/membership'))
+        return (options?.body as { billing?: unknown })?.billing
+          ? entitlement(owner, { review_token: 'verified-billing-proof' })
+          : entitlement(owner, { status: 'unlinked', allowed_slots: [1], account_limit: null });
+      return fallback(path, options);
+    }) as Api;
+    const { form, startMigration } = setup(rows, api);
+    assign();
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Billing' }));
+    const customers = await screen.findAllByRole('checkbox', {
+      name: 'Stripe customer Synthetic Crew',
+    });
+    fireEvent.click(customers[0]);
+    fireEvent.click(customers[1]);
+    const before = vi
+      .mocked(api)
+      .mock.calls.filter(([path]) => path.endsWith('/membership')).length;
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
+    expect(screen.getByLabelText(`I confirm these Stripe customers belong to @${owner}`)).toBe(
+      document.activeElement,
+    );
+    expect(screen.getByRole('heading', { name: 'Confirm membership & billing' })).toBeTruthy();
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path.endsWith('/membership'))).toHaveLength(
+      before,
+    );
+    expect(new FormData(form).has(`membership-review-${owner}`)).toBe(false);
+    fireEvent.click(screen.getByLabelText(`I confirm these Stripe customers belong to @${owner}`));
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
+    expect(screen.getByLabelText('Membership tier for Crew plan')).toBe(document.activeElement);
+    fireEvent.change(screen.getByLabelText('Membership tier for Crew plan'), {
+      target: { value: 'galleon' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
+    await screen.findByRole('heading', { name: 'Confirm accounts & slots' });
+    expect(new FormData(form).get(`membership-review-${owner}`)).toBe('verified-billing-proof');
+    expect(vi.mocked(api).mock.calls.at(-2)?.[1]?.body).toMatchObject({
+      billing: { customer_ids: ['cus_crew', 'cus_crew_history'] },
+    });
+    expect(startMigration).not.toHaveBeenCalled();
+  });
+  it('keeps an uncovered confirmed slot in Billing rather than advancing to an Accounts dead end', async () => {
+    setup(
+      [
+        {
+          ...rows[0],
+          discord_user_id: owner,
+          discord_username: 'crew_owner',
+          membership_slot: 2,
+          owner_basis: 'approved',
+        },
+      ],
+      fixtureApi(
+        entitlement(owner, { status: 'unlinked', account_limit: null, allowed_slots: [1] }),
+      ),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Billing' }));
+    await screen.findByRole('checkbox', { name: 'Stripe customer Synthetic Crew' });
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
+    expect(screen.getByLabelText('Search Stripe customers')).toBe(document.activeElement);
+    expect(screen.getByRole('heading', { name: 'Confirm membership & billing' })).toBeTruthy();
+  });
+  it('explains insufficient verified allowance without repeatedly checking the same valid billing', async () => {
+    const api = fixtureApi(
+      entitlement(owner, { account_limit: 1, allowed_slots: [1], tier_name: 'Sloop' }),
+    );
+    setup(rows, api);
+    assign();
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Billing' }));
+    await screen.findByText('Sloop · 1 account');
+    const before = vi
+      .mocked(api)
+      .mock.calls.filter(([path]) => path.endsWith('/membership')).length;
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
+    expect(screen.getByRole('heading', { name: 'Confirm membership & billing' })).toBeTruthy();
+    expect(document.activeElement?.id).toBe(`billing-membership-status-${owner}`);
+    expect(
+      screen.getAllByText(/This membership covers 1 account, but 2 accounts are selected/),
+    ).toHaveLength(2);
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path.endsWith('/membership'))).toHaveLength(
+      before,
+    );
+  });
+  it.each(['Back', 'another member'])(
+    'does not auto-advance after navigating to %s during billing verification',
+    async (destination) => {
+      const fallback = fixtureApi();
+      let resolveBilling!: (value: MigrationOwnerMembership) => void;
+      const api = vi.fn(async (path, options) => {
+        if (path.endsWith('/membership')) {
+          const body = options?.body as { discord_user_id: string; billing?: unknown };
+          if (body.discord_user_id === other) return entitlement(other);
+          if (body.billing)
+            return new Promise<MigrationOwnerMembership>((resolve) => {
+              resolveBilling = resolve;
+            });
+          return entitlement(owner, { status: 'unlinked', allowed_slots: [] });
+        }
+        return fallback(path, options);
+      }) as Api;
+      setup(
+        [
+          {
+            ...rows[0],
+            discord_user_id: owner,
+            discord_username: 'first_owner',
+            owner_basis: 'approved',
+            membership_slot: 1,
+          },
+          {
+            ...rows[1],
+            discord_user_id: other,
+            discord_username: 'second_owner',
+            owner_basis: 'approved',
+            membership_slot: 1,
+          },
+        ],
+        api,
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Next: Billing' }));
+      await screen.findByRole('checkbox', { name: 'Stripe customer Synthetic Crew' });
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Stripe customer Synthetic Crew' }));
+      fireEvent.change(screen.getByLabelText('Membership tier for Crew plan'), {
+        target: { value: 'galleon' },
+      });
+      fireEvent.click(
+        screen.getByLabelText('I confirm these Stripe customers belong to @first_owner'),
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
+      expect(resolveBilling).toBeTypeOf('function');
+      if (destination === 'Back') fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+      else
+        fireEvent.change(screen.getByLabelText('Member to review'), { target: { value: other } });
+      await act(async () => resolveBilling(entitlement(owner)));
+      expect(
+        screen.getByRole('heading', {
+          name: destination === 'Back' ? 'Choose account owners' : 'Confirm membership & billing',
+        }),
+      ).toBeTruthy();
+      expect(screen.queryByRole('heading', { name: 'Confirm accounts & slots' })).toBeNull();
+    },
+  );
   it('groups three arbitrary names under one searched owner without requiring a Discord subscriber role', async () => {
     const users = [...rows, { ...rows[0], source_user_id: 'source-c', username: 'third-name' }];
     const { api, form, startMigration } = setup(users);
@@ -277,10 +476,10 @@ describe('migration setup wizard', () => {
           owner_basis,
         },
       ]);
-      expect(screen.getByRole('checkbox', { name: 'Assign personal-name' })).toHaveProperty(
-        'disabled',
-        true,
-      );
+      expect(screen.queryByRole('checkbox', { name: 'Assign personal-name' })).toBeNull();
+      expect(
+        screen.getByText('Confirmed owner · @crew_owner. Included in this migration.'),
+      ).toBeTruthy();
       await accounts();
       expect(screen.getByLabelText('Membership account slot for personal-name')).toHaveProperty(
         'disabled',
@@ -344,7 +543,7 @@ describe('migration setup wizard', () => {
     setup(rows, api);
     assign();
     fireEvent.click(screen.getByRole('button', { name: 'Next: Billing' }));
-    await screen.findByText('Billing is temporarily unavailable.');
+    await screen.findAllByText('Billing is temporarily unavailable.');
     expect(screen.getByRole('button', { name: 'Next: Accounts' })).toHaveProperty('disabled', true);
     fireEvent.click(screen.getByRole('button', { name: `Check membership again for ${owner}` }));
     await screen.findByText('Galleon · 3 accounts');

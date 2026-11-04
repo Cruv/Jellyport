@@ -1,4 +1,4 @@
-FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS build
+FROM node:24.22.2-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -7,7 +7,7 @@ COPY server ./server
 COPY frontend ./frontend
 RUN npm run build
 
-FROM node:24.21.0-bookworm-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS runtime
+FROM node:24.22.2-bookworm-slim@sha256:c86ecead9e55a5210ac1727de38a4ca840bf03dcaf34dc9749addbf383b1920c AS runtime
 LABEL org.opencontainers.image.source="https://github.com/Cruv/Jellyport" \
       org.opencontainers.image.description="Jellyport - Emby to Jellyfin account and watched-status migration"
 WORKDIR /app

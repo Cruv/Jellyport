@@ -200,9 +200,48 @@ test('migration billing hides canceled-only duplicate customers while preserving
     fullPage: true,
   });
   await activate(approval);
-  await activate(
-    review.getByRole('button', { name: 'Confirm billing & check membership', exact: true }),
-  );
+  let releaseMembershipResponse!: () => void;
+  let membershipResponseHeld = false;
+  const membershipResponseGate = new Promise<void>((resolve) => {
+    releaseMembershipResponse = resolve;
+  });
+  await page.route('**/api/migrations/preview/*/membership', async (route) => {
+    expect(new URL(route.request().url()).origin).toBe(admin.url);
+    if (!route.request().postDataJSON()?.billing) return route.continue();
+    // The real local API verifies the selected customers and paid period. Hold
+    // only delivery of its unmodified response to inspect the waiting interface.
+    const response = await route.fetch();
+    expect(response.ok()).toBe(true);
+    membershipResponseHeld = true;
+    await membershipResponseGate;
+    await route.fulfill({ response });
+  });
+  try {
+    await activate(
+      review.getByRole('button', { name: 'Confirm billing & check membership', exact: true }),
+    );
+    await expect.poll(() => membershipResponseHeld).toBe(true);
+    const checking = review.getByRole('button', { name: 'Checking membership…', exact: true });
+    await expect(checking).toBeDisabled();
+    await expect(checking).toBeInViewport({ ratio: 1 });
+    const pendingStatus = review.getByRole('status', { name: 'Billing confirmation result' });
+    await expect(pendingStatus).toHaveText(
+      'Checking current Stripe subscriptions and paid invoices…',
+    );
+    await expect(pendingStatus).toBeInViewport({ ratio: 1 });
+    await expectReachableFooter();
+    await expectContainedLayout(page);
+    await page.screenshot({
+      path: info.outputPath('billing-verification-pending.png'),
+      fullPage: true,
+    });
+    expect(membershipChecks.filter((request) => request.billing)).toHaveLength(1);
+    expect(stripe.status().linked_customer_count).toBe(0);
+    expect(admin.writes).toEqual([]);
+    expect(accepted).toEqual([]);
+  } finally {
+    releaseMembershipResponse();
+  }
   await expect(
     review.getByRole('heading', { name: 'Confirm accounts & slots', exact: true }),
   ).toBeVisible();

@@ -396,6 +396,9 @@ test('one wizard reviews a missing Stripe identity, price mapping, account slots
   await review
     .getByRole('button', { name: 'Confirm billing & check membership', exact: true })
     .click();
+  await expect(
+    review.getByRole('heading', { name: 'Confirm accounts & slots', exact: true }),
+  ).toBeVisible();
   await expect(review.getByText('Galleon · 3 accounts', { exact: true })).toBeVisible();
   expect(stripe.status().linked_customer_count).toBe(0);
   expect(stripe.status().price_tiers).toEqual([]);
@@ -403,9 +406,6 @@ test('one wizard reviews a missing Stripe identity, price mapping, account slots
   expect(store.linksForMember(paidOwner)).toEqual([]);
   expect(admin.writes).toEqual([]);
   expect(accepted).toEqual([]);
-  await expect(
-    review.getByRole('heading', { name: 'Confirm accounts & slots', exact: true }),
-  ).toBeVisible();
   const target = review.getByRole('combobox', {
     name: 'Jellyfin destination for alex',
     exact: true,

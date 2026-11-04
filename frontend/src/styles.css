@@ -3586,6 +3586,39 @@ progress.progress-track::-moz-progress-bar {
   margin-top: 3px;
   color: var(--muted);
 }
+.migration-account-fixed {
+  cursor: default;
+}
+.migration-account-fixed > svg {
+  flex-shrink: 0;
+  margin-top: 4px;
+  color: var(--muted);
+}
+.wizard-next-help {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: left;
+}
+.billing-selected-review {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.billing-selected-customers {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.billing-selected-customers li + li {
+  margin-top: 8px;
+}
+.billing-selected-customers small {
+  display: block;
+  color: var(--muted);
+}
 .migration-owner-summary {
   padding: 18px;
   border: 1px solid var(--line);

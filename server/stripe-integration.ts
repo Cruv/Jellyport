@@ -146,6 +146,9 @@ export interface StripeMigrationCustomers {
     linked_discord_id: string | null;
     linked_username: string | null;
     suggested: boolean;
+    /** Cached Stripe observations for disambiguation, never proof of paid access. */
+    subscription_count: number;
+    subscription_statuses: string[];
     prices: Array<{ price_id: string; name: string | null; tier_id: string | null }>;
   }>;
   tiers: Array<{ id: string; name: string; account_limit: number }>;
@@ -633,6 +636,7 @@ export class StripeIntegration {
     const prices = new Map(this.state.price_tiers.map((entry) => [entry.price_id, entry.tier_id]));
     const products = new Map(snapshot.products.map((entry) => [entry.id, entry.name]));
     const grouped = new Map<string, StripeMigrationCustomers['customers'][number]>();
+    const statuses = new Map<string, Set<string>>();
     for (const subscription of snapshot.subscriptions) {
       const link = links.get(subscription.customer_id);
       let customer = grouped.get(subscription.customer_id);
@@ -644,10 +648,15 @@ export class StripeIntegration {
           linked_discord_id: link?.discord_user_id ?? null,
           linked_username: link?.username ?? null,
           suggested: false,
+          subscription_count: 0,
+          subscription_statuses: [],
           prices: [],
         };
         grouped.set(customer.id, customer);
+        statuses.set(customer.id, new Set());
       }
+      customer.subscription_count++;
+      statuses.get(customer.id)!.add(subscription.status);
       customer.suggested ||= subscription.identity_candidates.some(
         (candidate) =>
           candidate.discord_user_id === ownerId &&
@@ -662,6 +671,10 @@ export class StripeIntegration {
           });
     }
     const rows = [...grouped.values()]
+      .map((customer) => ({
+        ...customer,
+        subscription_statuses: [...statuses.get(customer.id)!].sort(),
+      }))
       .filter(
         (customer) =>
           !search ||

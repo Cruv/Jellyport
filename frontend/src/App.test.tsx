@@ -2919,10 +2919,8 @@ describe('React account safeguards', () => {
     fireEvent.click(await screen.findByRole('checkbox', { name: 'Select all visible Emby users' }));
     fireEvent.click(screen.getByRole('button', { name: 'Preview migration (1)' }));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByRole('checkbox', { name: 'Assign simple' })).toHaveProperty(
-      'disabled',
-      true,
-    );
+    expect(within(dialog).queryByRole('checkbox', { name: 'Assign simple' })).toBeNull();
+    expect(within(dialog).getByText(/Confirmed owner.*Included in this migration/)).toBeTruthy();
     const recipient = dialog.querySelector('input[name="complex"]') as HTMLInputElement;
     expect(recipient.value).toBe('123456789012345678');
     fireEvent.click(within(dialog).getByRole('button', { name: 'Next: Billing' }));

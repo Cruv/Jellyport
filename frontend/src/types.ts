@@ -122,6 +122,9 @@ export interface MigrationBillingInventory {
     linked_discord_id: string | null;
     linked_username: string | null;
     suggested: boolean;
+    /** Optional during rolling updates; Stripe status does not verify paid access. */
+    subscription_count?: number;
+    subscription_statuses?: string[];
     prices: Array<{ price_id: string; name: string; tier_id: string | null }>;
   }>;
   tiers: Array<{ id: string; name: string; account_limit: number }>;

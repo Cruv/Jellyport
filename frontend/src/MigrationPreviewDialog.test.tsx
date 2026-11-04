@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { Profiler } from 'react';
 import MigrationPreviewDialog from './MigrationPreviewDialog';
 import type {
   Api,
@@ -118,10 +119,11 @@ function setup(
   api = fixtureApi(),
   pending = false,
   templateUserId: string | null = 'template',
+  onCommit?: () => void,
 ) {
   const startMigration = vi.fn((event) => event.preventDefault());
   const close = vi.fn();
-  const rendered = render(
+  const component = (
     <MigrationPreviewDialog
       review={{ previewId: 'review-synthetic', preview: { users } }}
       api={api}
@@ -130,7 +132,16 @@ function setup(
       startMigration={startMigration}
       busy={new Set(pending ? ['migration'] : [])}
       templateUserId={templateUserId || undefined}
-    />,
+    />
+  );
+  const rendered = render(
+    onCommit ? (
+      <Profiler id="migration-review" onRender={onCommit}>
+        {component}
+      </Profiler>
+    ) : (
+      component
+    ),
   );
   return {
     ...rendered,
@@ -165,6 +176,30 @@ function chooseCustomer() {
 }
 
 describe('migration setup wizard', () => {
+  it('handles Next immediately when fresh billing makes the button interactive', async () => {
+    const api = fixtureApi(
+      entitlement(owner, { account_limit: 1, allowed_slots: [1], tier_name: 'Sloop' }),
+    );
+    let clicked = false;
+    setup(rows, api, false, 'template', () => {
+      if (clicked || !document.body.textContent?.includes('Sloop · 1 account')) return;
+      const next = screen.getByRole<HTMLButtonElement>('button', { name: 'Next: Accounts' });
+      if (next.disabled) return;
+      // A fast activation in this commit must use the same billing state as
+      // the newly enabled button, before passive effects get their turn.
+      clicked = true;
+      next.click();
+    });
+    assign();
+    fireEvent.click(screen.getByRole('button', { name: 'Next: Billing' }));
+    await screen.findByText('Sloop · 1 account');
+    expect(clicked).toBe(true);
+    expect(document.activeElement?.id).toBe(`billing-membership-status-${owner}`);
+    expect(screen.getByRole('heading', { name: 'Confirm membership & billing' })).toBeTruthy();
+    expect(vi.mocked(api).mock.calls.filter(([path]) => path.endsWith('/membership'))).toHaveLength(
+      1,
+    );
+  });
   it('applies the pending owner on Next while retaining a confirmed second account and slot', async () => {
     const { form } = setup(
       [

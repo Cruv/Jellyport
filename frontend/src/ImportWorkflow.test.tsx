@@ -530,6 +530,21 @@ describe('bounded destination import diagnostics', () => {
     expect(screen.queryByText(/No recent progress update/)).toBeNull();
   });
   it.each([
+    ['version_mismatch', 'Backup server version does not match'],
+    ['version_unsupported', 'Backup server version is unsupported'],
+  ] as const)('distinguishes %s without hiding the actionable failure', (code, label) => {
+    renderStatus({
+      status: {
+        ...idle,
+        last_outcome: 'failed',
+        last_error: 'Create a fresh backup after upgrading the linked server.',
+      },
+      importErrorCode: code,
+    });
+    expect(screen.getByText(label)).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toContain('Create a fresh backup');
+  });
+  it.each([
     { started_at: 'PRIVATE_INVALID_TIMESTAMP' },
     { updated_at: '2026-01-01T00:00:00Z' },
     { source_rows: -1 },

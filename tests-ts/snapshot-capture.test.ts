@@ -600,3 +600,20 @@ it.each(['sqlite_online_backup', 'file_copy'] as const)(
   'captures %s while writes continue and publishes only migration tables',
   verifyCaptureWhileWriting,
 );
+
+it('recovers interrupted 4.10.2 plugin requests without rewriting their exact source version', async () => {
+  const path = await directory();
+  const key = randomBytes(32);
+  const request = {
+    ...recoveryRequest(),
+    capture_method: 'plugin_backup' as const,
+    binding: { ...recoveryRequest().binding, version: '4.10.2.0' },
+  };
+  await writeEnvelope(join(path, `${request.id}.working`), request, key);
+  await recoverSnapshotHelper(path, key);
+  expect(await readEnvelope<CaptureResult>(join(path, `${request.id}.result`), key)).toMatchObject({
+    id: request.id,
+    binding: request.binding,
+    ok: false,
+  });
+});

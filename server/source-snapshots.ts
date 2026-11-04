@@ -27,6 +27,7 @@ import {
   snapshotOrphanIdentityVersion,
   writeEnvelope,
   SNAPSHOT_VERSION,
+  supportedSnapshotVersion,
   MAX_SNAPSHOT_BYTES,
   SNAPSHOT_MAX_AGE,
   type CaptureRequest,
@@ -164,27 +165,43 @@ export class SourceSnapshots {
     this.timer.unref();
     await this.tick();
   }
-  private async helperStatus(): Promise<{ capture_method: SnapshotCaptureMethod } | null> {
+  private async helperStatus(): Promise<{
+    capture_method: SnapshotCaptureMethod;
+    versions: string[];
+  } | null> {
     if (!this.key || this.options.demo) return null;
     try {
       const status = await readEnvelope<{
         version: number;
         emby_version: string;
+        emby_versions?: unknown;
         updated_at: string;
         capture_method?: unknown;
       }>(join(this.directory, 'helper.status'), this.key);
       if (!(
         status.version === 1 &&
-        status.emby_version === SNAPSHOT_VERSION &&
+        supportedSnapshotVersion(status.emby_version) &&
         Math.abs(Date.now() - Date.parse(status.updated_at)) < 20_000
       ))
         return null;
       const capture_method = snapshotCaptureMethod(status.capture_method);
+      const versions = status.emby_versions ?? [status.emby_version];
+      if (
+        !Array.isArray(versions) ||
+        !versions.length ||
+        versions.length > 2 ||
+        versions.some((version) => !supportedSnapshotVersion(version)) ||
+        new Set(versions).size !== versions.length ||
+        !versions.includes(status.emby_version) ||
+        (capture_method !== 'plugin_backup' &&
+          (versions.length !== 1 || versions[0] !== SNAPSHOT_VERSION))
+      )
+        return null;
       if (this.state.last_capture_method !== capture_method) {
         this.state.last_capture_method = capture_method;
         this.save();
       }
-      return { capture_method };
+      return { capture_method, versions };
     } catch {
       return null;
     }
@@ -201,8 +218,10 @@ export class SourceSnapshots {
       if (
         !value.ok ||
         value.id !== id ||
-        value.binding.version !== SNAPSHOT_VERSION ||
+        !supportedSnapshotVersion(value.binding.version) ||
         value.schema !== 'emby-4.10.1.0' ||
+        (snapshotCaptureMethod(value.capture_method) !== 'plugin_backup' &&
+          value.binding.version !== SNAPSHOT_VERSION) ||
         !snapshotIdentitiesMatch(
           value.identities,
           value.user_ids,
@@ -370,9 +389,13 @@ export class SourceSnapshots {
       let userIds: string[];
       try {
         const info = await client.systemInfo();
-        if (info.Version !== SNAPSHOT_VERSION || typeof info.Id !== 'string' || !info.Id)
+        if (!supportedSnapshotVersion(info.Version) || typeof info.Id !== 'string' || !info.Id)
           throw new ServiceError(
-            'Database snapshots currently support verified Emby 4.10.1.0 only.',
+            'Database snapshots currently support verified Emby 4.10.1.0 and 4.10.2.0 only.',
+          );
+        if (!helper.versions.includes(info.Version))
+          throw new ServiceError(
+            'The snapshot helper does not support the configured Emby version. Update both Jellyport containers; live captures also require the matching helper version setting.',
           );
         binding = { url: sourceUrl(settings), server_id: info.Id, version: info.Version };
         userIds = (await client.users()).map((user) => user.Id.toLowerCase().replaceAll('-', ''));
@@ -579,6 +602,7 @@ export class SourceSnapshots {
     settings: Settings,
     serverId: string,
     id?: string,
+    liveVersion: string = SNAPSHOT_VERSION,
   ): Promise<{ id: string; metadata: SnapshotMetadata; result: CaptureResult }> {
     if (this.clearing || this.stopping)
       throw new ServiceError(
@@ -591,6 +615,10 @@ export class SourceSnapshots {
     if (result.binding.url !== sourceUrl(settings) || result.binding.server_id !== serverId)
       throw new ServiceError(
         'The saved database belongs to a different Emby connection. Capture the configured server again.',
+      );
+    if (!supportedSnapshotVersion(liveVersion) || result.binding.version !== liveVersion)
+      throw new ServiceError(
+        'The saved database Emby version does not match the running server. Import a fresh backup before migrating.',
       );
     if (
       Date.now() - Date.parse(snapshotHistoryTime(result)) > MAX_AGE ||

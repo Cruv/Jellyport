@@ -38,7 +38,7 @@ services:
       - JELLYPORT_SNAPSHOT_METHOD=plugin_backup # Requires 0.14.0+ on both services.
       - JELLYPORT_JELLYFIN_BACKUP_DIR=/jellyfin-backups # Jellyfin native database-only ZIP backups, 0.15.0+.
       - JELLYPORT_EMBY_BACKUP_DIR=/emby-backups
-      - JELLYPORT_EMBY_VERSION=4.10.1.0 # Must match the supported Emby version.
+      - JELLYPORT_EMBY_VERSION=4.10.1.0 # Adapter baseline; plugin backups bind to the verified live version.
       - TZ=Etc/UTC
     volumes:
       - type: bind

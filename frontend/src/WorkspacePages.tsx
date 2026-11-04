@@ -308,6 +308,8 @@ export function MigratePage({
               <h2>Emby users</h2>
               <p>
                 Select up to 100 users. Preview resolves saved mappings and checks account access.
+                {!taskReadiness.ready &&
+                  ' You can select accounts while the migration requirements are resolved.'}
               </p>
             </div>
             <span className="status">{num(users.emby.length)} users</span>
@@ -332,7 +334,6 @@ export function MigratePage({
                   aria-label="Select all visible Emby users"
                   checked={!!pagination.items.length && selectedVisible === pagination.items.length}
                   disabled={
-                    !taskReadiness.ready ||
                     busy ||
                     (selectedVisible < pagination.items.length &&
                       selected.size + pagination.items.length - selectedVisible > 100)
@@ -370,11 +371,7 @@ export function MigratePage({
                           type="checkbox"
                           aria-label={`Select ${user.Name}`}
                           checked={selected.has(user.Id)}
-                          disabled={
-                            !taskReadiness.ready ||
-                            busy ||
-                            (!selected.has(user.Id) && selected.size >= 100)
-                          }
+                          disabled={busy || (!selected.has(user.Id) && selected.size >= 100)}
                           onChange={(event) => {
                             const next = new Set(selected);
                             if (event.target.checked) next.add(user.Id);

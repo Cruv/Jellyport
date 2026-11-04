@@ -19,6 +19,7 @@ function deferred() {
 describe('playback-conscious migration orchestration', () => {
   let directory: string, store: Store, servers: DemoServers, service: Service;
   let events: MediaWorkloadEvent[];
+  let sourceVersion: string;
   const releases: Array<() => void> = [];
   beforeEach(() => {
     directory = mkdtempSync(join(tmpdir(), 'jellyport-workload-service-'));
@@ -31,13 +32,14 @@ describe('playback-conscious migration orchestration', () => {
       jellyfin_api_key: 'private-fixture-target-key',
       template_user_id: 'template',
     });
+    sourceVersion = '4.10.1.0';
     servers = new DemoServers();
     events = [];
     service = new Service(store, {
       clientFactory: (...args) => {
         const client = servers.factory(...args);
         if (args[2] === 'emby')
-          client.systemInfo = async () => ({ Id: 'fixture-source', Version: '4.10.1.0' });
+          client.systemInfo = async () => ({ Id: 'fixture-source', Version: sourceVersion });
         return client;
       },
       observeMedia: (event) => events.push(event),
@@ -101,6 +103,24 @@ describe('playback-conscious migration orchestration', () => {
     const items = vi.spyOn(service.sourceSnapshots, 'items').mockImplementation(read);
     return { select, items };
   }
+
+  it('passes exact 4.10.2 source version through saved preview, admission and execution', async () => {
+    sourceVersion = '4.10.2.0';
+    const saved = snapshots();
+    const preview = await service.preview(['e-river'], { use_snapshots: true });
+    const job = await service.migrateUsers(
+      ['e-river'],
+      {},
+      undefined,
+      'played_favorites',
+      preview.source_snapshot_ids,
+    );
+    const result = await finish(job);
+    expect(result.status).not.toBe('failed');
+    expect(saved.select).toHaveBeenCalledTimes(3);
+    for (const call of saved.select.mock.calls) expect(call[4]).toBe('4.10.2.0');
+    expect(saved.items).toHaveBeenCalledOnce();
+  });
 
   it.each(['completed', 'failed', 'canceled'] as const)(
     'releases a bulk snapshot job reference when the job is %s',

@@ -290,6 +290,30 @@ it('contains worker errors without exposing source paths or replacing unrelated 
   expect(await readFile(join(f.root, 'unrelated-good.db.enc'), 'utf8')).toBe('good');
   expect(await readdir(f.root)).not.toContain(`${f.prefix}.db.enc`);
 });
+it('emits one bounded JSON event per early version failure without duplicating fields', async () => {
+  const f = await fixture();
+  const logs = vi.spyOn(console, 'info').mockImplementation(() => {});
+  f.worker.mockRejectedValue(new DestinationCatalogError('version_mismatch'));
+  await f.process();
+  expect(logs).toHaveBeenCalledTimes(3);
+  const events = logs.mock.calls.map(([value]) => {
+    expect(typeof value).toBe('string');
+    const line = String(value);
+    expect(Buffer.byteLength(line)).toBeLessThan(512);
+    expect(line.match(/"event":/g)).toHaveLength(1);
+    expect(line.match(/"outcome":/g)).toHaveLength(1);
+    return JSON.parse(line);
+  });
+  expect(events.map((event) => event.outcome)).toEqual(['started', 'stage_failed', 'failed']);
+  expect(events[1]).toMatchObject({
+    stage: 'validating_backup',
+    error_code: 'version_mismatch',
+    source_rows: 0,
+  });
+  expect((await f.result()).error).toContain(
+    'After a Jellyfin upgrade, create a fresh database backup',
+  );
+});
 it('publishes authenticated aggregate progress and retains a specific safe early failure without a completed catalog', async () => {
   const f = await fixture();
   f.worker.mockImplementation(async (_request, _signal, _timeout, options) => {

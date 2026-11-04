@@ -23,6 +23,7 @@ const importFailures: Record<DestinationCatalogErrorCode, string> = {
   backup_missing: 'Completed backup not found',
   backup_expired: 'Backup expired',
   backup_future: 'Backup timestamp is in the future',
+  version_unsupported: 'Backup server version is unsupported',
   version_mismatch: 'Backup server version does not match',
   backup_invalid: 'Backup is invalid or unsupported',
   backup_changed: 'Backup changed during import',

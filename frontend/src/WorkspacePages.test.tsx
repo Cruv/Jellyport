@@ -2,6 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { useState } from 'react';
+import { WorkflowProvider } from './WorkflowRequirements';
 import {
   AccountsPage,
   ActivityPage,
@@ -256,6 +257,80 @@ describe('Account page request lifecycle', () => {
 });
 
 describe('Workspace navigation and migration controls', () => {
+  it.each(['loading', 'blocked', 'failed'])(
+    'allows migration selections while requirements are %s without enabling preview',
+    async (state) => {
+      const api = vi.fn(async () => {
+        if (state === 'loading') return new Promise(() => {});
+        if (state === 'failed') throw new Error('Requirements are temporarily unavailable.');
+        return {
+          checked_at: new Date().toISOString(),
+          actions: {
+            migrate_saved: {
+              ready: false,
+              blockers: [
+                {
+                  code: 'matching_catalog',
+                  message: 'Import a current Jellyfin matching catalog before migrating.',
+                  route: { page: 'settings', tab: 'history', subtab: 'jellyfin' },
+                },
+              ],
+              warnings: [],
+            },
+          },
+        };
+      }) as Api;
+      function Selection() {
+        const [selected, select] = useState(new Set<string>());
+        return (
+          <WorkflowProvider api={api} notify={vi.fn()} enabled onSettingsSaved={vi.fn()}>
+            <MigratePage
+              users={{
+                emby: [
+                  { Id: 'source-one', Name: 'MemberOne' },
+                  { Id: 'source-two', Name: 'MemberTwo' },
+                ],
+                jellyfin: [],
+              }}
+              overview={overview}
+              selected={selected}
+              select={select}
+              search=""
+              setSearch={vi.fn()}
+              preview={vi.fn()}
+              useSnapshots
+              setUseSnapshots={vi.fn()}
+              busy={false}
+              navigate={vi.fn()}
+            />
+          </WorkflowProvider>
+        );
+      }
+      render(<Selection />);
+      if (state === 'blocked') await screen.findByText('Before you continue');
+      if (state === 'failed') await screen.findByText('Requirements are temporarily unavailable.');
+      const one = screen.getByRole('checkbox', { name: 'Select MemberOne' }) as HTMLInputElement;
+      const all = screen.getByRole('checkbox', {
+        name: 'Select all visible Emby users',
+      }) as HTMLInputElement;
+      expect(one.disabled).toBe(false);
+      expect(all.disabled).toBe(false);
+      fireEvent.click(one);
+      expect(one.checked).toBe(true);
+      expect(all.indeterminate).toBe(true);
+      fireEvent.click(all);
+      expect(all.checked).toBe(true);
+      expect(
+        (screen.getByRole('checkbox', { name: 'Select MemberTwo' }) as HTMLInputElement).checked,
+      ).toBe(true);
+      expect(
+        (screen.getByRole('button', { name: 'Preview migration (2)' }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(true);
+      fireEvent.click(screen.getByRole('button', { name: 'Clear selection' }));
+      expect(one.checked).toBe(false);
+    },
+  );
   it('keeps a new-account draft when switching to recovery without starting either action', () => {
     const api = vi.fn() as Api;
     page(api);
@@ -530,6 +605,13 @@ describe('Workspace navigation and migration controls', () => {
     expect(
       (screen.getByRole('checkbox', { name: 'Use saved Emby snapshot' }) as HTMLInputElement)
         .disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole('checkbox', { name: 'Select all visible Emby users' }) as HTMLInputElement)
+        .disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole('checkbox', { name: 'Select MemberOne' }) as HTMLInputElement).disabled,
     ).toBe(true);
   });
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   STRIPE_API_VERSION,
+  STRIPE_INVOICE_PERMISSION_MESSAGE,
   StripeClient,
   StripeClientError,
   type StripeClientOptions,
@@ -93,7 +94,7 @@ describe('read-only Stripe API boundary', () => {
           'Stripe-Version': STRIPE_API_VERSION,
         });
         expect(address).not.toContain(key);
-        if (url.pathname === '/v1/customers' || url.pathname === '/v1/checkout/sessions') {
+        if (['/v1/customers', '/v1/checkout/sessions', '/v1/invoices'].includes(url.pathname)) {
           expect(url.searchParams.get('limit')).toBe('1');
           return json(list([]));
         }
@@ -133,12 +134,12 @@ describe('read-only Stripe API boundary', () => {
         .find((url) => url.searchParams.has('starting_after'))
         ?.searchParams.get('starting_after'),
     ).toBe('sub_a');
-    expect(requests).toHaveLength(6);
+    expect(requests).toHaveLength(7);
     expect(JSON.stringify(snapshot)).not.toContain('private-');
     expect(snapshot.subscriptions[0]).not.toHaveProperty('metadata');
   });
 
-  it('verifies all five read permissions even when there are no subscriptions or products', async () => {
+  it('verifies all six read permissions even when there are no subscriptions or products', async () => {
     const paths: string[] = [];
     const api = client({
       transport: async (address) => {
@@ -150,13 +151,14 @@ describe('read-only Stripe API boundary', () => {
     expect(paths.sort()).toEqual([
       '/v1/checkout/sessions',
       '/v1/customers',
+      '/v1/invoices',
       '/v1/prices',
       '/v1/products',
       '/v1/subscriptions',
     ]);
   });
 
-  it.each(['/v1/customers', '/v1/checkout/sessions'])(
+  it.each(['/v1/customers', '/v1/checkout/sessions', '/v1/invoices'])(
     'rejects an incomplete restricted key when its %s read permission is missing',
     async (deniedPath) => {
       const api = client({
@@ -168,6 +170,70 @@ describe('read-only Stripe API boundary', () => {
       await expect(api.snapshot()).rejects.toMatchObject({ code: 'forbidden' });
     },
   );
+
+  it('reports the invoice permission failure safely before publishing a snapshot', async () => {
+    const paths: string[] = [];
+    const api = client({
+      transport: async (address) => {
+        const url = new URL(address);
+        paths.push(url.pathname);
+        if (url.pathname === '/v1/invoices') {
+          expect([...url.searchParams]).toEqual([['limit', '1']]);
+          return json(
+            {
+              error: {
+                type: 'invalid_request_error',
+                code: 'more_permissions_required',
+                message: `${key} private@example.invalid`,
+              },
+            },
+            403,
+          );
+        }
+        return json(list([]));
+      },
+    });
+    await expect(api.snapshot()).rejects.toMatchObject({
+      code: 'forbidden',
+      resource: 'invoices',
+      message: STRIPE_INVOICE_PERMISSION_MESSAGE,
+    });
+    expect(paths).toEqual(['/v1/customers', '/v1/checkout/sessions', '/v1/invoices']);
+  });
+
+  it('validates and discards the invoice permission probe rather than retaining invoice contents', async () => {
+    const api = client({
+      transport: async (address) =>
+        json(
+          list(
+            new URL(address).pathname === '/v1/invoices'
+              ? [
+                  {
+                    id: 'in_private',
+                    object: 'invoice',
+                    livemode: false,
+                    customer_email: 'private@example.invalid',
+                  },
+                ]
+              : [],
+          ),
+        ),
+    });
+    const snapshot = await api.snapshot();
+    expect(snapshot).toMatchObject({ subscriptions: [], products: [] });
+    expect(JSON.stringify(snapshot)).not.toContain('private');
+    const wrongMode = client({
+      transport: async (address) =>
+        json(
+          list(
+            new URL(address).pathname === '/v1/invoices'
+              ? [{ id: 'in_private', object: 'invoice', livemode: true }]
+              : [],
+          ),
+        ),
+    });
+    await expect(wrongMode.snapshot()).rejects.toMatchObject({ code: 'invalid_response' });
+  });
 
   it('returns conflicting explicit identity hints without choosing or trusting one', async () => {
     const api = client({

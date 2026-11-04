@@ -70,10 +70,19 @@ reformat unrelated Markdown tables or foreign work. Finish owned changes with
 
 `npm test` includes behavioral unit/component regressions for navigation, filtered
 selections, stale recovery responses, independent saves, cancelled confirmations,
-and failed-save retries. The required Node 24 CI job also runs Chromium and WebKit
-browser tests after building the app. A browser failure fails that required job
-and prevents image publication. Node 24 is the only supported runtime and runs
-the full unit/component suite and production build.
+and failed-save retries. CI runs the full unit/component suite, production build
+and dependency audit once on Node 24, then runs the four existing browser profiles
+in parallel on separate Ubuntu VMs. Each profile keeps one worker, no retries and
+its complete configured case selection. The unit suite compares the real
+Playwright case inventory with the union of all four CI profile invocations;
+missing profiles, duplicate cases or omitted cases fail verification.
+
+Browser jobs restore the same immutable build by artifact ID, verify its workflow
+run and revision, and install only their required Chromium or WebKit browser.
+The required `test (24)` check succeeds only after scope validation, unit tests,
+build, audit and every browser profile succeed. Failed, canceled, missing or
+unexpectedly skipped dependencies cannot produce its runtime success marker.
+A browser failure prevents image publication. Node 24 is the only supported runtime.
 
 To run the browser suite locally:
 
@@ -82,6 +91,11 @@ npm run build
 npx playwright install chromium webkit
 npm run test:e2e
 ```
+
+For a focused local rerun, append `-- --project=iphone-portrait` and the affected
+spec path to `npm run test:e2e`. Run profiles serially on one development checkout;
+the demo port and process-level fixtures are shared. CI parallelism comes from
+separate VMs rather than increasing workers against that shared state.
 
 The [Playwright suite](https://playwright.dev/docs/intro) checks all ten workspace
 pages at desktop and mobile widths, document overflow, focused Settings tabs,
@@ -94,8 +108,10 @@ Writable administration scenarios run isolated Fastify apps with temporary
 storage and fake media, authentication and bot adapters. They verify persisted
 mapping/role/account/membership outcomes, uncertain creation recovery and private
 in-memory draft lifetime; they cannot target a production server.
-It uses the built interface and real Jellyport API with simulated media servers. These are behavioral and layout checks, not pixel-baseline comparisons
-or a guarantee of support for every browser.
+It uses the built interface and real Jellyport API with simulated media servers.
+These are behavioral and layout checks, not pixel-baseline comparisons or a
+guarantee of support for every browser. A successful flow using a fake Stripe or
+bot adapter does not verify the real provider's client, HTTP responses or permissions.
 
 iPhone coverage uses Playwright's iPhone 16 Pro Max touch/mobile WebKit profiles:
 the portrait screen is 440 × 956 CSS pixels with a 440 × 763 browser viewport,
@@ -120,6 +136,17 @@ failure stays visible. Fix the behavior or test synchronization rather than
 relaxing safeguards or accepting a failed run.
 
 ## Verification proportional to risk
+
+Reproduce an integration failure at the failing boundary before running broad QA.
+For Stripe, first exercise the real Stripe client with representative raw HTTP
+JSON, including omitted/expanded fields and error responses, then cover the
+affected Jellyport API and wizard flow. Use sanitized synthetic HTTP fixtures;
+when authorized, a read-only provider check can establish the current live response
+shape without recording keys or customer data. A fake adapter bypasses that
+boundary and cannot substitute for this regression or support a claim that live
+Stripe verification works. Build and run the affected browser flow after the
+boundary regression passes, then run broader checks when shared changes or the
+release gates require them.
 
 | Change                                              | Sufficient local evidence before delivery                                                                                                                                                                                                      |
 | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -169,15 +196,21 @@ automated; the owner has not established a separate release cadence.
 
 The workflows define the executable gates:
 
+- Pull requests and pushes to `main` run `Checks`; feature-branch pushes do not
+  duplicate the pull-request run. Superseded automatic runs for the same pull
+  request or main branch are canceled. Manual dispatch remains full verification.
 - Documentation-only changes run documentation validation. The required
   `test (24)` and `docker` checks remain present and cannot pass if
   that validation fails; they skip application work only for the explicit docs
   allowlist. Any code, script, configuration or workflow change gets full checks.
   Keep `docs/` assets exclusive to documentation; if runtime code begins consuming
   them, change the classifier and its tests before relying on this exemption.
-- Runtime verification covers Node 24, the full suite, production builds and
-  dependency audit, Compose examples, and demo/setup/secure-cookie/unprivileged
-  container smoke. `Checks` manual dispatch always runs full verification.
+- Runtime verification covers Node 24, the full suite, production build, dependency
+  audit and all four browser profiles, plus Compose examples and
+  demo/setup/secure-cookie/unprivileged container smoke. The `test (24)` aggregate
+  joins the unit/build/audit and complete browser results; `docker` retains its
+  separate required check. Documentation-only success requires successful scope
+  validation and explicitly skipped runtime dependencies.
 - Automatic publication requires a successful same-repository main-push check
   run for the exact current main commit **with full runtime verification**.
   Documentation-only validation cannot authorize an image. Manual publication

@@ -110,39 +110,6 @@ describe('documentation-only workflow scope', () => {
   });
 });
 
-describe('browser regression checks gate the required runtime job', () => {
-  const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
-  const testJob = workflow.match(/\n  test:\n([\s\S]*?)\n  docker:/)?.[1];
-  if (!testJob) throw new Error('Required runtime test job must be present.');
-  const steps = testJob.split(/^      - /m).slice(1);
-
-  function namedStep(name: string) {
-    const matching = steps.filter((step) => step.startsWith(`name: ${name}\n`));
-    expect(matching, `${name} must occur exactly once in the required test job`).toHaveLength(1);
-    return matching[0];
-  }
-
-  it('runs Chromium and WebKit interface checks on Node 24 after the build and before the success marker', () => {
-    expect(testJob).toContain('node: [24]');
-    const install = namedStep('Install browser for interface regression tests');
-    const browser = namedStep('Run desktop and mobile interface regression tests');
-    const marker = namedStep('Runtime checks passed');
-    expect(install).toContain('        run: npx playwright install --with-deps chromium webkit\n');
-    expect(browser).toContain('        run: npm run test:e2e\n');
-    for (const step of [install, browser]) {
-      expect(step).toContain("        if: needs.scope.outputs.docs_only != 'true'\n");
-      expect(step).not.toMatch(/continue-on-error|\|\|\s*true|always\(\)|set\s+\+e/);
-    }
-    expect(marker).toContain("        if: needs.scope.outputs.docs_only != 'true'\n");
-    expect(marker).not.toMatch(/continue-on-error|always\(\)/);
-    const buildIndex = steps.findIndex((step) => step.startsWith('run: npm run build\n'));
-    expect(buildIndex).toBeGreaterThanOrEqual(0);
-    expect(steps.indexOf(install)).toBeGreaterThan(buildIndex);
-    expect(steps.indexOf(browser)).toBeGreaterThan(steps.indexOf(install));
-    expect(steps.indexOf(marker)).toBeGreaterThan(steps.indexOf(browser));
-  });
-});
-
 describe('image publication requires actual runtime validation', () => {
   const sha = 'a'.repeat(40);
   const repository = 'Fixture/Jellyport';

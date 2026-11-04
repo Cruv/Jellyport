@@ -10,6 +10,11 @@ import type { IdentityReviewApplyResult } from '../../server/identity-review-typ
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import { date, num, type Api, type DiscordMember, type MembershipTier, type Notify } from './types';
 
+// Only this fixed permission diagnostic may replace the generic sync failure.
+// Never render arbitrary persisted provider errors or credential-bearing text.
+const invoicePermissionMessage =
+  'Stripe denied access to invoices. Enable Invoices Read on the saved restricted key, then run Test & sync Stripe and check membership again.';
+
 export interface StripeIntegrationStatus {
   configured: boolean;
   mode: 'live' | 'test' | null;
@@ -538,8 +543,9 @@ export default function StripeIntegrationPanel({
               )}
               {status.last_error && (
                 <p className="error-block" role="alert">
-                  The last Stripe sync could not finish. Check the restricted key permissions and
-                  retry.
+                  {status.last_error === invoicePermissionMessage
+                    ? invoicePermissionMessage
+                    : 'The last Stripe sync could not finish. Check the restricted key permissions and retry.'}
                 </p>
               )}
               {status.automation_enabled && (
@@ -600,10 +606,9 @@ export default function StripeIntegrationPanel({
               <div className="support-note">
                 <p>
                   Create a restricted key in Stripe → Developers → API keys. Choose Read for
-                  Customers, Products, Prices, Subscriptions, and Checkout Sessions. Leave every
-                  other permission at None. For membership automation, also enable Read for
-                  Invoices. Role cleanup also requires Invoices Read. No write permissions are
-                  needed.
+                  Customers, Products, Prices, Subscriptions, Checkout Sessions, and Invoices. Leave
+                  every other permission at None. Invoices Read is required for migration membership
+                  checks, membership automation, and role cleanup. No write permissions are needed.
                 </p>
                 <p>
                   Use a live key to inspect live subscriptions, including MEE6 subscriptions. Enter
@@ -612,6 +617,12 @@ export default function StripeIntegrationPanel({
                 </p>
               </div>
             </details>
+            <p className="section-note">
+              Migration membership checks need Invoices Read even when automation is off. For a
+              saved connection, add this permission to the existing restricted key in Stripe, then
+              choose Test & sync Stripe. Keep the existing key in Jellyport to preserve its saved
+              identity links.
+            </p>
             <form
               className="form-stack"
               onSubmit={save}

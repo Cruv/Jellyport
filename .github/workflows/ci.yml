@@ -1,10 +1,17 @@
 name: Checks
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
   contents: read
+
+# Superseded pull-request/main revisions cannot publish, so stop their checks.
+# Manual full runs remain independent from automatic verification.
+concurrency:
+  group: jellyport-checks-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 jobs:
   scope:
     runs-on: ubuntu-latest
@@ -31,54 +38,114 @@ jobs:
             node scripts/docs-scope.mjs "$BASE_SHA" "$HEAD_SHA" >> "$GITHUB_OUTPUT"
           fi
       - run: node scripts/check-docs.mjs
-  test:
+  unit:
     needs: scope
+    if: needs.scope.result == 'success' && needs.scope.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      build_artifact_id: ${{ steps.build_artifact.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npm audit --omit=dev --audit-level=high
+      - name: Bind the build to this workflow run and revision
+        run: node scripts/ci-runtime.mjs build-write dist
+      - name: Preserve the immutable verified build
+        id: build_artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: browser-build-${{ github.sha }}-${{ github.run_attempt }}
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  browser:
+    needs: [scope, unit]
+    if: needs.scope.result == 'success' && needs.scope.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: desktop
+            browser: chromium
+          - project: mobile
+            browser: chromium
+          - project: iphone-portrait
+            browser: webkit
+          - project: iphone-landscape
+            browser: webkit
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Require the exact immutable build artifact ID
+        env:
+          CI_BUILD_ARTIFACT_ID: ${{ needs.unit.outputs.build_artifact_id }}
+        run: node scripts/ci-runtime.mjs artifact-id
+      - name: Restore this run's exact verified build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.unit.outputs.build_artifact_id }}
+          path: dist/
+          digest-mismatch: error
+      - name: Verify the build belongs to this run and revision
+        run: node scripts/ci-runtime.mjs build-verify dist
+      - name: Install the profile's browser
+        run: npx playwright install --with-deps ${{ matrix.browser }}
+      - name: Run every regression in this browser profile
+        run: npm run test:e2e -- --project=${{ matrix.project }}
+      - name: Preserve synthetic browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: browser-failures-${{ matrix.project }}-${{ github.run_attempt }}
+          path: test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Preserve the established required check name while joining all four profiles.
+  test:
+    needs: [scope, unit, browser]
     if: always()
     runs-on: ubuntu-latest
     strategy:
       matrix:
         node: [24]
     steps:
-      - name: Require successful scope and documentation checks
-        if: needs.scope.result != 'success'
-        run: exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        if: needs.scope.outputs.docs_only != 'true'
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        if: needs.scope.outputs.docs_only != 'true'
         with:
           node-version: ${{ matrix.node }}
-          cache: npm
-      - run: npm ci
-        if: needs.scope.outputs.docs_only != 'true'
-      - run: npm test
-        if: needs.scope.outputs.docs_only != 'true'
-      - run: npm run build
-        if: needs.scope.outputs.docs_only != 'true'
-      - name: Install browser for interface regression tests
-        if: needs.scope.outputs.docs_only != 'true'
-        run: npx playwright install --with-deps chromium webkit
-      - name: Run desktop and mobile interface regression tests
-        if: needs.scope.outputs.docs_only != 'true'
-        run: npm run test:e2e
-      - name: Preserve synthetic browser failure evidence
-        if: failure() && needs.scope.outputs.docs_only != 'true'
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: browser-failures
-          path: test-results/
-          retention-days: 7
-          if-no-files-found: ignore
-      - run: npm audit --omit=dev --audit-level=high
-        if: needs.scope.outputs.docs_only != 'true'
+      - name: Require complete scope, unit, build, audit and browser results
+        env:
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: node scripts/ci-runtime.mjs gate
       - name: Runtime checks passed
         if: needs.scope.outputs.docs_only != 'true'
         run: echo 'Complete runtime suite passed.'
       - name: Documentation-only checks passed
         if: needs.scope.outputs.docs_only == 'true'
         run: echo 'Documentation checks passed; no runtime validation or release requested.'
+
   docker:
     needs: scope
     if: always()

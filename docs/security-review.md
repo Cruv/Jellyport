@@ -134,8 +134,11 @@ and local demo pages rather than real signups or live media accounts.
 
 The Stripe connector uses restricted keys and GET requests to a fixed HTTPS
 Stripe origin. It pins the API version, forbids redirects, bounds response bytes,
-pagination, request concurrency, retries and total sync time, and checks each of
-the five documented Read permissions. Upstream bodies and errors are not logged
+pagination, request concurrency, retries and total sync time. The initial connector
+checked five Read permissions. Version 0.33.4 adds an Invoices Read probe to every
+connection test because migration membership verification requires paid-invoice
+access even with automation off. Permission failures use fixed, allowlisted
+remediation messages. Upstream bodies and arbitrary errors are not logged
 or echoed. Keys, minimized customer/subscription observations, Checkout identity
 hints, approved Discord links and persisted invoice-backed authority proofs use
 the existing authenticated encryption. Normal subscription-event responses omit

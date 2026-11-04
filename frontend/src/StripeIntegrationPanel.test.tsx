@@ -7,6 +7,7 @@ import StripeIntegrationPanel, {
 } from './StripeIntegrationPanel';
 import type { Api, ApiOptions } from './types';
 import type { IdentityReviewSnapshot } from '../../server/identity-review-types';
+import { STRIPE_INVOICE_PERMISSION_MESSAGE } from '../../server/stripe-client';
 
 const initial: StripeIntegrationStatus = {
   configured: false,
@@ -547,13 +548,73 @@ describe('Stripe integration settings', () => {
       false,
     );
     expect(
-      screen.getByText(/Customers, Products, Prices, Subscriptions, and Checkout Sessions/),
+      screen.getByText(
+        /Customers, Products, Prices, Subscriptions, Checkout Sessions, and Invoices/,
+      ),
     ).toBeTruthy();
     expect(screen.getByText(/Syncing and approving identity links do not create/)).toBeTruthy();
     expect(screen.getByLabelText('Restricted Stripe API key')).toHaveProperty('type', 'password');
     expect(localStorage.length).toBe(0);
     expect(sessionStorage.length).toBe(0);
   });
+
+  it('explains migration invoice access for an existing connection without requiring key replacement or automation', async () => {
+    const p = page({ ...cleanupStatus, linked_customer_count: 13 });
+    await screen.findByText('Live restricted key saved');
+    expect(
+      screen.getByText(
+        /Migration membership checks need Invoices Read even when automation is off/,
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/add this permission to the existing restricted key in Stripe/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/Keep the existing key in Jellyport to preserve its saved identity links/),
+    ).toBeTruthy();
+    expect(screen.getByLabelText('Restricted Stripe API key saved')).toHaveProperty('value', '');
+    expect(
+      screen.getByLabelText('Use verified Stripe billing for membership automation'),
+    ).toHaveProperty('checked', false);
+    expect(screen.getByRole('button', { name: 'Test & sync Stripe' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(p.api).toHaveBeenCalledTimes(1);
+    expect(p.api).toHaveBeenCalledWith('/api/stripe/status', { signal: expect.any(AbortSignal) });
+    expect(localStorage.length).toBe(0);
+    expect(sessionStorage.length).toBe(0);
+  });
+
+  it('shows the fixed invoice permission remedy for a saved connection without exposing or replacing the key', async () => {
+    const p = page({
+      ...cleanupStatus,
+      linked_customer_count: 13,
+      last_error: STRIPE_INVOICE_PERMISSION_MESSAGE,
+    });
+    await screen.findByText('Live restricted key saved');
+    expect(screen.getByRole('alert').textContent).toBe(STRIPE_INVOICE_PERMISSION_MESSAGE);
+    expect(screen.getByLabelText('Restricted Stripe API key saved')).toHaveProperty('value', '');
+    expect(screen.getByRole('button', { name: 'Test & sync Stripe' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    expect(p.api).toHaveBeenCalledTimes(1);
+    expect(p.api).toHaveBeenCalledWith('/api/stripe/status', { signal: expect.any(AbortSignal) });
+    expect(p.notify).not.toHaveBeenCalled();
+  });
+
+  it.each(['PRIVATE_SYNC_DETAIL', `${STRIPE_INVOICE_PERMISSION_MESSAGE} PRIVATE_PROVIDER_DETAIL`])(
+    'keeps unrecognized sync errors private',
+    async (last_error) => {
+      page({ ...cleanupStatus, last_error });
+      await screen.findByText('Live restricted key saved');
+      expect(screen.getByRole('alert').textContent).toBe(
+        'The last Stripe sync could not finish. Check the restricted key permissions and retry.',
+      );
+      expect(document.body.textContent).not.toContain(last_error);
+    },
+  );
 
   it('submits a restricted key once, clears the field, and omits a blank replacement', async () => {
     let status = initial;

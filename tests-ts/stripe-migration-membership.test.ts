@@ -3,11 +3,14 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../server/store.js';
+import { ServiceError } from '../server/errors.js';
 import { StripeIntegration, type StripeMigrationDraft } from '../server/stripe-integration.js';
 import { Memberships } from '../server/memberships.js';
 import type { Job } from '../server/service.js';
 import {
   StripeClient,
+  STRIPE_API_VERSION,
+  STRIPE_INVOICE_PERMISSION_MESSAGE,
   type StripePaidPeriod,
   type StripeSnapshot,
   type StripeSubscription,
@@ -370,7 +373,10 @@ describe('owner-scoped Stripe membership evidence for migration', () => {
     await vi.waitFor(() => expect(f.customerRead).toHaveBeenCalledTimes(1));
     await f.configure({ price_tiers: [{ price_id: 'price_member', tier_id: 'sloop' }] });
     pending.resolve([subscription()]);
-    expect(await review).toMatchObject({ status: 'unavailable' });
+    expect(await review).toMatchObject({
+      status: 'unavailable',
+      message: 'The billing review changed or expired. Refresh this membership.',
+    });
     expect(f.invoiceRead).not.toHaveBeenCalled();
   });
   it('limits parallel owners to four and times out queued and active reads without leaking slots', async () => {
@@ -425,6 +431,14 @@ describe('owner-scoped Stripe membership evidence for migration', () => {
     await vi.waitFor(() => expect(f.customerRead).toHaveBeenCalledTimes(2));
     await f.integration.stop();
     expect(await work).toMatchObject({ status: 'unavailable' });
+  });
+  it('does not echo arbitrary ServiceErrors from an upstream adapter', async () => {
+    const f = await fixture();
+    f.invoiceRead.mockRejectedValueOnce(new ServiceError('private invoice and contact details'));
+    const review = await f.integration.reviewMembership(owner);
+    expect(review).toMatchObject({ status: 'unavailable' });
+    expect(review.proof).toBeUndefined();
+    expect(review.message).not.toContain('private');
   });
 });
 
@@ -1020,5 +1034,214 @@ describe('Stripe customer subscription API filtering', () => {
       code: 'response_limit',
     });
     expect(calls).toBe(2);
+  });
+});
+
+async function realHttpFixture() {
+  const directory = mkdtempSync(join(tmpdir(), 'jellyport-synthetic-stripe-http-review-'));
+  const store = new Store(directory);
+  store.saveSettings({
+    ...store.settings(),
+    discord_enabled: true,
+    discord_guild_id: '200001',
+    new_subscriber_source: 'trusted_messages',
+    jellyfin_url: 'http://jellyfin.example.test',
+    auto_provision: false,
+    auto_disable: false,
+  });
+  let failure: 'none' | 'invoice403' | 'subscriptions403' | 'invoice401' | 'invoiceMalformed' =
+    'none';
+  const requests: URL[] = [];
+  const onEntitlement = vi.fn(async () => {});
+  const invoice = () => ({
+    id: 'in_member',
+    object: 'invoice',
+    livemode: true,
+    status: 'paid',
+    amount_remaining: 0,
+    customer: 'cus_member',
+    customer_email: 'private-customer@example.invalid',
+    created: base - 1000,
+    status_transitions: { paid_at: base - 50 },
+    parent: { type: 'subscription_details', subscription_details: { subscription: 'sub_member' } },
+    lines: {
+      has_more: false,
+      data: [
+        {
+          id: 'il_member',
+          object: 'line_item',
+          livemode: true,
+          quantity: 1,
+          parent: {
+            type: 'subscription_item_details',
+            subscription_item_details: {
+              subscription: 'sub_member',
+              subscription_item: 'si_member',
+              proration: false,
+            },
+          },
+          pricing: {
+            type: 'price_details',
+            price_details: { price: 'price_member', product: 'prod_member' },
+          },
+          period: { start: base - 100, end: base + 3600 },
+        },
+      ],
+    },
+  });
+  const integration = new StripeIntegration(store, {
+    clientFactory: (key) =>
+      new StripeClient(key, {
+        requestGapMs: 0,
+        retryDelayMs: 1,
+        transport: async (address, init) => {
+          const url = new URL(address);
+          requests.push(url);
+          expect(url.origin).toBe('https://api.stripe.com');
+          expect(init.method).toBe('GET');
+          expect(init.headers).toMatchObject({ 'Stripe-Version': STRIPE_API_VERSION });
+          const denied =
+            (url.pathname === '/v1/invoices' && failure === 'invoice403') ||
+            (url.pathname === '/v1/subscriptions' && failure === 'subscriptions403');
+          if (denied || (url.pathname === '/v1/invoices' && failure === 'invoice401'))
+            return new Response(
+              JSON.stringify({
+                error: {
+                  type: 'invalid_request_error',
+                  code: 'more_permissions_required',
+                  message: 'rk_live_syntheticOnly private-customer@example.invalid',
+                },
+              }),
+              { status: denied ? 403 : 401 },
+            );
+          if (url.pathname === '/v1/subscriptions')
+            return json([{ ...rawSubscription(), created: base - 1000 }]);
+          if (url.pathname === '/v1/invoices') {
+            if (url.searchParams.has('subscription')) {
+              expect(url.searchParams.get('subscription')).toBe('sub_member');
+              expect(url.searchParams.get('status')).toBe('paid');
+              expect(url.searchParams.get('limit')).toBe('1');
+            }
+            return json([
+              { ...invoice(), ...(failure === 'invoiceMalformed' ? { parent: null } : {}) },
+            ]);
+          }
+          if (url.pathname === '/v1/products')
+            return json([
+              {
+                id: 'prod_member',
+                object: 'product',
+                livemode: true,
+                name: 'Synthetic plan',
+                active: true,
+              },
+            ]);
+          if (url.pathname === '/v1/prices')
+            return json([{ id: 'price_member', object: 'price', livemode: true }]);
+          expect(['/v1/customers', '/v1/checkout/sessions']).toContain(url.pathname);
+          return json([]);
+        },
+      }),
+    resolveDiscordMember: async (id) => ({ id, username: 'synthetic.member' }),
+    now: () => base * 1000,
+    onEntitlement,
+  });
+  resources.push({ directory, store, integration });
+  await integration.configure({
+    api_key: 'rk_live_syntheticOnly',
+    sync_enabled: false,
+    expected_revision: integration.status().revision,
+  });
+  await integration.sync();
+  requests.length = 0;
+  return {
+    store,
+    integration,
+    requests,
+    onEntitlement,
+    setFailure: (value: typeof failure) => {
+      failure = value;
+    },
+  };
+}
+
+describe('complete migration billing review through the real HTTP client', () => {
+  it('verifies current subscriptions and paid invoice lines without persisting the draft', async () => {
+    const f = await realHttpFixture();
+    const changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
+    const result = await f.integration.reviewMembership(owner, undefined, migrationDraft());
+    expect(result).toMatchObject({ status: 'verified', tier_id: 'galleon', account_limit: 3 });
+    expect(result.proof?.draft).toEqual(migrationDraft());
+    expect(f.requests.map((url) => url.pathname)).toEqual(['/v1/subscriptions', '/v1/invoices']);
+    expect(f.requests[0]!.searchParams.get('customer')).toBe('cus_member');
+    expect(f.integration.status().linked_customer_count).toBe(0);
+    expect(f.store.membershipRecords()).toEqual([]);
+    expect(f.store.jobs()).toEqual([]);
+    expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
+    expect(f.onEntitlement).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toContain('private-customer');
+  });
+  it.each(['invoice403', 'subscriptions403', 'invoice401', 'invoiceMalformed'] as const)(
+    'keeps %s failures actionable and private without a proof or saved changes',
+    async (failure) => {
+      const f = await realHttpFixture();
+      f.setFailure(failure);
+      const changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
+      const result = await f.integration.reviewMembership(owner, undefined, migrationDraft());
+      expect(result.status).toBe('unavailable');
+      expect(result.proof).toBeUndefined();
+      if (failure === 'invoice403') expect(result.message).toBe(STRIPE_INVOICE_PERMISSION_MESSAGE);
+      else {
+        expect(result.message).toContain(
+          failure === 'subscriptions403' ? 'customer subscriptions' : 'paid invoices',
+        );
+        expect(result.message).toContain(
+          failure.endsWith('403')
+            ? 'read permission'
+            : failure === 'invoice401'
+              ? 'restricted API key'
+              : 'unexpected response',
+        );
+      }
+      expect(result.message).not.toContain('private-customer');
+      expect(result.message).not.toContain('rk_live_syntheticOnly');
+      expect(f.requests.map((url) => url.pathname)).toEqual(
+        failure === 'subscriptions403'
+          ? ['/v1/subscriptions']
+          : ['/v1/subscriptions', '/v1/invoices'],
+      );
+      expect(f.integration.status().linked_customer_count).toBe(0);
+      expect(f.store.membershipRecords()).toEqual([]);
+      expect(f.store.jobs()).toEqual([]);
+      expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
+      expect(f.onEntitlement).not.toHaveBeenCalled();
+    },
+  );
+  it('requires invoice read permission on sync and preserves prior observations and approved links', async () => {
+    const f = await realHttpFixture();
+    await f.integration.linkCustomer({
+      customer_id: 'cus_member',
+      discord_user_id: owner,
+      expected_revision: f.integration.status().revision,
+    });
+    const previous = f.integration.subscriptions();
+    const lastSync = f.integration.status().last_sync;
+    f.setFailure('invoice403');
+    await expect(f.integration.sync()).rejects.toThrow(STRIPE_INVOICE_PERMISSION_MESSAGE);
+    expect(f.integration.status()).toMatchObject({
+      configured: true,
+      last_sync: lastSync,
+      last_error: STRIPE_INVOICE_PERMISSION_MESSAGE,
+      linked_customer_count: 1,
+    });
+    expect(f.integration.subscriptions()).toEqual(previous);
+    expect(f.onEntitlement).not.toHaveBeenCalled();
+    f.setFailure('none');
+    await f.integration.sync();
+    expect(f.integration.status()).toMatchObject({
+      configured: true,
+      last_error: null,
+      linked_customer_count: 1,
+    });
   });
 });

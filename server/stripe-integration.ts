@@ -957,6 +957,8 @@ export class StripeIntegration {
     let reviewedSubscriptions: StripeSnapshot['subscriptions'] | undefined;
     const run = async (): Promise<StripeMigrationMembershipReview> => {
       let release: (() => void) | undefined;
+      let stage: 'customer subscriptions' | 'paid invoices' | 'billing evidence' =
+        'billing evidence';
       try {
         release = await this.acquireMigrationOwner(controller.signal);
         current();
@@ -969,6 +971,7 @@ export class StripeIntegration {
         const seen = new Set<string>();
         for (const link of links) {
           current();
+          stage = 'customer subscriptions';
           const rows = await waitForMigrationReview(
             client.customerSubscriptions(link.customer_id, controller.signal),
             controller.signal,
@@ -1002,6 +1005,7 @@ export class StripeIntegration {
         const periods = new Map<string, StripePaidPeriod | null>();
         for (const subscription of subscriptions) {
           current();
+          stage = 'paid invoices';
           periods.set(
             subscription.id,
             await waitForMigrationReview(
@@ -1011,6 +1015,7 @@ export class StripeIntegration {
           );
         }
         current();
+        stage = 'billing evidence';
         const decision = stripeBillingDecisions(
           {
             mode: 'live',
@@ -1101,7 +1106,29 @@ export class StripeIntegration {
           proof,
           ...(changes ? { changes } : {}),
         };
-      } catch {
+      } catch (error) {
+        if (error instanceof StripeClientError) {
+          const safe = new StripeClientError(
+            error.code,
+            error.resource ?? (stage === 'paid invoices' ? 'invoices' : undefined),
+          );
+          return unavailable(
+            safe.code === 'forbidden' && safe.resource === 'invoices'
+              ? safe.message
+              : `Stripe membership verification failed while reading ${stage}. ${safe.message}`,
+          );
+        }
+        // Only messages produced by this review are eligible for display. Other
+        // ServiceErrors and upstream exceptions can contain private information.
+        if (
+          error instanceof ServiceError &&
+          [
+            'The billing review changed or expired. Refresh this membership.',
+            'Stripe returned conflicting customer subscriptions.',
+            'A selected subscription price changed. Refresh the customer review.',
+          ].includes(error.message)
+        )
+          return unavailable(error.message);
         return unavailable(
           controller.signal.aborted
             ? 'Stripe membership verification timed out. Try again after checking the connection.'
@@ -1437,7 +1464,7 @@ export class StripeIntegration {
         ) {
           this.state.last_error =
             error instanceof StripeClientError
-              ? error.message
+              ? new StripeClientError(error.code, error.resource).message
               : controller.signal.aborted
                 ? 'Stripe sync reached its time limit. The previous saved billing data was preserved.'
                 : 'Stripe sync failed. The previous saved billing data was preserved.';
@@ -1451,7 +1478,7 @@ export class StripeIntegration {
         }
         throw new ServiceError(
           error instanceof StripeClientError
-            ? error.message
+            ? new StripeClientError(error.code, error.resource).message
             : 'Stripe sync could not complete. The previous saved billing data was preserved.',
         );
       }

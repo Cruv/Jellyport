@@ -1,5 +1,7 @@
 /** A deliberately read-only, bounded boundary around Stripe's public API. */
 export const STRIPE_API_VERSION = '2025-06-30.basil';
+export const STRIPE_INVOICE_PERMISSION_MESSAGE =
+  'Stripe denied access to invoices. Enable Invoices Read on the saved restricted key, then run Test & sync Stripe and check membership again.';
 export type StripeMode = 'live' | 'test';
 export type StripeClientErrorCode =
   | 'invalid_key'
@@ -30,8 +32,17 @@ const messages: Record<StripeClientErrorCode, string> = {
 };
 
 export class StripeClientError extends Error {
-  constructor(readonly code: StripeClientErrorCode) {
-    super(messages[code]);
+  constructor(
+    readonly code: StripeClientErrorCode,
+    readonly resource?: 'invoices',
+  ) {
+    super(
+      code === 'forbidden' && resource === 'invoices'
+        ? STRIPE_INVOICE_PERMISSION_MESSAGE
+        : Object.hasOwn(messages, code)
+          ? messages[code]
+          : 'Stripe could not complete the read. Previous saved billing data is preserved.',
+    );
     this.name = 'StripeClientError';
   }
 }
@@ -341,7 +352,11 @@ export class StripeClient {
       () => {},
       () => {},
     );
-    return abortable(queued, signal);
+    return abortable(queued, signal).catch((error: unknown) => {
+      if (path === '/v1/invoices' && error instanceof StripeClientError)
+        throw new StripeClientError(error.code, 'invoices');
+      throw error;
+    });
   }
 
   private async list<T>(
@@ -516,7 +531,7 @@ export class StripeClient {
   }
 
   private async checkReadPermission(
-    path: '/v1/customers' | '/v1/checkout/sessions',
+    path: '/v1/customers' | '/v1/checkout/sessions' | '/v1/invoices',
     signal: AbortSignal | undefined,
     budget: ReadBudget,
   ): Promise<void> {
@@ -530,9 +545,14 @@ export class StripeClient {
       throw new StripeClientError('invalid_response');
     for (const raw of result.data) {
       const row = object(raw);
-      if (row.object !== (path === '/v1/customers' ? 'customer' : 'checkout.session'))
-        throw new StripeClientError('invalid_response');
-      id(row.id, path === '/v1/customers' ? 'cus' : 'cs_(?:test|live)|cs');
+      const kind =
+        path === '/v1/customers'
+          ? { object: 'customer', prefix: 'cus' }
+          : path === '/v1/invoices'
+            ? { object: 'invoice', prefix: 'in' }
+            : { object: 'checkout.session', prefix: 'cs_(?:test|live)|cs' };
+      if (row.object !== kind.object) throw new StripeClientError('invalid_response');
+      id(row.id, kind.prefix);
       this.checkMode(row);
     }
   }
@@ -586,10 +606,12 @@ export class StripeClient {
 
   async snapshot(signal?: AbortSignal): Promise<StripeSnapshot> {
     const budget = { bytes: 0 };
-    // Probe identity resources even for empty accounts or previously cached identity lookups.
-    // These responses are validated and discarded; no contact/session data is retained.
+    // Probe identity and invoice resources even for empty accounts. Migration
+    // verification needs invoice access even while automatic billing is disabled.
+    // Responses are validated and discarded; no contact/session/invoice data is retained.
     await this.checkReadPermission('/v1/customers', this.signal(signal), budget);
     await this.checkReadPermission('/v1/checkout/sessions', this.signal(signal), budget);
+    await this.checkReadPermission('/v1/invoices', this.signal(signal), budget);
     const subscriptions = await this.subscriptions(signal, budget);
     const products = await this.products(signal, budget);
     await this.checkPrices(signal, budget);

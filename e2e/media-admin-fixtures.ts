@@ -9,7 +9,11 @@ import { DEFAULT_SETTINGS } from '../server/types';
 import type { BotAdapter } from '../server/service';
 import type { JellyfinAuthentication } from '../server/jellyfin-auth';
 import type { MediaUserDataPatch } from '../server/media';
-import type { StripeSubscription } from '../server/stripe-client';
+import {
+  StripeClient,
+  type StripeClientOptions,
+  type StripeSubscription,
+} from '../server/stripe-client';
 
 export const paidOwner = '111111111111111111';
 export const guestOwner = '222222222222222222';
@@ -31,6 +35,7 @@ export interface AdminFixture {
   loseRenameReadback: (name: string) => void;
   activateStripeSubscription: () => void;
   setStripeSubscriptions: (subscriptions: StripeSubscription[]) => void;
+  setStripeHttpTransport: (transport: NonNullable<StripeClientOptions['transport']>) => void;
 }
 
 // Writable end-to-end fixtures exercise the real HTTP handlers, Store and workers.
@@ -72,6 +77,7 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
       let lostRenameReadbackId: string | null = null;
       let stripeMigrationActive = false;
       let stripeSubscriptions: StripeSubscription[] | undefined;
+      let stripeHttpTransport: StripeClientOptions['transport'];
       const identity = {
         serverId: 'demo-jellyfin',
         userId: 'synthetic-admin',
@@ -94,6 +100,12 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
         allowedHosts: ['127.0.0.1'],
         authClient,
         stripeClientFactory: (key) => {
+          if (stripeHttpTransport)
+            return new StripeClient(key, {
+              transport: stripeHttpTransport,
+              requestGapMs: 0,
+              retryDelayMs: 1,
+            });
           const mode = key.startsWith('rk_live_') ? ('live' as const) : ('test' as const);
           const now = Math.floor(Date.now() / 1000);
           const snapshot = async () => ({
@@ -309,6 +321,9 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
         },
         setStripeSubscriptions: (subscriptions) => {
           stripeSubscriptions = structuredClone(subscriptions);
+        },
+        setStripeHttpTransport: (transport) => {
+          stripeHttpTransport = transport;
         },
       });
     } finally {

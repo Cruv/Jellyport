@@ -2,7 +2,7 @@ import type { Locator } from '@playwright/test';
 import { test, expect, paidOwner, expectContainedLayout } from './media-admin-fixtures';
 import type { StripeSubscription } from '../server/stripe-client';
 
-test('one owner and two separate Stripe customer records can be reviewed without a hidden billing prerequisite', async ({
+test('migration billing hides canceled-only duplicate customers while preserving the confirmed owner and review safeguards', async ({
   page,
   admin,
 }, info) => {
@@ -163,26 +163,26 @@ test('one owner and two separate Stripe customer records can be reviewed without
     .locator('.migration-account-choice')
     .filter({ hasText: 'cus_RecoveryHistorical' });
   await expect(activeCustomer).toContainText('Synthetic duplicate owner');
-  await expect(oldCustomer).toContainText('Synthetic duplicate owner');
   await expect(activeCustomer).toContainText('active');
-  await expect(oldCustomer).toContainText('canceled');
+  await expect(oldCustomer).toHaveCount(0);
   await activate(activeCustomer.getByRole('checkbox'));
-  await activate(oldCustomer.getByRole('checkbox'));
   const approval = review.getByRole('checkbox', {
     name: 'I confirm these Stripe customers belong to @crew_owner',
     exact: true,
   });
   await expect(approval).not.toBeChecked();
   const pages = review.getByRole('navigation', { name: 'Stripe customer results', exact: true });
+  await expect(pages.getByRole('status')).toHaveText('1–5 of 6');
   await activate(pages.getByRole('button', { name: 'Next page', exact: true }));
   await expect(
     review.locator('.migration-account-choice').filter({
       has: page.getByRole('checkbox', { name: /^Stripe customer / }),
     }),
-  ).toHaveCount(2);
+  ).toHaveCount(1);
+  await expect(oldCustomer).toHaveCount(0);
   await activate(pages.getByRole('button', { name: 'Previous page', exact: true }));
   await expect(activeCustomer.getByRole('checkbox')).toBeChecked();
-  await expect(oldCustomer.getByRole('checkbox')).toBeChecked();
+  await expect(oldCustomer).toHaveCount(0);
   const checksBeforeApproval = membershipChecks.length;
   await activate(review.getByRole('button', { name: 'Next: Accounts', exact: true }));
   await expect(
@@ -200,7 +200,48 @@ test('one owner and two separate Stripe customer records can be reviewed without
     fullPage: true,
   });
   await activate(approval);
-  await activate(review.getByRole('button', { name: 'Next: Accounts', exact: true }));
+  let releaseMembershipResponse!: () => void;
+  let membershipResponseHeld = false;
+  const membershipResponseGate = new Promise<void>((resolve) => {
+    releaseMembershipResponse = resolve;
+  });
+  await page.route('**/api/migrations/preview/*/membership', async (route) => {
+    expect(new URL(route.request().url()).origin).toBe(admin.url);
+    if (!route.request().postDataJSON()?.billing) return route.continue();
+    // The real local API verifies the selected customers and paid period. Hold
+    // only delivery of its unmodified response to inspect the waiting interface.
+    const response = await route.fetch();
+    expect(response.ok()).toBe(true);
+    membershipResponseHeld = true;
+    await membershipResponseGate;
+    await route.fulfill({ response });
+  });
+  try {
+    await activate(
+      review.getByRole('button', { name: 'Confirm billing & check membership', exact: true }),
+    );
+    await expect.poll(() => membershipResponseHeld).toBe(true);
+    const checking = review.getByRole('button', { name: 'Checking membership…', exact: true });
+    await expect(checking).toBeDisabled();
+    await expect(checking).toBeInViewport({ ratio: 1 });
+    const pendingStatus = review.getByRole('status', { name: 'Billing confirmation result' });
+    await expect(pendingStatus).toHaveText(
+      'Checking current Stripe subscriptions and paid invoices…',
+    );
+    await expect(pendingStatus).toBeInViewport({ ratio: 1 });
+    await expectReachableFooter();
+    await expectContainedLayout(page);
+    await page.screenshot({
+      path: info.outputPath('billing-verification-pending.png'),
+      fullPage: true,
+    });
+    expect(membershipChecks.filter((request) => request.billing)).toHaveLength(1);
+    expect(stripe.status().linked_customer_count).toBe(0);
+    expect(admin.writes).toEqual([]);
+    expect(accepted).toEqual([]);
+  } finally {
+    releaseMembershipResponse();
+  }
   await expect(
     review.getByRole('heading', { name: 'Confirm accounts & slots', exact: true }),
   ).toBeVisible();
@@ -218,7 +259,7 @@ test('one owner and two separate Stripe customer records can be reviewed without
   expect(membershipChecks.at(-1)).toMatchObject({
     discord_user_id: paidOwner,
     billing: {
-      customer_ids: ['cus_RecoveryActive', 'cus_RecoveryHistorical'],
+      customer_ids: ['cus_RecoveryActive'],
       price_tiers: [],
     },
   });

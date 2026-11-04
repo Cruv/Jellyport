@@ -462,38 +462,57 @@ describe('inline migration billing relationship drafts', () => {
     expect(f.customerRead).not.toHaveBeenCalled();
     expect(f.snapshot).not.toHaveBeenCalled();
   });
-  it('distinguishes same-name and same-email customer records with cached subscription summaries without approving either', async () => {
+  it('omits terminal-only customers while preserving distinct current customers and mixed history', async () => {
     const f = await draftFixture();
     const identity = {
       customer_name: 'Synthetic Crew Owner',
       customer_email: 'crew@example.invalid',
     };
     f.data.subscriptions.push(
-      { ...subscription('cus_member', 'prior'), ...identity, status: 'canceled' },
+      {
+        ...subscription('cus_member', 'prior'),
+        ...identity,
+        status: 'canceled',
+        items: [
+          {
+            id: 'si_prior',
+            price_id: 'price_retired',
+            product_id: 'prod_retired',
+            quantity: 1,
+          },
+        ],
+      },
       { ...subscription('cus_member', 'replacement'), ...identity },
       { ...subscription('cus_old', 'old'), ...identity, status: 'canceled' },
+      { ...subscription('cus_current_other', 'current_other'), ...identity },
     );
+    f.data.products.push({ id: 'prod_retired', name: 'Former Synthetic Plan', active: false });
     await f.integration.sync();
     f.snapshot.mockClear();
     const changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
     const result = f.integration.searchMigrationCustomers(owner, 'crew@example.invalid');
     expect(result.customers).toHaveLength(2);
     expect(result.customers.map((customer) => customer.id).sort()).toEqual([
+      'cus_current_other',
       'cus_member',
-      'cus_old',
     ]);
     expect(result.customers.find((customer) => customer.id === 'cus_member')).toMatchObject({
       name: identity.customer_name,
       email: identity.customer_email,
       subscription_count: 3,
       subscription_statuses: ['active', 'canceled'],
+      prices: expect.arrayContaining([
+        { price_id: 'price_member', name: 'Synthetic Crew Plan', tier_id: null },
+        { price_id: 'price_retired', name: 'Former Synthetic Plan', tier_id: null },
+      ]),
     });
-    expect(result.customers.find((customer) => customer.id === 'cus_old')).toMatchObject({
+    expect(result.customers.find((customer) => customer.id === 'cus_current_other')).toMatchObject({
       name: identity.customer_name,
       email: identity.customer_email,
       subscription_count: 1,
-      subscription_statuses: ['canceled'],
+      subscription_statuses: ['active'],
     });
+    expect(f.integration.subscriptions().some((row) => row.customer_id === 'cus_old')).toBe(true);
     expect(result.customers.every((customer) => customer.linked_discord_id === null)).toBe(true);
     expect(f.integration.status().linked_customer_count).toBe(0);
     expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
@@ -501,12 +520,78 @@ describe('inline migration billing relationship drafts', () => {
     expect(f.invoiceRead).not.toHaveBeenCalled();
     expect(f.snapshot).not.toHaveBeenCalled();
   });
+  it.each(['canceled', 'incomplete_expired', 'mixed-terminal'])(
+    'hides %s-only customers from every picker search without removing approved history',
+    async (status) => {
+      const f = await fixture();
+      Object.assign(f.data.subscriptions[0]!, {
+        customer_name: 'Former Synthetic Owner',
+        customer_email: 'former@example.invalid',
+        status: status === 'mixed-terminal' ? 'canceled' : status,
+        identity_candidates: [
+          { discord_user_id: owner, source: 'customer_metadata', field: 'discord_id' },
+        ],
+      });
+      if (status === 'mixed-terminal')
+        f.data.subscriptions.push({
+          ...subscription('cus_member', 'expired'),
+          status: 'incomplete_expired',
+        });
+      await f.integration.sync();
+      const original = f.integration.subscriptions();
+      const changes = f.store.db.prepare('SELECT total_changes() AS count').get()!.count;
+      for (const query of ['', 'cus_member', 'Former Synthetic', 'former@example.invalid'])
+        expect(f.integration.searchMigrationCustomers(owner, query)).toMatchObject({
+          available: true,
+          customers: [],
+          next_cursor: null,
+        });
+      expect(f.integration.subscriptions()).toEqual(original);
+      expect(f.integration.status().linked_customer_count).toBe(1);
+      expect(f.store.db.prepare('SELECT total_changes() AS count').get()!.count).toBe(changes);
+    },
+  );
+  it.each(['active', 'trialing', 'past_due', 'unpaid', 'paused', 'incomplete', 'future_unknown'])(
+    'keeps %s subscriptions discoverable without treating discovery as paid access',
+    async (status) => {
+      const f = await draftFixture();
+      Object.assign(f.data.subscriptions[0]!, {
+        status,
+        cancel_at_period_end: status === 'active',
+      });
+      await f.integration.sync();
+      expect(f.integration.searchMigrationCustomers(owner).customers).toMatchObject([
+        { id: 'cus_member', subscription_statuses: [status] },
+      ]);
+      const review = await f.integration.reviewMembership(owner, undefined, migrationDraft());
+      if (status === 'active') expect(review.status).toBe('verified');
+      else expect(review.proof).toBeUndefined();
+      expect(f.integration.status().linked_customer_count).toBe(0);
+    },
+  );
+  it('rejects cached picker choices which have since been canceled', async () => {
+    const f = await draftFixture();
+    expect(f.integration.searchMigrationCustomers(owner).customers[0]?.id).toBe('cus_member');
+    Object.assign(f.data.subscriptions[0]!, { status: 'canceled', ended_at: base - 1000 });
+    f.periods.set('sub_member', { ...period(), start: base - 2000, end: base - 1000 });
+    const review = await f.integration.reviewMembership(owner, undefined, migrationDraft());
+    expect(review.status).toBe('inactive');
+    expect(review.proof).toBeUndefined();
+    expect(f.integration.status().linked_customer_count).toBe(0);
+    expect(f.store.jobs()).toEqual([]);
+  });
   it('paginates the local inventory in bounded, context-specific pages', async () => {
     const f = await draftFixture();
     for (let index = 0; index < 54; index++)
       f.data.subscriptions.push({
         ...subscription(`cus_search${index}`, `search${index}`),
         customer_name: `Synthetic ${String(index).padStart(2, '0')}`,
+      });
+    for (let index = 0; index < 27; index++)
+      f.data.subscriptions.push({
+        ...subscription(`cus_former${index}`, `former${index}`),
+        customer_name: `A Former ${String(index).padStart(2, '0')}`,
+        status: index % 2 ? 'canceled' : 'incomplete_expired',
       });
     await f.integration.sync();
     f.snapshot.mockClear();

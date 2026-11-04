@@ -143,6 +143,47 @@ function projected(output: string) {
 }
 
 describe('Jellyfin backup catalog reader', () => {
+  it.each([
+    ['12.2.0', '12.2.0.0'],
+    ['12.2.0.0', '12.2.0.0'],
+    ['12.4.0', '12.4.0.0'],
+    ['12.4.0.0', '12.4.0.0'],
+  ])(
+    'imports the verified %s backup format with its own matching live version',
+    async (version, normalized) => {
+      const now = Date.parse('2026-11-04T12:00:00.000Z');
+      const source = await fixture(
+        [
+          item(1, 'MediaBrowser.Controller.Entities.TV.Series'),
+          item(2, 'MediaBrowser.Controller.Entities.TV.Episode', {
+            SeriesId: id(1),
+            IndexNumber: 3,
+            ParentIndexNumber: 2,
+          }),
+        ],
+        [{ ItemId: id(1), ProviderId: 'Tvdb', ProviderValue: '123' }],
+        [],
+        { ...manifest, ServerVersion: version, DateCreated: new Date(now - 60_000).toISOString() },
+      );
+      const result = await importJellyfinBackupCatalog(source.archive, source.output, {
+        expectedServerVersion: version.slice(0, 6),
+        now,
+      });
+      expect(result.manifest.serverVersion).toBe(normalized);
+      expect(projected(source.output).items).toMatchObject([
+        { Id: apiId(1), Type: 'Series', ProviderIds: { Tvdb: '123' } },
+        {
+          Id: apiId(2),
+          Type: 'Episode',
+          SeriesId: apiId(1),
+          IndexNumber: 3,
+          ParentIndexNumber: 2,
+          SeriesProviderIds: { Tvdb: '123' },
+        },
+      ]);
+    },
+  );
+
   it('projects only matching identities, resolves providers and preserves multi-episode bounds', async () => {
     const source = await fixture(
       [
@@ -574,6 +615,8 @@ describe('Jellyfin backup catalog reader', () => {
 
   it.each([
     { ...manifest, ServerVersion: '12.3.0.0' },
+    { ...manifest, ServerVersion: '12.4.1.0' },
+    { ...manifest, ServerVersion: '13.0.0.0' },
     { ...manifest, BackupEngineVersion: '0.3.0' },
     { ...manifest, DateCreated: 'not-a-date' },
     { ...manifest, Options: { Database: false } },
@@ -581,14 +624,33 @@ describe('Jellyfin backup catalog reader', () => {
     const source = await fixture([item(1)], [], [], value);
     await expect(importJellyfinBackupCatalog(source.archive, source.output)).rejects.toMatchObject({
       error_code:
-        value.ServerVersion !== manifest.ServerVersion ? 'version_mismatch' : 'backup_invalid',
+        value.ServerVersion !== manifest.ServerVersion ? 'version_unsupported' : 'backup_invalid',
     });
+  });
+
+  it('never uses a newer supported backup with an older linked server', async () => {
+    const now = Date.parse('2026-11-04T12:00:00.000Z');
+    const source = await fixture([item(1)], [], [], {
+      ...manifest,
+      ServerVersion: '12.4.0.0',
+      DateCreated: new Date(now - 60_000).toISOString(),
+    });
+    source.entries[1]!.text = 'this table must not be parsed';
+    await writeFile(source.archive, zip(source.entries));
+    await expect(
+      importJellyfinBackupCatalog(source.archive, source.output, {
+        expectedServerVersion: '12.2.0',
+        now,
+      }),
+    ).rejects.toMatchObject({ error_code: 'version_mismatch' });
+    await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it.each([
     ['expired', -49 * 60 * 60_000, '12.2.0', 'backup_expired'],
     ['future', 61_000, '12.2.0', 'backup_future'],
     ['different linked version', -60_000, '12.3.0', 'version_mismatch'],
+    ['backup predating a linked server upgrade', -60_000, '12.4.0', 'version_mismatch'],
   ] as const)(
     'rejects %s manifest policy before creating output or parsing corrupt table JSON',
     async (_label, offset, version, code) => {

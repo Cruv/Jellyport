@@ -1,9 +1,18 @@
 # Emby Backup & Restore history imports — 0.14.0
 
 Jellyport imports saved history from the **full-backup layout** produced by Emby
-Server **4.10.1.0** with Backup & Restore **1.8.7.0**. Both the web app and isolated
-helper must run Jellyport **0.14.0 or later**. Other versions and dated database-only
-folders are rejected until their format and source binding are verified.
+Server **4.10.1.0** and **4.10.2.0** with Backup & Restore **1.8.7.0**. Emby
+4.10.2.0 requires Jellyport **0.33.1 or later on both the web app and helper**;
+4.10.1.0 imports remain compatible with existing projections. Other versions and
+dated database-only folders are rejected until their format and source binding
+are verified.
+
+The 4.10.2.0 compatibility check inspected a completed plugin backup's schema:
+consumed library/user columns and the unique history key match the previously
+verified upgraded 4.10.1.0 layout. Synthetic imports exercise both versions through
+the real network-isolated helper. This does not reclassify older isolated API or
+performance trials as 4.10.2.0 tests. Raw file-copy and SQLite Online Backup modes
+remain limited to 4.10.1.0.
 
 ## Configure Emby and the helper
 
@@ -18,7 +27,11 @@ folders are rejected until their format and source binding are verified.
    **backup root** read-only at `/emby-backups`; it must contain
    `embyserver-backup-full/backupinfo.json` and that folder's `data/library.db`,
    `data/users.db` and `data/device.txt`. A laptop's mounted-share path is not the
-   Docker host's path. Do not substitute a live database mount.
+   Docker host's path. Do not substitute a live database mount. The existing
+   `JELLYPORT_EMBY_VERSION=4.10.1.0` helper setting can remain for plugin mode:
+   the updated helper explicitly advertises both supported backup versions, and
+   each request still requires the backup's version to exactly match the running
+   Emby server. An older helper cannot satisfy a 4.10.2.0 request.
 3. Keep `/work` helper-only and private. Share only the separate `/snapshots`
    exchange with Jellyport, and preserve the existing Jellyport `/data` mount.
    The helper needs no network and opens only copied private SQLite databases.
@@ -37,9 +50,11 @@ folders are rejected until their format and source binding are verified.
 ## Validation and freshness
 
 The importer reads a fixed allowlist only. It checks the known manifest version,
-`CanRestore`, full-backup flag, original date, embedded server ID and exact user
-identity set. Files must be regular, settled and unchanged before/open/after the
-copy; manifest and identity bytes are rechecked. Symlinks, database sidecars,
+`CanRestore`, full-backup flag, exact requested server version, original date,
+embedded server ID and exact user identity set. A backup from a different
+supported server version is still rejected; a server upgrade requires a fresh
+completed backup. Files must be regular, settled and unchanged before/open/after
+the copy; manifest and identity bytes are rechecked. Symlinks, database sidecars,
 changes, unsupported schemas and corruption fail without replacing saved history.
 SQLite integrity checks, schema validation and projection run on private copies.
 Copied-byte fingerprints identify unchanged generations. Authentication databases,

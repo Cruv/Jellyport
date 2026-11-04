@@ -10,6 +10,8 @@ import {
 import {
   CAPTURE_DEADLINE,
   SNAPSHOT_VERSION,
+  SNAPSHOT_VERSIONS,
+  supportedSnapshotVersion,
   encryptDatabase,
   readEnvelope,
   recoverSnapshotHelper,
@@ -29,6 +31,7 @@ const workDirectory = process.env.JELLYPORT_SNAPSHOT_WORK_DIR;
 const jellyfinBackups = process.env.JELLYPORT_JELLYFIN_BACKUP_DIR;
 const jellyfinBackupCleanup = process.env.JELLYPORT_JELLYFIN_BACKUP_CLEANUP === 'true';
 const captureMethod = snapshotCaptureMethod(process.env.JELLYPORT_SNAPSHOT_METHOD);
+const configuredVersion = process.env.JELLYPORT_EMBY_VERSION;
 const source =
   captureMethod === 'plugin_backup'
     ? process.env.JELLYPORT_EMBY_BACKUP_DIR
@@ -37,20 +40,23 @@ if (
   !directory ||
   !source ||
   !workDirectory ||
-  process.env.JELLYPORT_EMBY_VERSION !== SNAPSHOT_VERSION
+  !supportedSnapshotVersion(configuredVersion) ||
+  (captureMethod !== 'plugin_backup' && configuredVersion !== SNAPSHOT_VERSION)
 )
   throw new Error(
     'Configure snapshot exchange, private work directory, the selected Emby source mount and supported version.',
   );
+const supportedVersions: readonly string[] =
+  captureMethod === 'plugin_backup' ? SNAPSHOT_VERSIONS : [configuredVersion];
 process.umask(0o077);
 await mkdir(directory, { recursive: true, mode: 0o700 });
 await mkdir(workDirectory, { recursive: true, mode: 0o700 });
 process.env.SQLITE_TMPDIR = workDirectory;
 if (directory === workDirectory)
   throw new Error('The helper work directory must be separate from the snapshot exchange.');
-async function sourceIdentity(serverId: string): Promise<void> {
+async function sourceIdentity(serverId: string, version: string): Promise<void> {
   for (const [name, expected] of [
-    ['lastversion.txt', SNAPSHOT_VERSION],
+    ['lastversion.txt', version],
     ['device.txt', serverId],
   ]) {
     const path = join(source!, name!);
@@ -69,7 +75,8 @@ const heartbeat = setInterval(() => {
         join(directory, 'helper.status'),
         {
           version: 1,
-          emby_version: SNAPSHOT_VERSION,
+          emby_version: configuredVersion,
+          emby_versions: supportedVersions,
           capture_method: captureMethod,
           jellyfin_catalog_enabled: !!jellyfinBackups,
           jellyfin_backup_selection_enabled: !!jellyfinBackups,
@@ -106,7 +113,8 @@ while (!stopping) {
       join(directory, 'helper.status'),
       {
         version: 1,
-        emby_version: SNAPSHOT_VERSION,
+        emby_version: configuredVersion,
+        emby_versions: supportedVersions,
         capture_method: captureMethod,
         jellyfin_catalog_enabled: !!jellyfinBackups,
         jellyfin_backup_selection_enabled: !!jellyfinBackups,
@@ -147,7 +155,7 @@ while (!stopping) {
         request = await readEnvelope<CaptureRequest>(path, key);
         if (
           request.id !== id ||
-          request.binding?.version !== SNAPSHOT_VERSION ||
+          !supportedVersions.includes(request.binding?.version) ||
           !Number.isFinite(Date.parse(request.requested_at)) ||
           Math.abs(Date.now() - Date.parse(request.requested_at)) > CAPTURE_DEADLINE
         )
@@ -163,7 +171,8 @@ while (!stopping) {
       try {
         if (snapshotCaptureMethod(request.capture_method) !== captureMethod)
           throw new Error('The helper capture method changed. Request a new capture.');
-        if (captureMethod !== 'plugin_backup') await sourceIdentity(request.binding.server_id);
+        if (captureMethod !== 'plugin_backup')
+          await sourceIdentity(request.binding.server_id, request.binding.version);
         temporary = await mkdtemp(join(workDirectory, `capture-${id}-`));
         const output = join(temporary, 'library.db');
         const value = await snapshotProcess<{
@@ -178,13 +187,15 @@ while (!stopping) {
             output,
             capture_method: captureMethod,
             server_id: request.binding.server_id,
+            server_version: request.binding.version,
           },
           controller.signal,
         );
         snapshotOrphanIdentityVersion(value.orphan_identity_version);
         if (!snapshotIdentitiesMatch(value.identities, request.user_ids, captureMethod))
           throw new Error('The mounted database does not contain the requested users.');
-        if (captureMethod !== 'plugin_backup') await sourceIdentity(request.binding.server_id);
+        if (captureMethod !== 'plugin_backup')
+          await sourceIdentity(request.binding.server_id, request.binding.version);
         await encryptDatabase(
           output,
           join(directory, `${id}.db.enc.pending`),

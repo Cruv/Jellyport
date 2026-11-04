@@ -417,6 +417,7 @@ export type DestinationCatalogErrorCode =
   | 'backup_missing'
   | 'backup_expired'
   | 'backup_future'
+  | 'version_unsupported'
   | 'version_mismatch'
   | 'backup_invalid'
   | 'backup_changed'

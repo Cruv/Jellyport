@@ -5,7 +5,14 @@ import { pipeline } from 'node:stream/promises';
 import { join } from 'node:path';
 
 export const snapshotId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+// The projection schema keeps its original identifier; source versions remain exact bindings.
 export const SNAPSHOT_VERSION = '4.10.1.0';
+export const SNAPSHOT_VERSIONS = ['4.10.1.0', '4.10.2.0'] as const;
+export function supportedSnapshotVersion(
+  value: unknown,
+): value is (typeof SNAPSHOT_VERSIONS)[number] {
+  return SNAPSHOT_VERSIONS.some((version) => version === value);
+}
 export const MAX_SNAPSHOT_BYTES = 8 * 1024 ** 3;
 export const CAPTURE_DEADLINE = 5 * 60_000;
 export const SNAPSHOT_MAX_AGE = 48 * 60 * 60_000;
@@ -241,7 +248,9 @@ function recoveredRequest(value: CaptureRequest, id: string): CaptureRequest {
     !value.binding.url ||
     typeof value.binding.server_id !== 'string' ||
     !value.binding.server_id ||
-    value.binding.version !== SNAPSHOT_VERSION ||
+    !supportedSnapshotVersion(value.binding.version) ||
+    (snapshotCaptureMethod(value.capture_method) !== 'plugin_backup' &&
+      value.binding.version !== SNAPSHOT_VERSION) ||
     (value.user_ids !== undefined &&
       (!Array.isArray(value.user_ids) ||
         value.user_ids.length > 1000 ||
@@ -254,7 +263,7 @@ function recoveredRequest(value: CaptureRequest, id: string): CaptureRequest {
     binding: {
       url: value.binding.url,
       server_id: value.binding.server_id,
-      version: SNAPSHOT_VERSION,
+      version: value.binding.version,
     },
     ...(value.capture_method === undefined
       ? {}
@@ -275,6 +284,7 @@ async function completedCapture(
       value.requested_at !== request.requested_at ||
       value.binding.url !== request.binding.url ||
       value.binding.server_id !== request.binding.server_id ||
+      value.binding.version !== request.binding.version ||
       snapshotCaptureMethod(value.capture_method) !==
         snapshotCaptureMethod(request.capture_method) ||
       typeof value.ok !== 'boolean' ||

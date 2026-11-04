@@ -42,6 +42,7 @@ type Request =
       output: string;
       capture_method?: SnapshotCaptureMethod;
       server_id?: string;
+      server_version?: string;
     }
   | {
       operation: 'read';
@@ -110,7 +111,9 @@ async function run(request: Request): Promise<unknown> {
   if (request.operation !== 'capture') throw new Error('Unknown operation.');
   if (snapshotCaptureMethod(request.capture_method) === 'plugin_backup') {
     if (!request.server_id) throw new Error('A verified source server identity is required.');
-    return importPluginBackup(request.directory, request.output, request.server_id);
+    return importPluginBackup(request.directory, request.output, request.server_id, {
+      serverVersion: request.server_version,
+    });
   }
   if (snapshotCaptureMethod(request.capture_method) === 'file_copy')
     return captureFileCopy(request.directory, request.output);

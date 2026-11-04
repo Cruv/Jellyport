@@ -208,8 +208,17 @@ it is separate from the latest attempt's duration. Missing progress from an olde
 helper is shown without inventing counts or a completion percentage. Diagnostics
 contain no private paths, item identities, credentials or playback details.
 
-The initial adapter supports the inspected **Jellyfin 12.2.0.0 / backup engine
-0.2.0** schema only. Other versions fail explicitly until their format is verified.
+The adapter supports the inspected **Jellyfin 12.2.0.0 and 12.4.0.0 / backup engine
+0.2.0** schemas. The 12.4 backup service, manifest, base-item/provider entities and
+database table declarations were compared with 12.2 on 2026-11-04 and are unchanged.
+See the upstream [backup service](https://github.com/jellyfin/jellyfin/blob/v12.4/Jellyfin.Server.Implementations/FullSystemBackup/BackupService.cs),
+[base-item model](https://github.com/jellyfin/jellyfin/blob/v12.4/src/Jellyfin.Database/Jellyfin.Database.Implementations/Entities/BaseItemEntity.cs)
+and [provider model](https://github.com/jellyfin/jellyfin/blob/v12.4/src/Jellyfin.Database/Jellyfin.Database.Implementations/Entities/BaseItemProvider.cs).
+Other versions fail explicitly until their format is verified. The archive version
+must still match the linked live server exactly after zero-padding normalization;
+12.2 backups cannot be reused after upgrading to 12.4. Create and import a fresh
+backup after an upgrade. A newer Jellyport release does not renew an old backup's
+age or convert its contents to the newer server version.
 The importer selects the newest canonical filename and rejects an incomplete or
 invalid newest archive rather than silently using an older one.
 

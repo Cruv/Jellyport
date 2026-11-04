@@ -19,14 +19,13 @@ import { projectCatalogItem, type MediaItem } from './media.js';
 import { jellyfinAsciiPathKey } from './jellyfin-library-membership.js';
 import {
   DestinationCatalogError,
-  DESTINATION_BACKUP_SERVER_VERSION,
   DESTINATION_CATALOG_MAX_AGE,
   destinationCatalogErrorCode,
   normalizedServerVersion,
+  supportedDestinationBackupVersion,
 } from './destination-catalog-files.js';
 
 export const JELLYFIN_BACKUP_PROJECTION_FORMAT = 'jellyfin-backup-catalog-v2';
-const VERSION = DESTINATION_BACKUP_SERVER_VERSION;
 const ENGINE_VERSION = '0.2.0';
 const MAX_ARCHIVE_BYTES = 8 * 1024 ** 3;
 const MAX_ITEMS_BYTES = 16 * 1024 ** 3;
@@ -154,11 +153,17 @@ function unchanged(first: BigIntStats, second: BigIntStats): boolean {
 }
 function readManifest(bytes: Buffer): JellyfinBackupManifest {
   const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
-  if (isObject(value) && typeof value.ServerVersion === 'string' && value.ServerVersion !== VERSION)
-    throw new DestinationCatalogError('version_mismatch');
+  if (
+    isObject(value) &&
+    typeof value.ServerVersion === 'string' &&
+    normalizedServerVersion(value.ServerVersion) &&
+    !supportedDestinationBackupVersion(value.ServerVersion)
+  )
+    throw new DestinationCatalogError('version_unsupported');
   if (
     !isObject(value) ||
-    value.ServerVersion !== VERSION ||
+    typeof value.ServerVersion !== 'string' ||
+    !supportedDestinationBackupVersion(value.ServerVersion) ||
     value.BackupEngineVersion !== ENGINE_VERSION ||
     !isObject(value.Options) ||
     value.Options.Database !== true ||
@@ -182,7 +187,7 @@ function readManifest(bytes: Buffer): JellyfinBackupManifest {
   )
     throw invalid();
   return {
-    serverVersion: VERSION,
+    serverVersion: normalizedServerVersion(value.ServerVersion),
     backupEngineVersion: ENGINE_VERSION,
     createdAt: new Date(date).toISOString(),
   };

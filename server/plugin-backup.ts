@@ -7,6 +7,7 @@ import { inspectLibrary, projectLibrary, readUserIdentities } from './emby-snaps
 import {
   MAX_SNAPSHOT_BYTES,
   SNAPSHOT_VERSION,
+  supportedSnapshotVersion,
   SNAPSHOT_PLUGIN_VERSION,
   SNAPSHOT_MAX_AGE,
 } from './snapshot-files.js';
@@ -38,6 +39,8 @@ export interface PluginBackupCaptureResult extends FileCopyCaptureResult {
 export interface PluginBackupCaptureOptions {
   /** Deterministic clock for isolated tests; callers do not supply this over IPC. */
   now?: number;
+  /** Exact source version verified by the app, not a compatible-version substitute. */
+  serverVersion?: string;
   /** A caller can lower, never raise, the combined source/output byte ceiling. */
   maxBytes?: number;
   /** Race observation point for isolated synthetic tests, never a source path. */
@@ -81,13 +84,17 @@ async function exactRead(handle: FileHandle, length: number): Promise<Buffer> {
   }
   return buffer;
 }
-function backupManifest(buffer: Buffer, now: number): { created: string; users: Set<string> } {
+function backupManifest(
+  buffer: Buffer,
+  now: number,
+  serverVersion: string,
+): { created: string; users: Set<string> } {
   const value = JSON.parse(buffer.toString('utf8')) as Record<string, unknown>;
   if (
     !value ||
     typeof value !== 'object' ||
     Array.isArray(value) ||
-    value.ServerVersion !== SNAPSHOT_VERSION ||
+    value.ServerVersion !== serverVersion ||
     value.PluginVersion !== EMBY_BACKUP_PLUGIN_VERSION ||
     value.CanRestore !== true ||
     value.IsFullBackup !== true ||
@@ -159,8 +166,10 @@ export async function importPluginBackup(
   let ownsOutput = false;
   try {
     const now = options.now ?? Date.now(),
-      maxBytes = options.maxBytes ?? MAX_SNAPSHOT_BYTES;
+      maxBytes = options.maxBytes ?? MAX_SNAPSHOT_BYTES,
+      serverVersion = options.serverVersion ?? SNAPSHOT_VERSION;
     if (
+      !supportedSnapshotVersion(serverVersion) ||
       !Number.isFinite(now) ||
       !Number.isSafeInteger(maxBytes) ||
       maxBytes < 1 ||
@@ -211,7 +220,7 @@ export async function importPluginBackup(
       if (!sameFile(initial, await handle.stat({ bigint: true }))) throw failed();
       if (!name.endsWith('.db')) source.metadata = await exactRead(handle, Number(initial.size));
     }
-    const manifest = backupManifest(sources[0]!.metadata!, now);
+    const manifest = backupManifest(sources[0]!.metadata!, now, serverVersion);
     if (
       sources[1]!
         .metadata!.toString('utf8')

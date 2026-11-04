@@ -3,7 +3,9 @@ import { snapshotId } from './snapshot-files.js';
 import { ServiceError } from './errors.js';
 import { validJellyfinBackupName } from './jellyfin-backup-api.js';
 
-export const DESTINATION_BACKUP_SERVER_VERSION = '12.2.0.0';
+// Explicitly inspected native JSON backup formats. Do not infer compatibility
+// from a shared major/minor range or from the backup engine version alone.
+export const DESTINATION_BACKUP_SERVER_VERSIONS = ['12.2.0.0', '12.4.0.0'] as const;
 export const DESTINATION_CATALOG_MAX_AGE = 48 * 60 * 60_000;
 // Offline ZIP/index preparation is separate from the user migration performance target.
 export const DESTINATION_CATALOG_DEADLINE = 30 * 60_000;
@@ -31,6 +33,7 @@ export const DESTINATION_CATALOG_ERROR_CODES = [
   'backup_missing',
   'backup_expired',
   'backup_future',
+  'version_unsupported',
   'version_mismatch',
   'backup_invalid',
   'backup_changed',
@@ -58,8 +61,10 @@ const failureMessages: Record<DestinationCatalogErrorCode, string> = {
     'The latest Jellyfin backup is older than 48 hours. Create a new database backup and import it.',
   backup_future:
     'The Jellyfin backup time is in the future. Check the server clocks and create a new database backup.',
+  version_unsupported:
+    'This Jellyfin backup server version is not supported by this Jellyport importer. Supported versions are 12.2.0 and 12.4.0 with backup engine 0.2.0. Update Jellyport when support for that server version is available.',
   version_mismatch:
-    'The Jellyfin backup version does not match the linked server. Create a database backup from that server.',
+    'The Jellyfin backup version does not match the linked server. After a Jellyfin upgrade, create a fresh database backup from the linked server and import it. Reimporting a backup from the previous version cannot refresh it.',
   backup_invalid:
     'The Jellyfin backup has an unsupported or invalid catalog. It could not be validated. Create a completed database backup and import it again.',
   backup_changed:
@@ -193,6 +198,10 @@ export const normalizedServerVersion = (version: string) =>
   /^\d{1,5}\.\d{1,5}(?:\.\d{1,5}){0,2}$/.test(version)
     ? version.split('.').map(Number).concat([0, 0]).slice(0, 4).join('.')
     : '';
+export const supportedDestinationBackupVersion = (version: string): boolean =>
+  DESTINATION_BACKUP_SERVER_VERSIONS.some(
+    (supported) => supported === normalizedServerVersion(version),
+  );
 function validUrl(value: unknown): boolean {
   if (typeof value !== 'string' || value.length > 4096) return false;
   try {
@@ -249,6 +258,7 @@ export function validDestinationResult(value: DestinationCatalogResult): boolean
     Date.parse(value.backup_created_at) <= Date.parse(value.finished_at) + 60_000 &&
     normalizedServerVersion(value.server_version ?? '') ===
       normalizedServerVersion(value.binding.version) &&
+    supportedDestinationBackupVersion(value.server_version ?? '') &&
     value.backup_engine_version === '0.2.0' &&
     typeof value.backup_fingerprint === 'string' &&
     /^[a-f0-9]{64}$/.test(value.backup_fingerprint)

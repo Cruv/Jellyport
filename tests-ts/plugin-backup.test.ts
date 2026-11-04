@@ -36,7 +36,7 @@ async function settled(path: string) {
   const date = new Date(NOW - PLUGIN_BACKUP_SETTLE_MS - 60_000);
   await utimes(path, date, date);
 }
-async function fixture() {
+async function fixture(serverVersion = '4.10.1.0') {
   const directory = await mkdtemp(join(tmpdir(), 'jellyport-plugin-backup-test-'));
   directories.push(directory);
   const root = join(directory, 'backups'),
@@ -46,10 +46,24 @@ async function fixture() {
     output = join(work, 'projection.db');
   await mkdir(data, { recursive: true, mode: 0o700 });
   await mkdir(work, { mode: 0o700 });
-  const schema = await readFile(
+  let schema = await readFile(
     new URL('./fixtures/emby-4.10.1.0-schema.sql', import.meta.url),
     'utf8',
   );
+  if (serverVersion === '4.10.2.0')
+    schema = schema
+      .replace('RunTimeTicks INTEGER', 'RunTimeTicks BIGINT')
+      .replace('rating REAL', 'rating FLOAT')
+      .replace('played INT not null', 'played BIT not null')
+      .replace('isFavorite INT not null', 'isFavorite BIT not null')
+      .replace('playbackPositionTicks INTEGER', 'playbackPositionTicks BIGINT')
+      .replace(/guid BLOB/g, 'guid GUID')
+      .replace(/,\s*PRIMARY KEY \(UserDataKeyId,userId\)/, '')
+      .replace(
+        ') STRICT, WITHOUT ROWID;',
+        '); CREATE UNIQUE INDEX VerifiedUserDataKey ON UserDatas(UserDataKeyId,userId);',
+      )
+      .replace(/ STRICT/g, '');
   const library = new DatabaseSync(join(data, 'library.db'));
   try {
     library.exec(schema.slice(0, schema.indexOf('CREATE TABLE LocalUsersv2')));
@@ -74,7 +88,7 @@ async function fixture() {
     users.close();
   }
   const manifest = {
-    ServerVersion: '4.10.1.0',
+    ServerVersion: serverVersion,
     PluginVersion: '1.8.7.0',
     CanRestore: true,
     IsFullBackup: true,
@@ -122,64 +136,69 @@ async function reject(
 }
 
 describe('Emby Backup & Restore completed full-backup imports', () => {
-  it('reads only the fixed full-backup allowlist, preserves history and publishes a private sanitized projection', async () => {
-    const value = await fixture(),
-      before = await hash(join(value.data, 'library.db'));
-    const copied: string[] = [];
-    const result = await importPluginBackup(value.root, value.output, SERVER, {
-      now: NOW,
-      copied: async (name) => {
-        copied.push(name);
-        const temporary = (await readdir(value.work)).find((name) =>
-          name.startsWith('plugin-backup-'),
-        )!;
-        expect((await lstat(join(value.work, temporary))).mode & 0o777).toBe(0o700);
-        expect(await readdir(join(value.work, temporary))).not.toContain('authentication.db');
-      },
-    });
-    expect(copied).toEqual([
-      'backupinfo.json',
-      'data/device.txt',
-      'data/library.db',
-      'data/users.db',
-    ]);
-    expect(result).toMatchObject({
-      schema: 'emby-4.10.1.0',
-      item_count: 1,
-      orphan_identity_version: 1,
-      identities: { [GUID]: 1 },
-      backup_created_at: '2026-10-15T10:00:00.123Z',
-      plugin_version: '1.8.7.0',
-    });
-    expect(result.backup_fingerprint).toMatch(/^[a-f0-9]{64}$/);
-    expect(result.bytes).toBe((await lstat(value.output)).size);
-    expect((await lstat(value.output)).mode & 0o777).toBe(0o600);
-    expect(await hash(join(value.data, 'library.db'))).toBe(before);
-    expect((await readFile(value.output)).includes(Buffer.from(SECRET))).toBe(false);
-    expect(readSnapshotItems(value.output, GUID, result.identities)[0]?.UserData).toMatchObject({
-      Played: true,
-      PlayCount: 9,
-      IsFavorite: true,
-      PlaybackPositionTicks: 123000,
-      LastPlayedDate: new Date(1791374400 * 1000).toISOString(),
-    });
-    expect(await readdir(value.work)).toEqual(['projection.db']);
-    const database = new DatabaseSync(value.output, { readOnly: true });
-    try {
-      expect(
-        database
-          .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
-          .all()
-          .map((row) => row.name),
-      ).toEqual(['JellyportRecoveredHistory', 'MediaItems', 'UserDatas']);
-    } finally {
-      database.close();
-    }
-    const second = await importPluginBackup(value.root, join(value.work, 'second.db'), SERVER, {
-      now: NOW,
-    });
-    expect(second.backup_fingerprint).toBe(result.backup_fingerprint);
-  });
+  it.each(['4.10.1.0', '4.10.2.0'])(
+    'reads only the fixed full-backup allowlist for %s, preserves history and publishes a private sanitized projection',
+    async (serverVersion) => {
+      const value = await fixture(serverVersion),
+        before = await hash(join(value.data, 'library.db'));
+      const copied: string[] = [];
+      const result = await importPluginBackup(value.root, value.output, SERVER, {
+        now: NOW,
+        serverVersion,
+        copied: async (name) => {
+          copied.push(name);
+          const temporary = (await readdir(value.work)).find((name) =>
+            name.startsWith('plugin-backup-'),
+          )!;
+          expect((await lstat(join(value.work, temporary))).mode & 0o777).toBe(0o700);
+          expect(await readdir(join(value.work, temporary))).not.toContain('authentication.db');
+        },
+      });
+      expect(copied).toEqual([
+        'backupinfo.json',
+        'data/device.txt',
+        'data/library.db',
+        'data/users.db',
+      ]);
+      expect(result).toMatchObject({
+        schema: 'emby-4.10.1.0',
+        item_count: 1,
+        orphan_identity_version: 1,
+        identities: { [GUID]: 1 },
+        backup_created_at: '2026-10-15T10:00:00.123Z',
+        plugin_version: '1.8.7.0',
+      });
+      expect(result.backup_fingerprint).toMatch(/^[a-f0-9]{64}$/);
+      expect(result.bytes).toBe((await lstat(value.output)).size);
+      expect((await lstat(value.output)).mode & 0o777).toBe(0o600);
+      expect(await hash(join(value.data, 'library.db'))).toBe(before);
+      expect((await readFile(value.output)).includes(Buffer.from(SECRET))).toBe(false);
+      expect(readSnapshotItems(value.output, GUID, result.identities)[0]?.UserData).toMatchObject({
+        Played: true,
+        PlayCount: 9,
+        IsFavorite: true,
+        PlaybackPositionTicks: 123000,
+        LastPlayedDate: new Date(1791374400 * 1000).toISOString(),
+      });
+      expect(await readdir(value.work)).toEqual(['projection.db']);
+      const database = new DatabaseSync(value.output, { readOnly: true });
+      try {
+        expect(
+          database
+            .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")
+            .all()
+            .map((row) => row.name),
+        ).toEqual(['JellyportRecoveredHistory', 'MediaItems', 'UserDatas']);
+      } finally {
+        database.close();
+      }
+      const second = await importPluginBackup(value.root, join(value.work, 'second.db'), SERVER, {
+        now: NOW,
+        serverVersion,
+      });
+      expect(second.backup_fingerprint).toBe(result.backup_fingerprint);
+    },
+  );
 
   it.each([
     { ServerVersion: '4.10.2.0' },
@@ -358,3 +377,22 @@ describe('Emby Backup & Restore completed full-backup imports', () => {
     await absent(path);
   });
 });
+
+it.each([
+  ['4.10.1.0', '4.10.2.0'],
+  ['4.10.2.0', '4.10.1.0'],
+  ['4.10.2.0', '4.10.3.0'],
+])(
+  'rejects backup %s when the exact source request is %s before copying',
+  async (backupVersion, serverVersion) => {
+    const value = await fixture(backupVersion);
+    const copied: string[] = [];
+    await reject(value, {
+      serverVersion,
+      copied: (name) => {
+        copied.push(name);
+      },
+    });
+    expect(copied).toEqual([]);
+  },
+);

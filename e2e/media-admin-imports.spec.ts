@@ -302,10 +302,14 @@ test('missing and invalid backups fail visibly, retain original valid history, a
       exact: true,
     }),
   ).toBeVisible();
+  const selection = page.getByRole('checkbox', { name: 'Select synthetic_member', exact: true });
+  await expect(selection).toBeEnabled();
+  if (await page.evaluate(() => navigator.maxTouchPoints > 0)) await selection.tap();
+  else await selection.click();
+  await expect(selection).toBeChecked();
   await expect(
-    page.getByRole('checkbox', { name: 'Select synthetic_member', exact: true }),
+    page.getByRole('button', { name: 'Preview migration (1)', exact: true }),
   ).toBeDisabled();
-  await expect(page.getByRole('button', { name: 'Preview migration', exact: true })).toBeDisabled();
   expect(imports.writes).toEqual([]);
   expect(imports.app.jellyport.store.jobs()).toEqual([]);
 
@@ -323,13 +327,14 @@ test('missing and invalid backups fail visibly, retain original valid history, a
   );
   await setup.getByRole('button', { name: 'Return to my task', exact: true }).click();
   await expect(setup).toHaveCount(0);
-  await expect(
-    page.getByRole('checkbox', { name: 'Select synthetic_member', exact: true }),
-  ).toBeEnabled();
+  await expect(selection).toBeEnabled();
+  await expect(selection).toBeChecked();
   await expect(
     page.getByRole('checkbox', { name: 'Use saved Emby snapshot', exact: true }),
   ).toBeChecked();
-  await page.getByRole('checkbox', { name: 'Select synthetic_member', exact: true }).check();
+  await expect(
+    page.getByRole('button', { name: 'Preview migration (1)', exact: true }),
+  ).toBeEnabled();
   await page.getByRole('button', { name: 'Preview migration (1)', exact: true }).click();
   await expect(page.getByText(/No completed database capture is available/)).toBeVisible();
   expect(imports.writes).toEqual([]);

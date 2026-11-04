@@ -73,12 +73,14 @@ async function fixture(demo = false, imports?: ImportCoordinator) {
     updatedAt = new Date().toISOString(),
     version = SNAPSHOT_VERSION,
     captureMethod?: unknown,
+    versions?: unknown,
   ) {
     await writeEnvelope(
       join(shared, 'helper.status'),
       {
         version: 1,
         emby_version: version,
+        ...(versions === undefined ? {} : { emby_versions: versions }),
         updated_at: updatedAt,
         ...(captureMethod === undefined ? {} : { capture_method: captureMethod }),
       },
@@ -773,8 +775,8 @@ it('fails closed for stale helpers, unsupported server versions and unsupported 
   await expect(f.manager.refresh()).rejects.toThrow('helper is unavailable');
   expect(f.factory).not.toHaveBeenCalled();
   await f.heartbeat();
-  f.client.systemInfo.mockResolvedValueOnce({ Id: 'fixture-emby-server', Version: '4.10.2.0' });
-  await expect(f.manager.refresh()).rejects.toThrow('4.10.1.0 only');
+  f.client.systemInfo.mockResolvedValueOnce({ Id: 'fixture-emby-server', Version: '4.10.3.0' });
+  await expect(f.manager.refresh()).rejects.toThrow('4.10.1.0 and 4.10.2.0 only');
   f.client.users.mockResolvedValueOnce([{ Id: 'not-a-public-guid', Name: 'fixture' }]);
   await expect(f.manager.refresh()).rejects.toThrow('unsupported user identities');
   expect(f.client.close).toHaveBeenCalledTimes(2);
@@ -1450,4 +1452,63 @@ it('skips a nonexistent spring-forward wall-clock time in the actual scheduler',
   await f.tick();
   expect(f.factory).not.toHaveBeenCalled();
   expect((await f.manager.status()).next_run_at).toBe('2026-03-09T06:30:00.000Z');
+});
+
+it('imports verified 4.10.2 plugin backups only through a capable helper and preserves the source version across restarts', async () => {
+  const f = await fixture();
+  f.client.systemInfo.mockResolvedValue({ Id: 'fixture-emby-server', Version: '4.10.2.0' });
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  await expect(f.manager.refresh()).rejects.toThrow('helper does not support');
+  expect((await readdir(f.shared)).filter((name) => name.endsWith('.request'))).toEqual([]);
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'plugin_backup', [
+    '4.10.1.0',
+    '4.10.2.0',
+  ]);
+  await f.manager.refresh();
+  const request = await f.pendingRequest();
+  expect(request.binding.version).toBe('4.10.2.0');
+  const result = await f.finish(request, {
+    capture_method: 'plugin_backup',
+    backup_created_at: new Date(Date.now() - 60_000).toISOString(),
+    backup_fingerprint: 'a'.repeat(64),
+    plugin_version: '1.8.7.0',
+  });
+  await f.restart();
+  const selected = await f.manager.select(
+    userId,
+    f.settings,
+    'fixture-emby-server',
+    result.id,
+    '4.10.2.0',
+  );
+  expect(selected.metadata.source_server_version).toBe('4.10.2.0');
+  expect(selected.metadata.schema).toBe('emby-4.10.1.0');
+});
+
+it.each([
+  ['plugin_backup', ['4.10.1.0', '4.10.3.0']],
+  ['plugin_backup', ['4.10.2.0']],
+  ['plugin_backup', ['4.10.1.0', '4.10.1.0']],
+  ['file_copy', ['4.10.1.0', '4.10.2.0']],
+  ['sqlite_online_backup', ['4.10.1.0', '4.10.2.0']],
+] as const)(
+  'refuses malformed or unverified helper version capabilities for %s: %j',
+  async (method, versions) => {
+    const f = await fixture();
+    await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, method, versions);
+    await expect(f.manager.refresh()).rejects.toThrow('helper is unavailable');
+    expect(f.factory).not.toHaveBeenCalled();
+  },
+);
+
+it('refuses a supported backup from a different live server version without changing its saved generation', async () => {
+  const f = await fixture();
+  const result = await f.complete();
+  await expect(
+    f.manager.select(userId, f.settings, 'fixture-emby-server', result.id, '4.10.2.0'),
+  ).rejects.toThrow('version does not match');
+  expect((await f.manager.select(userId, f.settings, 'fixture-emby-server', result.id)).id).toBe(
+    result.id,
+  );
+  expect((await f.manager.status()).snapshots).toBe(1);
 });

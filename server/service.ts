@@ -65,6 +65,7 @@ import { AccountProfiles, type AccountProfileInput } from './account-profiles.js
 import { AdminAlerts } from './admin-alerts.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { SourceSnapshots, type SnapshotMetadata } from './source-snapshots.js';
+import { supportedSnapshotVersion } from './snapshot-files.js';
 import { ImportCoordinator } from './daily-import-schedule.js';
 import { DestinationCatalogs } from './destination-catalogs.js';
 import type { DestinationCatalogMetadata } from './destination-catalog-files.js';
@@ -1252,10 +1253,10 @@ export class Service {
           if (
             options.use_snapshots &&
             snapshotInfo &&
-            (snapshotInfo.Version !== '4.10.1.0' || typeof snapshotInfo.Id !== 'string')
+            (!supportedSnapshotVersion(snapshotInfo.Version) || typeof snapshotInfo.Id !== 'string')
           )
             throw new ServiceError(
-              'Database snapshots require the verified Emby 4.10.1.0 connection.',
+              'Database snapshots require a verified supported Emby connection.',
             );
           let captureId: string | undefined;
           for (const sourceId of sourceUserIds) {
@@ -1342,6 +1343,7 @@ export class Service {
                 settings,
                 snapshotInfo.Id as string,
                 captureId,
+                snapshotInfo.Version as string,
               );
               checkCanceled();
               captureId = saved.id;
@@ -3917,10 +3919,16 @@ export class Service {
         throw new ServiceError('Database captures must cover exactly the selected users.');
       await this.withClient(settings, 'emby', async (client) => {
         const info = await client.systemInfo();
-        if (info.Version !== '4.10.1.0' || typeof info.Id !== 'string')
+        if (!supportedSnapshotVersion(info.Version) || typeof info.Id !== 'string')
           throw new ServiceError('Emby version or identity changed. Review a new preview.');
         for (const id of sourceUserIds)
-          await this.sourceSnapshots.select(id, settings, info.Id, sourceSnapshotIds[id]);
+          await this.sourceSnapshots.select(
+            id,
+            settings,
+            info.Id,
+            sourceSnapshotIds[id],
+            info.Version,
+          );
       });
       admissionGuard?.();
     }
@@ -5611,7 +5619,7 @@ export class Service {
               return source;
             }
             const info = await emby.systemInfo();
-            if (info.Version !== '4.10.1.0' || typeof info.Id !== 'string')
+            if (!supportedSnapshotVersion(info.Version) || typeof info.Id !== 'string')
               throw new ServiceError('Emby version or identity changed. Review a new preview.');
             sourceOwnershipServerId = info.Id;
             registeredSource.value = this.sourceOwnership(request, settings, info.Id);
@@ -5620,6 +5628,7 @@ export class Service {
               settings,
               info.Id,
               request.source_snapshot_id,
+              info.Version,
             );
             savedMetadata = selected.metadata;
             const source = await readMigrationSource(

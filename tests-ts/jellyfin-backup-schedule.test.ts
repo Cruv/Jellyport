@@ -10,6 +10,7 @@ import type { JellyfinBackupManifest, JellyfinBackupTask } from '../server/jelly
 import type { MediaAPI } from '../server/media.js';
 import {
   destinationCatalogPrefix,
+  normalizedServerVersion,
   type DestinationCatalogRequest,
   type DestinationCatalogResult,
 } from '../server/destination-catalog-files.js';
@@ -165,7 +166,7 @@ async function fixture() {
       keys: 1,
       backup_created_at: request.expected_backup?.created_at ?? old.created_at,
       backup_fingerprint: createHash('sha256').update(request.id).digest('hex'),
-      server_version: '12.2.0.0',
+      server_version: normalizedServerVersion(request.binding.version),
       backup_engine_version: '0.2.0',
       projection_format: 2,
     };
@@ -220,6 +221,30 @@ async function fixture() {
 }
 
 describe('scheduled native Jellyfin backup creation', () => {
+  it('creates and imports the verified 12.4 backup format after a server upgrade', async () => {
+    const f = await fixture();
+    f.client.systemInfo.mockResolvedValue({ Id: serverId, Version: '12.4.0' });
+    await f.enable();
+    await f.due();
+    expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
+    const fresh = { ...manifest(), server_version: '12.4.0.0' };
+    f.creation.resolve(fresh);
+    await vi.waitFor(async () => {
+      expect((await f.manager.status()).backup_creation?.phase).toBe('waiting');
+    });
+    await f.tick();
+    const [request] = await f.requests();
+    expect(request).toMatchObject({
+      binding: { version: '12.4.0' },
+      expected_backup: { name: fresh.name, created_at: fresh.created_at },
+    });
+    await f.finish(request!);
+    expect(await f.manager.status()).toMatchObject({
+      last_outcome: 'succeeded',
+      record: { server_version: '12.4.0.0', backup_created_at: fresh.created_at },
+    });
+  });
+
   it('creates once, waits for completion, and imports the exact new backup before releasing its slot', async () => {
     const f = await fixture();
     f.client.createJellyfinBackup.mockImplementation(() => {

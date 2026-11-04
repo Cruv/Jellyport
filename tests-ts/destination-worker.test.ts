@@ -82,10 +82,14 @@ function zip(entries: Record<string, unknown>): Buffer {
   end.writeUInt32LE(offset, 16);
   return Buffer.concat([...local, centralBytes, end]);
 }
-function archive(created = new Date(Date.now() - 60_000).toISOString(), count = 1) {
+function archive(
+  created = new Date(Date.now() - 60_000).toISOString(),
+  count = 1,
+  version = '12.2.0.0',
+) {
   return zip({
     'manifest.json': {
-      ServerVersion: '12.2.0.0',
+      ServerVersion: version,
       BackupEngineVersion: '0.2.0',
       DateCreated: created,
       DatabaseTables: ['DbSet`1'],
@@ -150,6 +154,17 @@ async function waitFor<T>(read: () => Promise<T>): Promise<T> {
 }
 
 describe('isolated destination catalog worker and helper', () => {
+  it('imports a current 12.4 backup through the isolated worker with exact live-version binding', async () => {
+    const value = await fixture(archive(undefined, 2, '12.4.0.0'));
+    const result = await capture(value, '12.4.0');
+    expect(result).toMatchObject({
+      items: 2,
+      server_version: '12.4.0.0',
+      backup_engine_version: '0.2.0',
+    });
+    expect(result.backup_fingerprint).toBe(createHash('sha256').update(value.bytes).digest('hex'));
+  });
+
   it('imports the exact newly completed native archive even when another filename sorts later', async () => {
     const created_at = new Date(Date.now() - 1000).toISOString();
     const value = await fixture(archive(created_at));

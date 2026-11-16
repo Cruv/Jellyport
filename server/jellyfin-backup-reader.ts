@@ -44,6 +44,9 @@ const TOKEN_BATCH_SIZE = 256;
 const MANIFEST = 'manifest.json';
 const ITEMS = 'Database/BaseItems.json';
 const PROVIDERS = 'Database/BaseItemProviders.json';
+const canonicalCatalogNames = new Map(
+  [MANIFEST, ITEMS, PROVIDERS].map((name) => [name.toLowerCase(), name]),
+);
 const clrTypes: Readonly<Record<string, string>> = Object.freeze({
   'MediaBrowser.Controller.Entities.Movies.Movie': 'Movie',
   'MediaBrowser.Controller.Entities.TV.Episode': 'Episode',
@@ -333,6 +336,9 @@ async function selectedEntries(zip: ZipFile, signal?: AbortSignal): Promise<Map<
   for await (const entry of zip.eachEntry()) {
     check(signal);
     const name = entry.fileName;
+    // Unused paths can differ by case on Jellyfin's filesystem. We never
+    // extract them, and the entries we read must use their exact names.
+    const canonicalName = canonicalCatalogNames.get(name.toLowerCase());
     const mode = (entry.externalFileAttributes >>> 16) & 0xf000;
     if (
       name.length > 1024 ||
@@ -340,7 +346,8 @@ async function selectedEntries(zip: ZipFile, signal?: AbortSignal): Promise<Map<
       name.includes('\\') ||
       name.startsWith('/') ||
       name.split('/').some((part) => part === '..' || part === '.') ||
-      seen.has(name.toLowerCase()) ||
+      seen.has(name) ||
+      (canonicalName !== undefined && canonicalName !== name) ||
       entry.isEncrypted() ||
       mode === 0xa000 ||
       ![0, 8].includes(entry.compressionMethod) ||
@@ -351,7 +358,7 @@ async function selectedEntries(zip: ZipFile, signal?: AbortSignal): Promise<Map<
       entry.uncompressedSize > Math.max(1, entry.compressedSize) * 1000
     )
       throw invalid();
-    seen.add(name.toLowerCase());
+    seen.add(name);
     total += entry.uncompressedSize;
     if (total > 32 * 1024 ** 3) throw invalid();
     const maximum =

@@ -727,6 +727,29 @@ describe('Jellyfin backup catalog reader', () => {
     );
   });
 
+  it('accepts distinct paths that differ only by case in ignored archive entries', async () => {
+    const source = await fixture(
+      [item(1)],
+      [],
+      [
+        { name: 'Data/collections/Example.xml', text: '<item />' },
+        { name: 'Data/collections/example.xml', text: '<other />' },
+      ],
+    );
+    await expect(importJellyfinBackupCatalog(source.archive, source.output)).resolves.toMatchObject(
+      { stats: { projectedItems: 1 } },
+    );
+  });
+
+  it('rejects repeated exact paths even in ignored archive entries', async () => {
+    const duplicate = { name: 'Data/collections/Example.xml', text: '<item />' };
+    const source = await fixture([item(1)], [], [duplicate, duplicate]);
+    await expect(importJellyfinBackupCatalog(source.archive, source.output)).rejects.toMatchObject({
+      error_code: 'backup_invalid',
+    });
+    await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
   it('validates CRC and actual selected-entry sizes', async () => {
     const source = await fixture([item(1)]);
     source.entries[1]!.corruptCrc = true;

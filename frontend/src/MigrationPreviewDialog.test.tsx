@@ -293,9 +293,19 @@ describe('migration setup wizard', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Next: Accounts' }));
     await screen.findByRole('heading', { name: 'Confirm accounts & slots' });
     expect(new FormData(form).get(`membership-review-${owner}`)).toBe('verified-billing-proof');
-    expect(vi.mocked(api).mock.calls.at(-2)?.[1]?.body).toMatchObject({
-      billing: { customer_ids: ['cus_crew', 'cus_crew_history'] },
+    const billingChecks = vi.mocked(api).mock.calls.flatMap(([path, options]) => {
+      const body = options?.body as { billing?: unknown } | undefined;
+      return path.endsWith('/membership') && body?.billing ? [body] : [];
     });
+    expect(billingChecks).toEqual([
+      {
+        discord_user_id: owner,
+        billing: {
+          customer_ids: ['cus_crew', 'cus_crew_history'],
+          price_tiers: [{ price_id: 'price_crew', tier_id: 'galleon' }],
+        },
+      },
+    ]);
     expect(startMigration).not.toHaveBeenCalled();
   });
   it('keeps an uncovered confirmed slot in Billing rather than advancing to an Accounts dead end', async () => {

@@ -298,7 +298,9 @@ export default function WorkflowRequirements({
               type="button"
               onClick={() => context.repair(blocker.route)}
             >
-              Resolve requirement
+              {blocker.code === 'matching_catalog'
+                ? 'Manage Jellyfin imports'
+                : 'Resolve requirement'}
             </button>
           </li>
         ))}

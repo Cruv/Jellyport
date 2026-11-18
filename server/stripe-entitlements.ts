@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { Store } from './store.js';
+import type { SubscriptionEvent } from './service.js';
 import type { StripePaidPeriod, StripeSnapshot, StripeSubscription } from './stripe-client.js';
 import { ServiceError } from './errors.js';
 import { DEFAULT_MEMBERSHIP_TIERS } from './memberships.js';
@@ -30,7 +31,7 @@ interface Activation {
   baseline: string[];
   checked_at: string | null;
   latest: StripeEntitlementFact[];
-  receipts: Array<{ id: string; outcome: 'claimed' | 'complete' | 'review' }>;
+  receipts: Array<{ id: string; outcome: 'deferred' | 'claimed' | 'complete' | 'review' }>;
   error: string | null;
 }
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -53,6 +54,21 @@ export function stripeAuthority(
 }
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString();
 const freshMs = 30 * 60_000;
+/** Older releases saved an untouched pending event and marked its receipt for
+ * review. The exact pending expiry shape proves processing never started. */
+export function isDeferredStripeExpiry(event: SubscriptionEvent | null): boolean {
+  return (
+    event?.source === 'stripe' &&
+    event.action === 'expire' &&
+    event.status === 'pending' &&
+    event.stripe_entitlement?.event_id === event.id &&
+    event.stripe_entitlement.action === event.action &&
+    event.stripe_entitlement.discord_user_id === event.discord_user_id &&
+    !event.job_id &&
+    !event.error &&
+    (event.stripe_expiry_deferred === true || event.result === undefined)
+  );
+}
 export interface StripeBillingDecision {
   owner: string;
   action: 'subscribe' | 'expire';
@@ -73,27 +89,29 @@ export function stripeBillingDecisions(
 ): StripeBillingDecision[] {
   if (snapshot.mode !== 'live') return [];
   const decisions: StripeBillingDecision[] = [];
-  const owners = new Set(links.map((link) => link.discord_user_id));
-  for (const owner of owners) {
-    const customers = new Set(
-      links.filter((link) => link.discord_user_id === owner).map((link) => link.customer_id),
-    );
-    const subscriptions = snapshot.subscriptions.filter((subscription) =>
-      customers.has(subscription.customer_id),
-    );
-    if (
-      !subscriptions.length ||
-      [...customers].some(
-        (customer) => !subscriptions.some((entry) => entry.customer_id === customer),
-      )
-    )
-      continue;
+  const customersByOwner = new Map<string, Set<string>>();
+  for (const link of links) {
+    const customers = customersByOwner.get(link.discord_user_id) ?? new Set();
+    customers.add(link.customer_id);
+    customersByOwner.set(link.discord_user_id, customers);
+  }
+  const subscriptionsByCustomer = new Map<string, StripeSubscription[]>();
+  const position = new Map(snapshot.subscriptions.map((entry, index) => [entry.id, index]));
+  for (const subscription of snapshot.subscriptions) {
+    const entries = subscriptionsByCustomer.get(subscription.customer_id) ?? [];
+    entries.push(subscription);
+    subscriptionsByCustomer.set(subscription.customer_id, entries);
+  }
+  const tierByPrice = new Map(priceTiers.map(({ price_id, tier_id }) => [price_id, tier_id]));
+  for (const [owner, customers] of customersByOwner) {
+    if ([...customers].some((customer) => !subscriptionsByCustomer.has(customer))) continue;
+    const subscriptions = [...customers]
+      .flatMap((customer) => subscriptionsByCustomer.get(customer)!)
+      .sort((a, b) => position.get(a.id)! - position.get(b.id)!);
     const recognized = subscriptions.map((subscription) => {
       const period = periods.get(subscription.id),
         item = subscription.items[0];
-      const tier = item
-        ? priceTiers.find((entry) => entry.price_id === item.price_id)?.tier_id
-        : null;
+      const tier = item ? tierByPrice.get(item.price_id) : null;
       if (
         !period ||
         !tier ||
@@ -205,7 +223,8 @@ export class StripeEntitlements {
       automation_enabled_at: state?.enabled_at ?? null,
       automation_error: state?.error ?? null,
       automation_review_count:
-        state?.receipts.filter((receipt) => receipt.outcome !== 'complete').length ?? 0,
+        state?.receipts.filter((receipt) => ['claimed', 'review'].includes(receipt.outcome))
+          .length ?? 0,
     };
   }
   configure(
@@ -253,6 +272,13 @@ export class StripeEntitlements {
     this.state.latest = [];
     this.persist();
   }
+  invalidateProof(): void {
+    if (this.state?.latest.length) {
+      this.state.latest = [];
+      this.state.checked_at = null;
+      this.persist();
+    }
+  }
   /** Aggregate every subscription belonging to every approved customer for an
    * owner. Unmapped/multiple/unknown billing never becomes an expiry decision. */
   prepare(
@@ -266,6 +292,8 @@ export class StripeEntitlements {
     const state = this.state!,
       facts: StripeEntitlementFact[] = [],
       time = this.now();
+    const authorityRevision = stripeAuthority(links, priceTiers, this.store);
+    const baseline = new Set(state.baseline);
     for (const {
       owner,
       action,
@@ -290,10 +318,10 @@ export class StripeEntitlements {
         observed_at: new Date(time).toISOString(),
         activation_revision: state.revision,
         generation,
-        authority_revision: stripeAuthority(links, priceTiers, this.store),
+        authority_revision: authorityRevision,
         is_new:
           action === 'subscribe' &&
-          !state.baseline.includes(subscription.id) &&
+          !baseline.has(subscription.id) &&
           subscription.created! * 1000 >= Date.parse(state.enabled_at) &&
           time - subscription.created! * 1000 <= 48 * 60 * 60_000,
       });
@@ -304,22 +332,37 @@ export class StripeEntitlements {
     this.persist();
     return structuredClone(facts);
   }
-  claim(fact: StripeEntitlementFact): boolean {
+  claim(fact: StripeEntitlementFact, deferred = false): boolean {
     this.assert(fact);
-    if (this.state!.receipts.some((receipt) => receipt.id === fact.event_id)) return false;
+    const previous = this.state!.receipts.find((receipt) => receipt.id === fact.event_id);
+    if (previous) {
+      if (deferred || fact.action !== 'expire') return false;
+      if (
+        previous.outcome !== 'deferred' &&
+        !(
+          previous.outcome === 'review' &&
+          isDeferredStripeExpiry(this.store.subscription(fact.event_id))
+        )
+      )
+        return false;
+      previous.outcome = 'claimed';
+      this.persist();
+      return true;
+    }
     if (this.state!.receipts.length >= 10_000)
       throw new ServiceError(
         'Stripe automation reached its safe receipt limit; review stored billing events.',
       );
-    this.state!.receipts.push({ id: fact.event_id, outcome: 'claimed' });
+    this.state!.receipts.push({ id: fact.event_id, outcome: deferred ? 'deferred' : 'claimed' });
     this.persist();
     return true;
   }
-  finish(fact: StripeEntitlementFact, succeeded: boolean): void {
+  finish(fact: StripeEntitlementFact, succeeded: boolean | 'deferred'): void {
     if (!this.enabled(fact.generation)) return;
     const receipt = this.state!.receipts.find((entry) => entry.id === fact.event_id);
     if (receipt) {
-      receipt.outcome = succeeded ? 'complete' : 'review';
+      if (receipt.outcome === 'deferred' && succeeded === false) return;
+      receipt.outcome = succeeded === 'deferred' ? 'deferred' : succeeded ? 'complete' : 'review';
       this.persist();
     }
   }

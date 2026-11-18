@@ -9,6 +9,7 @@ import { DEMO_SETTINGS } from '../server/types.js';
 import { WorkflowReadiness } from '../server/workflow-readiness.js';
 import { WorkflowReviews } from '../server/workflow-reviews.js';
 import type { ClientFactory } from '../server/media.js';
+import { ServiceError } from '../server/errors.js';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
@@ -95,6 +96,29 @@ describe('workflow requirements before account tasks', () => {
     expect((await f.readiness.snapshot()).actions.create_account.ready).toBe(true);
     f.store.saveSettings({ ...f.store.settings(), template_user_id: '' });
     expect((await f.readiness.snapshot()).actions.create_account.ready).toBe(false);
+  });
+  it('checks catalog version against the live Jellyfin metadata and routes mismatch to imports', async () => {
+    const f = fixture((client, kind) => {
+      if (kind === 'jellyfin')
+        client.systemInfo = async () => ({ Id: 'current-jf', Version: '12.3.0' });
+    });
+    const check = vi
+      .spyOn(f.service.destinationSnapshots, 'queuedSelection')
+      .mockImplementation((_settings, info) => {
+        if (info?.Version === '12.3.0')
+          throw new ServiceError(
+            'The current Jellyfin version differs from the saved matching catalog.',
+          );
+      });
+    const result = await f.readiness.snapshot();
+    expect(check).toHaveBeenCalledWith(f.store.settings(), { Id: 'current-jf', Version: '12.3.0' });
+    for (const action of [result.actions.migrate, result.actions.migrate_saved])
+      expect(action.blockers).toContainEqual({
+        code: 'matching_catalog',
+        message: 'The current Jellyfin version differs from the saved matching catalog.',
+        route: { page: 'settings', tab: 'history', subtab: 'jellyfin' },
+      });
+    expect(result.actions.create_account.ready).toBe(true);
   });
   it('does not block Jellyfin account management when only Emby is unavailable', async () => {
     const f = fixture((client, kind) => {

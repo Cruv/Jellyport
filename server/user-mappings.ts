@@ -254,9 +254,7 @@ export class UserMappings {
     return mapping ? structuredClone(mapping) : null;
   }
   getAllForDiscord(discordUserId: string, settings: Settings): UserMapping[] {
-    return this.list(settings)
-      .filter((mapping) => mapping.discord_user_id === discordUserId)
-      .sort((a, b) => (a.membership_slot ?? 1) - (b.membership_slot ?? 1));
+    return [1, 2, 3].flatMap((slot) => this.getForDiscord(discordUserId, settings, slot) ?? []);
   }
   getForTarget(
     targetId: string | null,

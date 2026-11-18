@@ -43,6 +43,8 @@ The migration wizard uses four steps: **Owners → Billing → Accounts → Revi
 
 An unmapped source can also select an existing, enabled, unprotected Jellyfin destination in the wizard. This pins exact source and destination server IDs, account IDs and names, preserves the destination's credentials and preferences, and creates the new mapping only on acceptance. Existing confirmed mappings and ownership cannot be reassigned through this flow. Local accounts can remain independent of Discord.
 
+Each accepted migration also pins the Jellyfin server identity and the exact destination account ID or the absence of the reviewed username. Jellyport checks that pin during acceptance, at provisioning, and before batches of history updates. A replaced account, a newly occupied name, or changed protection requires a fresh review. Older queued migration requests that lack a destination pin stop at the affected account. Direct API and Discord submissions capture the same destination pin at admission.
+
 One final acceptance rechecks session ownership, billing proofs, account identities, occupied slots and local revisions. Stripe customer links, new global price mappings, membership decisions, new source approvals, target mapping and queued work persist in one local transaction. Cancellation or failed admission leaves none of those relationship changes behind. New memberships keep general provisioning off and only selected accounts migrate. After successful acceptance, confirmed decisions remain even if later media work fails or is canceled. Customer-list refresh is a bounded read-only operation with no billing automation, media writes or library scans.
 
 ## Jellyfin onboarding roles

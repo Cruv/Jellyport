@@ -809,12 +809,7 @@ export class SourceSnapshots {
     }
   }
   private pins(): Set<string> {
-    return new Set(
-      this.store
-        .jobs()
-        .filter((job) => ['queued', 'running'].includes(job.status))
-        .flatMap((job) => Object.values(job.source_snapshot_ids ?? {})),
-    );
+    return this.store.activeSnapshotPins('source');
   }
   private async prune() {
     for (const [id, expires] of this.previewPins)

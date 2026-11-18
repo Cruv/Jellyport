@@ -172,7 +172,11 @@ describe('local activity and report cleanup', () => {
         AND json_extract(payload,'$.status')='processing' LIMIT 1`,
       )
       .all('job-processing');
-    expect(plan.some((step) => String(step.detail).includes('subscriptions_job_id'))).toBe(true);
+    expect(
+      plan.some((step) =>
+        /SEARCH subscriptions USING INDEX subscriptions_(job_id|status)/.test(String(step.detail)),
+      ),
+    ).toBe(true);
     expect(clientFactory).not.toHaveBeenCalled();
   });
 

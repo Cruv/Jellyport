@@ -660,7 +660,18 @@ describe('account migration and subscription safety', () => {
       servers.userData['e-river'] = { '3': { IsFavorite: true } };
       store.saveQueuedJob(
         queued,
-        [{ source_user_id: 'e-river', migration_scope: legacyScope }],
+        [
+          {
+            source_user_id: 'e-river',
+            migration_scope: legacyScope,
+            migration_destination: {
+              server_id: 'demo-jellyfin',
+              target_user_id: 'j-river',
+              username: 'river',
+              source_username: 'river',
+            },
+          },
+        ],
         store.settings(),
       );
       store.close();
@@ -695,7 +706,21 @@ describe('account migration and subscription safety', () => {
       progress: { processed: 0, total: 1 },
       results: [],
     };
-    store.saveQueuedJob(queued, [{ source_user_id: 'e-river' }], store.settings());
+    store.saveQueuedJob(
+      queued,
+      [
+        {
+          source_user_id: 'e-river',
+          migration_destination: {
+            server_id: 'demo-jellyfin',
+            target_user_id: 'j-river',
+            username: 'river',
+            source_username: 'river',
+          },
+        },
+      ],
+      store.settings(),
+    );
     store.close();
     store = new Store(directory);
     service = new Service(store, { clientFactory: servers.factory });
@@ -1581,18 +1606,18 @@ describe('account migration and subscription safety', () => {
     bot.active = true;
     bot.members = [{ id: '123456789', username: 'alex' }];
     service.bot = bot;
-    await service.setMembershipAccess({
-      discord_user_id: '123456789',
-      access_mode: 'subscription',
-      tier_id: 'sloop',
-      provision_jellyfin: true,
-    });
     store.saveSettings({
       ...store.settings(),
       discord_role_events: true,
       discord_member_role_id: '12345678',
       auto_provision: true,
       auto_disable: true,
+    });
+    await service.setMembershipAccess({
+      discord_user_id: '123456789',
+      access_mode: 'subscription',
+      tier_id: 'sloop',
+      provision_jellyfin: true,
     });
     await service.reconcileMemberships();
     expect(store.link('123456789')?.username).toBe('alex');

@@ -172,9 +172,9 @@ describe('manual per-account family exemptions and account access', () => {
   it.each(['missing-role', 'left-discord'])(
     'does not disable a family slot after %s',
     async (reason) => {
+      automation();
       await provision();
       await profile(account(1).Id);
-      automation();
       bot.active = false;
       if (reason === 'left-discord') bot.present = false;
       writes.length = 0;

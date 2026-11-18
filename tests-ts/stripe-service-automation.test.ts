@@ -299,6 +299,39 @@ describe('Stripe-first membership automation without MEE6', () => {
     expect(target.Policy?.IsDisabled).toBe(true);
     expect(bot.sendCredentials).toHaveBeenCalledTimes(1);
   });
+  it.each([false, true])(
+    'reconsiders a deferred expiry once, including a pending expiry from an older release (%s)',
+    async (legacy) => {
+      await newSubscription();
+      await stripe.sync();
+      const target = servers.users.jellyfin.find((account) => account.Name === 'new.member')!;
+      store.saveSettings({ ...store.settings(), auto_disable: false });
+      vi.setSystemTime(new Date((base + 86_401) * 1000));
+      data.subscriptions[0]!.status = 'canceled';
+      data.subscriptions[0]!.ended_at = base + 86_400;
+      await stripe.sync();
+      const pending = store.subscriptions().find((event) => event.action === 'expire')!;
+      expect(pending).toMatchObject({ status: 'pending', stripe_expiry_deferred: true });
+      expect(target.Policy?.IsDisabled).toBe(false);
+      if (legacy) {
+        delete pending.stripe_expiry_deferred;
+        delete pending.result;
+        store.saveSubscription(pending);
+      }
+      store.saveSettings({ ...store.settings(), auto_disable: true });
+      const verified = period;
+      period = null;
+      await stripe.sync();
+      expect(target.Policy?.IsDisabled).toBe(false);
+      period = verified;
+      await stripe.sync();
+      expect(target.Policy?.IsDisabled).toBe(true);
+      expect(store.subscription(pending.id)).toMatchObject({ status: 'applied' });
+      const afterExpiry = writes.length;
+      await stripe.sync();
+      expect(writes).toHaveLength(afterExpiry);
+    },
+  );
   it('preserves active accounts when invoice evidence is unavailable or subscription is past due', async () => {
     await newSubscription();
     await stripe.sync();

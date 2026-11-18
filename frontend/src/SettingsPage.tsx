@@ -12,6 +12,11 @@ import {
 import { Callout, Heading, Icon } from './components';
 import { Tabs, TabPanel } from './ui-layout';
 import AdminAlertsPanel from './AdminAlertsPanel';
+import DiscordAuthorityPanel, {
+  AuthorityCutoverDialog,
+  cutoverFields,
+  type AuthorityCutover,
+} from './DiscordAuthorityPanel';
 import SourceSnapshotsPanel from './SourceSnapshotsPanel';
 import DestinationCatalogPanel from './DestinationCatalogPanel';
 import ActivityRetentionPanel from './ActivityRetentionPanel';
@@ -312,14 +317,18 @@ export default function SettingsPage({
   const [selectedTier, setSelectedTier] = useState(0);
   const [historyTab, setHistoryTab] = useRouteTab('settings', 'history');
   const [dirty, setDirtyDraft] = useWorkspaceDraftState('settings.dirty', false);
+  const [draftBase, setDraftBase] = useWorkspaceDraftState<Settings | null>('settings.base', null);
+  const [conflictingRevisions, setConflictingRevisions] = useState<Record<string, string>>({});
   const latestDirty = useRef(dirty);
   const setDirty = useCallback(
     (value: boolean) => {
       // Effects must inspect this live guard, not an earlier render's snapshot.
+      if (value && !latestDirty.current) setDraftBase(s);
+      if (!value) setDraftBase(null);
       latestDirty.current = value;
       setDirtyDraft(value);
     },
-    [setDirtyDraft],
+    [s, setDirtyDraft, setDraftBase],
   );
   const [validationRevision, setValidationRevision] = useState(0);
   const pendingFocus = useRef<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement | null>(
@@ -361,6 +370,13 @@ export default function SettingsPage({
     (s.membership_tiers || defaultMembershipTiers).map((tier) => ({ ...tier })),
   );
   const [busy, setBusy] = useState('');
+  const [cutover, setCutover] = useState<AuthorityCutover | null>(null);
+  const cutoverDecision = useRef<((approved: boolean) => void) | null>(null);
+  function finishCutover(approved: boolean) {
+    cutoverDecision.current?.(approved);
+    cutoverDecision.current = null;
+    setCutover(null);
+  }
   const changing = useRef(false);
   const mounted = useRef(false);
   const requestVersion = useRef(0);
@@ -369,6 +385,8 @@ export default function SettingsPage({
     return () => {
       mounted.current = false;
       requestVersion.current++;
+      cutoverDecision.current?.(false);
+      cutoverDecision.current = null;
     };
   }, []);
 
@@ -628,18 +646,82 @@ export default function SettingsPage({
         notify(invalid.validationMessage || 'Check the highlighted setting.', true);
         return;
       }
+      const base = draftBase ?? s;
+      const revisions = base.field_revisions;
+      const originalValues: Record<string, unknown> = {
+        default_role_id: '',
+        password_length: 12,
+        password_exclude_ambiguous: true,
+        credential_message_template: DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
+        bot_message_templates: {},
+        bot_message_retention_days: 30,
+        subscription_message_patterns: [],
+        membership_tiers: defaultMembershipTiers,
+        auto_create_new_subscribers: false,
+        new_subscriber_source: 'trusted_messages',
+        ...namingSettings(base),
+        ...base,
+        emby_api_key: '',
+        jellyfin_api_key: '',
+        discord_bot_token: '',
+      };
+      const changes = Object.fromEntries(
+        Object.entries(data).filter(
+          ([key, value]) => JSON.stringify(value) !== JSON.stringify(originalValues[key]),
+        ),
+      );
+      const expectedRevisions = Object.fromEntries(
+        Object.keys(changes).map((key) => [key, revisions?.[key] ?? '0']),
+      );
+      const authorityChanges = Object.fromEntries(
+        cutoverFields
+          .filter((field) => Object.hasOwn(changes, field))
+          .map((field) => [field, changes[field]]),
+      );
+      let authorityToken: string | undefined;
+      if (revisions && Object.keys(authorityChanges).length) {
+        const review = await api<AuthorityCutover>('/api/discord/authority/review', {
+          method: 'POST',
+          body: authorityChanges,
+          signal: AbortSignal.timeout(15_000),
+        });
+        if (!mounted.current || requestVersion.current !== version) return;
+        if (review.affected.length) {
+          const approved = await new Promise<boolean>((resolve) => {
+            cutoverDecision.current = resolve;
+            setCutover(review);
+          });
+          if (!approved || !mounted.current || requestVersion.current !== version) return;
+          authorityToken = review.review_token;
+        }
+      }
       await api('/api/settings', {
         method: 'PUT',
-        body: data,
+        body: revisions
+          ? {
+              changes,
+              expected_revisions: expectedRevisions,
+              ...(authorityToken ? { authority_review_token: authorityToken } : {}),
+            }
+          : data,
         signal: AbortSignal.timeout(30_000),
       });
       if (!mounted.current || requestVersion.current !== version) return;
+      setConflictingRevisions({});
       setDirty(false);
       notify('Settings saved. Your connections are ready to test.');
       await refresh();
     } catch (error) {
-      if (mounted.current && requestVersion.current === version)
+      if (mounted.current && requestVersion.current === version) {
+        const conflict =
+          error instanceof Error
+            ? (error.cause as
+                { conflicts?: string[]; field_revisions?: Record<string, string> } | undefined)
+            : undefined;
+        if (conflict?.conflicts?.length && conflict.field_revisions)
+          setConflictingRevisions(conflict.field_revisions);
         notify(error instanceof Error ? error.message : 'Settings could not be saved.', true);
+      }
     } finally {
       if (requestVersion.current === version) {
         changing.current = false;
@@ -714,6 +796,7 @@ export default function SettingsPage({
   }
   return (
     <div className="page-stack settings-focus">
+      {cutover && <AuthorityCutoverDialog review={cutover} finish={finishCutover} />}
       {!embedded && (
         <Heading
           title="Settings"
@@ -725,6 +808,46 @@ export default function SettingsPage({
         <Callout title="A settings save is still in progress.">
           You can keep editing this draft. Wait for the earlier request to finish before saving
           another change; this draft has not been submitted.
+        </Callout>
+      )}
+      {!!Object.keys(conflictingRevisions).length && (
+        <Callout warning title="Another save changed these settings.">
+          <p>
+            {Object.keys(conflictingRevisions)
+              .map((field) => field.replaceAll('_', ' '))
+              .join(', ')}
+          </p>
+          <div className="button-row">
+            <button
+              type="button"
+              className="btn btn-quiet"
+              disabled={!!busy || pendingSave}
+              onClick={() => {
+                setDirty(false);
+                setConflictingRevisions({});
+                void refresh();
+              }}
+            >
+              Discard settings draft
+            </button>
+            <button
+              type="button"
+              className="btn btn-quiet"
+              disabled={!!busy || pendingSave}
+              onClick={() => {
+                setDraftBase({
+                  ...(draftBase ?? s),
+                  field_revisions: {
+                    ...(draftBase ?? s).field_revisions,
+                    ...conflictingRevisions,
+                  },
+                });
+                setConflictingRevisions({});
+              }}
+            >
+              Keep my edits
+            </button>
+          </div>
         </Callout>
       )}
 
@@ -1361,6 +1484,9 @@ export default function SettingsPage({
                         </details>
                       </div>
                     </Section>
+                    {!demo && s.discord_enabled && (
+                      <DiscordAuthorityPanel api={api} notify={notify} />
+                    )}
                   </section>
                 </TabPanel>
                 <TabPanel id="settings-bot" tabId="alerts" active={discordTab === 'alerts'}>

@@ -57,15 +57,50 @@ describe('Fernet compatibility and authentication', () => {
 });
 
 describe('persistent operational state', () => {
+  it('normalizes interrupted migration rows across restart and keeps completed work intact', () => {
+    const path = directory();
+    const store = new Store(path);
+    const completed = { username: 'completed-user', status: 'completed', applied: 23 };
+    store.saveJob({
+      ...job('running'),
+      kind: 'migrate',
+      progress: { processed: 1, total: 3, current_user: 'unfinished-user', items_updated: 7 },
+      results: [completed, { username: 'unfinished-user', status: 'running', applied: 7 }],
+    });
+    store.close();
+    const reopened = new Store(path);
+    try {
+      expect(reopened.job('job-1')).toMatchObject({
+        status: 'interrupted',
+        finished_at: expect.any(String),
+        progress: { processed: 1, total: 3 },
+        results: [completed, { username: 'unfinished-user', status: 'interrupted', applied: 7 }],
+      });
+      expect(reopened.job('job-1')?.progress).not.toHaveProperty('current_user');
+      expect(reopened.job('job-1')?.results[0]).toEqual(completed);
+    } finally {
+      reopened.close();
+    }
+  });
   it('opens a Python-schema database and preserves links, audit history and secrets', () => {
     const path = directory();
     writeFileSync(join(path, 'secret.key'), key);
     const db = new DatabaseSync(join(path, 'jellyport.db'));
     db.exec(
-      'CREATE TABLE settings(id INTEGER PRIMARY KEY, encrypted BLOB NOT NULL); CREATE TABLE links(discord_user_id TEXT PRIMARY KEY,username TEXT NOT NULL,remote_id TEXT UNIQUE NOT NULL,disabled_by_jellyport INTEGER DEFAULT 0);',
+      'CREATE TABLE settings(id INTEGER PRIMARY KEY, encrypted BLOB NOT NULL); CREATE TABLE links(discord_user_id TEXT PRIMARY KEY,username TEXT NOT NULL,remote_id TEXT UNIQUE NOT NULL,disabled_by_jellyport INTEGER DEFAULT 0); CREATE TABLE credentials(job_id TEXT NOT NULL,username TEXT NOT NULL,encrypted BLOB NOT NULL,expires REAL NOT NULL, PRIMARY KEY(job_id,username));',
     );
     db.prepare('INSERT INTO settings VALUES(1,?)').run(Buffer.from(legacy));
     db.prepare('INSERT INTO links VALUES(?,?,?,?)').run('123456', 'legacy-user', 'jf-legacy', 1);
+    db.prepare('INSERT INTO credentials VALUES(?,?,?,?)').run(
+      'job-1',
+      'legacy-user',
+      new SecretCipher(key).encrypt({
+        username: 'legacy-user',
+        password: 'synthetic-legacy-secret',
+        server_url: 'https://media.example',
+      }),
+      Date.now() / 1000 + 300,
+    );
     db.close();
     const store = new Store(path);
     try {
@@ -79,6 +114,10 @@ describe('persistent operational state', () => {
       });
       store.saveJob(job('completed'));
       expect(store.jobs()[0].id).toBe('job-1');
+      expect(store.revealCredentials('job-1', 'synthetic-browser-session')[0]?.password).toBe(
+        'synthetic-legacy-secret',
+      );
+      expect(store.revealCredentials('job-1', 'other-browser-session')).toEqual([]);
     } finally {
       store.close();
     }

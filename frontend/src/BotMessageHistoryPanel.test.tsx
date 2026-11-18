@@ -25,7 +25,7 @@ const message: BotMessageHistory = {
   message_id: '234567890123456789',
 };
 describe('administrator bot message history', () => {
-  it('loads exact unmasked message content only on request and can read it repeatedly', async () => {
+  it('loads delivery records on request and keeps legacy message bodies out of the report', async () => {
     const api = vi.fn(async () => ({ messages: [message] })) as Api;
     const notify = vi.fn();
     const first = render(
@@ -37,11 +37,11 @@ describe('administrator bot message history', () => {
     fireEvent.click(screen.getByRole('button', { name: 'View bot messages' }));
     await screen.findByText('household.owner_2 · Slot 2');
     expect(
-      screen.getByRole('article', { name: 'Message for household.owner_2' }).querySelector('pre')
-        ?.textContent,
-    ).toBe(message.content);
+      screen.getByRole('article', { name: 'Message for household.owner_2' }).querySelector('pre'),
+    ).toBeNull();
     expect(first.container.querySelector('script')).toBeNull();
     expect(screen.getByText(/@household.owner/)).toBeTruthy();
+    expect(screen.queryByText(/EXAMPLE-password-42/)).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Refresh bot messages' }));
     await waitFor(() => expect(api).toHaveBeenCalledTimes(2));
     expect(
@@ -54,22 +54,6 @@ describe('administrator bot message history', () => {
     expect(sessionStorage.length).toBe(0);
     expect(localStorage.length).toBe(0);
   });
-  it('copies the exact archived wire content including the password', async () => {
-    const writeText = vi.fn(async () => {});
-    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText } });
-    const notify = vi.fn();
-    render(
-      <BotMessageHistoryPanel
-        jobId="job_1"
-        api={vi.fn(async () => ({ messages: [message] })) as Api}
-        notify={notify}
-      />,
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'View bot messages' }));
-    fireEvent.click(await screen.findByRole('button', { name: 'Copy exact message' }));
-    await waitFor(() => expect(writeText).toHaveBeenCalledExactlyOnceWith(message.content));
-    expect(notify).toHaveBeenCalledWith('Exact bot message copied.');
-  });
   it('does not claim delivery for a failed or uncertain attempt', async () => {
     render(
       <BotMessageHistoryPanel
@@ -80,11 +64,8 @@ describe('administrator bot message history', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: 'View bot messages' }));
     await screen.findByText(/Delivery outcome uncertain/);
-    expect(screen.getByText(/not confirmed as delivered/)).toBeTruthy();
-    expect(
-      screen.getByRole('article', { name: 'Message for household.owner_2' }).querySelector('pre')
-        ?.textContent,
-    ).toBe(message.content);
+    expect(screen.getByText(/Delivery was unconfirmed/)).toBeTruthy();
+    expect(screen.queryByText(/EXAMPLE-password-42/)).toBeNull();
   });
   it('aborts a pending private read on close and ignores a late response', async () => {
     let reply!: (value: { messages: BotMessageHistory[] }) => void;

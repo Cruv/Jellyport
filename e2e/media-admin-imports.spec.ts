@@ -298,9 +298,12 @@ test('missing and invalid backups fail visibly, retain original valid history, a
   test.setTimeout(60_000);
   await page.goto('/#/migrate');
   await expect(
-    page.getByText('Import a current Jellyfin matching catalog before migrating.', {
-      exact: true,
-    }),
+    page.getByText(
+      'Import a current Jellyfin matching catalog before migrating. Live library scans are disabled for this backup configuration.',
+      {
+        exact: true,
+      },
+    ),
   ).toBeVisible();
   const selection = page.getByRole('checkbox', { name: 'Select synthetic_member', exact: true });
   await expect(selection).toBeEnabled();
@@ -315,7 +318,7 @@ test('missing and invalid backups fail visibly, retain original valid history, a
 
   // Repair the catalog prerequisite in place. Returning from setup refreshes
   // readiness; no mocked approval or live catalog fallback is permitted.
-  await page.getByRole('button', { name: 'Resolve requirement', exact: true }).click();
+  await page.getByRole('button', { name: 'Manage Jellyfin imports', exact: true }).click();
   const setup = page.getByRole('dialog', { name: 'Complete required setup', exact: true });
   await importBackup(
     page,

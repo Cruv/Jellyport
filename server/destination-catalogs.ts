@@ -349,12 +349,7 @@ export class DestinationCatalogs {
     }
   }
   private pins(): Set<string> {
-    return new Set(
-      this.store
-        .jobs()
-        .filter((job) => ['queued', 'running'].includes(job.status))
-        .flatMap((job) => (job.destination_catalog_id ? [job.destination_catalog_id] : [])),
-    );
+    return this.store.activeSnapshotPins('destination');
   }
   private async completeFile(value: DestinationCatalogResult): Promise<boolean> {
     try {
@@ -658,7 +653,10 @@ export class DestinationCatalogs {
     await rm(join(this.directory, `${backupCleanupPrefix(request.id)}.request`), { force: true });
   }
   /** Queue pinning is synchronous; execution authenticates the file and live identity again. */
-  queuedSelection(settings: Settings): string | undefined {
+  queuedSelection(
+    settings: Settings,
+    server?: { Id?: unknown; Version?: unknown },
+  ): string | undefined {
     if (this.stopping || this.clearing)
       throw new ServiceError('Saved Jellyfin catalogs are unavailable.');
     if (!this.state.configured) return;
@@ -673,6 +671,19 @@ export class DestinationCatalogs {
     if (!usable)
       throw new ServiceError(
         'Import a current Jellyfin matching catalog before migrating. Live library scans are disabled for this backup configuration.',
+      );
+    if (
+      server &&
+      (typeof server.Id !== 'string' ||
+        typeof server.Version !== 'string' ||
+        !sameBinding(latest!.binding, {
+          url: settings.jellyfin_url,
+          server_id: server.Id,
+          version: server.Version,
+        }))
+    )
+      throw new ServiceError(
+        'The current Jellyfin server or version differs from the saved matching catalog. Import a backup from the connected Jellyfin server before migrating.',
       );
     return latest.id;
   }

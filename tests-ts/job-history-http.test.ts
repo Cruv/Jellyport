@@ -237,7 +237,12 @@ describe('administrator activity cleanup HTTP endpoint', () => {
     expect(response.json()).toEqual({ removed_ids: [completed.id, failed.id], skipped: [] });
     expect(response.body).not.toMatch(/PRIVATE-|username|results|password|token|unmatched_items/);
     expect(store.jobs()).toEqual([]);
-    expect((await app.inject({ url: '/api/jobs', headers })).json()).toEqual({ jobs: [] });
+    expect((await app.inject({ url: '/api/jobs', headers })).json()).toEqual({
+      jobs: [],
+      total: 0,
+      overall: 0,
+      active: 0,
+    });
     const removedReport = await app.inject({ url: `/api/jobs/${completed.id}`, headers });
     expect(removedReport.statusCode).toBe(400);
     expect(removedReport.body).not.toContain('PRIVATE-');
@@ -365,4 +370,51 @@ describe('administrator activity cleanup HTTP endpoint', () => {
     });
     expect(clientFactory).not.toHaveBeenCalled();
   });
+});
+
+it('pages and filters projected activity, with a bounded idle feed and full diagnostics only on demand', async () => {
+  const { app, headers, clientFactory } = await fixture();
+  for (let index = 0; index < 31; index++) {
+    const job = historicalJob(
+      `summary-${index.toString().padStart(2, '0')}`,
+      index % 2 ? 'failed' : 'completed',
+    );
+    job.results[0]!.username = index % 2 ? 'Synthetic matching member' : 'Other member';
+    app.jellyport.store.saveJob(job);
+  }
+  const page = await app.inject({
+    url: '/api/jobs?limit=5&offset=5&status=failed&query=MATCHING',
+    headers,
+  });
+  expect(page.statusCode).toBe(200);
+  expect(page.json()).toMatchObject({ active: 0, total: 15, overall: 31 });
+  expect(page.json().jobs.map(({ id }: Job) => id)).toEqual([
+    'summary-19',
+    'summary-17',
+    'summary-15',
+    'summary-13',
+    'summary-11',
+  ]);
+  expect(page.body).not.toMatch(/PRIVATE-PLAYBACK-TITLE|PRIVATE-REPORT-WARNING/);
+  expect((await app.inject({ url: '/api/jobs?limit=101', headers })).statusCode).toBe(422);
+  const detail = await app.inject({ url: '/api/jobs/summary-19', headers });
+  expect(detail.body).toContain('PRIVATE-PLAYBACK-TITLE');
+
+  const idle = await app.inject({ url: '/api/jobs/live', headers });
+  expect(idle.json()).toMatchObject({ active: [], active_count: 0, total: 31 });
+  app.jellyport.store.saveJob(historicalJob('other-tab', 'queued'));
+  const live = await app.inject({ url: '/api/jobs/live', headers });
+  expect(live.json().active).toMatchObject([{ id: 'other-tab' }]);
+  expect(live.json().revision).not.toBe(idle.json().revision);
+  expect(live.json().recent).toHaveLength(6);
+  expect(live.body).not.toContain('PRIVATE-PLAYBACK-TITLE');
+  expect(clientFactory).not.toHaveBeenCalled();
+
+  const overview = await app.inject({ url: '/api/overview', headers });
+  expect(overview.json().recent_jobs).toHaveLength(6);
+  expect(overview.body).not.toContain('PRIVATE-PLAYBACK-TITLE');
+  await app.inject({ url: '/api/overview', headers });
+  expect(clientFactory).toHaveBeenCalledTimes(1);
+  await app.inject({ url: '/api/overview?fresh=1', headers });
+  expect(clientFactory).toHaveBeenCalledTimes(2);
 });

@@ -1,4 +1,4 @@
-import { test, expect, navigate, expectContainedLayout } from './fixtures';
+import { test, expect, navigate, expectContainedLayout, mockActivity } from './fixtures';
 
 test('saved ambiguity compares one source against two destinations without counting the source as a choice', async ({
   page,
@@ -59,7 +59,7 @@ test('saved ambiguity compares one source against two destinations without count
       },
     ],
   };
-  await page.route('**/api/jobs', async (route) => route.fulfill({ json: { jobs: [report] } }));
+  await mockActivity(page, [report]);
   await page.route('**/api/jobs/synthetic-ambiguity-report', async (route) =>
     route.fulfill({ json: report }),
   );

@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { ServiceError } from './errors.js';
 import { DEFAULT_SETTINGS, type Settings } from './types.js';
 import { validateMembershipTiers } from './memberships.js';
@@ -7,6 +8,26 @@ import { validateAccountNaming } from './account-naming.js';
 import { validateBotMessageTemplates } from './bot-messages.js';
 import { validateSubscriptionMessagePatterns } from './subscription-messages.js';
 export const SECRET_FIELDS = ['emby_api_key', 'jellyfin_api_key', 'discord_bot_token'] as const;
+/** Fields used by account and migration reviews. Message display and retention save independently. */
+export function reviewSettings(settings: Settings) {
+  const {
+    bot_message_templates: _templates,
+    bot_message_retention_days: _retention,
+    subscription_message_patterns: _patterns,
+    discord_application_id: _applicationId,
+    discord_admin_role_id: _administratorRole,
+    discord_emby_role_id: _embyTag,
+    discord_jellyfin_role_id: _jellyfinTag,
+    discord_auto_role_sync: _tagSync,
+    discord_emby_only_role: _embyOnlyTag,
+    disable_on_cancel: _disableOnCancel,
+    ...policy
+  } = settings;
+  return policy;
+}
+export function sameReviewSettings(left: Settings, right: Settings): boolean {
+  return isDeepStrictEqual(reviewSettings(left), reviewSettings(right));
+}
 const snowflake = /^[0-9]{5,22}$/;
 const control = /[\x00-\x1f]/;
 

@@ -42,6 +42,20 @@ export class MediaOwnerships {
       .map((row) => this.store.decrypt<MediaOwnership>(row.encrypted as Uint8Array))
       .filter((row) => row.scope === scope && (!servers || servers[row.kind] === row.server_id));
   }
+  forOwner(discordId: string, settings: Settings): MediaOwnership[] {
+    const scope = this.scope(settings);
+    return this.store
+      .ownerRecords<MediaOwnership>('media_ownership', discordId)
+      .map(({ id, value }) => {
+        if (
+          value.discord_user_id !== discordId ||
+          id !== hash([value.scope, value.kind, value.server_id, value.account_id])
+        )
+          throw new ServiceError('The saved media ownership identity could not be authenticated.');
+        return value;
+      })
+      .filter((value) => value.scope === scope);
+  }
   /** Hot migration guards authenticate only the selected account, without
    * decrypting the complete identity directory for every played-state write. */
   get(
@@ -104,7 +118,6 @@ export class MediaOwnerships {
   /** Caller preflights exact IDs/names, scope and all conflicts before opening its transaction. */
   save(records: Omit<MediaOwnership, 'scope' | 'approved_at'>[], settings: Settings): void {
     const scope = this.scope(settings);
-    const save = this.store.db.prepare('INSERT OR REPLACE INTO media_ownership VALUES (?,?)');
     for (const record of records) {
       if (
         !['emby', 'jellyfin'].includes(record.kind) ||
@@ -118,9 +131,9 @@ export class MediaOwnerships {
       )
         throw new ServiceError('Select a valid existing account, Discord owner and account slot.');
       const value: MediaOwnership = { ...record, scope, approved_at: new Date().toISOString() };
-      save.run(
+      this.store.saveMediaOwnerRecord(
         hash([scope, record.kind, record.server_id, record.account_id]),
-        this.store.encrypt(value),
+        value,
       );
     }
   }

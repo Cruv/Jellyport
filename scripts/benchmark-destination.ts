@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
-import { MediaClient, type MediaItem } from '../server/media.js';
+import { MediaClient, MAX_DESTINATION_BATCH_IDS, type MediaItem } from '../server/media.js';
+import { jellyfinLibraryConfigHash } from '../server/jellyfin-library-membership.js';
 import { createMatcher } from '../server/matching.js';
 import { MigrationCatalogCache } from '../server/migration-catalog.js';
 import { mergeUserData, statePlan } from '../server/migration.js';
@@ -14,6 +15,9 @@ const USERS = 100;
 const ITEMS_PER_USER = 200;
 const PREVIOUS_PAGE_SIZE = 500;
 const CATALOG_PAGE_SIZE = 100;
+const library = { id: 'a'.repeat(32), locations: ['/synthetic/library'] };
+const libraryHash = jellyfinLibraryConfigHash([library]);
+const access = { policy: 0, configuration: 0, individual: 0 };
 const fixtureStarted = performance.now();
 const fixture: MediaItem[] = Array.from({ length: CATALOG_ITEMS }, (_, index) => ({
   Id: (index + 1).toString(16).padStart(32, '0'),
@@ -37,6 +41,20 @@ const client = new MediaClient('http://synthetic.invalid', 'synthetic-benchmark-
     assert.equal(options.method, 'GET', 'The benchmark must remain read-only.');
     const url = new URL(address);
     assert.equal(url.hostname, 'synthetic.invalid');
+    if (/^\/Users\/synthetic-user-\d+$/.test(url.pathname)) {
+      access.policy++;
+      const Id = url.pathname.split('/').at(-1)!;
+      return Response.json({ Id, Name: Id, Policy: { EnableAllFolders: true } });
+    }
+    if (url.pathname === '/Library/VirtualFolders') {
+      access.configuration++;
+      return Response.json([{ ItemId: library.id, Locations: library.locations }]);
+    }
+    if (/^\/UserItems\/[a-f0-9]{32}\/UserData$/.test(url.pathname)) {
+      access.individual++;
+      assert.match(url.searchParams.get('userId') ?? '', /^synthetic-user-\d+$/);
+      return Response.json({ Played: true, ItemId: url.pathname.split('/')[2] });
+    }
     let Items: MediaItem[];
     if (url.pathname === '/Items') {
       catalogCalls++;
@@ -57,7 +75,8 @@ const client = new MediaClient('http://synthetic.invalid', 'synthetic-benchmark-
       assert.equal(url.searchParams.has('StartIndex'), false);
       assert.equal(url.searchParams.get('EnableTotalRecordCount'), 'false');
       const ids = url.searchParams.get('Ids')!.split(',');
-      assert.ok(ids.length <= 100, 'State requests must remain bounded to 100 IDs.');
+      assert.ok(ids.length <= MAX_DESTINATION_BATCH_IDS);
+      assert.ok(encodeURIComponent(ids.join(',')).length <= 6000);
       assert.equal(Number(url.searchParams.get('Limit')), ids.length);
       maxStateBatch = Math.max(maxStateBatch, ids.length);
       Items = ids.map((id) => ({
@@ -110,7 +129,17 @@ try {
     }));
     const candidates = matcher.candidates(source);
     assert.equal(candidates.length, ITEMS_PER_USER);
-    const destination = await client.destinationItems(`synthetic-user-${user}`, candidates);
+    // Half the users have imported library membership. The others use a live
+    // catalog and require individual access probes before their batch state reads.
+    const reviewed =
+      user < USERS / 2
+        ? candidates.map((item) => ({
+            ...item,
+            JellyportLibraryIds: [library.id],
+            JellyportLibraryConfigHash: libraryHash,
+          }))
+        : candidates;
+    const destination = await client.destinationItems(`synthetic-user-${user}`, reviewed);
     const plan = statePlan(source, destination, DEFAULT_SETTINGS);
     assert.equal(plan.matches.length, ITEMS_PER_USER);
     assert.equal(plan.ambiguous.length, 0);
@@ -121,7 +150,10 @@ try {
     ).length;
   }
   assert.equal(catalogCalls, CATALOG_ITEMS / CATALOG_PAGE_SIZE + 1);
-  assert.equal(stateCalls, USERS * (ITEMS_PER_USER / 100));
+  assert.equal(stateCalls, USERS * Math.ceil(ITEMS_PER_USER / MAX_DESTINATION_BATCH_IDS));
+  assert.equal(access.policy, USERS);
+  assert.equal(access.configuration, USERS);
+  assert.equal(access.individual, (USERS / 2) * ITEMS_PER_USER);
   assert.equal(returnedCatalogItems, CATALOG_ITEMS);
   assert.equal(returnedStateItems, USERS * ITEMS_PER_USER);
   assert.equal(cacheHits, USERS);
@@ -139,7 +171,11 @@ try {
         observed: {
           catalog_api_calls: catalogCalls,
           destination_state_api_calls: stateCalls,
-          total_api_calls: catalogCalls + stateCalls,
+          destination_account_policy_calls: access.policy,
+          destination_library_configuration_calls: access.configuration,
+          destination_individual_access_probes: access.individual,
+          total_api_calls:
+            catalogCalls + stateCalls + access.policy + access.configuration + access.individual,
           metadata_items_returned: returnedCatalogItems,
           largest_catalog_batch: maxCatalogBatch,
           user_state_items_returned: returnedStateItems,

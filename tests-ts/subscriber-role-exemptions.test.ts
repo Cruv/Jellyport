@@ -253,7 +253,7 @@ describe('subscriber role cleanup access exceptions', () => {
     expect(service.subscriberRoleCleanupExempt(owner)).toBe(false);
   });
 
-  it('does not reuse old approval or Family scopes after changing the Discord server', () => {
+  it('holds the old membership for review without carrying approval or Family ownership to a different Discord server', () => {
     membership();
     ownership('jellyfin', 'j-secondary');
     family('jellyfin', 'j-secondary');
@@ -264,6 +264,11 @@ describe('subscriber role cleanup access exceptions', () => {
     );
     expect(service.subscriberRoleCleanupExempt(owner)).toBe(true);
     store.saveSettings({ ...store.settings(), discord_guild_id: '223456789012345678' });
-    expect(service.subscriberRoleCleanupExempt(owner)).toBe(false);
+    expect(service.mediaOwnerships.exceptions(store.settings()).has(`discord:${owner}`)).toBe(
+      false,
+    );
+    expect(service.mediaOwnerships.forOwner(owner, store.settings())).toEqual([]);
+    expect(service.discordAuthorityState(owner)).toBe('held');
+    expect(service.subscriberRoleCleanupExempt(owner)).toBe(true);
   });
 });

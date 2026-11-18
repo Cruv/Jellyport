@@ -173,6 +173,22 @@ describe('reviewed manual migration account slots', () => {
         },
       },
       expect.any(Function),
+      undefined,
+      undefined,
+      {
+        [ids[0]!]: {
+          server_id: 'demo-jellyfin',
+          source_username: 'Harbor',
+          username: 'Harbor',
+          target_user_id: null,
+        },
+        [ids[1]!]: {
+          server_id: 'demo-jellyfin',
+          source_username: 'Cabin',
+          username: 'Cabin',
+          target_user_id: null,
+        },
+      },
     );
   });
 

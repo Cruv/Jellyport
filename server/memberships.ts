@@ -4,6 +4,7 @@ import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import type { Store } from './store.js';
 import type { Settings } from './types.js';
 import { renderAccountUsername, type AccountNaming } from './account-naming.js';
+import { discordAuthority } from './discord-authority.js';
 
 export interface MembershipTier {
   id: string;
@@ -37,6 +38,8 @@ export interface Membership extends MembershipInput {
   server_url: string;
   server_id?: string;
   revision: string;
+  /** Undefined for decisions from releases that did not record provenance. */
+  discord_authority?: string;
 }
 
 function text(value: unknown, maximum: number): value is string {
@@ -155,6 +158,7 @@ export class Memberships {
       !text(value.server_url, 2048) ||
       normalizeJellyfinUrl(value.server_url) !== value.server_url ||
       (value.server_id !== undefined && !text(value.server_id, 256)) ||
+      (value.discord_authority !== undefined && !/^[a-f0-9]{64}$/.test(value.discord_authority)) ||
       !text(value.revision, 128) ||
       recordId(value) !== id
     )
@@ -174,6 +178,7 @@ export class Memberships {
       server_url: value.server_url,
       ...(value.server_id ? { server_id: value.server_id } : {}),
       revision: value.revision,
+      ...(value.discord_authority ? { discord_authority: value.discord_authority } : {}),
     };
   }
   private records(): Membership[] {
@@ -206,9 +211,20 @@ export class Memberships {
   /** Scoped records must never be mistaken for an unscoped legacy single-account member. */
   hasOtherScope(discordId: string, settings: Settings): boolean {
     const server = scope(this.store, settings);
-    return this.records().some(
-      (member) => member.discord_user_id === discordId && (!server || !sameScope(member, server)),
-    );
+    return this.store.ownerRecords<Membership>('memberships', discordId).some(({ id, value }) => {
+      const member = this.record(id, value);
+      return member.discord_user_id === discordId && (!server || !sameScope(member, server));
+    });
+  }
+  approveDiscordAuthority(discordId: string, settings: Settings, revision: string): void {
+    const existing = this.get(discordId, settings);
+    if (!existing || existing.revision !== revision)
+      throw new ServiceError('The saved membership changed. Review this household again.');
+    this.store.saveMembershipRecord(recordId(existing), {
+      ...existing,
+      discord_authority: discordAuthority(settings),
+      revision: randomUUID(),
+    });
   }
   /** Revoke only the exact automatic enrollment that a failed job created.
    * Configuration may have changed while its upstream request was pending; do
@@ -267,13 +283,15 @@ export class Memberships {
     validateInput(input);
     const server = scope(this.store, settings);
     if (!server) throw new ServiceError('Configure Jellyfin before creating memberships.');
-    const all = this.records();
-    const existing = all.find(
-      (value) => sameScope(value, server) && value.discord_user_id === input.discord_user_id,
-    );
+    const existing = this.get(input.discord_user_id, settings);
     if (expectedRevision !== undefined && existing?.revision !== expectedRevision)
       throw new ServiceError('The membership changed. Review it before retrying.');
-    if (!existing && all.length >= 10_000) throw new ServiceError('Too many saved memberships.');
+    if (
+      !existing &&
+      Number(this.store.db.prepare('SELECT count(*) AS count FROM memberships').get()?.count) >=
+        10_000
+    )
+      throw new ServiceError('Too many saved memberships.');
     if (
       existing &&
       existing.base_username === input.base_username &&
@@ -301,6 +319,11 @@ export class Memberships {
         : {}),
       ...server,
       revision: randomUUID(),
+      ...(!existing
+        ? { discord_authority: discordAuthority(settings) }
+        : existing.discord_authority
+          ? { discord_authority: existing.discord_authority }
+          : {}),
     };
     this.store.saveMembershipRecord(recordId(membership), membership);
     return membership;

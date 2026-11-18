@@ -5,7 +5,12 @@ import { ConnectionRows, UserWarnings } from './SettingsPage';
 import DiscordMemberPicker from './DiscordMemberPicker';
 import WorkflowRequirements, { useWorkflowAction } from './WorkflowRequirements';
 import { Pagination, Tabs, TabPanel, usePagination } from './ui-layout';
-import { navigateWorkspace, useRouteTab, LocalWorkspaceRoute } from './routing';
+import {
+  navigateWorkspace,
+  useRouteTab,
+  LocalWorkspaceRoute,
+  type WorkspaceRoute,
+} from './routing';
 import MembershipsPage from './MembershipsPage';
 import { useWorkspaceDraftState } from './workspace-drafts';
 import {
@@ -13,6 +18,8 @@ import {
   date,
   num,
   type Api,
+  type ActivityFilter,
+  type ActivityResults,
   type DiscordMember,
   type Job,
   type Notify,
@@ -34,6 +41,18 @@ export function OverviewPage({
   refresh,
 }: Common & { overview: Overview; refresh: () => void }) {
   const ready = data.connections.emby.connected && data.connections.jellyfin.connected;
+  const repairRoutes: Record<
+    NonNullable<NonNullable<Overview['inbox']>[number]['repair']>,
+    WorkspaceRoute
+  > = {
+    emby_history: { page: 'settings', tab: 'history', subtab: 'emby' },
+    jellyfin_history: { page: 'settings', tab: 'history', subtab: 'jellyfin' },
+    stripe: { page: 'settings', tab: 'stripe' },
+    identity: { page: 'memberships', tab: 'overview' },
+    discord: { page: 'settings', tab: 'discord', subtab: 'connection' },
+    events: { page: 'memberships', tab: 'events', subtab: 'review' },
+    account_recovery: { page: 'accounts', tab: 'recover' },
+  };
   return (
     <div className="page-stack">
       <Heading
@@ -102,6 +121,51 @@ export function OverviewPage({
           </div>
         ))}
       </div>
+      {(!!data.inbox?.length || data.backup_verification !== undefined) && (
+        <section className="panel">
+          <div className="panel-header">
+            <h2>Operations inbox</h2>
+          </div>
+          <ul className="operations-inbox">
+            {data.inbox?.map((item) => (
+              <li key={item.id}>
+                <div>
+                  <strong>{item.title}</strong>
+                  {item.attention && <span className="status warn">Needs attention</span>}
+                  {item.detail && <p>{item.detail}</p>}
+                  {item.next_run_at && <p>Next run {date(item.next_run_at)}</p>}
+                </div>
+                {item.job_id ? (
+                  <button className="btn btn-small btn-quiet" onClick={() => openJob(item.job_id!)}>
+                    View operation
+                  </button>
+                ) : (
+                  item.repair && (
+                    <button
+                      className="btn btn-small btn-quiet"
+                      onClick={() => navigateWorkspace(repairRoutes[item.repair!])}
+                    >
+                      {item.attention ? 'Review' : 'View'}
+                    </button>
+                  )
+                )}
+              </li>
+            ))}
+            {data.backup_verification !== undefined && (
+              <li>
+                <div>
+                  <strong>Jellyport backup verification</strong>
+                  <p>
+                    {data.backup_verification
+                      ? `Last verified ${date(data.backup_verification.verified_at)} · ${num(data.backup_verification.encrypted_records)} encrypted records checked`
+                      : 'No verification receipt has been recorded.'}
+                  </p>
+                </div>
+              </li>
+            )}
+          </ul>
+        </section>
+      )}
       <div className="overview-grid">
         <section className="panel">
           <div className="panel-header">
@@ -236,7 +300,14 @@ export function MigratePage({
             id="preview-migration"
             className="btn btn-primary"
             onClick={preview}
-            disabled={!taskReadiness.ready || !selected.size || selected.size > 100 || busy}
+            disabled={
+              !taskReadiness.ready ||
+              !!users.errors?.emby ||
+              !!users.errors?.jellyfin ||
+              !selected.size ||
+              selected.size > 100 ||
+              busy
+            }
           >
             {busy ? <span className="spinner" /> : <Icon name="migrate" />}
             {busy
@@ -260,23 +331,24 @@ export function MigratePage({
         </span>
       </div>
       <UserWarnings users={users} />
-      {!(overview.connections.emby.connected && overview.connections.jellyfin.connected) && (
-        <Callout icon="warning" warning title="Both servers need to be connected.">
-          <button
-            className="text-button"
-            onClick={() =>
-              navigateWorkspace({
-                page: 'settings',
-                tab: 'media',
-                subtab: overview.connections.emby.connected ? 'jellyfin' : 'emby',
-              })
-            }
-          >
-            Check your server settings
-          </button>{' '}
-          before starting a migration.
-        </Callout>
-      )}
+      {!taskReadiness.managed &&
+        !(overview.connections.emby.connected && overview.connections.jellyfin.connected) && (
+          <Callout icon="warning" warning title="Both servers need to be connected.">
+            <button
+              className="text-button"
+              onClick={() =>
+                navigateWorkspace({
+                  page: 'settings',
+                  tab: 'media',
+                  subtab: overview.connections.emby.connected ? 'jellyfin' : 'emby',
+                })
+              }
+            >
+              Check your server settings
+            </button>{' '}
+            before starting a migration.
+          </Callout>
+        )}
       <div className="migration-options">
         <label className="check-label">
           <input
@@ -577,13 +649,15 @@ export function AccountsPage({
       controllers.current.forEach((controller) => controller.abort());
     };
   }, []);
-  const ready =
-    taskReadiness.ready &&
-    overview.connections.jellyfin.connected &&
-    (settings.default_role_id || settings.template_user_id);
+  const ready = taskReadiness.managed
+    ? taskReadiness.ready
+    : !!(
+        overview.connections.jellyfin.connected &&
+        (settings.default_role_id || settings.template_user_id)
+      );
   async function create(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (busyRef.current || !creationAllowed || !taskReadiness.ready) return;
+    if (busyRef.current || !creationAllowed || !ready) return;
     const form = event.currentTarget;
     const values = new FormData(form);
     const username = String(values.get('username') || '').trim();
@@ -1081,13 +1155,23 @@ export function ActivityPage({
   openJob,
   navigate,
   clearHistory,
+  remote,
 }: Common & {
   jobs: Job[];
   refresh: () => void;
   clearHistory?: (filteredIds: string[], filtered: boolean, single?: Job) => void;
+  remote?: {
+    filter: ActivityFilter;
+    result: ActivityResults | null;
+    pending: boolean;
+    error: string;
+    change: (filter: ActivityFilter) => void;
+  };
 }) {
-  const [query, setQuery] = useState('');
-  const [status, setStatus] = useState('all');
+  const [localQuery, setQuery] = useState('');
+  const [localStatus, setStatus] = useState('all');
+  const query = remote?.filter.query ?? localQuery;
+  const status = remote?.filter.status ?? localStatus;
   const filtered = jobs.filter(
     (job) =>
       (status === 'all' ||
@@ -1096,8 +1180,19 @@ export function ActivityPage({
         .toLowerCase()
         .includes(query.trim().toLowerCase()),
   );
-  const pagination = usePagination(filtered, 25, `${status}:${query}`);
-  const count = jobs.filter(activeJob).length;
+  const localPagination = usePagination(filtered, 25, `${status}:${query}`);
+  const pagination = remote
+    ? {
+        items: remote.result?.jobs ?? [],
+        page: remote.filter.page,
+        pageSize: remote.filter.pageSize,
+        total: remote.result?.total ?? 0,
+        setPage: (page: number) => remote.change({ ...remote.filter, page }),
+        setPageSize: (pageSize: number) => remote.change({ ...remote.filter, pageSize, page: 1 }),
+      }
+    : localPagination;
+  const count = remote ? (remote.result?.active ?? 0) : jobs.filter(activeJob).length;
+  const total = remote ? (remote.result?.overall ?? 0) : jobs.length;
   return (
     <div className="page-stack">
       <Heading
@@ -1118,7 +1213,7 @@ export function ActivityPage({
                     status !== 'all' || query.trim() !== '',
                   )
                 }
-                disabled={!jobs.length}
+                disabled={remote ? !remote.result?.overall : !jobs.length}
               >
                 <Icon name="trash" />
                 Delete activity…
@@ -1138,7 +1233,7 @@ export function ActivityPage({
             </p>
           </div>
           <span className="status">
-            {num(jobs.length)} {jobs.length === 1 ? 'operation' : 'operations'}
+            {num(total)} {total === 1 ? 'operation' : 'operations'}
           </span>
         </div>
         <div className="view-toolbar">
@@ -1147,13 +1242,25 @@ export function ActivityPage({
             <input
               type="search"
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              maxLength={256}
+              onChange={(event) =>
+                remote
+                  ? remote.change({ ...remote.filter, query: event.target.value, page: 1 })
+                  : setQuery(event.target.value)
+              }
               placeholder="Username, operation, or job ID"
             />
           </label>
           <label className="field">
             Status
-            <select value={status} onChange={(event) => setStatus(event.target.value)}>
+            <select
+              value={status}
+              onChange={(event) =>
+                remote
+                  ? remote.change({ ...remote.filter, status: event.target.value, page: 1 })
+                  : setStatus(event.target.value)
+              }
+            >
               <option value="all">All operations</option>
               <option value="active">Running or queued</option>
               <option value="completed">Completed</option>
@@ -1163,13 +1270,22 @@ export function ActivityPage({
             </select>
           </label>
         </div>
-        <JobsTable
-          jobs={pagination.items}
-          filtered={query.trim() !== '' || status !== 'all'}
-          openJob={openJob}
-          migrate={() => navigate('migrate')}
-          clearReport={clearHistory ? (job) => clearHistory([job.id], true, job) : undefined}
-        />
+        {remote?.error && (
+          <p className="error-block" role="alert">
+            {remote.error}
+          </p>
+        )}
+        {remote?.pending && !remote.result ? (
+          <p role="status">Loading operations…</p>
+        ) : (
+          <JobsTable
+            jobs={pagination.items}
+            filtered={query.trim() !== '' || status !== 'all'}
+            openJob={openJob}
+            migrate={() => navigate('migrate')}
+            clearReport={clearHistory ? (job) => clearHistory([job.id], true, job) : undefined}
+          />
+        )}
         <Pagination
           label="Operations"
           page={pagination.page}
@@ -1359,6 +1475,14 @@ export function SubscriptionsPage({
                                 >
                                   Ignore
                                 </button>
+                                {event.job_id && (
+                                  <button
+                                    className="btn btn-small btn-quiet"
+                                    onClick={() => openJob(event.job_id!)}
+                                  >
+                                    View operation
+                                  </button>
+                                )}
                                 <button
                                   className="btn btn-small btn-primary"
                                   disabled={busy}

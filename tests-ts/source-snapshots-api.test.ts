@@ -284,6 +284,7 @@ it.each(
       users: [],
       mode: 'merge',
       migration_scope: expected,
+      destination_server_id: 'fixture-jellyfin',
     });
     const started = await app.inject({
       method: 'POST',
@@ -736,6 +737,7 @@ it.each(['watched_only', 'played_favorites'] as const)(
       users: [{ source_user_id: 'fixture-source', mapping_revision: null }] as never,
       mode: 'merge',
       migration_scope: scope,
+      destination_server_id: 'fixture-jellyfin',
     });
     const migrate = vi
       .spyOn(app.jellyport.service, 'migrateUsers')

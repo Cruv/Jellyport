@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import App from './App';
+import { jobOutcome } from './migration-outcome';
 import { StrictMode } from 'react';
 import type {
   Job,
@@ -251,6 +252,52 @@ beforeEach(() => {
           }),
         };
       }
+      if (path === '/api/overview?fresh=1') path = '/api/overview';
+      const url = new URL(path, 'http://test.invalid');
+      if (['/api/jobs/live', '/api/jobs/cleanup-review', '/api/jobs'].includes(url.pathname)) {
+        const status = statuses[url.pathname] ?? statuses['/api/jobs'] ?? 200;
+        const value = responses['/api/jobs'] as { jobs?: Job[] };
+        if (status >= 400) return { ok: false, status, json: async () => value };
+        const all = value.jobs ?? [];
+        const active = all.filter((job) => ['queued', 'running'].includes(job.status));
+        const query = (url.searchParams.get('query') ?? '').trim().toLowerCase();
+        const filter = url.searchParams.get('status') ?? 'all';
+        const filtered = all.filter(
+          (job) =>
+            (filter === 'all' ||
+              (filter === 'active' ? active.includes(job) : jobOutcome(job).value === filter)) &&
+            `${job.kind} ${job.id} ${job.results?.map((result) => result.username).join(' ') ?? ''}`
+              .toLowerCase()
+              .includes(query),
+        );
+        let data: unknown;
+        if (url.pathname === '/api/jobs/live') {
+          data = {
+            active: active.slice(0, 12),
+            active_count: active.length,
+            recent: all.slice(0, 6),
+            total: all.length,
+            revision: JSON.stringify(all),
+          };
+        } else if (url.pathname === '/api/jobs/cleanup-review') {
+          data = { all, filtered };
+        } else {
+          const offset = Number(url.searchParams.get('offset') ?? 0);
+          const limit = Number(url.searchParams.get('limit') ?? 25);
+          data = {
+            jobs: filtered.slice(offset, offset + limit),
+            total: filtered.length,
+            overall: all.length,
+            active: active.length,
+          };
+        }
+        return { ok: true, status, json: async () => data };
+      }
+      if (path === '/api/jobs/cleanup' && path in responses && (statuses[path] ?? 200) < 300) {
+        const { removed_ids } = responses[path] as HistoryCleanupResult;
+        const all = (responses['/api/jobs'] as { jobs: Job[] }).jobs;
+        responses['/api/jobs'] = { jobs: all.filter((item) => !removed_ids.includes(item.id)) };
+      }
       if (!(path in responses)) throw new Error(`Unexpected request: ${path}`);
       const value = responses[path];
       const status = statuses[path] || 200;
@@ -275,7 +322,7 @@ describe('explicit workspace feedback', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn((path: string, options?: RequestInit) => {
-        if (path === '/api/overview')
+        if (path === '/api/overview?fresh=1')
           return new Promise<Response>((resolve) => {
             reply = resolve;
           });
@@ -316,7 +363,11 @@ describe('Activity report cleanup', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete activity…' }));
+    const button = await screen.findByRole<HTMLButtonElement>('button', {
+      name: 'Delete activity…',
+    });
+    await waitFor(() => expect(button.disabled).toBe(false));
+    fireEvent.click(button);
     return screen.findByRole('dialog', { name: 'Delete activity history?' });
   }
   const cleanupRequests = () => requests.filter((request) => request.path === '/api/jobs/cleanup');
@@ -353,6 +404,11 @@ describe('Activity report cleanup', () => {
     fireEvent.change(await screen.findByRole('combobox', { name: 'Status' }), {
       target: { value: 'failed' },
     });
+    await waitFor(() =>
+      expect(
+        screen.getByRole<HTMLButtonElement>('button', { name: 'Delete activity…' }).disabled,
+      ).toBe(false),
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Delete activity…' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByRole('combobox', { name: 'Reports to review' })).toHaveProperty(
@@ -380,11 +436,9 @@ describe('Activity report cleanup', () => {
     });
     expect((request.options?.headers as Record<string, string>)['X-CSRF-Token']).toBe('test-csrf');
     fireEvent.click(within(dialog).getByRole('button', { name: 'Done' }));
-    expect(screen.getByText('31 operations')).toBeTruthy();
-    fireEvent.change(screen.getByRole('combobox', { name: 'Status' }), {
-      target: { value: 'failed' },
-    });
-    expect(screen.getByText('private-newly-finished')).toBeTruthy();
+    await screen.findByText('31 operations');
+    expect(screen.getByRole('combobox', { name: 'Status' })).toHaveProperty('value', 'failed');
+    await screen.findByText('private-newly-finished');
     expect(screen.queryByText('private-old-1')).toBeNull();
   });
 
@@ -419,6 +473,11 @@ describe('Activity report cleanup', () => {
       fireEvent.change(await screen.findByRole('combobox', { name: 'Status' }), {
         target: { value: status },
       });
+      await waitFor(() =>
+        expect(
+          screen.getByRole<HTMLButtonElement>('button', { name: 'Delete activity…' }).disabled,
+        ).toBe(false),
+      );
       fireEvent.click(screen.getByRole('button', { name: 'Delete activity…' }));
       const dialog = await screen.findByRole('dialog');
       expect(within(dialog).getByRole('combobox', { name: 'Reports to review' })).toHaveProperty(
@@ -447,6 +506,11 @@ describe('Activity report cleanup', () => {
     fireEvent.change(await screen.findByRole('searchbox', { name: 'Search operations' }), {
       target: { value: 'private-selected' },
     });
+    await waitFor(() =>
+      expect(
+        screen.getByRole<HTMLButtonElement>('button', { name: 'Delete activity…' }).disabled,
+      ).toBe(false),
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Delete activity…' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByRole('combobox', { name: 'Reports to review' })).toHaveProperty(
@@ -630,6 +694,11 @@ describe('Activity report cleanup', () => {
     );
     fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    await waitFor(() =>
+      expect(
+        screen.getByRole<HTMLButtonElement>('button', { name: 'Delete activity…' }).disabled,
+      ).toBe(false),
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Delete activity…' }));
     const dialog = await screen.findByRole('dialog');
     fireEvent.click(within(dialog).getByRole('button', { name: 'Delete 1 report' }));
@@ -865,7 +934,8 @@ describe('React account safeguards', () => {
     render(<App />);
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
     await waitFor(() => expect(poll).toBeTypeOf('function'));
-    statuses['/api/jobs'] = 503;
+    await screen.findByText('1 active');
+    statuses['/api/jobs/live'] = 503;
     responses['/api/jobs'] = { detail: 'Synthetic temporary failure' };
     await act(async () => {
       await poll!();
@@ -873,12 +943,14 @@ describe('React account safeguards', () => {
     expect(screen.getByText('Activity updates paused.')).toBeTruthy();
     expect(screen.getByText(/The last known operation status is shown/)).toBeTruthy();
     expect(requests.filter((r) => r.options?.method === 'POST')).toHaveLength(0);
-    statuses['/api/jobs'] = 200;
+    statuses['/api/jobs/live'] = 200;
     responses['/api/jobs'] = { jobs: [job] };
-    fireEvent.click(screen.getByRole('button', { name: 'Refresh Activity' }));
-    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    await act(async () => {
+      await poll!();
+    });
     await waitFor(() => expect(screen.queryByText('Activity updates paused.')).toBeNull());
-    expect(screen.getByRole('button', { name: 'Delete activity…' })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    await screen.findByRole('button', { name: 'Delete activity…' });
   });
   it('distinguishes a still-processing subscription from a completed access change', async () => {
     const event = {
@@ -1596,7 +1668,7 @@ describe('React account safeguards', () => {
       else Reflect.deleteProperty(navigator, 'clipboard');
     }
   });
-  it('does not display late credential responses after the dialog is closed', async () => {
+  it('holds the credential dialog open until a delayed response arrives and consumes it on close', async () => {
     await openJob();
     fireEvent.click(screen.getByRole('button', { name: 'Reveal new credentials' }));
     let resolve!: (value: unknown) => void;
@@ -1614,11 +1686,22 @@ describe('React account safeguards', () => {
     );
     fireEvent.click(screen.getByRole('button', { name: 'Reveal credentials' }));
     await waitFor(() => expect(resolve).toBeTypeOf('function'));
-    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    expect(screen.getByRole('button', { name: 'Close dialog' })).toHaveProperty('disabled', true);
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveProperty('disabled', true);
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.getByRole('dialog', { name: 'Reveal new account credentials?' })).toBeTruthy();
     resolve({ credentials: [{ username: 'alex', password: 'late-secret' }] });
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Revealing…' })).toBeNull());
+    await screen.findByText('late-secret');
+    responses['/api/jobs/job-1/credentials/receipt'] = { consumed: true };
+    fireEvent.click(screen.getByRole('button', { name: 'Done' }));
     expect(screen.queryByText('late-secret')).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
+    expect(requests).toContainEqual(
+      expect.objectContaining({
+        path: '/api/jobs/job-1/credentials/receipt',
+        options: expect.objectContaining({ method: 'DELETE' }),
+      }),
+    );
   });
   it('requires inspection and explicit approval before account recovery, and invalidates approval when inputs change', async () => {
     responses['/api/accounts/recovery?username=alex'] = {
@@ -1713,7 +1796,7 @@ describe('React account safeguards', () => {
       discord_user_id: '123456789012345678',
     });
   });
-  it('shows the exact archived bot message including its password again after reopening Activity details', async () => {
+  it('shows only Discord delivery metadata after reopening Activity details', async () => {
     const content =
       'Account: family_2\nPassword: SyntheticArchive42\nhttps://jellyfin.example.test';
     responses['/api/jobs/job-1/messages'] = {
@@ -1735,17 +1818,16 @@ describe('React account safeguards', () => {
     expect(requests.some((request) => request.path.endsWith('/messages'))).toBe(false);
     fireEvent.click(within(dialog).getByRole('button', { name: 'View bot messages' }));
     const article = await within(dialog).findByRole('article', { name: 'Message for family_2' });
-    expect(article.querySelector('pre')?.textContent).toBe(content);
+    expect(article.textContent).toContain('@family.owner');
+    expect(article.textContent).not.toContain('SyntheticArchive42');
     fireEvent.click(within(dialog).getByRole('button', { name: /^Close$/ }));
     expect(screen.queryByText(/SyntheticArchive42/)).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'View operation details' }));
     const reopened = await screen.findByRole('dialog');
     fireEvent.click(within(reopened).getByRole('button', { name: 'View bot messages' }));
-    expect(
-      (
-        await within(reopened).findByRole('article', { name: 'Message for family_2' })
-      ).querySelector('pre')?.textContent,
-    ).toBe(content);
+    const delivery = await within(reopened).findByRole('article', { name: 'Message for family_2' });
+    expect(delivery.textContent).toContain('Sent');
+    expect(delivery.textContent).not.toContain('SyntheticArchive42');
     expect(requests.filter((request) => request.path === '/api/jobs/job-1/messages')).toHaveLength(
       2,
     );
@@ -2104,6 +2186,7 @@ describe('React account safeguards', () => {
     expect(JSON.parse(String(request.options?.body))).toEqual({
       source_user_ids: ['e-alex', 'e-river'],
       preview_id: 'preview-bulk',
+      submission_receipt: 'preview-bulk',
       migration_scope: 'watched_only',
       discord_recipients: { 'e-river': '123456789012345678' },
       membership_slots: { 'e-river': 1 },
@@ -2192,6 +2275,7 @@ describe('React account safeguards', () => {
     ).toEqual({
       source_user_ids: ['source-a', 'source-b'],
       preview_id: 'shared-owner-preview',
+      submission_receipt: 'shared-owner-preview',
       migration_scope: 'watched_only',
       discord_recipients: { 'source-a': '123456789012345678', 'source-b': '123456789012345678' },
       membership_slots: { 'source-a': 1, 'source-b': 2 },
@@ -2366,6 +2450,7 @@ describe('React account safeguards', () => {
     expect(JSON.parse(String(migration.options?.body))).toEqual({
       source_user_ids: ['e-alex', 'e-river'],
       preview_id: 'preview-task-1',
+      submission_receipt: 'preview-task-1',
       migration_scope: 'watched_only',
       discord_recipients: {},
     });
@@ -2950,6 +3035,7 @@ describe('React account safeguards', () => {
     ).toEqual({
       source_user_ids: ['complex'],
       preview_id: 'preview-mapped',
+      submission_receipt: 'preview-mapped',
       migration_scope: 'watched_only',
       discord_recipients: { complex: '123456789012345678' },
       membership_review_tokens: { '123456789012345678': 'review-token-123456789012345678' },
@@ -3049,6 +3135,7 @@ describe('React account safeguards', () => {
       expect(JSON.parse(String(accepted.options?.body))).toEqual({
         source_user_ids: [sourceId],
         preview_id: 'protected-history-review',
+        submission_receipt: 'protected-history-review',
         migration_scope: 'watched_only',
         discord_recipients: {},
       });
@@ -3336,11 +3423,11 @@ describe('React account safeguards', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
-    const table = screen.getByRole('table');
+    const table = await screen.findByRole('table');
     const filter = screen.getByRole('combobox', { name: 'Status' });
     expect(within(filter).queryByRole('option', { name: 'Succeeded with warnings' })).toBeNull();
     fireEvent.change(filter, { target: { value: 'completed' } });
-    expect(within(table).getAllByRole('row')).toHaveLength(3);
+    await waitFor(() => expect(within(table).getAllByRole('row')).toHaveLength(3));
     expect(within(table).getByText('verified-history-user')).toBeTruthy();
     expect(within(table).getByText('ordinary-completed-user')).toBeTruthy();
     expect(within(table).getAllByText('Completed')).toHaveLength(2);
@@ -3348,14 +3435,14 @@ describe('React account safeguards', () => {
     expect(within(table).queryByText('legacy-review-user')).toBeNull();
     expect(within(table).queryByText('failed-history-user')).toBeNull();
     fireEvent.change(filter, { target: { value: 'partial' } });
-    expect(within(table).getAllByRole('row')).toHaveLength(2);
+    await waitFor(() => expect(within(table).getAllByRole('row')).toHaveLength(2));
     expect(within(table).getByText('legacy-review-user')).toBeTruthy();
     expect(within(table).getByText('Needs review')).toBeTruthy();
     expect(within(table).queryByText('verified-history-user')).toBeNull();
     expect(within(table).queryByText('ordinary-completed-user')).toBeNull();
     fireEvent.change(filter, { target: { value: 'failed' } });
-    expect(within(table).getAllByRole('row')).toHaveLength(2);
-    expect(within(table).getByText('failed-history-user')).toBeTruthy();
+    await waitFor(() => expect(within(table).getAllByRole('row')).toHaveLength(2));
+    await within(table).findByText('failed-history-user');
     expect(within(table).getByText('Failed')).toBeTruthy();
     expect(jobs).toEqual(before);
     expect(
@@ -4281,5 +4368,67 @@ it('shows a creation prerequisite before final submission and keeps the account 
   fireEvent.click(submit);
   await waitFor(() =>
     expect(requests.filter((request) => request.path === '/api/accounts')).toHaveLength(1),
+  );
+});
+
+it('enables account creation after a successful requirements refresh with an older Overview snapshot', async () => {
+  const readiness = responses['/api/workflow-readiness'] as {
+    actions: Record<string, { ready: boolean; blockers: unknown[]; warnings: string[] }>;
+  };
+  responses['/api/workflow-readiness/refresh'] = structuredClone(readiness);
+  readiness.actions.create_account = {
+    ready: false,
+    blockers: [
+      {
+        code: 'account_defaults',
+        message: 'Choose current account defaults.',
+        route: { page: 'settings', tab: 'accounts', subtab: 'permissions' },
+      },
+    ],
+    warnings: [],
+  };
+  responses['/api/settings'] = { ...settings, template_user_id: '', default_role_id: '' };
+  responses['/api/overview'] = {
+    ...overview,
+    connections: {
+      ...overview.connections,
+      jellyfin: { ...overview.connections.jellyfin, connected: false },
+    },
+  };
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Create account' }));
+  fireEvent.change(await screen.findByLabelText('Username'), {
+    target: { value: 'synthetic-owner' },
+  });
+  await screen.findByText('Choose current account defaults.');
+  const form = screen.getByLabelText('Username').closest('form')!;
+  const submit = within(form).getByRole('button', { name: 'Create account' });
+  expect(submit).toHaveProperty('disabled', true);
+  fireEvent.click(screen.getByRole('button', { name: 'Check requirements again' }));
+  await waitFor(() => expect(submit).toHaveProperty('disabled', false));
+  expect(requests.some((request) => request.path === '/api/accounts')).toBe(false);
+});
+
+it('keeps the reviewed Emby selection while a replacement roster is unavailable', async () => {
+  const roster = { emby: [{ Id: 'e-fixture', Name: 'synthetic-emby-user' }], jellyfin: [] };
+  responses['/api/users'] = roster;
+  render(<App />);
+  const navigation = within(await screen.findByRole('complementary', { name: 'Main navigation' }));
+  fireEvent.click(navigation.getByRole('button', { name: 'Migrate users' }));
+  fireEvent.click(await screen.findByRole('checkbox', { name: 'Select synthetic-emby-user' }));
+  fireEvent.click(navigation.getByRole('button', { name: 'Overview' }));
+  await screen.findByRole('heading', { name: 'Overview' });
+  responses['/api/users'] = {
+    emby: [],
+    jellyfin: [],
+    errors: { emby: 'Emby roster read failed.' },
+  };
+  fireEvent.click(navigation.getByRole('button', { name: 'Migrate users' }));
+  expect(
+    await screen.findByRole('checkbox', { name: 'Select synthetic-emby-user' }),
+  ).toHaveProperty('checked', true);
+  expect(screen.getByRole('button', { name: 'Preview migration (1)' })).toHaveProperty(
+    'disabled',
+    true,
   );
 });

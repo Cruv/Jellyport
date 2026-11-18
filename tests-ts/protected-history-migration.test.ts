@@ -164,7 +164,8 @@ describe('reviewed protected-account history migration', () => {
         client.updateUserData = update;
         return client;
       };
-      expect((await migrate(pins)).status).toBe('failed');
+      await expect(migrate(pins)).rejects.toThrow(/prepare a new (migration )?review/i);
+      expect(store.jobs()).toEqual([]);
       expect(update).not.toHaveBeenCalled();
       assertNoManagement();
     },

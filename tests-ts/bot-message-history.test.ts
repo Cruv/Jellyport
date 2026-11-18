@@ -113,7 +113,7 @@ describe('private administrator bot message archive', () => {
     expect(recovered).not.toHaveProperty('message_id');
     expect(recovered).not.toHaveProperty('sent_at');
   });
-  it('requires an authenticated administrator and exposes private messages only through the dedicated no-store endpoint', async () => {
+  it('requires authentication and returns delivery metadata without legacy archived credentials', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'jellyport-messages-api-'));
     directories.push(directory);
     const app = await createApp({
@@ -166,7 +166,13 @@ describe('private administrator bot message archive', () => {
       const response = await app.inject({ url: '/api/jobs/synthetic-job/messages', headers });
       expect(response.statusCode).toBe(200);
       expect(response.headers['cache-control']).toContain('no-store');
-      expect(response.json().messages[0].content).toContain('SYNTHETIC_PRIVATE_PASSWORD');
+      expect(response.json().messages[0]).toMatchObject({
+        status: 'sent',
+        recipient_id: '100001',
+        account_username: 'river_2',
+      });
+      expect(response.json().messages[0]).not.toHaveProperty('content');
+      expect(response.body).not.toContain('SYNTHETIC_PRIVATE_PASSWORD');
     }
     for (const url of ['/api/jobs', '/api/jobs/synthetic-job'])
       expect((await app.inject({ url, headers })).body).not.toContain('SYNTHETIC_PRIVATE_PASSWORD');
@@ -222,6 +228,7 @@ describe('private administrator bot message archive', () => {
         expect(store.botMessages(queued.id)[0].status).toBe(
           failure === 'cleanup' ? 'sent' : 'uncertain',
         );
+        expect(store.botMessages(queued.id)[0].content).toBe('');
       } finally {
         vi.restoreAllMocks();
         await service.stop();

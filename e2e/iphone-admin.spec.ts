@@ -1,5 +1,12 @@
 import type { Locator, Page } from '@playwright/test';
-import { test, expect, navigate, expectContainedLayout, isCompactLayout } from './fixtures';
+import {
+  test,
+  expect,
+  navigate,
+  expectContainedLayout,
+  isCompactLayout,
+  mockActivity,
+} from './fixtures';
 
 test.beforeEach(({ browserName, isMobile }) => {
   test.skip(
@@ -235,22 +242,16 @@ test('synthetic safe-area insets keep drawer controls and confirmation footers r
   page,
   mutations,
 }, info) => {
-  await page.route('**/api/jobs', async (route) =>
-    route.fulfill({
-      json: {
-        jobs: [
-          {
-            id: 'synthetic-phone-report',
-            kind: 'migrate',
-            status: 'completed',
-            created_at: '2000-01-01T00:00:00Z',
-            finished_at: '2000-01-02T00:00:00Z',
-            results: [],
-          },
-        ],
-      },
-    }),
-  );
+  await mockActivity(page, [
+    {
+      id: 'synthetic-phone-report',
+      kind: 'migrate',
+      status: 'completed',
+      created_at: '2000-01-01T00:00:00Z',
+      finished_at: '2000-01-02T00:00:00Z',
+      results: [],
+    },
+  ]);
   await page.goto('/');
   // Device emulation supplies Safari/touch/screen metrics, not physical notch
   // env() values. Override only the app's inset variables as a synthetic check.

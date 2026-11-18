@@ -4,6 +4,7 @@ import { useWorkspaceDraftState } from './workspace-drafts';
 import { Callout, Empty, Heading, Icon, Loading, Modal } from './components';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import DiscordMemberPicker from './DiscordMemberPicker';
+import HouseholdTimeline from './HouseholdTimeline';
 import { MemberIdentityAccountReview } from './IdentityReviewPanel';
 import WorkflowRequirements, { useWorkflowAction } from './WorkflowRequirements';
 import {
@@ -55,6 +56,7 @@ export default function MembershipsPage({
   api,
   notify,
   created,
+  openJob,
   embedded = false,
   refreshKey = 0,
   initialMember,
@@ -66,6 +68,7 @@ export default function MembershipsPage({
   api: Api;
   notify: Notify;
   created: (job: Job) => void;
+  openJob?: (id: string) => void;
   embedded?: boolean;
   refreshKey?: number;
   initialMember?: { id: string; username: string };
@@ -102,6 +105,7 @@ export default function MembershipsPage({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [review, setReview] = useState<MembershipReview | null>(null);
+  const [timelineOwner, setTimelineOwner] = useState<{ id: string; username: string } | null>(null);
   const [reviewExpired, setReviewExpired] = useState(false);
   const [identityOpen, setIdentityOpen] = useState(false);
   const [identityBusy, setIdentityBusy] = useState(false);
@@ -117,7 +121,11 @@ export default function MembershipsPage({
   const busyRef = useRef(false);
   useEffect(() => {
     if (!busyRef.current) setReview(null);
+    setTimelineOwner(null);
   }, [view]);
+  useEffect(() => {
+    if (!active) setTimelineOwner(null);
+  }, [active]);
   useEffect(() => {
     if (!review) return;
     const remaining = Date.parse(review.plan.expires_at) - Date.now();
@@ -506,22 +514,36 @@ export default function MembershipsPage({
                             : `${tiers.find((entry) => entry.id === item.tier_id)?.name || item.tier_id} · ${item.active === false ? 'Inactive membership' : `${item.account_limit} entitled ${item.account_limit === 1 ? 'account' : 'accounts'}`}`}
                         </p>
                       </div>
-                      <button
-                        className="btn"
-                        disabled={busy}
-                        aria-label={`Manage membership for ${item.base_username}`}
-                        onClick={() =>
-                          selectMember({
-                            id: item.discord_user_id,
-                            username: item.base_username,
-                            display_name: null,
-                            nickname: null,
-                            membership_active: null,
-                          })
-                        }
-                      >
-                        Manage
-                      </button>
+                      <div className="button-row">
+                        <button
+                          className="btn btn-quiet"
+                          aria-label={`Open household timeline for ${item.base_username}`}
+                          onClick={() =>
+                            setTimelineOwner({
+                              id: item.discord_user_id,
+                              username: item.base_username,
+                            })
+                          }
+                        >
+                          Timeline
+                        </button>
+                        <button
+                          className="btn"
+                          disabled={busy}
+                          aria-label={`Manage membership for ${item.base_username}`}
+                          onClick={() =>
+                            selectMember({
+                              id: item.discord_user_id,
+                              username: item.base_username,
+                              display_name: null,
+                              nickname: null,
+                              membership_active: null,
+                            })
+                          }
+                        >
+                          Manage
+                        </button>
+                      </div>
                     </div>
                     {item.links.length ? (
                       <ul className="account-slot-list">
@@ -651,6 +673,15 @@ export default function MembershipsPage({
                         </p>
                       ) : null}
                       <div className="button-row">
+                        <button
+                          type="button"
+                          className="btn btn-quiet"
+                          onClick={() =>
+                            setTimelineOwner({ id: member.id, username: member.username })
+                          }
+                        >
+                          Open household timeline
+                        </button>
                         <button
                           type="button"
                           className="btn btn-quiet"
@@ -830,6 +861,14 @@ export default function MembershipsPage({
           </section>
         </TabPanel>
       </div>
+      {active && timelineOwner && (
+        <HouseholdTimeline
+          api={api}
+          owner={timelineOwner}
+          close={() => setTimelineOwner(null)}
+          openJob={openJob}
+        />
+      )}
       {review && (
         <Modal
           title="Review membership update"

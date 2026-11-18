@@ -607,6 +607,36 @@ describe('user directory and informational Discord organization', () => {
     expect(bot.members.get(owner)!.roles).toContain(embyRole);
   });
 
+  it('synchronizes the selected owner without reading full media rosters or neighboring Discord members', async () => {
+    linked();
+    membership('1000099999', 'complimentary', 'unrelated');
+    const rosters = vi.fn();
+    const reads: Array<[string, string]> = [];
+    const factory = service.clientFactory;
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      const user = client.user.bind(client);
+      client.users = async () => {
+        rosters();
+        throw new Error('Unexpected whole-roster read');
+      };
+      client.user = async (id) => {
+        reads.push([String(args[2]), id]);
+        return user(id);
+      };
+      return client;
+    };
+    expect(await organization.syncOwners([owner])).toEqual({ updated: 1, failed: 0 });
+    expect(rosters).not.toHaveBeenCalled();
+    expect(bot.memberTagState).toHaveBeenCalledExactlyOnceWith(owner);
+    expect(reads).toEqual([
+      ['emby', 'e-river'],
+      ['jellyfin', 'j-river'],
+    ]);
+    expect(bot.members.get(owner)?.roles).toContain(jellyfinRole);
+    expect(mediaWrites).toEqual([]);
+  });
+
   it.each(['missing', 'duplicate', 'unsafe', 'permission'])(
     'refuses %s organizational role configuration without writing anything',
     async (kind) => {

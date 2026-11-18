@@ -459,6 +459,7 @@ export interface SourceSnapshotStatus extends ImportWorkflowStatus {
   records: SourceSnapshotMetadata[];
 }
 export interface Job {
+  outcome_status?: string;
   preview_timing?: {
     preview_id: string;
     started_at: string;
@@ -483,11 +484,47 @@ export interface Job {
   migration_scope?: HistoricalMigrationScope;
   cancel_requested?: boolean;
 }
+export interface ActivityFilter {
+  query: string;
+  status: string;
+  page: number;
+  pageSize: number;
+}
+export interface ActivityResults {
+  jobs: Job[];
+  total: number;
+  overall: number;
+  active: number;
+}
+export interface LiveOperations {
+  active: Job[];
+  active_count: number;
+  recent: Job[];
+  total: number;
+  revision: string;
+}
 export interface Overview {
   counts: { emby_users?: number; jellyfin_users?: number; jobs?: number };
   connections: Connections;
   recent_jobs: Job[];
   pending_subscriptions?: number;
+  inbox?: Array<{
+    id: string;
+    title: string;
+    detail?: string;
+    attention: boolean;
+    next_run_at?: string | null;
+    repair?:
+      | 'emby_history'
+      | 'jellyfin_history'
+      | 'stripe'
+      | 'identity'
+      | 'discord'
+      | 'events'
+      | 'account_recovery';
+    job_id?: string;
+  }>;
+  backup_verification?: { verified_at: string; encrypted_records: number } | null;
 }
 export interface PreviewUser {
   membership_slot?: number;
@@ -585,6 +622,7 @@ export interface Credential {
   message?: string;
 }
 export interface Settings {
+  field_revisions?: Record<string, string>;
   emby_url: string;
   emby_api_key_set: boolean;
   jellyfin_url: string;
@@ -630,6 +668,7 @@ export interface ApiOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   body?: unknown;
   signal?: AbortSignal;
+  keepalive?: boolean;
 }
 export type Api = <T>(path: string, options?: ApiOptions) => Promise<T>;
 export type Notify = (message: string, error?: boolean) => void;

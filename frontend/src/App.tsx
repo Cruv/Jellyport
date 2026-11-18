@@ -42,6 +42,9 @@ import {
   num,
   safeUrl,
   type Api,
+  type ActivityFilter,
+  type ActivityResults,
+  type LiveOperations,
   type ApiOptions,
   type Credential,
   type Job,
@@ -96,7 +99,7 @@ type Dialog =
   | { kind: 'preview'; preview: Preview; previewId: string; reviewElapsedMs?: number }
   | { kind: 'job'; job: Job }
   | { kind: 'reveal'; jobId: string }
-  | { kind: 'credentials'; credentials: Credential[] }
+  | { kind: 'credentials'; jobId: string; credentials: Credential[] }
   | {
       kind: 'cleanup';
       candidates: CleanupCandidate[];
@@ -114,6 +117,16 @@ interface Toast {
 const message = (error: unknown) =>
   error instanceof Error ? error.message : 'The operation could not be completed.';
 const emptyUsers: Users = { emby: [], jellyfin: [] };
+const pendingSubmissionKey = 'jellyport:pending-migration-receipt';
+function pendingSubmission(value?: string): string {
+  try {
+    if (value === '') sessionStorage.removeItem(pendingSubmissionKey);
+    else if (value) sessionStorage.setItem(pendingSubmissionKey, value);
+    return sessionStorage.getItem(pendingSubmissionKey) ?? '';
+  } catch {
+    return value ?? '';
+  }
+}
 const nextPreviewPoll = (signal: AbortSignal) =>
   new Promise<void>((resolve, reject) => {
     const abort = () => {
@@ -129,7 +142,7 @@ const nextPreviewPoll = (signal: AbortSignal) =>
   });
 
 export default function App() {
-  const { navigationDrawer } = useClientLayout();
+  const { navigationDrawer, compactRecords } = useClientLayout();
   useVisualViewport();
   const [session, setSession] = useState<Session | null>(null);
   const sessionRef = useRef<Session | null>(null);
@@ -145,14 +158,30 @@ export default function App() {
   const [loginError, setLoginError] = useState('');
   const [overview, setOverview] = useState<Overview | null>(null);
   const [users, setUsers] = useState<Users>(emptyUsers);
+  const lastMigrationRoster = useRef<Users['emby']>([]);
   const [mappings, setMappings] = useState<UserMapping[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
-  const [jobs, setJobs] = useState<Job[]>([]);
-  const jobsRef = useRef(jobs);
+  const [activityFilter, setActivityFilter] = useState<
+    Omit<ActivityFilter, 'pageSize'> & { pageSize?: number }
+  >({
+    query: '',
+    status: 'all',
+    page: 1,
+  });
+  const activityPageSize = activityFilter.pageSize ?? (compactRecords ? 5 : 25);
+  const [activity, setActivity] = useState<ActivityResults | null>(null);
+  const [activityPending, setActivityPending] = useState(false);
+  const [activityError, setActivityError] = useState('');
+  const [activityRefresh, setActivityRefresh] = useState(0);
+  const [live, setLive] = useState<LiveOperations | null>(null);
+  const [receipt, setReceipt] = useState(pendingSubmission);
+  const [followUp, setFollowUp] = useState<{
+    job_id: string;
+    source_user_ids: string[];
+    use_snapshots: boolean;
+    migration_scope: 'played_favorites' | 'watched_only';
+  } | null>(null);
   const historyRevision = useRef(0);
-  jobsRef.current = jobs;
-  const overviewRef = useRef(overview);
-  overviewRef.current = overview;
   const [events, setEvents] = useState<SubscriptionEvent[]>([]);
   const [selected, setSelected] = useState(new Set<string>());
   const [useSnapshots, setUseSnapshots] = useState(false);
@@ -245,22 +274,37 @@ export default function App() {
     readyPreview.current = null;
     ready?.cancel();
   }, []);
-  const closeDialog = useCallback(() => {
-    releaseReadyPreview();
-    dialogVersion.current++;
-    setDialog(null);
-  }, [releaseReadyPreview]);
+  const closeDialog = useCallback(
+    (force = false) => {
+      if (!force && busyRef.current.has('reveal')) return;
+      releaseReadyPreview();
+      dialogVersion.current++;
+      dialogRef.current = null;
+      setDialog(null);
+    },
+    [releaseReadyPreview],
+  );
   const showDialog = useCallback(
     (next: Dialog) => {
+      if (busyRef.current.has('reveal') && next.kind !== 'credentials') return;
       releaseReadyPreview();
       dialogVersion.current++;
       // An async result can arrive after navigation opens. Only one overlay may
       // own focus and scrolling; release the drawer before mounting its dialog.
       setMobileOpen(false);
+      dialogRef.current = next;
       setDialog(next);
     },
     [releaseReadyPreview],
   );
+  useEffect(() => {
+    const discardView = (event: PageTransitionEvent) => {
+      if (event.persisted && ['credentials', 'reveal'].includes(dialogRef.current?.kind ?? ''))
+        closeDialog(true);
+    };
+    window.addEventListener('pageshow', discardView);
+    return () => window.removeEventListener('pageshow', discardView);
+  }, [closeDialog]);
   const cancelPreview = useCallback(() => {
     const run = previewRun.current;
     if (!run) return;
@@ -287,12 +331,17 @@ export default function App() {
     setLoadedPage(null);
     setOverview(null);
     setUsers(emptyUsers);
+    lastMigrationRoster.current = [];
     setMappings([]);
     setMemberHandoff(undefined);
     setSettings(null);
     settingsSaveOwner.current = null;
     setSettingsSavePending(false);
-    setJobs([]);
+    setActivity(null);
+    setActivityFilter({ query: '', status: 'all', page: 1 });
+    setLive(null);
+    setReceipt(pendingSubmission(''));
+    setFollowUp(null);
     setEvents([]);
     setSelected(new Set());
     setUseSnapshots(false);
@@ -301,7 +350,7 @@ export default function App() {
     setSearch('');
     setToasts([]);
     setMobileOpen(false);
-    closeDialog();
+    closeDialog(true);
   }, [cancelPreview, closeDialog]);
   const acceptSession = useCallback((value: Session) => {
     sessionRef.current = value;
@@ -379,6 +428,7 @@ export default function App() {
             detail = 'message' in detail ? String(detail.message) : JSON.stringify(detail);
           throw new Error(
             typeof detail === 'string' ? detail : `Request failed (${response.status}).`,
+            { cause: data },
           );
         }
         return data as T;
@@ -444,14 +494,14 @@ export default function App() {
       if (target !== pageRef.current) return;
       const version = ++loadVersion.current;
       const historyVersion = historyRevision.current;
-      setLoading(true);
+      if (target !== 'activity') setLoading(true);
       setPageError('');
       setPollPaused(false);
       if (manual) notify('Refreshing workspace…');
       let complete = true;
       try {
         if (target === 'overview') {
-          const value = await api<Overview>('/api/overview');
+          const value = await api<Overview>(manual ? '/api/overview?fresh=1' : '/api/overview');
           if (version === loadVersion.current && historyVersion === historyRevision.current)
             setOverview(value);
         } else if (target === 'migrate') {
@@ -460,12 +510,14 @@ export default function App() {
             api<Overview>('/api/overview'),
           ]);
           if (version === loadVersion.current) {
-            setUsers(value);
+            const rosterUnavailable = !!value.errors?.emby;
+            if (!rosterUnavailable) lastMigrationRoster.current = value.emby;
+            setUsers({ ...value, emby: lastMigrationRoster.current });
             setOverview(summary);
-            setSelected(
-              (current) =>
-                new Set([...current].filter((id) => value.emby.some((user) => user.Id === id))),
-            );
+            if (!rosterUnavailable) {
+              const availableIds = new Set(value.emby.map((user) => user.Id));
+              setSelected((current) => new Set([...current].filter((id) => availableIds.has(id))));
+            }
           }
         } else if (target === 'roles') {
           const [listed, configuration] = await Promise.all([
@@ -504,9 +556,7 @@ export default function App() {
             setOverview(summary);
           }
         } else if (target === 'activity') {
-          const value = await api<{ jobs: Job[] }>('/api/jobs');
-          if (version === loadVersion.current && historyVersion === historyRevision.current)
-            setJobs(value.jobs || []);
+          setActivityRefresh((current) => current + 1);
         } else if (target === 'subscriptions') {
           const value = await api<{ events: SubscriptionEvent[] }>('/api/subscriptions');
           if (version === loadVersion.current) setEvents(value.events || []);
@@ -589,81 +639,133 @@ export default function App() {
     closeDialog();
     setMobileOpen(false);
   }, [routeHash, page, cancelPreview, closeDialog]);
-  const hasActive =
-    jobs.some(activeJob) ||
-    overview?.recent_jobs.some(activeJob) ||
-    (dialog?.kind === 'job' && activeJob(dialog.job));
+  const hasActive = !!live?.active_count || (dialog?.kind === 'job' && activeJob(dialog.job));
   useEffect(() => {
-    if (!session?.authenticated || !hasActive || pollPaused) return;
+    if (!session?.authenticated || page !== 'activity') return;
+    const controller = new AbortController();
+    const { query, status, page: index } = activityFilter;
+    const params = new URLSearchParams({
+      limit: String(activityPageSize),
+      offset: String((index - 1) * activityPageSize),
+      status,
+      query,
+    });
+    setActivityPending(true);
+    setActivityError('');
+    void api<ActivityResults>(`/api/jobs?${params}`, { signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        const lastPage = Math.max(1, Math.ceil(result.total / activityPageSize));
+        if (index > lastPage) setActivityFilter((current) => ({ ...current, page: lastPage }));
+        else setActivity(result);
+      })
+      .catch((error) => {
+        if (!controller.signal.aborted) setActivityError(message(error));
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setActivityPending(false);
+      });
+    return () => controller.abort();
+  }, [activityFilter, activityPageSize, activityRefresh, api, page, session?.authenticated]);
+  useEffect(() => {
+    if (!session?.authenticated) return;
+    const controller = new AbortController();
     let polling = false;
-    let stopped = false;
+    let previous: LiveOperations | undefined;
     const poll = async () => {
       if (polling || document.hidden) return;
       polling = true;
-      const historyVersion = historyRevision.current;
+      const revision = historyRevision.current;
       try {
-        const previous = new Set(
-          [...jobsRef.current, ...(overviewRef.current?.recent_jobs || [])]
-            .filter(activeJob)
-            .map((job) => job.id),
-        );
-        const result = await api<{ jobs: Job[] }>('/api/jobs');
+        const next = await api<LiveOperations>('/api/jobs/live', { signal: controller.signal });
+        if (controller.signal.aborted || revision !== historyRevision.current) return;
         if (
-          stopped ||
-          !sessionRef.current?.authenticated ||
-          historyVersion !== historyRevision.current
+          !Array.isArray(next?.active) ||
+          !Array.isArray(next.recent) ||
+          typeof next.revision !== 'string'
         )
-          return;
-        const next = result.jobs || [];
-        setJobs(next);
+          throw new Error('Operation status is unavailable.');
+        setLive(next);
+        setPollPaused(false);
+        if (previous && previous.revision !== next.revision && pageRef.current === 'activity')
+          setActivityRefresh((current) => current + 1);
         setOverview((current) =>
-          current ? { ...current, recent_jobs: next.slice(0, 6) } : current,
+          current
+            ? {
+                ...current,
+                counts: { ...current.counts, jobs: next.total },
+                recent_jobs: next.recent,
+              }
+            : current,
         );
-        const finished = next.some((job) => previous.has(job.id) && !activeJob(job));
-        if (finished && pageRef.current === 'migrate') {
-          const listed = await api<Users>('/api/users');
-          if (!stopped && pageRef.current === 'migrate') setUsers(listed);
-        }
         const current = dialogRef.current;
-        if (current?.kind === 'job') {
+        if (
+          current?.kind === 'job' &&
+          activeJob(current.job) &&
+          previous?.revision !== next.revision
+        ) {
+          const version = dialogVersion.current;
+          const id = encodeURIComponent(current.job.id);
+          const summary =
+            next.active.find((job) => job.id === current.job.id) ??
+            next.recent.find((job) => job.id === current.job.id) ??
+            (await api<Job>(`/api/jobs/${id}/summary`, { signal: controller.signal }));
+          const sameRows =
+            JSON.stringify(
+              current.job.results?.map(({ username, status }) => ({ username, status })) ?? [],
+            ) === JSON.stringify(summary.results ?? []);
           const job =
-            next.find((item) => item.id === current.job.id) ||
-            (await api<Job>(`/api/jobs/${encodeURIComponent(current.job.id)}`));
-          if (!stopped)
-            setDialog((value) =>
-              value?.kind === 'job' && value.job.id === current.job.id
-                ? { kind: 'job', job }
-                : value,
-            );
+            activeJob(summary) && sameRows
+              ? {
+                  ...current.job,
+                  status: summary.status,
+                  progress: summary.progress,
+                  updated_at: summary.updated_at,
+                  cancel_requested: summary.cancel_requested,
+                }
+              : await api<Job>(`/api/jobs/${id}`, { signal: controller.signal });
+          if (!controller.signal.aborted && version === dialogVersion.current)
+            setDialog({ kind: 'job', job });
         }
-        if (pageRef.current === 'overview') {
-          const value = await api<Overview>('/api/overview');
-          if (
-            !stopped &&
-            pageRef.current === 'overview' &&
-            historyVersion === historyRevision.current
-          )
-            setOverview(value);
+        const finished = previous?.active.some((job) =>
+          next.recent.some((item) => item.id === job.id && !activeJob(item)),
+        );
+        previous = next;
+        if (finished && pageRef.current === 'migrate') {
+          const listed = await api<Users>('/api/users', { signal: controller.signal });
+          if (!controller.signal.aborted && pageRef.current === 'migrate') {
+            if (!listed.errors?.emby) lastMigrationRoster.current = listed.emby;
+            setUsers({ ...listed, emby: lastMigrationRoster.current });
+          }
         }
-      } catch (error) {
-        if (!stopped && sessionRef.current?.authenticated) {
-          setPollPaused(true);
-          notify(`Progress updates paused: ${message(error)} Refresh Activity to retry.`, true);
-        }
+      } catch {
+        if (!controller.signal.aborted && sessionRef.current?.authenticated) setPollPaused(true);
       } finally {
         polling = false;
       }
     };
+    void poll();
     const interval = setInterval(() => void poll(), 3000);
+    document.addEventListener('visibilitychange', poll);
     return () => {
-      stopped = true;
+      controller.abort();
       clearInterval(interval);
+      document.removeEventListener('visibilitychange', poll);
     };
-  }, [api, hasActive, notify, pollPaused, session?.authenticated]);
+  }, [api, session?.authenticated]);
   const created = (job: Job) => {
-    setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+    setLive((current) =>
+      current && activeJob(job)
+        ? {
+            ...current,
+            active: [job, ...current.active.filter((item) => item.id !== job.id)].slice(0, 12),
+            active_count:
+              current.active_count + Number(!current.active.some((item) => item.id === job.id)),
+          }
+        : current,
+    );
+    setActivityRefresh((current) => current + 1);
     showDialog({ kind: 'job', job });
-    setPollPaused(false);
   };
   const openJob = (id: string) => {
     const version = dialogVersion.current;
@@ -680,7 +782,12 @@ export default function App() {
       setPollPaused(false);
     });
   };
-  function preview(sourceUserIds = [...selected], savedSource = useSnapshots) {
+  function preview(
+    sourceUserIds = [...selected],
+    savedSource = useSnapshots,
+    scope: 'played_favorites' | 'watched_only' = 'played_favorites',
+    followUpJob?: string,
+  ) {
     if (busyRef.current.has('preview')) return;
     if (!sourceChosen.current && sourceDefaults !== 'ready') {
       notify('Choose a history source before preparing a migration preview.', true);
@@ -733,7 +840,8 @@ export default function App() {
           method: 'POST',
           body: {
             source_user_ids: sourceUserIds,
-            migration_scope: 'played_favorites',
+            migration_scope: scope,
+            ...(followUpJob ? { follow_up_job_id: followUpJob } : {}),
             ...(savedSource ? { use_snapshots: true } : {}),
           },
           // Receive the task ID even if the user leaves while this short request is in flight.
@@ -807,6 +915,40 @@ export default function App() {
       }
     })();
   }
+  useEffect(() => {
+    if (!followUp || page !== 'migrate' || loadedPage !== 'migrate' || loading) return;
+    setFollowUp(null);
+    setSelected(new Set(followUp.source_user_ids));
+    chooseHistorySource(followUp.use_snapshots);
+    preview(
+      followUp.source_user_ids,
+      followUp.use_snapshots,
+      followUp.migration_scope,
+      followUp.job_id,
+    );
+  }, [followUp, page, loadedPage, loading]);
+  function reviewFollowUp(id: string) {
+    const version = dialogVersion.current;
+    void work('follow-up', async () => {
+      const result = await api<Omit<NonNullable<typeof followUp>, 'job_id'>>(
+        `/api/jobs/${encodeURIComponent(id)}/follow-up`,
+      );
+      if (version !== dialogVersion.current || !sessionRef.current?.authenticated) return;
+      navigate('migrate');
+      setFollowUp({ ...result, job_id: id });
+    });
+  }
+  function findSubmission(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const value = receipt.trim();
+    void work('receipt', async () => {
+      const result = await api<{ job_id: string }>(
+        `/api/migrations/receipts/${value ? encodeURIComponent(value) : 'latest'}`,
+      );
+      if (value && value === pendingSubmission()) pendingSubmission('');
+      openJob(result.job_id);
+    });
+  }
   function refreshPreview() {
     if (dialog?.kind !== 'preview' || busyRef.current.has('migration')) return;
     const ids = dialog.preview.users.map((user) => user.source_user_id);
@@ -847,11 +989,13 @@ export default function App() {
     });
     const ids = dialog.preview.users.map((user) => user.source_user_id);
     void work('migration', async () => {
+      setReceipt(pendingSubmission(dialog.previewId));
       const job = await api<Job>('/api/migrations', {
         method: 'POST',
         body: {
           source_user_ids: ids,
           preview_id: dialog.previewId,
+          submission_receipt: dialog.previewId,
           migration_scope:
             dialog.preview.migration_scope === 'played_favorites'
               ? 'played_favorites'
@@ -870,6 +1014,7 @@ export default function App() {
           ...(Object.keys(mappingRevisions).length ? { mapping_revisions: mappingRevisions } : {}),
         },
       });
+      if (pendingSubmission() === dialog.previewId) pendingSubmission('');
       // The accepted job now owns its trusted review metadata and any selected snapshot pins.
       if (readyPreview.current?.id === dialog.previewId) readyPreview.current = null;
       setSelected(new Set());
@@ -883,7 +1028,7 @@ export default function App() {
         method: 'POST',
         body: {},
       });
-      setJobs((current) => [job, ...current.filter((item) => item.id !== id)]);
+      setActivityRefresh((current) => current + 1);
       setOverview((current) =>
         current
           ? {
@@ -908,27 +1053,55 @@ export default function App() {
     void work('reveal', async () => {
       const result = await api<{ credentials: Credential[] }>(
         `/api/jobs/${encodeURIComponent(id)}/credentials`,
-        { method: 'POST', body: {} },
+        { method: 'POST', body: { recoverable: true }, signal: AbortSignal.timeout(30_000) },
       );
       if (version === dialogVersion.current)
-        showDialog({ kind: 'credentials', credentials: result.credentials || [] });
+        showDialog({ kind: 'credentials', jobId: id, credentials: result.credentials || [] });
     });
   }
-  function reviewHistory(filteredIds: string[], filtered = false, single?: Job) {
-    const candidates = single ? [single] : jobsRef.current;
-    showDialog({
-      kind: 'cleanup',
-      candidates: candidates.map(({ id, status, created_at, updated_at, finished_at }) => ({
-        id,
-        status,
-        created_at,
-        updated_at,
-        finished_at,
-      })),
-      filteredIds: single ? [single.id] : [...filteredIds],
-      openedAt: Date.now(),
-      single: !!single,
-      filtered,
+  function dismissDialog() {
+    const current = dialogRef.current;
+    if (busyRef.current.has('reveal')) return;
+    closeDialog();
+    if (current?.kind === 'credentials' && current.credentials.length)
+      void api(`/api/jobs/${encodeURIComponent(current.jobId)}/credentials/receipt`, {
+        method: 'DELETE',
+        keepalive: true,
+      }).catch(() => {
+        // A receipt whose acknowledgment was lost still expires on the server.
+      });
+  }
+  function reviewHistory(_filteredIds: string[], filtered = false, single?: Job) {
+    if (single) {
+      showDialog({
+        kind: 'cleanup',
+        candidates: [single],
+        filteredIds: [single.id],
+        openedAt: Date.now(),
+        single: true,
+        filtered: true,
+      });
+      return;
+    }
+    const version = dialogVersion.current;
+    void work('cleanup-review', async () => {
+      const params = new URLSearchParams({
+        query: activityFilter.query,
+        status: activityFilter.status,
+      });
+      const review = await api<{ all: CleanupCandidate[]; filtered: CleanupCandidate[] }>(
+        `/api/jobs/cleanup-review?${params}`,
+      );
+      if (version !== dialogVersion.current || !sessionRef.current?.authenticated) return;
+      const candidates = new Map([...review.all, ...review.filtered].map((job) => [job.id, job]));
+      showDialog({
+        kind: 'cleanup',
+        candidates: [...candidates.values()],
+        filteredIds: review.filtered.map((job) => job.id),
+        openedAt: Date.now(),
+        single: false,
+        filtered,
+      });
     });
   }
   async function cleanupHistory(ids: string[]): Promise<HistoryCleanupResult | undefined> {
@@ -942,7 +1115,10 @@ export default function App() {
     const requested = new Set(ids);
     const removed = new Set(result.removed_ids.filter((id) => requested.has(id)));
     historyRevision.current++;
-    setJobs((current) => current.filter((job) => !removed.has(job.id)));
+    setActivity((current) =>
+      current ? { ...current, jobs: current.jobs.filter((job) => !removed.has(job.id)) } : current,
+    );
+    setActivityRefresh((current) => current + 1);
     setOverview((current) =>
       current
         ? {
@@ -1000,22 +1176,28 @@ export default function App() {
   }
   function apply(event: SubscriptionEvent) {
     void work('event', async () => {
-      const result = await api<SubscriptionEvent>(
-        `/api/subscriptions/${encodeURIComponent(event.id)}/apply`,
-        { method: 'POST', body: {} },
-      );
-      closeDialog();
-      notify(
-        result.status === 'failed'
-          ? result.error || 'The subscription event could not be applied.'
-          : result.status === 'processing'
-            ? 'Subscription processing is in progress. Follow its operation before retrying.'
-            : result.status === 'applied'
-              ? 'Subscription event applied.'
-              : 'Subscription event status refreshed.',
-        result.status === 'failed',
-      );
-      await load('memberships');
+      try {
+        const result = await api<SubscriptionEvent>(
+          `/api/subscriptions/${encodeURIComponent(event.id)}/apply`,
+          { method: 'POST', body: {} },
+        );
+        closeDialog();
+        notify(
+          result.status === 'failed'
+            ? result.error || 'The subscription event could not be applied.'
+            : result.status === 'canceled'
+              ? 'Subscription work was canceled. Review the linked operation for completed changes.'
+              : result.status === 'processing'
+                ? 'Subscription processing is in progress. Follow its operation before retrying.'
+                : result.status === 'applied'
+                  ? 'Subscription event applied.'
+                  : 'Subscription event status refreshed.',
+          result.status === 'failed',
+        );
+      } finally {
+        // A failed request can still have created a durable operation to inspect.
+        await load('memberships');
+      }
     });
   }
   function ignore(event: SubscriptionEvent) {
@@ -1188,11 +1370,20 @@ export default function App() {
   else if (page === 'activity')
     content = (
       <ActivityPage
-        jobs={jobs}
+        jobs={[]}
         navigate={navigate}
         openJob={openJob}
         refresh={() => void load(page, true)}
         clearHistory={reviewHistory}
+        remote={{
+          filter: { ...activityFilter, pageSize: activityPageSize },
+          result: activity,
+          pending: activityPending,
+          error: activityError,
+          change: (filter) => {
+            setActivityFilter(filter);
+          },
+        }}
       />
     );
   else if (page === 'subscriptions')
@@ -1344,6 +1535,50 @@ export default function App() {
                     </div>
                   )}
                   <WorkspaceNotice />
+                  <details className="operations-tray panel">
+                    <summary>
+                      <strong>Operations tray</strong>
+                      {!!live?.active_count && (
+                        <span className="status">{num(live.active_count)} active</span>
+                      )}
+                    </summary>
+                    <div className="operations-tray-body">
+                      {live?.active.map((job) => (
+                        <button
+                          className="text-button"
+                          key={job.id}
+                          onClick={() => openJob(job.id)}
+                        >
+                          {job.progress &&
+                          typeof job.progress === 'object' &&
+                          job.progress.current_user
+                            ? job.progress.current_user
+                            : (job.results?.[0]?.username ?? job.kind)}
+                          {' · '}
+                          {job.status}
+                        </button>
+                      ))}
+                      {(live?.active_count ?? 0) > 12 && (
+                        <button className="text-button" onClick={() => navigate('activity')}>
+                          View all operations
+                        </button>
+                      )}
+                      <form className="operations-receipt" onSubmit={findSubmission}>
+                        <label className="field">
+                          Migration submission receipt
+                          <input
+                            value={receipt}
+                            maxLength={36}
+                            placeholder="Leave blank for your latest migration"
+                            onChange={(event) => setReceipt(event.target.value)}
+                          />
+                        </label>
+                        <button className="btn btn-small btn-quiet" disabled={busy.has('receipt')}>
+                          Find operation
+                        </button>
+                      </form>
+                    </div>
+                  </details>
                   {page === 'migrate' && previewProgress && (
                     <div className="setup-server preview-progress mb-17" role="status">
                       <span>
@@ -1362,8 +1597,8 @@ export default function App() {
                   )}
                   {pollPaused && hasActive && (
                     <Callout warning title="Activity updates paused.">
-                      The last known operation status is shown. Refresh Activity to check whether
-                      work is still running before retrying an action.{' '}
+                      The last known operation status is shown. Jellyport will keep trying to
+                      reconnect.{' '}
                       <button
                         type="button"
                         className="text-button"
@@ -1385,8 +1620,9 @@ export default function App() {
         {session?.authenticated && dialog && (
           <DialogContent
             api={api}
+            reviewFollowUp={reviewFollowUp}
             dialog={dialog}
-            close={closeDialog}
+            close={dismissDialog}
             startMigration={startMigration}
             refreshPreview={refreshPreview}
             reveal={reveal}
@@ -1591,6 +1827,7 @@ function DialogContent({
   close,
   startMigration,
   refreshPreview,
+  reviewFollowUp,
   reveal,
   cancelJob,
   showReveal,
@@ -1606,6 +1843,7 @@ function DialogContent({
   close: () => void;
   startMigration: (event: FormEvent<HTMLFormElement>) => void;
   refreshPreview: () => void;
+  reviewFollowUp: (id: string) => void;
   reveal: (id: string) => void;
   cancelJob: (id: string) => void;
   showReveal: (id: string) => void;
@@ -1682,6 +1920,15 @@ function DialogContent({
             {finishedJob(job) && (
               <button className="btn btn-quiet" onClick={() => clearReport(job)}>
                 Delete report…
+              </button>
+            )}
+            {migrationJob && finishedJob(job) && job.status !== 'completed' && (
+              <button
+                className="btn btn-quiet"
+                disabled={busy.has('follow-up')}
+                onClick={() => reviewFollowUp(job.id)}
+              >
+                Review remaining accounts
               </button>
             )}
             {activeJob(job) && (
@@ -2056,9 +2303,10 @@ function DialogContent({
         title="Reveal new account credentials?"
         description="This is a one-time view. Copy credentials before closing the dialog."
         close={close}
+        closeDisabled={busy.has('reveal')}
         footer={
           <>
-            <button className="btn btn-quiet" onClick={close}>
+            <button className="btn btn-quiet" onClick={close} disabled={busy.has('reveal')}>
               Cancel
             </button>
             <button
@@ -2073,8 +2321,8 @@ function DialogContent({
         }
       >
         <Callout icon="key" warning title="Keep this information private." className="mb-0">
-          The password is shown only when you request it and is not saved in browser storage. A
-          revealed credential cannot be viewed again.
+          Copy credentials before closing this view. If the response is lost, reopen this operation
+          within 90 seconds in the same signed-in session.
         </Callout>
       </Modal>
     );

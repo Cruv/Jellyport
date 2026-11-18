@@ -37,9 +37,7 @@ export default function BotMessagesSettings({
       <div className="panel-header">
         <div>
           <h3>Bot messages and delivery history</h3>
-          <p>
-            Customize outgoing text and how long exact account messages are kept for administrators.
-          </p>
+          <p>Customize outgoing text and how long delivery records are kept for administrators.</p>
         </div>
       </div>
       <div className="panel-body form-stack">
@@ -110,11 +108,9 @@ export default function BotMessagesSettings({
             onChange={(event) => changeRetention(event.target.value)}
           />
           <small>
-            Default: 30 days. Use 0 to keep indefinitely, up to 3,650 days otherwise. Exact account
-            messages include passwords, are encrypted at rest, and are visible in full to signed-in
-            Jellyport administrators under Activity. Deleting a report also deletes its archived
-            messages. This does not extend temporary account-recovery credentials or recover older
-            deleted messages.
+            Default: 30 days. Use 0 to keep delivery records until the report is deleted, or enter
+            up to 3,650 days. Delivery records appear under Activity. Temporary credentials expire
+            separately.
           </small>
         </div>
       </div>

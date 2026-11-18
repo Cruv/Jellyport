@@ -144,6 +144,48 @@ describe('membership lifecycle races and edge cases', () => {
     expect(store.takeCredentials(job.id)).toEqual([]);
   });
 
+  it('reports a canceled provisioning operation on its membership event without repeating it', async () => {
+    expect((await provision()).status).toBe('completed');
+    const started = deferred<void>();
+    const release = deferred<void>();
+    const factory = service.clientFactory;
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      const create = client.createUser.bind(client);
+      client.createUser = async (username, password) => {
+        if (username === 'Jim_2') {
+          started.resolve();
+          await release.promise;
+          throw new MediaError('Synthetic canceled account request.');
+        }
+        return create(username, password);
+      };
+      return client;
+    };
+    const id = 'canceled-subscription-work';
+    await service.recordSubscription({
+      id,
+      action: 'subscribe',
+      discord_user_id: owner,
+      source: 'mee6_message',
+      detail: 'Brigantine Crewman Plan',
+    });
+    const applying = service.applySubscription(id);
+    try {
+      await started.promise;
+      const jobId = store.subscription(id)?.job_id;
+      expect(jobId).toBeTruthy();
+      service.cancelJob(jobId!);
+    } finally {
+      release.resolve();
+    }
+    const result = await applying;
+    expect(result.status).toBe('canceled');
+    expect(service.getJob(result.job_id!).status).toBe('canceled');
+    expect((await service.applySubscription(id)).job_id).toBe(result.job_id);
+    expect(accounts().map((account) => account.Name)).toEqual(['Jim']);
+  });
+
   it.each(['Jim', 'Jim_2'])(
     'waits for in-flight creation of %s and suspends every account that was linked',
     async (blockedUsername) => {
@@ -277,6 +319,14 @@ describe('membership lifecycle races and edge cases', () => {
   it.each([true, false])(
     'retains a cancellation hold despite an active Discord role until a fresh subscribe event (linked accounts: %s)',
     async (hasLinkedAccounts) => {
+      store.saveSettings({
+        ...store.settings(),
+        auto_provision: true,
+        auto_disable: true,
+        disable_on_cancel: true,
+        discord_role_events: true,
+        discord_member_role_id: '987654321',
+      });
       if (hasLinkedAccounts) await provision('galleon');
       else
         service.memberships.save(
@@ -288,14 +338,6 @@ describe('membership lifecycle races and edge cases', () => {
           },
           store.settings(),
         );
-      store.saveSettings({
-        ...store.settings(),
-        auto_provision: true,
-        auto_disable: true,
-        disable_on_cancel: true,
-        discord_role_events: true,
-        discord_member_role_id: '987654321',
-      });
       expect((await cancellation(`cancel-hold-${hasLinkedAccounts}`)).status).toBe('applied');
       const jobs = store.jobs().length,
         events = store.subscriptions().length;

@@ -39,6 +39,12 @@ export class WorkflowReadiness {
   async snapshot(refresh = false): Promise<WorkflowReadinessSnapshot> {
     if (this.closed) throw new ServiceError('Workflow checks are stopping.');
     const settings = this.service.store.settings();
+    let catalog: string | undefined;
+    try {
+      catalog = this.service.destinationSnapshots.queuedSelection(settings);
+    } catch {
+      catalog = 'unavailable';
+    }
     const key = createHash('sha256')
       .update(
         JSON.stringify([
@@ -46,6 +52,7 @@ export class WorkflowReadiness {
           this.service.store.authState(),
           this.service.roles.list(settings),
           this.service.bot?.status(),
+          catalog,
         ]),
       )
       .digest('hex');
@@ -69,7 +76,14 @@ export class WorkflowReadiness {
     const auth = this.service.store.authState();
     const probe = async (kind: 'emby' | 'jellyfin') => {
       const configured = !!settings[`${kind}_url`] && !!settings[`${kind}_api_key`];
-      if (!configured) return { configured, available: false, id: '', users: [] as MediaUser[] };
+      const unavailable = {
+        configured,
+        available: false,
+        id: '',
+        version: undefined,
+        users: [] as MediaUser[],
+      };
+      if (!configured) return unavailable;
       const client = this.service.client(settings, kind);
       this.clients.add(client);
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -91,7 +105,11 @@ export class WorkflowReadiness {
               throw new Error('identity');
             const users = await client.users();
             if (users.length > 10_000) throw new Error('limit');
-            return { id: info.Id, users };
+            return {
+              id: info.Id,
+              version: typeof info.Version === 'string' ? info.Version : undefined,
+              users,
+            };
           })(),
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
@@ -103,7 +121,7 @@ export class WorkflowReadiness {
         ]);
         return { configured, available: true, ...value };
       } catch {
-        return { configured, available: false, id: '', users: [] as MediaUser[] };
+        return unavailable;
       } finally {
         active = false;
         if (timer) clearTimeout(timer);
@@ -195,11 +213,17 @@ export class WorkflowReadiness {
     }
     const matching: WorkflowBlocker[] = [];
     try {
-      this.service.destinationSnapshots.queuedSelection(settings);
-    } catch {
+      this.service.destinationSnapshots.queuedSelection(
+        settings,
+        jellyfin.available ? { Id: jellyfin.id, Version: jellyfin.version } : undefined,
+      );
+    } catch (error) {
       matching.push({
         code: 'matching_catalog',
-        message: 'Import a current Jellyfin matching catalog before migrating.',
+        message:
+          error instanceof ServiceError
+            ? error.message
+            : 'Import a current Jellyfin matching catalog before migrating.',
         route: { page: 'settings', tab: 'history', subtab: 'jellyfin' },
       });
     }

@@ -79,6 +79,7 @@ export default function MemberManagementPage({
           api={api}
           notify={notify}
           created={created}
+          openJob={openJob}
           refreshKey={identityVersion}
           initialMember={focusMember}
           handoffKey={focusMember?.key}

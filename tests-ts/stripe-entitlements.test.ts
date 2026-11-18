@@ -74,6 +74,29 @@ describe('verified Stripe entitlement policy', () => {
   function prepare(data = snapshot(), periods = new Map([['sub_new', paid()]])) {
     return policy.prepare(generation, data, links, prices, periods);
   }
+  it.each(['pending', 'failed'])(
+    'only reopens a legacy expiry receipt when the saved event never left pending (%s)',
+    (status) => {
+      clock = (base + 86_401) * 1000;
+      const fact = prepare(
+        snapshot([{ ...subscription(), status: 'canceled', ended_at: base + 86_400 }]),
+      )[0]!;
+      expect(fact.action).toBe('expire');
+      expect(policy.claim(fact)).toBe(true);
+      policy.finish(fact, false);
+      store.saveSubscription({
+        action: 'expire',
+        id: fact.event_id,
+        discord_user_id: owner,
+        source: 'stripe',
+        status,
+        created_at: new Date(clock).toISOString(),
+        stripe_entitlement: fact,
+      });
+      const restarted = new StripeEntitlements(store, () => clock);
+      expect(restarted.claim(fact)).toBe(status === 'pending');
+    },
+  );
   it('recognizes a newly created, paid subscription only for the approved identity and mapped price', () => {
     const facts = prepare();
     expect(facts).toHaveLength(1);

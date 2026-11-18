@@ -16,10 +16,12 @@ import {
   type StripeMigrationDraft,
 } from './stripe-integration.js';
 import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
-import { promisify } from 'node:util';
+import { isDeepStrictEqual, promisify } from 'node:util';
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Store } from './store.js';
+import { readBackupVerification } from './backup-verification.js';
+import { operationsInbox } from './operations-inbox.js';
 import {
   Service,
   migrationScope,
@@ -34,14 +36,16 @@ import { WorkflowReviews } from './workflow-reviews.js';
 import { PreviewTasks } from './preview-tasks.js';
 import { CloneReviews, type CloneAccountsInput } from './account-cloning.js';
 import type { MigrationScope } from './migration.js';
+import { householdTimeline } from './household-timeline.js';
 import { BotManager, BotError } from './bot.js';
 import { UserOrganization } from './user-organization.js';
 import { IdentityReview } from './identity-review.js';
 import { registerIdentityReviewRoutes } from './identity-review-routes.js';
 import { DemoServers } from './demo.js';
 import { ServiceError, MediaError } from './errors.js';
-import { DEMO_SETTINGS } from './types.js';
-import { SECRET_FIELDS, validateSettings } from './settings.js';
+import { DEFAULT_SETTINGS, DEMO_SETTINGS, type Settings } from './types.js';
+import { reviewSettings, SECRET_FIELDS, validateSettings } from './settings.js';
+import { DiscordAuthorityReviews } from './discord-authority-routes.js';
 import {
   hostPolicy,
   localSetupHost,
@@ -87,6 +91,8 @@ interface RecoveryRequest extends AccountRequest {
 }
 interface MigrationRequest {
   preview_id?: string;
+  submission_receipt?: string;
+  follow_up_job_id?: string;
   source_user_ids: string[];
   discord_recipients?: Record<string, string>;
   membership_slots?: Record<string, number>;
@@ -145,6 +151,8 @@ const migrationSchema = {
   required: ['source_user_ids'],
   properties: {
     preview_id: snapshotId,
+    submission_receipt: { type: 'string', format: 'uuid' },
+    follow_up_job_id: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,128}$' },
     source_user_ids: { type: 'array', minItems: 1, maxItems: 100, uniqueItems: true, items: id },
     migration_scope: { type: 'string', enum: ['complete', 'watched_only', 'played_favorites'] },
     use_snapshots: { type: 'boolean' },
@@ -229,7 +237,22 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   const workflowReviews = new WorkflowReviews<ReviewedMembershipWorkflow>();
   const acceptingPreviews = new Set<string>();
   const previewContext = () =>
-    createHash('sha256').update(JSON.stringify(store.settings())).digest('hex');
+    createHash('sha256')
+      .update(JSON.stringify(reviewSettings(store.settings())))
+      .digest('hex');
+  const cloneSettings = (settings: Settings) => [
+    settings.jellyfin_url,
+    settings.jellyfin_api_key,
+    settings.template_user_id,
+    settings.password_length,
+    settings.password_exclude_ambiguous,
+    settings.credential_message_template,
+    settings.jellyfin_public_url,
+  ];
+  const cloneContext = () =>
+    createHash('sha256')
+      .update(JSON.stringify(cloneSettings(store.settings())))
+      .digest('hex');
   const bot = new BotManager(service);
   service.bot = bot;
   const stripe: StripeIntegration = new StripeIntegration(store, {
@@ -291,6 +314,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     },
   });
   service.verifyStripeEntitlement = (fact) => stripe.assertEntitlement(fact);
+  const discordAuthorityReviews = new DiscordAuthorityReviews(service, stripe);
   service.reviewStripeMigrationMembership = (id, signal, draft) =>
     stripe.reviewMembership(id, signal, draft);
   service.verifyStripeMigrationMembership = (proof) => stripe.assertMigrationMembership(proof);
@@ -323,6 +347,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     const value = sessions.get(sid);
     if (!value) return undefined;
     sessions.delete(sid);
+    if (value.authenticated) store.discardSessionCredentialReceipts(sid);
     previews.cancelOwner(sid);
     cloneReviews.cancelOwner(sid);
     workflowReviews.cancelOwner(sid);
@@ -856,6 +881,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       result[`${key}_set`] = Boolean(settings[key]);
     }
     result.jellyfin_auth_managed = !demo && store.authState()?.kind === 'configured';
+    result.field_revisions = store.settingRevisions();
     result.bot_invite_url = settings.discord_application_id
       ? `https://discord.com/oauth2/authorize?${new URLSearchParams({ client_id: settings.discord_application_id, scope: 'bot applications.commands', permissions: settings.discord_emby_role_id || settings.discord_jellyfin_role_id ? '268504064' : '68608', guild_id: settings.discord_guild_id, disable_guild_select: 'true' })}`
       : '';
@@ -865,6 +891,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     return result;
   }
   app.get('/api/settings', async () => publicSettings());
+  discordAuthorityReviews.register(app, (request) => {
+    if (!session(request)?.authenticated || !request.cookies[COOKIE])
+      throw new JellyfinAuthError('Sign in again to review Discord authority.', 401);
+    return request.cookies[COOKIE];
+  });
   app.get('/api/workflow-readiness', async () => workflowReadiness.snapshot());
   app.post('/api/workflow-readiness/refresh', async () => workflowReadiness.snapshot(true));
   app.get('/api/source-snapshots', async () => service.sourceSnapshots.status());
@@ -1003,13 +1034,54 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   app.put<{ Body: Record<string, unknown> }>(
     '/api/settings',
     { schema: { body: { type: 'object' } } },
-    async (request) => {
+    async (request, reply) => {
       if (demo)
         throw new ServiceError(
           'Demo settings are read-only. Run without JELLYPORT_DEMO to connect your servers.',
         );
-      const incoming = { ...request.body };
+      const {
+        changes,
+        expected_revisions: expectedRevisions,
+        authority_review_token: authorityReviewToken,
+      } = request.body;
+      const versioned = changes !== undefined || expectedRevisions !== undefined;
+      if (
+        versioned &&
+        (!changes ||
+          typeof changes !== 'object' ||
+          Array.isArray(changes) ||
+          !expectedRevisions ||
+          typeof expectedRevisions !== 'object' ||
+          Array.isArray(expectedRevisions) ||
+          Object.keys(request.body).some(
+            (key) => !['changes', 'expected_revisions', 'authority_review_token'].includes(key),
+          ))
+      )
+        throw new ServiceError('Submit changed settings with their current field revisions.');
+      const incoming = versioned
+        ? { ...(changes as Record<string, unknown>) }
+        : { ...request.body };
+      delete incoming.authority_review_token;
+      if (Object.keys(incoming).some((key) => !Object.hasOwn(DEFAULT_SETTINGS, key)))
+        throw new ServiceError('Unknown setting supplied.');
       for (const key of SECRET_FIELDS) if (incoming[key] === '') delete incoming[key];
+      if (versioned) {
+        const fields = Object.keys(incoming);
+        const expected = expectedRevisions as Record<string, unknown>;
+        if (
+          fields.some((key) => !Object.hasOwn(expected, key) || typeof expected[key] !== 'string')
+        )
+          throw new ServiceError('Refresh Settings before submitting changed fields.');
+        const current = store.settingRevisions();
+        const conflicts = fields.filter((key) => expected[key] !== (current[key] ?? '0'));
+        if (conflicts.length)
+          return reply.code(409).send({
+            detail:
+              'Another save changed the same settings. Review the conflicts before saving again.',
+            conflicts,
+            field_revisions: Object.fromEntries(conflicts.map((key) => [key, current[key] ?? '0'])),
+          });
+      }
       const binding = store.authState();
       if (binding?.kind === 'configured') {
         if (
@@ -1024,17 +1096,29 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           throw new ServiceError('Use Replace Jellyfin API key to save a pre-created API key.');
         delete incoming.jellyfin_url;
       }
-      const settings = { ...store.settings(), ...incoming };
+      const previous = store.settings();
+      const settings = { ...previous, ...incoming };
       validateSettings(settings);
       if (settings.default_role_id && !service.roles.get(settings.default_role_id, settings))
         throw new ServiceError('Choose an account role saved for this Jellyfin server.');
       for (const key of ['emby_url', 'jellyfin_url', 'jellyfin_public_url'] as const)
         settings[key] = settings[key].replace(/\/+$/, '');
-      store.saveSettings(settings);
-      previews.close();
-      cloneReviews.close();
-      workflowReviews.clear();
-      await bot.restart(settings);
+      if (!isDeepStrictEqual(previous, settings)) {
+        discordAuthorityReviews.assertCutover(
+          previous,
+          settings,
+          authorityReviewToken,
+          request.cookies[COOKIE]!,
+        );
+        store.saveSettings(settings);
+        if (!isDeepStrictEqual(reviewSettings(previous), reviewSettings(settings))) {
+          previews.close();
+          workflowReviews.clear();
+        }
+        if (!isDeepStrictEqual(cloneSettings(previous), cloneSettings(settings)))
+          cloneReviews.close();
+        await bot.applySettings(previous, settings);
+      }
       return publicSettings();
     },
   );
@@ -1087,7 +1171,6 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         previews.close();
         cloneReviews.close();
         workflowReviews.clear();
-        await bot.restart(store.settings());
         return publicSettings();
       } finally {
         replacingKey = false;
@@ -1118,23 +1201,65 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     };
   });
   app.post('/api/connections/test', async () => service.connections());
-  app.get('/api/overview', async () => {
-    const connections = await service.connections();
-    const users = await service.users();
-    const jobs = store.jobs();
+  app.get<{ Querystring: { fresh?: string } }>('/api/overview', async (request) => {
+    const [{ connections, emby_users, jellyfin_users }, inbox] = await Promise.all([
+      service.overviewHealth(request.query.fresh === '1'),
+      operationsInbox(
+        store,
+        service.sourceSnapshots,
+        service.destinationSnapshots,
+        stripe,
+        identities.cachedAttention(),
+        discordAuthorityReviews.attentionCount(),
+      ),
+    ]);
     return {
       counts: {
-        emby_users: users.emby.length,
-        jellyfin_users: users.jellyfin.length,
-        jobs: jobs.length,
+        emby_users,
+        jellyfin_users,
+        jobs: store.jobCount(),
       },
       connections,
-      recent_jobs: jobs.slice(0, 6),
-      pending_subscriptions: store.subscriptions().filter((event) => event.status === 'pending')
-        .length,
+      recent_jobs: store.jobSummaries({ limit: 6 }).jobs,
+      pending_subscriptions: store.subscriptionCount('pending'),
+      inbox,
+      ...(demo
+        ? {}
+        : {
+            backup_verification: readBackupVerification(
+              store,
+              process.env.JELLYPORT_BACKUP_VERIFICATION_RECEIPT,
+            ),
+          }),
       demo,
     };
   });
+  const followUpSelection = (id: string) => {
+    const job = service.getJob(id);
+    if (!['migrate', 'migration'].includes(job.kind) || ['queued', 'running'].includes(job.status))
+      throw new ServiceError('Wait for the migration to finish before preparing a follow-up.');
+    const original = store.migrationSources(job.id);
+    if (!original)
+      throw new ServiceError(
+        'This older operation has no verified source selection. Select the affected Emby accounts in Migrate users.',
+      );
+    const completed = new Set(
+      job.results
+        .filter(({ status }) => status === 'completed')
+        .map(({ source_user_id }) => source_user_id),
+    );
+    const source_user_ids = original.ids.filter((id) => !completed.has(id));
+    if (!source_user_ids.length)
+      throw new ServiceError('All originally selected accounts completed.');
+    return {
+      scope: original.scope,
+      selection: {
+        source_user_ids,
+        use_snapshots: !!job.source_snapshot_ids,
+        migration_scope: migrationScope(job.migration_scope),
+      },
+    };
+  };
   app.post<{ Body: MigrationRequest }>(
     '/api/migrations/preview',
     { schema: { body: migrationSchema } },
@@ -1142,8 +1267,32 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       validateSnapshotSelection(request.body);
       if (request.body.preview_id)
         throw new ServiceError('A preview ID can be used only when accepting a ready review.');
+      if (request.body.submission_receipt)
+        throw new ServiceError('A submission receipt belongs to a reviewed migration submission.');
       if (request.body.source_snapshot_ids)
         throw new ServiceError('Start a new preview to select its source snapshots.');
+      if (request.body.follow_up_job_id) {
+        const signed = session(request);
+        const context = previewContext();
+        const { scope, selection } = followUpSelection(request.body.follow_up_job_id);
+        const selected = new Set(request.body.source_user_ids);
+        if (
+          selected.size !== selection.source_user_ids.length ||
+          !selection.source_user_ids.every((id) => selected.has(id)) ||
+          migrationScope(request.body.migration_scope) !== selection.migration_scope ||
+          (request.body.use_snapshots ?? false) !== selection.use_snapshots
+        )
+          throw new ServiceError(
+            'The follow-up account selection changed. Start from its Activity report again.',
+          );
+        await service.verifyFollowUpSource(scope);
+        if (!signed || session(request) !== signed)
+          throw new JellyfinAuthError('Session ended. Sign in again.', 401);
+        if (previewContext() !== context)
+          throw new ServiceError(
+            'Configuration changed. Open the operation and start a new review.',
+          );
+      }
       return reply
         .code(202)
         .send(
@@ -1433,10 +1582,71 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       }
     },
   );
+  const submissionOwner = (request: FastifyRequest) => {
+    const identity = session(request)?.identity;
+    const auth = store.authState();
+    if (!demo && (!identity || auth?.kind !== 'configured'))
+      throw new JellyfinAuthError('Sign in to Jellyport.', 401);
+    return createHash('sha256')
+      .update(
+        JSON.stringify([auth?.kind === 'configured' ? auth.serverId : 'demo', identity?.userId]),
+      )
+      .digest('hex');
+  };
+  const submissionKey = (owner: string, receipt: string) =>
+    createHash('sha256')
+      .update(JSON.stringify([owner, receipt]))
+      .digest('hex');
+  app.get('/api/migrations/receipts/latest', async (request, reply) => {
+    const id = store.latestMigrationSubmission(submissionOwner(request));
+    return id
+      ? { job_id: id }
+      : reply
+          .code(404)
+          .send({ detail: 'No retained migration submission was found for this administrator.' });
+  });
+  app.get<{ Params: { id: string } }>(
+    '/api/migrations/receipts/:id',
+    { schema: { params: previewParams } },
+    async (request, reply) => {
+      const found = store.migrationSubmission(
+        submissionKey(submissionOwner(request), request.params.id),
+      );
+      return found
+        ? { job_id: found.id }
+        : reply
+            .code(404)
+            .send({ detail: 'No retained operation matches that submission receipt.' });
+    },
+  );
   app.post<{ Body: MigrationRequest }>(
     '/api/migrations',
     { schema: { body: migrationSchema } },
     async (request, reply) => {
+      if (request.body.follow_up_job_id)
+        throw new ServiceError('Prepare a fresh follow-up review before starting the migration.');
+      const receipt = request.body.submission_receipt;
+      if (receipt && receipt !== request.body.preview_id)
+        throw new ServiceError('The migration receipt must match the approved review.');
+      const owner = receipt ? submissionOwner(request) : undefined;
+      const submission =
+        receipt && owner
+          ? {
+              key: submissionKey(owner, receipt),
+              owner,
+              requestHash: createHash('sha256').update(JSON.stringify(request.body)).digest('hex'),
+            }
+          : undefined;
+      if (submission) {
+        const existing = store.migrationSubmission(submission.key);
+        if (existing) {
+          if (existing.requestHash !== submission.requestHash)
+            return reply
+              .code(409)
+              .send({ detail: 'This receipt belongs to a different reviewed submission.' });
+          return reply.code(202).send(service.getJob(existing.id));
+        }
+      }
       validateSnapshotSelection(request.body);
       if (request.body.use_snapshots && !request.body.source_snapshot_ids)
         throw new ServiceError('Review source snapshots before starting the migration.');
@@ -1517,12 +1727,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         }
       }
       const manualApproval = Object.keys(manualOwners).length > 0;
-      const approvedMappingOwner = reviewed?.preview?.users.some(
-        (user) => user.mapping_id && user.owner_basis === 'approved',
-      );
-      const guardOwnerApproval = () => {
+      const guardMigrationApproval = () => {
         if (!approvalSession?.authenticated || session(request) !== approvalSession)
-          throw new JellyfinAuthError('Sign in again before approving account owners.', 401);
+          throw new JellyfinAuthError('Sign in again before approving the migration.', 401);
         if (
           !reviewed ||
           previews.get(request.cookies[COOKIE]!, approvalContext, reviewed.id)?.status !==
@@ -1536,6 +1743,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       let acceptedScope = migrationScope(request.body.migration_scope);
       let mappingRevisions = request.body.mapping_revisions;
       let previewTiming;
+      let reviewedDestinations: Parameters<Service['migrateUsers']>[12];
       if (request.body.preview_id) {
         if (
           reviewed?.status !== 'ready' ||
@@ -1576,6 +1784,17 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
             'The migration selection differs from this review. Prepare a new review.',
           );
         mappingRevisions = expectedRevisions;
+        reviewedDestinations = Object.fromEntries(
+          preview.users.map((user) => [
+            user.source_user_id,
+            {
+              server_id: preview.destination_server_id,
+              target_user_id: user.target_user_id,
+              username: user.username,
+              source_username: user.source_username,
+            },
+          ]),
+        );
         previewTiming = {
           preview_id: reviewed.id,
           started_at: reviewed.started_at,
@@ -1599,10 +1818,11 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           reviewed?.preview?.household_targets,
         ];
         if (manualApproval) migrationArguments[8] = manualOwners;
-        if (manualApproval || approvedMappingOwner || reviewedMemberships || reviewedTargets)
-          migrationArguments[9] = guardOwnerApproval;
+        if (reviewed) migrationArguments[9] = guardMigrationApproval;
         if (reviewedMemberships) migrationArguments[10] = reviewedMemberships;
         if (reviewedTargets) migrationArguments[11] = reviewedTargets;
+        if (reviewedDestinations) migrationArguments[12] = reviewedDestinations;
+        if (submission) migrationArguments[13] = submission;
         const job = await service.migrateUsers(...migrationArguments);
         // The duration is now copied into the durable job; release session-owned review data.
         if (reviewed) previews.cancel(request.cookies[COOKIE]!, reviewed.id);
@@ -1695,9 +1915,9 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     async (request) => {
       const owner = request.cookies[COOKIE]!;
       const original = session(request);
-      const context = previewContext();
+      const context = cloneContext();
       const review = await service.reviewCloneAccounts(request.body);
-      if (!original?.authenticated || session(request) !== original || previewContext() !== context)
+      if (!original?.authenticated || session(request) !== original || cloneContext() !== context)
         throw new ServiceError(
           'The administrator session or settings changed. Prepare a new clone review.',
         );
@@ -1718,14 +1938,10 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     },
     async (request, reply) => {
       const original = session(request);
-      const context = previewContext();
+      const context = cloneContext();
       const reviewed = cloneReviews.take(request.cookies[COOKIE]!, context, request.body.review_id);
       const job = await service.cloneAccounts(reviewed, () => {
-        if (
-          !original?.authenticated ||
-          session(request) !== original ||
-          previewContext() !== context
-        )
+        if (!original?.authenticated || session(request) !== original || cloneContext() !== context)
           throw new ServiceError(
             'The administrator session or settings changed. Prepare a new clone review.',
           );
@@ -1801,7 +2017,66 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           ),
         ),
   );
-  app.get('/api/jobs', async () => ({ jobs: store.jobs() }));
+  const jobFilters = {
+    query: { type: 'string', maxLength: 256 },
+    status: {
+      type: 'string',
+      enum: ['all', 'active', 'completed', 'partial', 'failed', 'canceled'],
+    },
+  };
+  app.get<{ Querystring: { query?: string; status?: string; limit?: string; offset?: string } }>(
+    '/api/jobs',
+    {
+      schema: {
+        querystring: {
+          type: 'object',
+          properties: {
+            ...jobFilters,
+            limit: { type: 'string', pattern: '^(?:[1-9][0-9]?|100)$' },
+            offset: { type: 'string', pattern: '^(?:0|[1-9][0-9]{0,14})$' },
+          },
+        },
+      },
+    },
+    async (request) => ({
+      ...store.jobSummaries({
+        query: request.query.query,
+        status: request.query.status,
+        limit: Number(request.query.limit ?? 25),
+        offset: Number(request.query.offset ?? 0),
+      }),
+      active: store.activeJobCount(),
+      overall: store.jobCount(),
+    }),
+  );
+  app.get('/api/jobs/live', async () => ({
+    active: store.jobSummaries({ status: 'active', limit: 12 }).jobs,
+    active_count: store.activeJobCount(),
+    recent: store.jobSummaries({ limit: 6 }).jobs,
+    total: store.jobCount(),
+    // Comparing this token lets Activity refresh after updates outside its visible page.
+    revision: store.jobSummaryRevision(),
+  }));
+  app.get<{ Querystring: { query?: string; status?: string } }>(
+    '/api/jobs/cleanup-review',
+    { schema: { querystring: { type: 'object', properties: jobFilters } } },
+    async (request) => {
+      const { query, status } = request.query;
+      const filtered = !!query?.trim() || (!!status && status !== 'all');
+      const review = (filter: { query?: string; status?: string }) =>
+        store
+          .jobSummaries({ ...filter, limit: 1001, oldestFirst: true })
+          .jobs.map(({ id, status, created_at, updated_at, finished_at }) => ({
+            id,
+            status,
+            created_at,
+            updated_at,
+            finished_at,
+          }));
+      const all = review({});
+      return { all, filtered: filtered ? review({ query, status }) : all };
+    },
+  );
   app.get('/api/jobs/retention', async () => service.jobRetentionStatus());
   app.put<{ Body: { retention_days: number } }>(
     '/api/jobs/retention',
@@ -1850,28 +2125,74 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   app.get<{ Params: { job_id: string } }>('/api/jobs/:job_id', async (request) =>
     service.getJob(request.params.job_id),
   );
+  app.get<{ Params: { job_id: string } }>(
+    '/api/jobs/:job_id/summary',
+    async (request, reply) =>
+      store.jobSummary(request.params.job_id) ??
+      reply.code(404).send({ detail: 'Operation unavailable.' }),
+  );
+  app.get<{ Params: { job_id: string } }>('/api/jobs/:job_id/follow-up', async (request) => {
+    return followUpSelection(request.params.job_id).selection;
+  });
   app.post<{ Params: { job_id: string } }>('/api/jobs/:job_id/cancel', async (request) =>
     service.cancelJob(request.params.job_id),
   );
-  app.post<{ Params: { job_id: string } }>('/api/jobs/:job_id/credentials', async (request) => {
-    const job = service.getJob(request.params.job_id);
-    if (['queued', 'running'].includes(job.status))
-      throw new ServiceError('Wait for the job to finish before revealing its credentials.');
-    return { credentials: store.takeCredentials(job.id) };
-  });
+  app.post<{ Params: { job_id: string }; Body?: { recoverable?: boolean } }>(
+    '/api/jobs/:job_id/credentials',
+    async (request) => {
+      const job = service.getJob(request.params.job_id);
+      if (['queued', 'running'].includes(job.status))
+        throw new ServiceError('Wait for the job to finish before revealing its credentials.');
+      return {
+        credentials:
+          request.body?.recoverable === true
+            ? store.revealCredentials(job.id, request.cookies[COOKIE]!)
+            : store.takeCredentials(job.id),
+      };
+    },
+  );
+  app.delete<{ Params: { job_id: string } }>(
+    '/api/jobs/:job_id/credentials/receipt',
+    async (request) => {
+      store.consumeCredentialReceipt(request.params.job_id, request.cookies[COOKIE]!);
+      return { consumed: true };
+    },
+  );
   app.get<{ Params: { job_id: string } }>('/api/jobs/:job_id/messages', async (request, reply) => {
     const job = service.getJob(request.params.job_id);
     reply.header('Cache-Control', 'no-store');
-    return { messages: store.botMessages(job.id) };
+    return {
+      messages: store.botMessages(job.id).map(({ content: _privateBody, ...message }) => message),
+    };
   });
   const publicSubscription = (event: Awaited<ReturnType<Service['applySubscription']>>) => {
-    const { stripe_entitlement: _privateEvidence, ...summary } = event;
+    const {
+      stripe_entitlement: _privateEvidence,
+      discord_authority: _authority,
+      ...summary
+    } = event;
     return summary;
   };
   app.get('/api/subscriptions', async () => ({
     events: store.subscriptions().map(publicSubscription),
   }));
   app.get('/api/memberships', async () => ({ memberships: service.listMemberships() }));
+  app.get<{ Params: { id: string } }>(
+    '/api/memberships/:id/timeline',
+    {
+      schema: {
+        params: {
+          type: 'object',
+          required: ['id'],
+          properties: { id: { type: 'string', pattern: '^[0-9]{5,22}$' } },
+        },
+      },
+    },
+    async (request, reply) => {
+      reply.header('Cache-Control', 'no-store');
+      return householdTimeline(service, stripe, request.params.id);
+    },
+  );
   const workflowInputSchema = {
     type: 'object',
     additionalProperties: false,
@@ -2281,6 +2602,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     await Promise.all([stripe.stop(), bot.stop(), service.stop(), identitiesClosed]);
     await upkeep;
     await Promise.all([...sessions.values()].map((value) => revoke(value)));
+    for (const sid of authenticatedSessions.keys()) store.discardSessionCredentialReceipts(sid);
     sessions.clear();
     anonymousSessions.clear();
     authenticatedSessions.clear();

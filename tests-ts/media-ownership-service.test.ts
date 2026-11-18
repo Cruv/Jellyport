@@ -333,7 +333,8 @@ describe('approved media ownership in existing migration workflows', () => {
       const client = original(...args),
         read = client.users.bind(client);
       client.users = async () => {
-        if (args[2] === 'jellyfin' && ++targetLists === 2) {
+        // Admission and worker preparation each read the roster before provisioning.
+        if (args[2] === 'jellyfin' && ++targetLists === 3) {
           blocked.resolve();
           await released.promise;
         }

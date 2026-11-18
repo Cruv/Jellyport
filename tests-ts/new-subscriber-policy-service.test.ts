@@ -523,7 +523,8 @@ describe('future new-subscriber automatic Jellyfin onboarding', () => {
       if (++reads === 3) service.cancelJob(store.jobs()[0]!.id);
     };
     const event = await signup();
-    expect(event.status).toBe('failed');
+    expect(event.status).toBe('canceled');
+    expect(event.result).toContain('Review the linked operation');
     expect(service.getJob(event.job_id!).status).toBe('canceled');
     expect(service.memberships.get(owner, store.settings())?.provision_jellyfin).toBe(false);
     embyRead = undefined;

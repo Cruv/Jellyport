@@ -1,4 +1,4 @@
-import { test, expect, navigate, expectContainedLayout } from './fixtures';
+import { test, expect, navigate, expectContainedLayout, mockActivity } from './fixtures';
 
 test('activity retention has an independent compact settings view and starts off', async ({
   page,
@@ -31,29 +31,23 @@ test('failed and review-needed filters select recent finished reports for manual
   mutations,
 }) => {
   const now = new Date().toISOString();
-  await page.route('**/api/jobs', async (route) =>
-    route.fulfill({
-      json: {
-        jobs: [
-          {
-            id: 'synthetic-failed-report',
-            kind: 'migrate',
-            status: 'failed',
-            created_at: now,
-            finished_at: now,
-          },
-          {
-            id: 'synthetic-review-report',
-            kind: 'migrate',
-            status: 'partial',
-            created_at: now,
-            finished_at: now,
-          },
-          { id: 'synthetic-active-report', kind: 'migrate', status: 'running', created_at: now },
-        ],
-      },
-    }),
-  );
+  await mockActivity(page, [
+    {
+      id: 'synthetic-failed-report',
+      kind: 'migrate',
+      status: 'failed',
+      created_at: now,
+      finished_at: now,
+    },
+    {
+      id: 'synthetic-review-report',
+      kind: 'migrate',
+      status: 'partial',
+      created_at: now,
+      finished_at: now,
+    },
+    { id: 'synthetic-active-report', kind: 'migrate', status: 'running', created_at: now },
+  ]);
   await page.goto('/');
   await navigate(page, 'Activity');
   for (const status of ['failed', 'partial']) {

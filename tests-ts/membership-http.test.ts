@@ -124,6 +124,215 @@ afterEach(async () => {
 });
 
 describe('administrator membership HTTP endpoints', () => {
+  it('combines exact household accounts, redacted billing evidence and confirmed access changes', async () => {
+    const { app, headers } = await fixture();
+    const { service, store } = app.jellyport;
+    const settings = store.settings();
+    service.memberships.save(
+      {
+        discord_user_id: owner,
+        base_username: 'Jim',
+        tier_id: 'brigantine',
+        account_limit: 2,
+      },
+      settings,
+    );
+    store.saveLink(owner, 'river', 'j-river');
+    service.mediaOwnerships.save(
+      [
+        {
+          kind: 'emby',
+          server_id: 'demo-emby',
+          account_id: 'e-river',
+          username: 'River source',
+          discord_user_id: owner,
+          slot: 1,
+        },
+        {
+          kind: 'jellyfin',
+          server_id: 'demo-jellyfin',
+          account_id: 'j-river',
+          username: 'river',
+          discord_user_id: owner,
+          slot: 1,
+        },
+        {
+          kind: 'emby',
+          server_id: 'demo-emby',
+          account_id: 'other',
+          username: 'Different household',
+          discord_user_id: '555555555',
+          slot: 1,
+        },
+      ],
+      settings,
+    );
+    const observed = '2026-11-18T00:00:00.000Z';
+    const paidThrough = '2026-12-18T00:00:00.000Z';
+    store.saveSubscription({
+      id: 'paid-observation',
+      action: 'subscribe',
+      status: 'applied',
+      created_at: observed,
+      discord_user_id: owner,
+      source: 'stripe',
+      job_id: 'fixture-membership-operation',
+      stripe_entitlement: {
+        provider: 'stripe',
+        action: 'subscribe',
+        event_id: 'paid-observation',
+        discord_user_id: owner,
+        customer_id: 'private-customer-id',
+        subscription_id: 'private-subscription-id',
+        invoice_id: 'private-invoice-id',
+        tier_id: 'brigantine',
+        price_id: 'private-price-id',
+        created_at: observed,
+        paid_through: paidThrough,
+        observed_at: observed,
+        activation_revision: 'synthetic-activation',
+        generation: 'synthetic-generation',
+        authority_revision: 'synthetic-authority',
+        is_new: false,
+      },
+    });
+    store.saveSubscription({
+      id: 'other-event',
+      action: 'expire',
+      status: 'applied',
+      created_at: observed,
+      discord_user_id: '555555555',
+    });
+    const url = `/api/memberships/${owner}/timeline`;
+    expect((await app.inject(url)).statusCode).toBe(401);
+    const access = await app.inject({
+      method: 'POST',
+      url: '/api/accounts/access',
+      headers,
+      payload: {
+        kind: 'jellyfin',
+        user_id: 'j-river',
+        disabled: true,
+        expected_username: 'river',
+        expected_profile_revision: '',
+      },
+    });
+    expect(access.statusCode).toBe(200);
+    const response = await app.inject({ url, headers });
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(response.json()).toMatchObject({
+      discord_user_id: owner,
+      username: 'Jim',
+      membership: { account_limit: 2, active: true },
+      accounts: [
+        { kind: 'emby', username: 'River source', identity: 'confirmed', slot: 1 },
+        { kind: 'jellyfin', username: 'river', identity: 'confirmed', slot: 1 },
+      ],
+      stripe: { invoice: { paid_through: paidThrough, observed_at: observed } },
+      milestones: expect.arrayContaining([
+        expect.objectContaining({ type: 'access', disabled: true, username: 'river' }),
+        expect.objectContaining({ type: 'subscription', job_id: 'fixture-membership-operation' }),
+      ]),
+    });
+    expect(response.body).not.toMatch(
+      /private-(customer|subscription|invoice|price)-id|other-event|Different household/,
+    );
+    expect(
+      store.db.prepare('SELECT encrypted FROM household_access_history').get()?.encrypted,
+    ).toBeInstanceOf(Uint8Array);
+  });
+
+  it.each(['discord_guild_id', 'discord_member_role_id'] as const)(
+    'reviews the %s cutover and preserves access until the exact household is approved',
+    async (field) => {
+      const { app, headers, servers } = await fixture();
+      const { store, service, bot } = app.jellyport;
+      vi.spyOn(bot, 'restart').mockResolvedValue(undefined);
+      vi.spyOn(service.bot!, 'membershipActive').mockResolvedValue(false);
+      store.saveSettings({
+        ...store.settings(),
+        discord_enabled: true,
+        discord_guild_id: '200001',
+        discord_bot_token: 'synthetic-key',
+        discord_member_role_id: '200002',
+        discord_role_events: true,
+        auto_disable: true,
+      });
+      store.saveLink(owner, 'river', 'j-river');
+      const target = servers.users.jellyfin.find((user) => user.Id === 'j-river')!;
+      const changes = { [field]: '200003' };
+      const save = (token?: string) =>
+        app.inject({
+          method: 'PUT',
+          url: '/api/settings',
+          headers,
+          payload: { ...changes, ...(token ? { authority_review_token: token } : {}) },
+        });
+      expect((await save()).statusCode).toBe(400);
+      const preview = await app.inject({
+        method: 'POST',
+        url: '/api/discord/authority/review',
+        headers,
+        payload: changes,
+      });
+      expect(preview.statusCode).toBe(200);
+      expect(preview.json().affected).toMatchObject([
+        {
+          discord_user_id: owner,
+          accounts: [{ kind: 'jellyfin', id: 'j-river', username: 'river', slot: 1 }],
+        },
+      ]);
+      expect((await save(preview.json().review_token)).statusCode).toBe(200);
+      await service.reconcileMemberships();
+      expect(target.Policy?.IsDisabled).toBe(false);
+      expect(store.subscriptions()).toEqual([]);
+      expect(service.discordAuthorityState(owner)).toBe('held');
+      const base = `/api/discord/authority/households/${owner}`;
+      const review = await app.inject({ method: 'POST', url: `${base}/review`, headers });
+      expect(review.statusCode).toBe(200);
+      expect(review.json()).toMatchObject({
+        discord_user_id: owner,
+        has_role: false,
+        accounts: [{ id: 'j-river', disabled: false, pending: false }],
+      });
+      const approval = await app.inject({
+        method: 'POST',
+        url: `${base}/approve`,
+        headers,
+        payload: { review_token: review.json().review_token },
+      });
+      expect(approval.statusCode).toBe(200);
+      expect(service.discordAuthorityState(owner)).toBe('current');
+      expect(target.Policy?.IsDisabled).toBe(false);
+      await service.reconcileMemberships();
+      expect(target.Policy?.IsDisabled).toBe(true);
+    },
+  );
+
+  it('holds a legacy link with unknown authority even after ordinary edits', async () => {
+    const { app, servers } = await fixture();
+    const { store, service } = app.jellyport;
+    store.saveSettings({
+      ...store.settings(),
+      discord_enabled: true,
+      discord_member_role_id: '200002',
+      discord_guild_id: '200001',
+      discord_role_events: true,
+      auto_disable: true,
+    });
+    store.db
+      .prepare('INSERT INTO links (discord_user_id, username, remote_id) VALUES (?,?,?)')
+      .run(owner, 'river', 'j-river');
+    store.saveLink(owner, 'river', 'j-river');
+    vi.spyOn(service.bot!, 'membershipActive').mockResolvedValue(false);
+    await service.reconcileMemberships();
+    expect(service.discordAuthorityState(owner)).toBe('legacy');
+    expect(servers.users.jellyfin.find((user) => user.Id === 'j-river')?.Policy?.IsDisabled).toBe(
+      false,
+    );
+  });
+
   it('saves the new-subscriber switch only with current admin, CSRF and origin authority and keeps its cutoff private', async () => {
     const { app, headers, revoke } = await fixture();
     const { store, service, bot } = app.jellyport;

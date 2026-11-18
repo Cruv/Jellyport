@@ -134,18 +134,32 @@ export class UserOrganization {
   async directory(requireComplete = false): Promise<DirectorySnapshot> {
     const { settings, users, servers, sources, complete } = await this.catalog(requireComplete);
     const memberships = this.service.memberships.list(settings);
+    const byOwner = new Map(memberships.map((member) => [member.discord_user_id, member]));
     const mappings = this.service.mappings.list(settings);
     const rows: DirectoryUser[] = [];
+    const byRow = new Map<string, DirectoryUser>();
+    const accounts = {
+      emby: new Map(users.emby.map((user) => [user.Id, user])),
+      jellyfin: new Map(users.jellyfin.map((user) => [user.Id, user])),
+    };
+    const targetNames = new Map<string, typeof users.jellyfin>();
+    const sourceNameCounts = new Map<string, number>();
+    for (const user of users.jellyfin) {
+      const named = targetNames.get(user.Name);
+      if (named) named.push(user);
+      else targetNames.set(user.Name, [user]);
+    }
+    for (const user of users.emby)
+      sourceNameCounts.set(user.Name, (sourceNameCounts.get(user.Name) ?? 0) + 1);
     const usedEmby = new Set<string>(),
       usedJellyfin = new Set<string>();
     const getRow = (discordId: string | null, key: string): DirectoryUser => {
-      let row = rows.find((item) =>
-        discordId ? item.discord_user_id === discordId : item.id === key,
-      );
+      const rowId = discordId ? `discord:${discordId}` : key;
+      let row = byRow.get(rowId);
       if (!row) {
-        const membership = memberships.find((item) => item.discord_user_id === discordId);
+        const membership = discordId ? byOwner.get(discordId) : undefined;
         row = {
-          id: discordId ? `discord:${discordId}` : key,
+          id: rowId,
           emby: [],
           jellyfin: [],
           discord_user_id: discordId,
@@ -156,6 +170,7 @@ export class UserOrganization {
           family: false,
           requires_review: false,
         };
+        byRow.set(rowId, row);
         rows.push(row);
       }
       return row;
@@ -184,22 +199,25 @@ export class UserOrganization {
     };
     for (const member of memberships) getRow(member.discord_user_id, '');
     for (const ownership of this.service.mediaOwnerships.list(settings, servers)) {
-      const account = users[ownership.kind].find((user) => user.Id === ownership.account_id);
+      const account = accounts[ownership.kind].get(ownership.account_id);
       if (account) add(getRow(ownership.discord_user_id, ''), ownership.kind, account);
     }
     const addMapping = (mapping: (typeof mappings)[number], unassignedOnly = false) => {
-      const source = users.emby.find(
-        (user) =>
-          user.Id === mapping.source_user_id &&
-          user.Name === mapping.source_username &&
-          (!unassignedOnly || !usedEmby.has(user.Id)),
-      );
-      const target = users.jellyfin.find(
-        (user) =>
-          user.Id === mapping.target_user_id &&
-          user.Name === mapping.target_username &&
-          (!unassignedOnly || !usedJellyfin.has(user.Id)),
-      );
+      const matchedSource = accounts.emby.get(mapping.source_user_id);
+      const matchedTarget = mapping.target_user_id
+        ? accounts.jellyfin.get(mapping.target_user_id)
+        : undefined;
+      const source =
+        matchedSource?.Name === mapping.source_username &&
+        (!unassignedOnly || !usedEmby.has(matchedSource.Id))
+          ? matchedSource
+          : undefined;
+      const target =
+        matchedTarget &&
+        matchedTarget.Name === mapping.target_username &&
+        (!unassignedOnly || !usedJellyfin.has(matchedTarget.Id))
+          ? matchedTarget
+          : undefined;
       if (!source && !target) return;
       const row = getRow(mapping.discord_user_id, `mapping:${mapping.id}`);
       if (mapping.discord_username) row.discord_username = mapping.discord_username;
@@ -210,13 +228,11 @@ export class UserOrganization {
     for (const link of this.service.store.links()) {
       if (
         this.service.memberships.hasOtherScope(link.discord_user_id, settings) &&
-        !memberships.some((member) => member.discord_user_id === link.discord_user_id)
+        !byOwner.has(link.discord_user_id)
       )
         continue;
-      const target = users.jellyfin.find(
-        (user) => user.Id === link.remote_id && user.Name === link.username,
-      );
-      if (target) add(getRow(link.discord_user_id, ''), 'jellyfin', target);
+      const target = accounts.jellyfin.get(link.remote_id);
+      if (target?.Name === link.username) add(getRow(link.discord_user_id, ''), 'jellyfin', target);
     }
     // Standalone mappings may predate confirmed ownership. Keep only their
     // unassigned sides, without borrowing the other account's Discord owner.
@@ -226,14 +242,10 @@ export class UserOrganization {
       if (usedEmby.has(source.Id)) continue;
       const row = getRow(null, `emby:${source.Id}`);
       add(row, 'emby', source);
-      const targets = users.jellyfin.filter(
-        (target) => !usedJellyfin.has(target.Id) && target.Name === source.Name,
-      );
-      if (
-        targets.length === 1 &&
-        users.emby.filter((user) => user.Name === source.Name).length === 1
-      )
-        add(row, 'jellyfin', targets[0]!);
+      if (sourceNameCounts.get(source.Name) !== 1) continue;
+      const targets =
+        targetNames.get(source.Name)?.filter((target) => !usedJellyfin.has(target.Id)) ?? [];
+      if (targets.length === 1) add(row, 'jellyfin', targets[0]!);
     }
     for (const target of users.jellyfin)
       if (!usedJellyfin.has(target.Id))
@@ -265,8 +277,7 @@ export class UserOrganization {
   async listTagRoles() {
     return this.bot().listTagRoles!();
   }
-  private async plan(): Promise<TagPlan> {
-    const settings = this.service.store.settings();
+  private async validatedTagRoles(settings: Settings): Promise<string[]> {
     const selected = [settings.discord_emby_role_id, settings.discord_jellyfin_role_id].filter(
       (id): id is string => Boolean(id),
     );
@@ -291,6 +302,12 @@ export class UserOrganization {
       );
     if (new Set(selected).size !== selected.length)
       throw new ServiceError('Choose different Emby and Jellyfin organization roles.');
+    return selected;
+  }
+  private async plan(): Promise<TagPlan> {
+    const settings = this.service.store.settings();
+    const selected = await this.validatedTagRoles(settings);
+    const bot = this.bot();
     const directory = await this.directory(true);
     const linked = directory.users.filter((user) => user.discord_user_id);
     if (linked.length > 1000)
@@ -401,73 +418,142 @@ export class UserOrganization {
       this.applying = false;
     }
   }
-  /** Identity approvals synchronize only the reviewed owners. The full user lists
-   * are read once per plan, and subsequent checks target the owner's exact IDs.
-   * This keeps bulk linking from repeatedly enumerating every server account. */
+  /** Identity approvals synchronize only the reviewed owners and exact account IDs. */
   async syncOwners(ownerIds: string[], authorize: () => void = () => {}) {
     if (this.service.demo) throw new ServiceError('Demo organization is read-only.');
     if (this.applying) throw new ServiceError('Wait for the current Discord role update.');
     this.applying = true;
     try {
       const settings = this.service.store.settings();
-      const plan = await this.plan();
-      const directory = await this.directory(true);
-      if (fingerprint({ settings, directory }) !== plan.fingerprint)
-        throw new ServiceError('Ownership changed. Refresh the role review.');
-      const desired = new Set(ownerIds);
-      const localState = () => {
-        const hash = createHash('sha256').update(
-          JSON.stringify([
-            this.service.store.settings(),
-            this.service.store.authState(),
-            this.service.store.links(),
-          ]),
-        );
-        for (const table of [
-          'media_ownership',
-          'user_mappings',
-          'memberships',
-          'account_profiles',
-        ]) {
-          for (const row of this.service.store.db
-            .prepare(`SELECT id,encrypted FROM ${table} ORDER BY id`)
-            .iterate()) {
-            const bytes = row.encrypted as Uint8Array;
-            hash.update(JSON.stringify([table, row.id, bytes.byteLength])).update(bytes);
-          }
-        }
-        return hash.digest('hex');
-      };
-      const before = localState();
+      const store = this.service.store;
+      const serverContext = fingerprint([settings, store.authState()]);
+      const bot = this.bot();
+      authorize();
+      const selected = await this.validatedTagRoles(settings);
       let updated = 0,
         failed = 0;
-      for (const change of plan.changes) {
-        if (!desired.has(change.discord_user_id)) continue;
+      const readLocal = (owner: string) => ({
+        member: this.service.memberships.get(owner, settings),
+        ownerRecords: this.service.mediaOwnerships.forOwner(owner, settings),
+        mappings: this.service.mappings.getAllForDiscord(owner, settings),
+        links: store.linksForMember(owner),
+      });
+      const assertConnection = () => {
         authorize();
-        if (before !== localState())
-          throw new ServiceError('Ownership changed. Refresh remaining role updates.');
-        const row = directory.users.find(
-          (item) => item.discord_user_id === change.discord_user_id,
-        )!;
-        for (const kind of ['emby', 'jellyfin'] as const) {
-          if (!row[kind].length) continue;
-          const client = this.service.client(settings, kind);
-          try {
-            for (const account of row[kind]) {
-              const actual = await client.user(account.id);
-              if (actual.Id !== account.id || actual.Name !== account.name)
-                throw new ServiceError('A media account changed. Refresh remaining role updates.');
-            }
-          } finally {
-            await client.close();
-          }
-        }
-        authorize();
-        if (before !== localState())
-          throw new ServiceError('Ownership changed. Refresh remaining role updates.');
+        if (serverContext !== fingerprint([store.settings(), store.authState()]))
+          throw new ServiceError('Configuration changed. Review remaining role updates.');
+      };
+      for (const owner of new Set(ownerIds)) {
         try {
-          await this.bot().updateTagRoles!(change.discord_user_id, change.add, change.remove);
-          updated++;
+          assertConnection();
+          const records = readLocal(owner);
+          const signature = fingerprint(records);
+          const accounts = new Map<
+            string,
+            { kind: MediaKind; id: string; username: string; server?: string }
+          >();
+          const add = (kind: MediaKind, id: string, username: string, server?: string) => {
+            const key = JSON.stringify([kind, id]);
+            const previous = accounts.get(key);
+            if (
+              previous &&
+              (previous.username !== username ||
+                (server && previous.server && previous.server !== server))
+            )
+              throw new ServiceError('A media account identity conflicts. Review its owner.');
+            accounts.set(key, { kind, id, username, server: server ?? previous?.server });
+          };
+          for (const record of records.ownerRecords)
+            add(record.kind, record.account_id, record.username, record.server_id);
+          for (const mapping of records.mappings) {
+            add('emby', mapping.source_user_id, mapping.source_username);
+            if (mapping.target_user_id)
+              add('jellyfin', mapping.target_user_id, mapping.target_username);
+          }
+          if (records.member || !this.service.memberships.hasOtherScope(owner, settings))
+            for (const link of records.links) add('jellyfin', link.remote_id, link.username);
+          if (!records.member && !accounts.size) continue;
+          const member = await bot.memberTagState!(owner);
+          if (!member) continue;
+          if (member.id !== owner) throw new ServiceError('Discord returned a different member.');
+          const identified = new Map<string, string>();
+          const guard = () => {
+            assertConnection();
+            if (signature !== fingerprint(readLocal(owner)))
+              throw new ServiceError('Ownership changed. Refresh remaining role updates.');
+            for (const [key, { kind, id, username }] of accounts) {
+              const server = identified.get(key);
+              if (!server) continue;
+              const known = this.service.mediaOwnerships.get(kind, server, id, settings);
+              const mapping =
+                kind === 'emby'
+                  ? this.service.mappings.getForSource(id, settings)
+                  : this.service.mappings.getForTarget(id, username, settings);
+              const link = kind === 'jellyfin' ? store.linkForRemote(id) : null;
+              if (
+                (known && known.discord_user_id !== owner) ||
+                (link && link.discord_user_id !== owner) ||
+                (mapping?.discord_user_id &&
+                  mapping.discord_user_id !== owner &&
+                  (kind === 'emby' || mapping.target_user_id === id))
+              )
+                throw new ServiceError('A media account belongs to a different verified owner.');
+            }
+          };
+          const kinds = new Set<MediaKind>();
+          for (const kind of ['emby', 'jellyfin'] as const) {
+            if (!settings[`${kind}_url`] || !settings[`${kind}_api_key`]) continue;
+            const client = this.service.client(settings, kind);
+            try {
+              const info = await client.systemInfo();
+              const auth = store.authState();
+              if (
+                typeof info.Id !== 'string' ||
+                !info.Id ||
+                (kind === 'jellyfin' &&
+                  auth?.kind === 'configured' &&
+                  (info.Id !== auth.serverId ||
+                    normalizeJellyfinUrl(settings.jellyfin_url) !==
+                      normalizeJellyfinUrl(auth.serverUrl)))
+              )
+                throw new ServiceError('A media server changed. Review remaining role updates.');
+              for (const [key, account] of accounts) {
+                if (account.kind !== kind) continue;
+                const actual = await client.user(account.id);
+                if (
+                  (account.server && account.server !== info.Id) ||
+                  actual.Id !== account.id ||
+                  actual.Name !== account.username
+                )
+                  throw new ServiceError(
+                    'A media account changed. Refresh remaining role updates.',
+                  );
+                kinds.add(kind);
+                identified.set(key, info.Id);
+              }
+            } finally {
+              await client.close();
+            }
+          }
+          if (identified.size !== accounts.size)
+            throw new ServiceError('A media account could not be verified. Roles were preserved.');
+          const desired = new Set([
+            ...(kinds.has('jellyfin') ? [settings.discord_jellyfin_role_id] : []),
+            ...(kinds.has('emby') && (!kinds.has('jellyfin') || !settings.discord_emby_only_role)
+              ? [settings.discord_emby_role_id]
+              : []),
+          ]);
+          const addRoles = selected.filter(
+            (role) => desired.has(role) && !member.roles.includes(role),
+          );
+          const removeRoles = selected.filter(
+            (role) => !desired.has(role) && member.roles.includes(role),
+          );
+          guard();
+          if (addRoles.length || removeRoles.length) {
+            await bot.updateTagRoles!(owner, addRoles, removeRoles, guard);
+            updated++;
+          }
         } catch {
           failed++;
         }

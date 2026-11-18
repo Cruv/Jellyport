@@ -61,6 +61,17 @@ interface StripeState {
   hints: StoredHint[];
   hint_receipts: string[];
   checkout_cache: CheckoutCache[];
+  verification_cursor?: string;
+  verification?: BillingVerification;
+}
+interface BillingVerification {
+  owners_checked: number;
+  owners_waiting: number;
+  failed_owners?: number;
+  oversized_owners: number;
+  invoice_reads: number;
+  verification_ms: number;
+  action_ms: number;
 }
 export interface StripeIntegrationStatus {
   configured: boolean;
@@ -80,6 +91,7 @@ export interface StripeIntegrationStatus {
   price_tiers: StripePriceTier[];
   hints: StripeDiscordHint[];
   role_cleanup: StripeRoleCleanupStatus;
+  verification: BillingVerification | null;
 }
 export interface StripeSubscriptionReview {
   subscription_id: string;
@@ -170,7 +182,7 @@ export interface StripeIntegrationOptions {
   clientFactory?: (key: string) => BillingClient;
   resolveDiscordMember?: (id: string) => Promise<{ id?: string; username: string }>;
   now?: () => number;
-  onEntitlement?: (fact: StripeEntitlementFact) => Promise<void>;
+  onEntitlement?: (fact: StripeEntitlementFact) => Promise<void | 'deferred'>;
   roleCleanup?: StripeRoleCleanupAdapter;
 }
 
@@ -182,6 +194,8 @@ const stripePrice = /^price_[A-Za-z0-9]{1,240}$/;
 const checkoutTtl = 24 * 60 * 60 * 1000;
 const maxHints = 500;
 const maxCheckoutLookups = 100;
+const maxVerificationOwners = 25;
+const maxVerificationInvoiceReads = 100;
 const migrationReviewTtl = 60_000;
 const maxMigrationReviews = 128;
 const maxMigrationOwners = 4;
@@ -343,6 +357,7 @@ export class StripeIntegration {
       price_tiers: structuredClone(s.price_tiers),
       hints: s.hints.map(({ source_event: _source, ...hint }) => ({ ...hint })),
       role_cleanup: this.roleCleanup.status(s.generation),
+      verification: s.verification ?? null,
     };
   }
   toJSON(): StripeIntegrationStatus {
@@ -575,6 +590,39 @@ export class StripeIntegration {
             : null,
       };
     });
+  }
+  approvedCustomerOwners(): Array<{ discord_user_id: string; username: string }> {
+    this.scope();
+    return this.state.links.map(({ discord_user_id, username }) => ({ discord_user_id, username }));
+  }
+  householdEvidence(discordId: string) {
+    this.scope();
+    const { links, snapshot, last_sync: lastSync, price_tiers: priceTiers } = this.state;
+    const approved = links.filter((link) => link.discord_user_id === discordId);
+    const customers = new Set(approved.map((link) => link.customer_id));
+    const tiers = new Map(priceTiers.map(({ price_id, tier_id }) => [price_id, tier_id]));
+    const subscriptions = [];
+    const covered = new Set<string>();
+    for (const subscription of customers.size ? (snapshot?.subscriptions ?? []) : []) {
+      if (!customers.has(subscription.customer_id)) continue;
+      covered.add(subscription.customer_id);
+      if (subscriptions.length >= 50) continue;
+      const tierIds = new Set(subscription.items.map((item) => tiers.get(item.price_id)));
+      subscriptions.push({
+        id: subscription.id,
+        status: subscription.status,
+        tier_id: tierIds.size === 1 ? ([...tierIds][0] ?? null) : null,
+        cancel_at_period_end: subscription.cancel_at_period_end,
+        paused: subscription.pause_collection,
+      });
+    }
+    return {
+      username: approved[0]?.username ?? null,
+      customer_count: customers.size,
+      last_sync: lastSync,
+      complete: customers.size > 0 && covered.size === customers.size,
+      subscriptions,
+    };
   }
   private migrationContext(): string {
     this.scope();
@@ -1305,6 +1353,90 @@ export class StripeIntegration {
       },
     };
   }
+  private async verifyBillingBatch(
+    read: NonNullable<BillingClient['paidPeriod']>,
+    snapshot: StripeSnapshot,
+    signal: AbortSignal,
+    assertCurrent: () => void,
+  ) {
+    const begin = performance.now();
+    const groups = new Map<string, Set<string>>();
+    for (const { discord_user_id, customer_id } of this.state.links) {
+      const customers = groups.get(discord_user_id) ?? new Set();
+      customers.add(customer_id);
+      groups.set(discord_user_id, customers);
+    }
+    const subscriptions = new Map<string, string[]>();
+    for (const { id, customer_id } of snapshot.subscriptions) {
+      const ids = subscriptions.get(customer_id) ?? [];
+      ids.push(id);
+      subscriptions.set(customer_id, ids);
+    }
+    const owners = [...groups.keys()].sort();
+    const previous = this.state.verification_cursor;
+    const next = previous ? owners.findIndex((id) => id > previous) : 0;
+    const batch = next > 0 ? owners.slice(next) : owners;
+    const periods = new Map<string, StripePaidPeriod | null>();
+    const timeout = AbortSignal.timeout(120_000);
+    const verificationSignal = AbortSignal.any([signal, timeout]);
+    let ownersChecked = 0,
+      failedOwners = 0,
+      oversizedOwners = 0,
+      invoiceReads = 0;
+    let cursor = previous;
+    verifyOwner: for (const owner of batch.slice(0, maxVerificationOwners)) {
+      assertCurrent();
+      if (timeout.aborted) break;
+      const customers = [...groups.get(owner)!];
+      const ids = customers.flatMap((customer) => subscriptions.get(customer) ?? []);
+      if (customers.every((customer) => subscriptions.has(customer))) {
+        if (ids.length > maxVerificationInvoiceReads) oversizedOwners++;
+        else {
+          if (invoiceReads + ids.length > maxVerificationInvoiceReads) break;
+          const ownerPeriods = new Map<string, StripePaidPeriod | null>();
+          try {
+            for (const id of ids) {
+              verificationSignal.throwIfAborted();
+              invoiceReads++;
+              ownerPeriods.set(id, await read(id, verificationSignal));
+            }
+          } catch (error) {
+            // No proof for this owner can be published from a partial period set.
+            if (
+              !signal.aborted &&
+              (timeout.aborted ||
+                (error instanceof StripeClientError &&
+                  ['network', 'timeout', 'upstream'].includes(error.code)))
+            ) {
+              cursor = owner;
+              failedOwners++;
+              if (timeout.aborted) break;
+              continue verifyOwner;
+            }
+            throw error;
+          }
+          assertCurrent();
+          for (const [id, period] of ownerPeriods) periods.set(id, period);
+        }
+      }
+      cursor = owner;
+      ownersChecked++;
+    }
+    assertCurrent();
+    const metrics: BillingVerification = {
+      owners_checked: ownersChecked,
+      owners_waiting: batch.length - ownersChecked - failedOwners,
+      failed_owners: failedOwners,
+      oversized_owners: oversizedOwners,
+      invoice_reads: invoiceReads,
+      verification_ms: Math.round(performance.now() - begin),
+      action_ms: 0,
+    };
+    this.state.verification_cursor = cursor === owners.at(-1) ? undefined : cursor;
+    this.state.verification = metrics;
+    this.persist();
+    return { periods, metrics };
+  }
   sync(): Promise<StripeIntegrationStatus> {
     this.scope();
     if (this.task) return this.task;
@@ -1314,6 +1446,7 @@ export class StripeIntegration {
     this.roleCleanup.invalidateProof(
       'Stripe billing is being refreshed; role cleanup waits for verified invoices.',
     );
+    this.entitlements.invalidateProof();
     const generation = this.state.generation,
       revision = this.state.revision;
     const controller = new AbortController();
@@ -1379,6 +1512,7 @@ export class StripeIntegration {
         this.state.last_error = null;
         this.state.revision = randomUUID();
         this.persist();
+        clearTimeout(timer);
         const automationRevision = this.state.revision;
         if (this.entitlements.enabled(generation) || this.roleCleanup.enabled(generation)) {
           try {
@@ -1386,8 +1520,13 @@ export class StripeIntegration {
               throw new ServiceError(
                 'Stripe automation requires Invoices Read permission and paid-period support.',
               );
-            const periods = new Map<string, StripePaidPeriod | null>();
-            const authority = stripeAuthority(this.state.links, this.state.price_tiers, this.store);
+            const currentTiers = () =>
+              JSON.stringify(
+                (this.store.settings().membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS)
+                  .map((tier) => `${tier.id}:${tier.account_limit}`)
+                  .sort(),
+              );
+            const configuredTiers = currentTiers();
             const verifiedCurrent = () => {
               this.scope();
               if (
@@ -1395,23 +1534,17 @@ export class StripeIntegration {
                 controller.signal.aborted ||
                 this.state.revision !== automationRevision ||
                 this.state.generation !== generation ||
-                authority !== stripeAuthority(this.state.links, this.state.price_tiers, this.store)
+                configuredTiers !== currentTiers()
               )
                 throw new ServiceError('Stripe paid-period authority changed.');
             };
-            const approved = new Set(this.state.links.map((link) => link.customer_id));
-            const linked = snapshot.subscriptions.filter((subscription) =>
-              approved.has(subscription.customer_id),
+            const verificationStarted = performance.now();
+            const { periods, metrics } = await this.verifyBillingBatch(
+              client.paidPeriod.bind(client),
+              snapshot,
+              controller.signal,
+              verifiedCurrent,
             );
-            // At most one invoice GET per approved subscription, serially, sharing
-            // the existing timeout/rate/backoff boundary and cancellation signal.
-            for (const subscription of linked) {
-              verifiedCurrent();
-              periods.set(
-                subscription.id,
-                await client.paidPeriod(subscription.id, controller.signal),
-              );
-            }
             verifiedCurrent();
             this.roleCleanup.recordProof(
               generation,
@@ -1427,22 +1560,31 @@ export class StripeIntegration {
               this.state.price_tiers,
               periods,
             );
+            const actionsStarted = performance.now();
+            metrics.verification_ms = Math.round(actionsStarted - verificationStarted);
             for (const fact of facts) {
               verifiedCurrent();
               if (controller.signal.aborted || this.state.generation !== generation)
                 throw new ServiceError(
                   'Stripe automation stopped before additional access actions.',
                 );
-              if (!this.options.onEntitlement || !this.entitlements.claim(fact)) continue;
+              const deferred = fact.action === 'expire' && !this.store.settings().auto_disable;
+              if (!this.options.onEntitlement || !this.entitlements.claim(fact, deferred)) continue;
               try {
-                await this.options.onEntitlement(fact);
-                this.entitlements.finish(fact, true);
+                const result = await this.options.onEntitlement(fact);
+                this.entitlements.finish(
+                  fact,
+                  deferred || result === 'deferred' ? 'deferred' : true,
+                );
               } catch {
                 this.entitlements.finish(fact, false);
               }
             }
             verifiedCurrent();
             await this.roleCleanup.reconcile(generation);
+            verifiedCurrent();
+            metrics.action_ms = Math.round(performance.now() - actionsStarted);
+            this.persist();
           } catch (error) {
             this.roleCleanup.invalidateProof(
               'Stripe paid-period verification could not complete. Subscriber roles were preserved; refresh billing before retrying.',

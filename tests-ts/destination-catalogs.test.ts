@@ -674,6 +674,15 @@ describe('saved destination catalog manager', () => {
       record: { id: record.id, backup_created_at: record.backup_created_at },
     });
     expect(f.manager.queuedSelection(f.settings)).toBe(record.id);
+    expect(f.manager.queuedSelection(f.settings, { Id: serverId, Version: '12.2.0.0' })).toBe(
+      record.id,
+    );
+    expect(() =>
+      f.manager.queuedSelection(f.settings, { Id: serverId, Version: '12.3.0' }),
+    ).toThrow(/version differs.*Import a backup/);
+    expect(() =>
+      f.manager.queuedSelection(f.settings, { Id: 'f'.repeat(32), Version: '12.2.0' }),
+    ).toThrow(/server or version differs/);
     expect(await f.manager.metadata(record.id, f.settings, serverId, '12.2.0')).toMatchObject({
       id: record.id,
     });

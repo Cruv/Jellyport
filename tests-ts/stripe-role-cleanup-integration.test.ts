@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Store } from '../server/store.js';
+import type { StripeEntitlementFact } from '../server/stripe-entitlements.js';
 import { StripeIntegration, type StripeIntegrationOptions } from '../server/stripe-integration.js';
 import {
   StripeClientError,
@@ -68,7 +69,7 @@ function fixture() {
       present = false;
     },
   );
-  const onEntitlement = vi.fn(async () => {});
+  const onEntitlement = vi.fn(async (_fact: StripeEntitlementFact) => {});
   const adapter = {
     listRoles: vi.fn(async () => ({
       can_manage_roles: true,
@@ -140,6 +141,82 @@ afterEach(async () => {
 });
 
 describe('independent Stripe role cleanup integration', () => {
+  it('verifies complete evidence for each household and resumes bounded batches after a restart', async () => {
+    const f = fixture();
+    await f.setup();
+    const template = f.data.subscriptions[0]!;
+    const periods = new Map([[template.id, f.invoice]]);
+    for (let i = 0; i <= 26; i++) {
+      const id = `sub_batch${i}`;
+      const customer = `cus_batch${i}`;
+      f.data.subscriptions.push({
+        ...structuredClone(template),
+        id,
+        customer_id: customer,
+        ...(i === 0 ? { status: 'active', ended_at: undefined } : {}),
+      });
+      periods.set(id, {
+        ...f.invoice,
+        subscription_id: id,
+        customer_id: customer,
+        invoice_id: `in_batch${i}`,
+        ...(i === 0 ? { end: base + 3600 } : {}),
+      });
+    }
+    await f.integration.sync();
+    for (let i = 0; i <= 26; i++)
+      await f.integration.linkCustomer({
+        customer_id: `cus_batch${i}`,
+        discord_user_id: String(Number(owner) + i),
+        expected_revision: f.integration.status().revision,
+      });
+    f.paid.mockImplementation(async (id) => periods.get(id) ?? null);
+    await f.configure({ automation_enabled: true });
+    const first = await f.integration.sync();
+    expect(first.verification).toMatchObject({
+      owners_checked: 25,
+      owners_waiting: 2,
+      invoice_reads: 26,
+      verification_ms: expect.any(Number),
+      action_ms: expect.any(Number),
+    });
+    expect(f.paid).toHaveBeenCalledTimes(26);
+    expect(f.onEntitlement.mock.calls[0]?.[0]).toMatchObject({
+      discord_user_id: owner,
+      action: 'subscribe',
+    });
+    expect(
+      f.onEntitlement.mock.calls.filter(([fact]) => fact.discord_user_id === owner),
+    ).toHaveLength(1);
+
+    await f.integration.stop();
+    f.paid.mockClear();
+    const restarted = new StripeIntegration(f.store, f.options);
+    try {
+      expect((await restarted.sync()).verification).toMatchObject({
+        owners_checked: 2,
+        owners_waiting: 0,
+        invoice_reads: 2,
+      });
+      expect(f.paid.mock.calls.map(([id]) => id)).toEqual(['sub_batch25', 'sub_batch26']);
+      expect(f.onEntitlement).toHaveBeenCalledTimes(27);
+      f.paid.mockImplementation(async (id) => {
+        if (id === 'sub_batch0') throw new StripeClientError('network');
+        return periods.get(id) ?? null;
+      });
+      expect((await restarted.sync()).verification).toMatchObject({
+        owners_checked: 24,
+        owners_waiting: 2,
+        failed_owners: 1,
+        invoice_reads: 26,
+      });
+      expect(() => restarted.assertEntitlement(f.onEntitlement.mock.calls[0]![0])).toThrow();
+      expect(() => restarted.assertEntitlement(f.onEntitlement.mock.calls[1]![0])).not.toThrow();
+    } finally {
+      await restarted.stop();
+    }
+  });
+
   it('enables with one permission probe, waits for complete invoice verification, and needs no media automation', async () => {
     const f = fixture();
     await f.setup();

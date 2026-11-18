@@ -165,7 +165,8 @@ describe('played-status and favorites migration', () => {
     await service.start();
     const resumed = await finish(queued);
     expect(resumed.migration_scope).toBe('watched_only');
-    expect(resumed.results[0]?.data?.favorites).toBe(0);
+    expect(resumed.status).toBe('failed');
+    expect(resumed.results[0]?.error).toContain('no reviewed Jellyfin destination');
     expect(servers.userData['j-river']?.['favorite-only']).toBeUndefined();
   });
 });

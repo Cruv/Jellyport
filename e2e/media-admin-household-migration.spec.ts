@@ -240,15 +240,58 @@ test('differently named migration accounts can be explicitly grouped under one D
   });
   await review.getByRole('button', { name: 'Next: Review', exact: true }).click();
   await expect(review.getByRole('button', { name: 'Start migration', exact: true })).toBeEnabled();
-  const responsePromise = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname === '/api/migrations' &&
-      response.request().method() === 'POST',
+  let releaseHistory!: () => void;
+  const delayedHistory = new Promise<void>((resolve) => {
+    releaseHistory = resolve;
+  });
+  const clientFactory = service.clientFactory;
+  service.clientFactory = (...args) => {
+    const client = clientFactory(...args);
+    if (args[2] === 'emby') {
+      const read = client.migrationState!.bind(client);
+      client.migrationState = async (...parameters) => {
+        await delayedHistory;
+        return read(...parameters);
+      };
+    }
+    return client;
+  };
+  let submitted: { status: number; id: string } | undefined;
+  await page.route(
+    '**/api/migrations',
+    async (route) => {
+      const response = await route.fetch();
+      submitted = { status: response.status(), id: (await response.json()).id };
+      // Lose the browser response after the real API has durably accepted the operation.
+      await route.abort('failed');
+    },
+    { times: 1 },
   );
-  await review.getByRole('button', { name: 'Start migration', exact: true }).click();
-  const response = await responsePromise;
-  expect(response.status()).toBe(202);
-  const { id } = await response.json();
+  let id: string;
+  try {
+    await review.getByRole('button', { name: 'Start migration', exact: true }).click();
+    await expect.poll(() => submitted?.status).toBe(202);
+    id = submitted!.id;
+    const receipt = accepted[0]!.submission_receipt;
+    expect(receipt).toBeTruthy();
+    await page.reload();
+    await page.goto('/#/activity');
+    const tray = page.locator('.operations-tray');
+    await expect(tray.getByText('1 active', { exact: true })).toBeVisible();
+    await tray.getByText('Operations tray', { exact: true }).click();
+    await expect(tray.getByRole('button', { name: /running/ })).toBeVisible();
+    await expect(tray.getByRole('textbox', { name: 'Migration submission receipt' })).toHaveValue(
+      String(receipt),
+    );
+    const lookup = page.waitForRequest(
+      (request) => new URL(request.url()).pathname === `/api/migrations/receipts/${receipt}`,
+    );
+    await tray.getByRole('button', { name: 'Find operation' }).click();
+    await lookup;
+    await expect(page.getByRole('dialog').getByText(id, { exact: true })).toBeVisible();
+  } finally {
+    releaseHistory();
+  }
   await expect
     .poll(async () => (await (await admin.client.get(`/api/jobs/${id}`)).json()).status, {
       timeout: 15_000,

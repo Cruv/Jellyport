@@ -505,6 +505,113 @@ describe('Settings layout and navigation', () => {
     ).toEqual([18, 18]);
   });
 
+  it('submits only edited fields with their draft revisions and lets the operator resolve a conflict', async () => {
+    let attempts = 0;
+    const p = page(
+      { ...oldSettings, field_revisions: { password_length: 'first' } },
+      vi.fn(async () => {
+        if (++attempts === 1)
+          throw new Error('Another save changed the same settings.', {
+            cause: {
+              conflicts: ['password_length'],
+              field_revisions: { password_length: 'second' },
+            },
+          });
+        return {};
+      }) as Api,
+    );
+    fireEvent.change(screen.getByLabelText('Generated password length'), {
+      target: { value: '18' },
+    });
+    p.rerender(
+      <SettingsPage
+        {...p.props}
+        settings={{
+          ...p.props.settings,
+          emby_url: 'https://new-source.example',
+          field_revisions: { password_length: 'second', emby_url: 'new-source' },
+        }}
+      />,
+    );
+    submit();
+    await screen.findByText('Another save changed these settings.');
+    expect(screen.getByLabelText('Generated password length')).toHaveProperty('value', '18');
+    expect(p.refresh).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Keep my edits' }));
+    submit();
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(
+      p.requests
+        .filter(({ options }) => options?.method === 'PUT')
+        .map(({ options }) => options?.body),
+    ).toEqual(
+      ['first', 'second'].map((revision) => ({
+        changes: { password_length: 18 },
+        expected_revisions: { password_length: revision },
+      })),
+    );
+  });
+
+  it('shows the affected household before submitting a Discord role cutover and keeps the draft on cancel', async () => {
+    const settings = {
+      ...oldSettings,
+      discord_enabled: true,
+      discord_bot_token_set: true,
+      discord_guild_id: '200001',
+      discord_member_role_id: '200002',
+      field_revisions: { discord_member_role_id: 'previous-role' },
+    };
+    const p = page(
+      settings,
+      vi.fn(async (path) => {
+        if (path === '/api/discord/authority/review')
+          return {
+            current: settings,
+            proposed: { ...settings, discord_member_role_id: '200003' },
+            affected: [
+              {
+                discord_user_id: '100001',
+                username: 'Household owner',
+                slots: 1,
+                proposed_slots: 1,
+                tier_id: 'sloop',
+                customers: 1,
+                accounts: [
+                  { kind: 'jellyfin', id: 'j-family', username: 'family account', slot: 1 },
+                ],
+              },
+            ],
+            review_token: 'reviewed-role-change',
+          };
+        return {};
+      }) as Api,
+    );
+    settingsTab('Discord');
+    fireEvent.click(screen.getByRole('tab', { name: 'Bot connection' }));
+    const role = screen.getByLabelText(/Active membership role ID/);
+    fireEvent.change(role, { target: { value: '200003' } });
+    submit();
+    const review = await screen.findByRole('dialog', { name: 'Review affected households' });
+    expect(within(review).getByText(/Jellyfin family account/)).toBeTruthy();
+    expect(p.requests.some(({ options }) => options?.method === 'PUT')).toBe(false);
+    fireEvent.click(within(review).getByRole('button', { name: 'Keep editing' }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Save settings' })).toHaveProperty(
+        'disabled',
+        false,
+      ),
+    );
+    expect(role).toHaveProperty('value', '200003');
+    submit();
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve and save settings' }));
+    await waitFor(() => expect(p.refresh).toHaveBeenCalledOnce());
+    expect(p.requests.find(({ options }) => options?.method === 'PUT')?.options?.body).toEqual({
+      changes: { discord_member_role_id: '200003' },
+      expected_revisions: { discord_member_role_id: 'previous-role' },
+      authority_review_token: 'reviewed-role-change',
+    });
+  });
+
   it('shows one focused view and preserves unsaved fields and secrets across every tab', async () => {
     const p = page();
     expect(screen.getByRole('heading', { name: 'Settings', level: 1 })).toBeTruthy();

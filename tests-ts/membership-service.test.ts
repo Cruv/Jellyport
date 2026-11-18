@@ -209,6 +209,13 @@ describe('multi-account Discord membership provisioning', () => {
   });
 
   it('reconciles an Emby-only membership role without creating or requiring Jellyfin accounts', async () => {
+    store.saveSettings({
+      ...store.settings(),
+      discord_role_events: true,
+      discord_member_role_id: '7654321',
+      auto_provision: true,
+      auto_disable: true,
+    });
     await service.setMembershipAccess({
       discord_user_id: owner,
       access_mode: 'subscription',
@@ -221,13 +228,6 @@ describe('multi-account Discord membership provisioning', () => {
       mediaClients++;
       return factory(...args);
     };
-    store.saveSettings({
-      ...store.settings(),
-      discord_role_events: true,
-      discord_member_role_id: '7654321',
-      auto_provision: true,
-      auto_disable: true,
-    });
     bot.active = false;
     await service.reconcileMemberships();
     await service.reconcileMemberships();

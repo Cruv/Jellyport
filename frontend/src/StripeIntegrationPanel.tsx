@@ -32,6 +32,15 @@ export interface StripeIntegrationStatus {
   linked_customer_count: number;
   price_tiers: { price_id: string; tier_id: string }[];
   hints: { id: string; username: string; tier: string; observed_at: string }[];
+  verification?: {
+    owners_checked: number;
+    owners_waiting: number;
+    failed_owners?: number;
+    oversized_owners: number;
+    invoice_reads: number;
+    verification_ms: number;
+    action_ms: number;
+  } | null;
   role_cleanup?: {
     enabled: boolean;
     role_ids: string[];
@@ -536,6 +545,20 @@ export default function StripeIntegrationPanel({
                   Last successful sync: {status.last_sync ? date(status.last_sync) : 'Not run yet'}
                 </span>
               </div>
+              {status.verification && (
+                <p className="subtle">
+                  Last billing pass checked {num(status.verification.owners_checked)} households
+                  with {num(status.verification.invoice_reads)} invoice reads in{' '}
+                  {num(status.verification.verification_ms)} ms. Applying access decisions took{' '}
+                  {num(status.verification.action_ms)} ms.
+                  {status.verification.owners_waiting > 0 &&
+                    ` ${num(status.verification.owners_waiting)} households remain for a later pass.`}
+                  {status.verification.oversized_owners > 0 &&
+                    ` ${num(status.verification.oversized_owners)} households exceed the invoice verification limit and require review.`}
+                  {!!status.verification.failed_owners &&
+                    ` ${num(status.verification.failed_owners)} households kept their access after an incomplete invoice read.`}
+                </p>
+              )}
               {status.running && (
                 <p role="status">
                   <span className="spinner" /> Reading Stripe subscriptions…

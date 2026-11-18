@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { DemoServers } from '../server/demo.js';
 import { MediaError } from '../server/errors.js';
 import type { MediaItem, MediaUserDataPatch } from '../server/media.js';
@@ -104,6 +105,142 @@ describe('playback-conscious migration orchestration', () => {
     return { select, items };
   }
 
+  it.each(['source history', 'destination state', 'independent verification'])(
+    'completes unrelated access changes while %s is stalled',
+    async (stage) => {
+      const entered = deferred();
+      const release = deferred();
+      releases.push(release.resolve);
+      servers.users.jellyfin.push({
+        Id: 'unrelated',
+        Name: 'separate',
+        Policy: { IsAdministrator: false, IsDisabled: false },
+      });
+      const factory = service.clientFactory;
+      let destinationReads = 0;
+      const stall = async () => {
+        entered.resolve();
+        await release.promise;
+      };
+      service.clientFactory = (...args) => {
+        const client = factory(...args);
+        if (args[2] === 'emby' && stage === 'source history') {
+          const read = client.migrationState!.bind(client);
+          client.migrationState = async (...params) => {
+            await stall();
+            return read(...params);
+          };
+        }
+        if (args[2] === 'jellyfin') {
+          const read = client.destinationItems!.bind(client);
+          client.destinationItems = async (...params) => {
+            destinationReads++;
+            if (
+              (stage === 'destination state' && destinationReads === 1) ||
+              (stage === 'independent verification' && destinationReads === 2)
+            )
+              await stall();
+            return read(...params);
+          };
+        }
+        return client;
+      };
+      const migration = await service.migrateUsers(['e-river']);
+      await entered.promise;
+      const access = service.setAccountAccess({
+        kind: 'jellyfin',
+        user_id: 'unrelated',
+        disabled: true,
+        expected_username: 'separate',
+        expected_profile_revision: '',
+      });
+      try {
+        const result = await Promise.race([access, delay(1500, null, { ref: false })]);
+        expect(result).toMatchObject({ disabled: true });
+        expect(service.getJob(migration.id).status).toBe('running');
+      } finally {
+        release.resolve();
+        await access;
+      }
+      expect((await finish(migration)).status).toBe('completed');
+    },
+  );
+
+  it('does not use an account that appeared after the reviewed absence was queued', async () => {
+    const entered = deferred();
+    const release = deferred();
+    releases.push(release.resolve);
+    const factory = service.clientFactory;
+    const mutation = vi.fn();
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      if (args[2] === 'emby') {
+        const read = client.migrationState!.bind(client);
+        client.migrationState = async (...params) => {
+          entered.resolve();
+          await release.promise;
+          return read(...params);
+        };
+      } else {
+        client.updateUserData = mutation;
+        client.setPassword = mutation;
+        client.createUser = mutation;
+      }
+      return client;
+    };
+    const migration = await service.migrateUsers(['e-alex']);
+    await entered.promise;
+    servers.users.jellyfin.push({
+      Id: 'unreviewed',
+      Name: 'alex',
+      Policy: { IsAdministrator: false, IsDisabled: false },
+    });
+    release.resolve();
+    const job = await finish(migration);
+    expect(job.status).toBe('failed');
+    expect(job.results[0]).toMatchObject({
+      source_user_id: 'e-alex',
+      error: expect.stringContaining('new migration review'),
+    });
+    expect(mutation).not.toHaveBeenCalled();
+  });
+
+  it('revalidates the live destination after access changes during state preparation', async () => {
+    const entered = deferred();
+    const release = deferred();
+    releases.push(release.resolve);
+    const factory = service.clientFactory;
+    const update = vi.fn();
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      if (args[2] === 'jellyfin') {
+        const read = client.destinationItems!.bind(client);
+        client.destinationItems = async (...params) => {
+          const items = await read(...params);
+          entered.resolve();
+          await release.promise;
+          return items;
+        };
+        client.updateUserData = update;
+      }
+      return client;
+    };
+    const migration = await service.migrateUsers(['e-river']);
+    await entered.promise;
+    await service.setAccountAccess({
+      kind: 'jellyfin',
+      user_id: 'j-river',
+      disabled: true,
+      expected_username: 'river',
+      expected_profile_revision: '',
+    });
+    release.resolve();
+    const job = await finish(migration);
+    expect(job.status).toBe('failed');
+    expect(job.results[0]?.error).toContain('new migration review');
+    expect(update).not.toHaveBeenCalled();
+  });
+
   it('passes exact 4.10.2 source version through saved preview, admission and execution', async () => {
     sourceVersion = '4.10.2.0';
     const saved = snapshots();
@@ -154,6 +291,41 @@ describe('playback-conscious migration orchestration', () => {
       expect(releaseSnapshots).toHaveBeenCalledOnce();
     },
   );
+
+  it('marks only the running account interrupted on shutdown and retains completed migration results', async () => {
+    const entered = deferred();
+    const release = deferred();
+    releases.push(release.resolve);
+    const factory = service.clientFactory;
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      const create = client.createUser.bind(client);
+      client.createUser = async (username, password) => {
+        if (username === 'sam') {
+          entered.resolve();
+          await release.promise;
+          throw new MediaError('Synthetic upstream connection closed.');
+        }
+        return create(username, password);
+      };
+      return client;
+    };
+    const job = await service.migrateUsers(['e-river', 'e-sam'], {}, undefined, 'watched_only');
+    await entered.promise;
+    const inProgress = service.getJob(job.id);
+    expect(inProgress.results.map(({ status }) => status)).toEqual(['completed', 'running']);
+    const shutdown = service.stop();
+    release.resolve();
+    await shutdown;
+    const interrupted = service.getJob(job.id);
+    expect(interrupted).toMatchObject({
+      status: 'interrupted',
+      progress: { processed: 1, total: 2 },
+      results: [inProgress.results[0], { username: 'sam', status: 'interrupted' }],
+    });
+    expect(interrupted.results[0]).toEqual(inProgress.results[0]);
+    expect(interrupted.progress).not.toHaveProperty('current_user');
+  });
 
   it('does no catalog work in live previews and pins one 100,000-item metadata array across users even after TTL expiry', async () => {
     let clock = Date.UTC(2026, 9, 8, 12),

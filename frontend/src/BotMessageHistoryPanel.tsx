@@ -11,7 +11,7 @@ export default function BotMessageHistoryPanel({
   api: Api;
   notify: Notify;
 }) {
-  const [messages, setMessages] = useState<BotMessageHistory[] | null>(null);
+  const [messages, setMessages] = useState<Omit<BotMessageHistory, 'content'>[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const current = useRef<AbortController | null>(null);
@@ -35,7 +35,7 @@ export default function BotMessageHistoryPanel({
     setLoading(true);
     setError('');
     try {
-      const value = await api<{ messages: BotMessageHistory[] }>(
+      const value = await api<{ messages: Omit<BotMessageHistory, 'content'>[] }>(
         `/api/jobs/${encodeURIComponent(jobId)}/messages`,
         { signal: controller.signal },
       );
@@ -50,16 +50,6 @@ export default function BotMessageHistoryPanel({
     } finally {
       if (current.current === controller) current.current = null;
       if (mounted.current && !controller.signal.aborted) setLoading(false);
-    }
-  }
-  async function copy(content: string) {
-    try {
-      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
-      await navigator.clipboard.writeText(content);
-      if (mounted.current) notify('Exact bot message copied.');
-    } catch {
-      if (mounted.current)
-        notify('Clipboard access is unavailable. Select and copy the message text.', true);
     }
   }
   return (
@@ -80,9 +70,7 @@ export default function BotMessageHistoryPanel({
         </button>
       </div>
       <p className="section-note">
-        Archived message content is available to Jellyport administrators, including generated
-        passwords. This view can be opened again while the archive is retained. An archived password
-        may have changed since delivery.
+        Delivery records show the recipient, account and delivery outcome.
       </p>
       {error && (
         <p className="error-block" role="alert">
@@ -118,19 +106,10 @@ export default function BotMessageHistoryPanel({
           </p>
           {message.status !== 'sent' && (
             <p className="section-note">
-              This attempt is not confirmed as delivered. Its exact prepared content is retained for
-              administrator review.
+              Delivery was unconfirmed. Use the operation’s credential reveal if it is still
+              available.
             </p>
           )}
-          <pre className="credential-message">{message.content}</pre>
-          <small>Exact Discord content, including transport escaping.</small>
-          <button
-            type="button"
-            className="btn btn-small btn-quiet"
-            onClick={() => void copy(message.content)}
-          >
-            Copy exact message
-          </button>
         </article>
       ))}
     </section>

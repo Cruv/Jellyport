@@ -54,6 +54,10 @@ export class IdentityReview {
     this.cached = null;
     await this.roleSync.close();
   }
+  cachedAttention(): number | null {
+    const snapshot = this.cached?.snapshot;
+    return snapshot && Date.parse(snapshot.expires_at) > Date.now() ? snapshot.summary.gaps : null;
+  }
   private localFingerprint(): string {
     const settings = this.service.store.settings();
     return fingerprint({

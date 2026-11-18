@@ -169,6 +169,63 @@ it('keeps demo settings read-only', async () => {
   expect(response.statusCode).toBe(400);
   expect(response.json().detail).toContain('read-only');
 });
+
+it('recovers a lost credential response only in the session that claimed it', async () => {
+  const app = await setup();
+  const [first, second] = await Promise.all([login(app), login(app)]);
+  const { store } = app.jellyport;
+  const timestamp = new Date().toISOString();
+  for (const id of ['receipt-demo', 'expired-demo']) {
+    store.saveJob({
+      id,
+      kind: 'create',
+      status: 'completed',
+      created_at: timestamp,
+      updated_at: timestamp,
+      progress: { processed: 1, total: 1 },
+      results: [],
+    });
+    store.saveCredentials(id, 'sample-user', 'synthetic-receipt-secret', 'https://media.example');
+  }
+  const url = '/api/jobs/receipt-demo/credentials';
+  const request = (headers: typeof first, path = url) =>
+    app.inject({ method: 'POST', url: path, headers, payload: { recoverable: true } });
+  const results = await Promise.all([request(first), request(second)]);
+  expect(results.map((result) => result.json().credentials.length).sort()).toEqual([0, 1]);
+  const claimedByFirst = results[0]!.json().credentials.length === 1;
+  const owner = claimedByFirst ? first : second;
+  const other = claimedByFirst ? second : first;
+  const original = results[claimedByFirst ? 0 : 1]!;
+  expect(original.headers['cache-control']).toBe('no-store');
+  expect(original.json().credentials[0].password).toBe('synthetic-receipt-secret');
+  expect((await app.inject({ url: '/api/session', headers: owner })).json().authenticated).toBe(
+    true,
+  );
+  await app.inject({ method: 'DELETE', url: `${url}/receipt`, headers: other });
+  expect((await request(owner)).json()).toEqual(original.json());
+  expect((await request(other)).json().credentials).toEqual([]);
+  expect((await app.inject({ method: 'POST', url, headers: other })).json().credentials).toEqual(
+    [],
+  );
+  expect((await app.inject({ url: '/api/jobs/receipt-demo', headers: other })).body).not.toContain(
+    'synthetic-receipt-secret',
+  );
+  await app.inject({ method: 'DELETE', url: `${url}/receipt`, headers: owner });
+  expect((await request(owner)).json().credentials).toEqual([]);
+
+  const expiryUrl = '/api/jobs/expired-demo/credentials';
+  expect((await request(owner, expiryUrl)).json().credentials).toHaveLength(1);
+  const systemTime = Date.now();
+  const now = vi.spyOn(Date, 'now').mockReturnValue(systemTime + 60_000);
+  try {
+    expect((await request(owner, expiryUrl)).json().credentials).toHaveLength(1);
+    now.mockReturnValue(systemTime + 91_000);
+    expect((await request(owner, expiryUrl)).json().credentials).toEqual([]);
+    expect((await request(other, expiryUrl)).json().credentials).toEqual([]);
+  } finally {
+    now.mockRestore();
+  }
+});
 it('does not echo secret input in validation or malformed JSON errors', async () => {
   const app = await setup();
   const anonymous = await session(app);
@@ -270,6 +327,55 @@ it('validates saved settings and preserves blank secrets without exposing them',
     ).toBe(400);
   }
 });
+
+it('merges independent settings drafts and rejects only conflicting fields from a stale tab', async () => {
+  const app = await setup(false);
+  const [first, second] = await Promise.all([login(app), login(app)]);
+  const restart = vi.spyOn(app.jellyport.bot, 'restart');
+  const get = (headers: typeof first) => app.inject({ url: '/api/settings', headers });
+  const initial = (await get(first)).json().field_revisions;
+  const save = (
+    headers: typeof first,
+    changes: Record<string, unknown>,
+    revisions: Record<string, string> = initial,
+  ) =>
+    app.inject({
+      method: 'PUT',
+      url: '/api/settings',
+      headers,
+      payload: {
+        changes,
+        expected_revisions: Object.fromEntries(
+          Object.keys(changes).map((key) => [key, revisions[key] ?? '0']),
+        ),
+      },
+    });
+  const responses = await Promise.all([
+    save(first, { password_length: 16 }),
+    save(second, { bot_message_retention_days: 45 }),
+  ]);
+  expect(responses.map((response) => response.statusCode)).toEqual([200, 200]);
+  const result = (await get(second)).json();
+  expect(result).toMatchObject({ password_length: 16, bot_message_retention_days: 45 });
+  expect(result.field_revisions.bot_message_retention_days).not.toBe(
+    initial.bot_message_retention_days,
+  );
+  const collided = await save(second, { password_length: 20, password_exclude_ambiguous: false });
+  expect(collided.statusCode).toBe(409);
+  expect(collided.json()).toMatchObject({
+    conflicts: ['password_length'],
+    field_revisions: { password_length: result.field_revisions.password_length },
+  });
+  expect(app.jellyport.store.settings().password_exclude_ambiguous).toBe(true);
+  expect((await save(second, { password_length: 20 }, result.field_revisions)).statusCode).toBe(
+    200,
+  );
+  expect(app.jellyport.store.settings()).toMatchObject({
+    password_length: 20,
+    bot_message_retention_days: 45,
+  });
+  expect(restart).not.toHaveBeenCalled();
+});
 it('validates account and migration request shapes without coercion', async () => {
   const app = await setup();
   const headers = await login(app);
@@ -318,7 +424,12 @@ it.each(['complete', 'watched_only'] as const)(
         await new Promise<void>((_resolve, reject) =>
           signal.addEventListener('abort', () => reject(signal.reason), { once: true }),
         );
-        return { users: [], mode: 'merge', migration_scope: 'watched_only' };
+        return {
+          users: [],
+          mode: 'merge',
+          migration_scope: 'watched_only',
+          destination_server_id: 'demo-jellyfin',
+        };
       });
     const response = await app.inject({
       method: 'POST',
@@ -363,9 +474,12 @@ it.each([
   async (scope, expected) => {
     const app = await setup();
     const headers = await login(app);
-    const preview = vi
-      .spyOn(app.jellyport.service, 'preview')
-      .mockResolvedValue({ users: [], mode: 'merge', migration_scope: expected });
+    const preview = vi.spyOn(app.jellyport.service, 'preview').mockResolvedValue({
+      users: [],
+      mode: 'merge',
+      migration_scope: expected,
+      destination_server_id: 'demo-jellyfin',
+    });
     const migrate = vi.spyOn(app.jellyport.service, 'migrateUsers').mockResolvedValue({
       id: 'fixture-job',
       kind: 'migration',
@@ -442,6 +556,7 @@ it('passes protected-account pins only from the session-owned review and rejects
       {
         ...preview.users[0]!,
         history_only: true,
+        username: pin.target_username,
         target_user_id: pin.target_user_id,
         target_exists: true,
       },
@@ -491,11 +606,56 @@ it('passes protected-account pins only from the session-owned review and rejects
     expect.objectContaining({ preview_id: review.id }),
     { 'e-alex': pin },
     undefined,
+    undefined,
+    expect.any(Function),
+    undefined,
+    undefined,
+    {
+      'e-alex': {
+        server_id: preview.destination_server_id,
+        target_user_id: pin.target_user_id,
+        username: pin.target_username,
+        source_username: preview.users[0]!.source_username,
+      },
+    },
   );
   expect(
     (await app.inject({ url: `/api/migrations/preview/${review.id}`, headers })).statusCode,
   ).toBe(404);
 });
+
+it.each([
+  { source: 'e-alex', name: 'alex', reviewedTarget: null },
+  { source: 'e-river', name: 'river', reviewedTarget: 'j-river' },
+])(
+  'requires a new review when same-name destination $name changes before acceptance',
+  async ({ source, name, reviewedTarget }) => {
+    const app = await setup();
+    const headers = await login(app);
+    const servers = new DemoServers();
+    app.jellyport.service.clientFactory = servers.factory;
+    const review = await readyPreview(app, headers, [source]);
+    expect(review.preview.users[0].target_user_id).toBe(reviewedTarget);
+    servers.users.jellyfin = [
+      ...servers.users.jellyfin.filter((user) => user.Name !== name),
+      {
+        Id: 'unreviewed-replacement',
+        Name: name,
+        Policy: { IsAdministrator: false, IsDisabled: false },
+      },
+    ];
+    const rejected = await app.inject({
+      method: 'POST',
+      url: '/api/migrations',
+      headers,
+      payload: { source_user_ids: [source], preview_id: review.id },
+    });
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.json().detail).toMatch(/destination changed.*new migration review/i);
+    expect(app.jellyport.store.jobs()).toEqual([]);
+    expect(servers.played['unreviewed-replacement']).toBeUndefined();
+  },
+);
 
 it('passes household ownership only from its session-owned review and rejects client-supplied household proofs', async () => {
   const app = await setup();
@@ -544,6 +704,18 @@ it('passes household ownership only from its session-owned review and rejects cl
     expect.objectContaining({ preview_id: review.id }),
     undefined,
     { 'e-alex': proof },
+    undefined,
+    expect.any(Function),
+    undefined,
+    undefined,
+    {
+      'e-alex': {
+        server_id: preview.destination_server_id,
+        target_user_id: null,
+        username: 'alex',
+        source_username: 'alex',
+      },
+    },
   );
 });
 
@@ -800,6 +972,7 @@ it('discards ready history previews when integration settings change', async () 
     users: [],
     mode: 'merge',
     migration_scope: 'watched_only',
+    destination_server_id: 'test-server',
   });
   const started = await app.inject({
     method: 'POST',
@@ -1110,4 +1283,108 @@ it('returns only browser-required user fields rather than forwarding private ups
     expect(user.Id).toBeTruthy();
     expect(user.Name).toBeTruthy();
   }
+});
+
+it('looks up the original reviewed migration after a lost response and refuses altered replays', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const review = await readyPreview(app, headers);
+  const payload = {
+    source_user_ids: ['e-alex'],
+    preview_id: review.id,
+    submission_receipt: review.id,
+  };
+  const submit = () => app.inject({ method: 'POST', url: '/api/migrations', headers, payload });
+  const accepted = await submit();
+  expect(accepted.statusCode).toBe(202);
+  const job = accepted.json();
+  const lookUp = async (value: string, sessionHeaders = headers) =>
+    app.inject({ url: `/api/migrations/receipts/${value}`, headers: sessionHeaders });
+  expect((await lookUp(review.id)).json()).toEqual({ job_id: job.id });
+  expect((await lookUp('latest', await login(app))).json()).toEqual({ job_id: job.id });
+  expect((await submit()).json().id).toBe(job.id);
+  expect(app.jellyport.store.jobCount()).toBe(1);
+  expect(
+    (
+      await app.inject({
+        method: 'POST',
+        url: '/api/migrations',
+        headers,
+        payload: { ...payload, migration_scope: 'watched_only' },
+      })
+    ).statusCode,
+  ).toBe(409);
+  expect((await app.inject(`/api/migrations/receipts/${review.id}`)).statusCode).toBe(401);
+});
+
+it('uses recorded source identities for a fresh follow-up and excludes successful accounts', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const store = app.jellyport.store;
+  const timestamp = new Date().toISOString();
+  const job = {
+    id: 'synthetic-follow-up',
+    kind: 'migrate',
+    status: 'queued',
+    created_at: timestamp,
+    updated_at: timestamp,
+    progress: { processed: 0, total: 3 },
+    migration_scope: 'played_favorites' as const,
+    results: [],
+  };
+  store.saveQueuedJob(
+    job,
+    [
+      { username: 'Same display name', source_user_id: 'finished-source' },
+      { username: 'Same display name', source_user_id: 'partial-source' },
+      { username: 'Never started', source_user_id: 'unstarted-source' },
+    ],
+    store.settings(),
+    undefined,
+    { key: 'synthetic-opaque-key', owner: 'synthetic-owner-key', requestHash: 'synthetic-proof' },
+    'original-source-scope',
+  );
+  expect(store.claimQueuedJob(job.id)).toBe(true);
+  store.saveJob({
+    ...job,
+    status: 'partial',
+    results: [
+      { username: 'Same display name', source_user_id: 'finished-source', status: 'completed' },
+      { username: 'Same display name', source_user_id: 'partial-source', status: 'partial' },
+    ],
+  });
+  expect(store.latestMigrationSubmission('synthetic-owner-key')).toBe(job.id);
+  const response = await app.inject({ url: `/api/jobs/${job.id}/follow-up`, headers });
+  expect(response.statusCode).toBe(200);
+  const selection = response.json<{
+    source_user_ids: string[];
+    migration_scope: string;
+    use_snapshots: boolean;
+  }>();
+  expect(selection).toEqual({
+    source_user_ids: ['partial-source', 'unstarted-source'],
+    migration_scope: 'played_favorites',
+    use_snapshots: false,
+  });
+  const invalidReview = await app.inject({
+    method: 'POST',
+    url: '/api/migrations/preview',
+    headers,
+    payload: {
+      ...selection,
+      source_user_ids: ['finished-source', 'partial-source'],
+      follow_up_job_id: job.id,
+    },
+  });
+  expect(invalidReview.statusCode).toBe(400);
+  expect(invalidReview.json().detail).toContain('selection changed');
+  const changedSource = await app.inject({
+    method: 'POST',
+    url: '/api/migrations/preview',
+    headers,
+    payload: { ...selection, follow_up_job_id: job.id },
+  });
+  expect(changedSource.statusCode).toBe(400);
+  expect(changedSource.json().detail).toContain('original Emby server changed');
+  expect(store.jobCount()).toBe(1);
 });

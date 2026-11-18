@@ -72,6 +72,67 @@ export const test = base.extend<{ mutations: string[] }, { demoSession: DemoSess
 
 export { expect };
 
+/** Keep synthetic histories behind the same filter and pagination contract as Activity. */
+export async function mockActivity(
+  page: Page,
+  jobs: Array<{
+    id: string;
+    kind: string;
+    status: string;
+    created_at: string;
+    finished_at?: string;
+    progress?: { processed: number; total: number };
+    results?: Array<{ username: string; status: string }>;
+  }>,
+) {
+  const active = jobs.filter((job) => ['queued', 'running'].includes(job.status));
+  const filter = (url: URL) => {
+    const status = url.searchParams.get('status') ?? 'all';
+    const query = (url.searchParams.get('query') ?? '').trim().toLowerCase();
+    return jobs.filter(
+      (job) =>
+        (status === 'all' ||
+          job.status === status ||
+          (status === 'active' && active.includes(job)) ||
+          (status === 'partial' && job.status === 'interrupted')) &&
+        `${job.kind} ${job.id} ${job.results?.map((result) => result.username).join(' ') ?? ''}`
+          .toLowerCase()
+          .includes(query),
+    );
+  };
+  await page.route(
+    (url) => url.pathname === '/api/jobs',
+    async (route) => {
+      const url = new URL(route.request().url());
+      const matches = filter(url);
+      const offset = Number(url.searchParams.get('offset') ?? 0);
+      const limit = Number(url.searchParams.get('limit') ?? 25);
+      await route.fulfill({
+        json: {
+          jobs: matches.slice(offset, offset + limit),
+          total: matches.length,
+          overall: jobs.length,
+          active: active.length,
+        },
+      });
+    },
+  );
+  await page.route('**/api/jobs/cleanup-review*', async (route) =>
+    route.fulfill({ json: { all: jobs, filtered: filter(new URL(route.request().url())) } }),
+  );
+  await page.route('**/api/jobs/live', async (route) =>
+    route.fulfill({
+      json: {
+        active,
+        active_count: active.length,
+        recent: jobs.slice(0, 6),
+        total: jobs.length,
+        revision: 1,
+      },
+    }),
+  );
+}
+
 export async function navigate(page: Page, name: string) {
   await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
   // Match the client's input capability. Native taps avoid introducing mouse

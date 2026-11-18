@@ -93,6 +93,7 @@ function fixture(
     accept?: (body: any, signal: AbortSignal) => unknown | Promise<unknown>;
     access?: (body: any) => unknown | Promise<unknown>;
     read?: (signal: AbortSignal) => unknown | Promise<unknown>;
+    timeline?: (signal: AbortSignal) => unknown | Promise<unknown>;
     initialMember?: { id: string; username: string };
     handoffKey?: number;
     identityBlocked?: boolean;
@@ -125,6 +126,8 @@ function fixture(
       };
     if (path === '/api/memberships')
       return options.read ? options.read(config!.signal!) : { memberships: members };
+    if (path === `/api/memberships/${ownerId}/timeline` && options.timeline)
+      return options.timeline(config!.signal!);
     if (path.startsWith('/api/discord/members?')) return { members: [member], truncated: false };
     if (path === '/api/memberships/workflow/review') {
       const body = config!.body as any;
@@ -226,6 +229,67 @@ afterEach(() => {
 });
 
 describe('membership task workflow', () => {
+  it('loads one private household timeline on demand and cancels reads when it closes', async () => {
+    window.history.replaceState(null, '', '#/memberships/accounts/list');
+    const timeline = vi.fn(async () => ({
+      username: 'Jim',
+      discord_user_id: ownerId,
+      authority: 'held',
+      membership: {
+        access_mode: 'subscription',
+        active: true,
+        tier: 'Brigantine',
+        account_limit: 2,
+        provision_jellyfin: true,
+      },
+      accounts: [
+        {
+          kind: 'emby',
+          account_id: 'synthetic-emby',
+          username: 'Jim source',
+          slot: 1,
+          identity: 'confirmed',
+          access: null,
+        },
+      ],
+      stripe: {
+        customer_count: 1,
+        complete: true,
+        subscriptions: [],
+        invoice: {
+          paid_through: '2026-12-01T00:00:00.000Z',
+          observed_at: '2026-11-01T00:00:00.000Z',
+        },
+      },
+      milestones: [
+        {
+          type: 'access',
+          key: 'change-1',
+          kind: 'emby',
+          username: 'Jim source',
+          disabled: true,
+          at: '2026-11-04T00:00:00.000Z',
+        },
+      ],
+    }));
+    const f = fixture({ timeline });
+    const trigger = await screen.findByRole('button', { name: 'Open household timeline for Jim' });
+    expect(timeline).not.toHaveBeenCalled();
+    fireEvent.click(trigger);
+    const dialog = screen.getByRole('dialog', { name: 'Household timeline for Jim' });
+    expect(await within(dialog).findByText(/Brigantine · Active · 2 slots/)).toBeTruthy();
+    expect(within(dialog).getByText('Jim source')).toBeTruthy();
+    expect(within(dialog).getByText('Disabled Emby account Jim source')).toBeTruthy();
+    expect(within(dialog).getByText(/Invoice-backed paid through/)).toBeTruthy();
+    expect(within(dialog).getByRole('button', { name: 'Review Discord authority' })).toBeTruthy();
+    const signal = f.requests.find(({ path }) => path.endsWith('/timeline'))?.options?.signal;
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Close dialog' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(signal?.aborted).toBe(true);
+    expect(writes(f.requests)).toEqual([]);
+    expect(localStorage.length + sessionStorage.length).toBe(0);
+  });
+
   it('restores an empty editor without selecting a private owner or starting a check', async () => {
     window.history.replaceState(null, '', '#/memberships/accounts/editor');
     const f = fixture();

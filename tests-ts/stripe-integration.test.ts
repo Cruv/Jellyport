@@ -103,6 +103,30 @@ afterEach(async () => {
 });
 
 describe('read-only Stripe billing integration', () => {
+  it('projects only the exact owner’s approved Stripe inventory without customer PII', async () => {
+    const { integration, configure, setData } = fixture();
+    setData(snapshot(2));
+    await configure({ price_tiers: [{ price_id: 'price_Crew', tier_id: 'sloop' }] });
+    await integration.sync();
+    await integration.linkCustomer({
+      customer_id: 'cus_0',
+      discord_user_id: member,
+      expected_revision: integration.status().revision,
+    });
+    const result = integration.householdEvidence(member);
+    expect(result).toMatchObject({
+      customer_count: 1,
+      complete: true,
+      subscriptions: [{ id: 'sub_0', status: 'active' }],
+    });
+    expect(integration.householdEvidence('987654321')).toMatchObject({
+      customer_count: 0,
+      complete: false,
+      subscriptions: [],
+    });
+    expect(JSON.stringify(result)).not.toMatch(/sub_1|cus_|example\.test/);
+  });
+
   it('proposes MEE6 Checkout identities only for the configured Discord guild', async () => {
     const { integration, configure, setData } = fixture();
     const foreign = snapshot();

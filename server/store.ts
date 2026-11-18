@@ -1,15 +1,20 @@
 import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { SecretCipher } from './crypto.js';
 import { nameKey } from './identity.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { DEFAULT_SETTINGS, DEMO_SETTINGS, type Settings } from './types.js';
 import { jobRetentionTimestamp, type JobRetentionCursor } from './job-retention.js';
+import { finishJob } from './job-recovery.js';
+import { jobOutcome } from './job-outcome.js';
+import { legacyJobSummaryInput } from './job-summary-upgrade.js';
 import { NewSubscriberPolicy } from './new-subscriber-policy.js';
 import type { BotMessageHistory } from './bot-messages.js';
+import { discordAuthority } from './discord-authority.js';
+import type { MediaKind } from './media.js';
 import type {
   Job,
   JobRequest,
@@ -41,16 +46,51 @@ export interface Link {
   disabled_by_jellyport: number;
   pending_disabled: number | null;
 }
+interface HouseholdAccessChange {
+  id: string;
+  at: string;
+  kind: MediaKind;
+  username: string;
+  disabled: boolean;
+}
 export interface Credentials {
   username: string;
   password: string;
   server_url: string;
   message?: string;
 }
+const credentialRecoverySeconds = 90;
 export interface QueuedJob {
   job: Job;
   requests: JobRequest[];
   settings: Settings;
+}
+export type JobSummary = Pick<
+  Job,
+  | 'id'
+  | 'kind'
+  | 'status'
+  | 'created_at'
+  | 'updated_at'
+  | 'finished_at'
+  | 'migration_scope'
+  | 'progress'
+  | 'cancel_requested'
+> & {
+  outcome_status: string;
+  results: Pick<Job['results'][number], 'username' | 'status'>[];
+};
+export interface JobSummaryQuery {
+  status?: string;
+  query?: string;
+  limit: number;
+  offset?: number;
+  oldestFirst?: boolean;
+}
+export interface MigrationSubmission {
+  key: string;
+  owner: string;
+  requestHash: string;
 }
 export type AuthState =
   | { kind: 'pending'; generation: string; serverUrl?: string; previousServerId?: string }
@@ -74,6 +114,16 @@ export function adminAlertReceiptId(generation: string, source: AdminAlertSource
     .update(JSON.stringify([generation, source.kind, source.id, source.status]))
     .digest('hex');
 }
+function ownerIndexKey(value: unknown): string | null {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    !('discord_user_id' in value) ||
+    typeof value.discord_user_id !== 'string'
+  )
+    return null;
+  return createHash('sha256').update(value.discord_user_id).digest('hex');
+}
 const ADMIN_ALERT_SOURCES = `
   SELECT 'job' AS kind,id,json_extract(payload,'$.status') AS status FROM jobs
   WHERE json_extract(payload,'$.status') IN ('completed','partial','failed','interrupted','cancelled','canceled')
@@ -85,6 +135,8 @@ const ADMIN_ALERT_SOURCES = `
 export class Store {
   readonly db: DatabaseSync;
   readonly cipher: SecretCipher;
+  private readonly jobEpoch = randomBytes(8).toString('hex');
+  private jobRevision = 0;
   constructor(directory: string, options: { demo?: boolean } = {}) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const keyfile = join(directory, 'secret.key');
@@ -118,11 +170,28 @@ export class Store {
       PRAGMA journal_mode=WAL;
       PRAGMA busy_timeout=5000;
       CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS setting_revisions (field TEXT PRIMARY KEY, revision TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS new_subscriber_policy (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS stripe_entitlement_policy (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS stripe_role_cleanup_policy (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS auth_state (id INTEGER PRIMARY KEY CHECK(id=1), encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS job_summaries (
+        id TEXT PRIMARY KEY, created_at TEXT NOT NULL, status TEXT NOT NULL,
+        outcome TEXT NOT NULL, search_text TEXT NOT NULL, payload TEXT NOT NULL,
+        owner_id TEXT, source_pins TEXT, destination_pin TEXT
+      );
+      CREATE INDEX IF NOT EXISTS job_summaries_recent ON job_summaries(created_at DESC,id DESC);
+      CREATE INDEX IF NOT EXISTS job_summaries_outcome ON job_summaries(outcome,created_at DESC,id DESC);
+      CREATE INDEX IF NOT EXISTS job_summaries_active ON job_summaries(created_at DESC,id DESC)
+        WHERE status IN ('queued','running');
+      CREATE INDEX IF NOT EXISTS job_summaries_active_owner ON job_summaries(owner_id)
+        WHERE status IN ('queued','running');
+      CREATE INDEX IF NOT EXISTS job_summaries_owner_recent ON job_summaries(owner_id,created_at DESC,id DESC)
+        WHERE owner_id IS NOT NULL;
+      CREATE TRIGGER IF NOT EXISTS job_summaries_insert AFTER INSERT ON jobs BEGIN DELETE FROM job_summaries WHERE id=NEW.id; END;
+      CREATE TRIGGER IF NOT EXISTS job_summaries_update AFTER UPDATE ON jobs BEGIN DELETE FROM job_summaries WHERE id=OLD.id OR id=NEW.id; END;
+      CREATE TRIGGER IF NOT EXISTS job_summaries_delete AFTER DELETE ON jobs BEGIN DELETE FROM job_summaries WHERE id=OLD.id; END;
       CREATE TABLE IF NOT EXISTS job_retention (job_id TEXT PRIMARY KEY,age_ms REAL);
       CREATE INDEX IF NOT EXISTS job_retention_age ON job_retention(age_ms,job_id);
       CREATE TRIGGER IF NOT EXISTS job_retention_insert AFTER INSERT ON jobs BEGIN DELETE FROM job_retention WHERE job_id=NEW.id; END;
@@ -130,14 +199,26 @@ export class Store {
       CREATE TRIGGER IF NOT EXISTS job_retention_delete AFTER DELETE ON jobs BEGIN DELETE FROM job_retention WHERE job_id=OLD.id; END;
       CREATE TABLE IF NOT EXISTS job_retention_config (id INTEGER PRIMARY KEY CHECK(id=1),days INTEGER NOT NULL CHECK(typeof(days)='integer' AND days BETWEEN 0 AND 3650));
       CREATE TABLE IF NOT EXISTS accounts (name_key TEXT PRIMARY KEY, username TEXT NOT NULL, remote_id TEXT, status TEXT NOT NULL, password BLOB, expires REAL);
-      CREATE TABLE IF NOT EXISTS credentials (job_id TEXT NOT NULL, username TEXT NOT NULL, encrypted BLOB NOT NULL, expires REAL NOT NULL, PRIMARY KEY (job_id,username));
+      CREATE TABLE IF NOT EXISTS credentials (job_id TEXT NOT NULL, username TEXT NOT NULL, encrypted BLOB NOT NULL, expires REAL NOT NULL, reveal_session TEXT, PRIMARY KEY (job_id,username));
       CREATE TABLE IF NOT EXISTS bot_message_history (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, created_ms REAL NOT NULL, status TEXT NOT NULL, encrypted BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS bot_message_history_job ON bot_message_history(job_id,created_ms);
       CREATE INDEX IF NOT EXISTS bot_message_history_age ON bot_message_history(created_ms);
+      CREATE INDEX IF NOT EXISTS bot_uncertain_delivery ON bot_message_history(created_ms,job_id) WHERE status='uncertain';
       CREATE TRIGGER IF NOT EXISTS bot_message_history_delete AFTER DELETE ON jobs BEGIN DELETE FROM bot_message_history WHERE job_id=OLD.id; END;
       CREATE TABLE IF NOT EXISTS links (discord_user_id TEXT NOT NULL, membership_slot INTEGER NOT NULL DEFAULT 1 CHECK(membership_slot BETWEEN 1 AND 3), username TEXT NOT NULL, remote_id TEXT NOT NULL UNIQUE, disabled_by_jellyport INTEGER NOT NULL DEFAULT 0, pending_disabled INTEGER, PRIMARY KEY(discord_user_id,membership_slot));
       CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS household_access_history (
+        id TEXT PRIMARY KEY, owner_key TEXT NOT NULL, at TEXT NOT NULL, encrypted BLOB NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS household_access_owner ON household_access_history(owner_key,at DESC,id DESC);
       CREATE TABLE IF NOT EXISTS job_queue (job_id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
+      CREATE TABLE IF NOT EXISTS migration_submissions (
+        job_id TEXT PRIMARY KEY, receipt_key TEXT UNIQUE, owner_scope TEXT,
+        request_hash TEXT, source_ids TEXT NOT NULL, source_scope TEXT
+      );
+      CREATE INDEX IF NOT EXISTS migration_submissions_owner ON migration_submissions(owner_scope);
+      CREATE TRIGGER IF NOT EXISTS migration_submissions_delete AFTER DELETE ON jobs
+        BEGIN DELETE FROM migration_submissions WHERE job_id=OLD.id; END;
       CREATE TABLE IF NOT EXISTS migration_playlists (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS user_mappings (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS account_roles (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
@@ -156,6 +237,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS identity_role_sync_tasks (id TEXT PRIMARY KEY, created_ms REAL NOT NULL, encrypted BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS credentials_expiry ON credentials(expires);
       CREATE INDEX IF NOT EXISTS subscriptions_job_id ON subscriptions(json_extract(payload,'$.job_id'));
+      CREATE INDEX IF NOT EXISTS subscriptions_member ON subscriptions(json_extract(payload,'$.discord_user_id'),json_extract(payload,'$.source'));
+      CREATE INDEX IF NOT EXISTS subscriptions_status ON subscriptions(json_extract(payload,'$.status'));
     `);
     const columns = this.db.prepare('PRAGMA table_info(links)').all();
     if (!columns.some((row) => row.name === 'pending_disabled'))
@@ -169,6 +252,34 @@ export class Store {
           ALTER TABLE links_membership_migration RENAME TO links;
         `);
       });
+    if (!columns.some((row) => row.name === 'discord_authority'))
+      this.db.exec('ALTER TABLE links ADD COLUMN discord_authority TEXT');
+    for (const table of ['memberships', 'media_ownership'] as const) {
+      if (
+        !this.db
+          .prepare(`PRAGMA table_info(${table})`)
+          .all()
+          .some((row) => row.name === 'owner_hash')
+      ) {
+        this.transaction(() => {
+          this.db.exec(`ALTER TABLE ${table} ADD COLUMN owner_hash TEXT`);
+          const save = this.db.prepare(`UPDATE ${table} SET owner_hash=? WHERE id=?`);
+          for (const row of this.db.prepare(`SELECT id,encrypted FROM ${table}`).iterate())
+            save.run(ownerIndexKey(this.decrypt(row.encrypted as Uint8Array)), row.id);
+        });
+      }
+      this.db.exec(`CREATE INDEX IF NOT EXISTS ${table}_owner ON ${table}(owner_hash)`);
+    }
+    if (
+      !this.db
+        .prepare('PRAGMA table_info(credentials)')
+        .all()
+        .some((row) => row.name === 'reveal_session')
+    )
+      this.db.exec('ALTER TABLE credentials ADD COLUMN reveal_session TEXT');
+    this.db.exec(
+      'CREATE INDEX IF NOT EXISTS credentials_reveal_session ON credentials(reveal_session) WHERE reveal_session IS NOT NULL',
+    );
     // Authenticate existing settings before starting any worker or bot.
     const settings = this.settings();
     const auth = this.authState();
@@ -182,6 +293,7 @@ export class Store {
       UNION ALL SELECT 1 FROM jobs UNION ALL SELECT 1 FROM accounts
       UNION ALL SELECT 1 FROM credentials UNION ALL SELECT 1 FROM links
       UNION ALL SELECT 1 FROM subscriptions UNION ALL SELECT 1 FROM job_queue
+      UNION ALL SELECT 1 FROM household_access_history
       UNION ALL SELECT 1 FROM migration_playlists UNION ALL SELECT 1 FROM user_mappings
       UNION ALL SELECT 1 FROM account_roles UNION ALL SELECT 1 FROM account_role_assignments
       UNION ALL SELECT 1 FROM memberships UNION ALL SELECT 1 FROM account_profiles
@@ -220,28 +332,43 @@ export class Store {
       this.db.exec(
         'DELETE FROM job_retention WHERE NOT EXISTS(SELECT 1 FROM jobs WHERE jobs.id=job_retention.job_id)',
       );
+      // Upgrade old volumes once, projecting metadata inside SQLite without materializing reports.
+      for (const row of this.db.prepare(legacyJobSummaryInput).iterate()) {
+        const job = JSON.parse(String(row.payload)) as Job;
+        for (const result of job.results)
+          if (result.discord_delivery === null) delete result.discord_delivery;
+        this.saveJobSummary(job);
+      }
     });
-    for (const job of this.jobs()) {
-      if (
-        job.status === 'running' ||
-        (job.status === 'queued' &&
-          !this.db.prepare('SELECT 1 FROM job_queue WHERE job_id=?').get(job.id))
-      ) {
+    this.transaction(() => {
+      for (const job of this.recoverableJobs()) {
         job.status = 'interrupted';
         job.error =
           'App restarted during this job. Review its results and run again; existing accounts are preserved.';
+        finishJob(job, new Date().toISOString());
         this.saveJob(job);
         this.db.prepare('DELETE FROM job_queue WHERE job_id=?').run(job.id);
       }
-    }
-    for (const event of this.subscriptions()) {
-      if (event.status === 'processing') {
-        event.status = 'failed';
-        event.error =
-          'App restarted during this event. Review account and job status before applying again.';
+      for (const row of this.db
+        .prepare("SELECT id FROM subscriptions WHERE json_extract(payload,'$.status')='processing'")
+        .all()) {
+        const event = this.subscription(String(row.id))!;
+        const job = event.job_id
+          ? this.db.prepare('SELECT status FROM job_summaries WHERE id=?').get(event.job_id)
+          : undefined;
+        if (job?.status === 'canceled') {
+          event.status = 'canceled';
+          event.error = null;
+          event.result =
+            'Canceled. Completed account changes were preserved. Review the linked operation.';
+        } else {
+          event.status = 'failed';
+          event.error =
+            'App restarted during this event. Review account and job status before applying again.';
+        }
         this.saveSubscription(event);
       }
-    }
+    });
     this.purgeExpired();
     // A process interruption cannot prove whether Discord accepted a DM.
     for (const row of this.db
@@ -277,11 +404,24 @@ export class Store {
       ...(row ? this.decrypt<Partial<Settings>>(row.encrypted as Uint8Array) : {}),
     };
   }
+  settingRevisions(): Record<string, string> {
+    return Object.fromEntries(
+      this.db
+        .prepare('SELECT field,revision FROM setting_revisions')
+        .all()
+        .map((row) => [String(row.field), String(row.revision)]),
+    );
+  }
   saveSettings(settings: Settings): void {
     const previous = this.settings();
     this.db.exec('SAVEPOINT new_subscriber_settings');
     try {
       this.db.prepare('INSERT OR REPLACE INTO settings VALUES (1,?)').run(this.encrypt(settings));
+      const revise = this.db.prepare(
+        'INSERT OR REPLACE INTO setting_revisions (field,revision) VALUES (?,?)',
+      );
+      for (const field of Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[])
+        if (!isDeepStrictEqual(previous[field], settings[field])) revise.run(field, randomUUID());
       new NewSubscriberPolicy(this).capture(previous, settings);
       this.db.exec('RELEASE new_subscriber_settings');
     } catch (error) {
@@ -368,10 +508,24 @@ export class Store {
         value: this.decrypt<T>(row.encrypted as Uint8Array),
       }));
   }
+  ownerRecords<T>(
+    table: 'memberships' | 'media_ownership',
+    discordId: string,
+  ): Array<{ id: string; value: T }> {
+    return this.db
+      .prepare(`SELECT id,encrypted FROM ${table} WHERE owner_hash=? ORDER BY id`)
+      .all(ownerIndexKey({ discord_user_id: discordId }))
+      .map((row) => ({ id: String(row.id), value: this.decrypt<T>(row.encrypted as Uint8Array) }));
+  }
   saveMembershipRecord(id: string, value: unknown): void {
     this.db
-      .prepare('INSERT OR REPLACE INTO memberships (id,encrypted) VALUES (?,?)')
-      .run(id, this.encrypt(value));
+      .prepare('INSERT OR REPLACE INTO memberships (id,encrypted,owner_hash) VALUES (?,?,?)')
+      .run(id, this.encrypt(value), ownerIndexKey(value));
+  }
+  saveMediaOwnerRecord(id: string, value: unknown): void {
+    this.db
+      .prepare('INSERT OR REPLACE INTO media_ownership (id,encrypted,owner_hash) VALUES (?,?,?)')
+      .run(id, this.encrypt(value), ownerIndexKey(value));
   }
   accountProfileRecords<T>(): Array<{ id: string; value: T }> {
     return this.db
@@ -533,11 +687,17 @@ export class Store {
     // with the report even when this method is called without an outer transaction.
     this.db.exec('SAVEPOINT jellyport_save_job');
     try {
-      this.db.prepare('INSERT OR REPLACE INTO jobs VALUES (?,?)').run(job.id, JSON.stringify(job));
+      this.db
+        .prepare(
+          'INSERT INTO jobs VALUES (?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload',
+        )
+        .run(job.id, JSON.stringify(job));
       this.db
         .prepare('INSERT OR REPLACE INTO job_retention (job_id,age_ms) VALUES (?,?)')
         .run(job.id, jobRetentionTimestamp(job));
+      this.saveJobSummary(job);
       this.db.exec('RELEASE jellyport_save_job');
+      this.jobRevision++;
     } catch (error) {
       this.db.exec('ROLLBACK TO jellyport_save_job; RELEASE jellyport_save_job');
       throw error;
@@ -576,6 +736,170 @@ export class Store {
   job(id: string): Job | null {
     const row = this.db.prepare('SELECT payload FROM jobs WHERE id=?').get(id);
     return row ? (JSON.parse(row.payload as string) as Job) : null;
+  }
+  private saveJobSummary(job: Job): void {
+    const { id, created_at, updated_at, finished_at, migration_scope, progress } = job;
+    const { kind = 'operation', status = 'unknown' } = job;
+    const cancel_requested =
+      job.cancel_requested == null ? undefined : Boolean(job.cancel_requested);
+    const results = (job.results ?? []).map(({ username, status }) => ({ username, status }));
+    const outcome_status = jobOutcome(job).value;
+    const summary: JobSummary = {
+      id,
+      kind,
+      status,
+      created_at,
+      updated_at,
+      finished_at,
+      migration_scope,
+      progress,
+      results,
+      outcome_status,
+      cancel_requested,
+    };
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO job_summaries
+      (id,created_at,status,outcome,search_text,payload,owner_id,source_pins,destination_pin)
+      VALUES (?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        id,
+        created_at ?? '',
+        status,
+        outcome_status,
+        `${kind} ${id} ${results.map((result) => result.username).join(' ')}`.toLowerCase(),
+        JSON.stringify(summary),
+        job.membership_discord_user_id ?? null,
+        job.source_snapshot_ids ? JSON.stringify(job.source_snapshot_ids) : null,
+        job.destination_catalog_id ?? null,
+      );
+  }
+  jobCount(): number {
+    return Number(this.db.prepare('SELECT COUNT(*) AS n FROM job_summaries').get()?.n);
+  }
+  householdJobSummaries(discordId: string): JobSummary[] {
+    return this.db
+      .prepare(
+        `SELECT payload FROM job_summaries
+      WHERE owner_id=? ORDER BY created_at DESC,id DESC LIMIT 50`,
+      )
+      .all(discordId)
+      .map((row) => JSON.parse(row.payload as string) as JobSummary);
+  }
+  jobSummaryRevision(): string {
+    return `${this.jobEpoch}:${this.jobRevision}`;
+  }
+  subscriptionCount(status: string): number {
+    return Number(
+      this.db
+        .prepare("SELECT COUNT(*) AS n FROM subscriptions WHERE json_extract(payload,'$.status')=?")
+        .get(status)?.n,
+    );
+  }
+  jobsAwaitingCredentials(limit: number): Array<{ id: string; count: number }> {
+    return this.db
+      .prepare(
+        `SELECT credentials.job_id AS id, COUNT(*) AS n
+      FROM credentials JOIN job_summaries ON job_summaries.id=credentials.job_id
+      WHERE credentials.expires>? AND job_summaries.status NOT IN ('queued','running')
+      GROUP BY credentials.job_id ORDER BY MIN(credentials.expires),credentials.job_id LIMIT ?`,
+      )
+      .all(Date.now() / 1000, limit)
+      .map((row) => ({ id: String(row.id), count: Number(row.n) }));
+  }
+  uncertainDeliveries(limit: number): string[] {
+    return this.db
+      .prepare(
+        `SELECT job_id FROM bot_message_history
+      WHERE status='uncertain' AND created_ms>?
+      GROUP BY job_id ORDER BY MAX(created_ms) DESC LIMIT ?`,
+      )
+      .all(Date.now() - (this.settings().bot_message_retention_days ?? 30) * 86_400_000, limit)
+      .map(({ job_id }) => String(job_id));
+  }
+  jobSummaries({
+    status = 'all',
+    query = '',
+    limit,
+    offset = 0,
+    oldestFirst = false,
+  }: JobSummaryQuery) {
+    const conditions: string[] = [];
+    const bindings: string[] = [];
+    if (status === 'active') conditions.push("status IN ('queued','running')");
+    else if (status === 'partial') conditions.push("outcome IN ('partial','interrupted')");
+    else if (status === 'canceled') conditions.push("outcome IN ('canceled','cancelled')");
+    else if (status !== 'all') {
+      conditions.push('outcome=?');
+      bindings.push(status);
+    }
+    if (query.trim()) {
+      conditions.push('instr(search_text,?)>0');
+      bindings.push(query.trim().toLowerCase());
+    }
+    const where = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
+    const from = oldestFirst
+      ? 'job_summaries LEFT JOIN job_retention ON job_id=id'
+      : 'job_summaries';
+    const order = oldestFirst
+      ? `CASE WHEN status IN ('completed','partial','failed','interrupted','cancelled','canceled') THEN 0 ELSE 1 END,
+        age_ms IS NULL,age_ms,created_at,id`
+      : 'created_at DESC,id DESC';
+    const jobs = this.db
+      .prepare(`SELECT payload FROM ${from}${where} ORDER BY ${order} LIMIT ? OFFSET ?`)
+      .all(...bindings, limit, offset)
+      .map((row) => JSON.parse(String(row.payload)) as JobSummary);
+    const total = Number(
+      this.db.prepare(`SELECT COUNT(*) AS n FROM job_summaries${where}`).get(...bindings)?.n,
+    );
+    return { jobs, total };
+  }
+  jobSummary(id: string): JobSummary | null {
+    const row = this.db.prepare('SELECT payload FROM job_summaries WHERE id=?').get(id);
+    return row ? (JSON.parse(String(row.payload)) as JobSummary) : null;
+  }
+  activeJobCount(): number {
+    return Number(
+      this.db
+        .prepare("SELECT COUNT(*) AS n FROM job_summaries WHERE status IN ('queued','running')")
+        .get()?.n,
+    );
+  }
+  activeSnapshotPins(kind: 'source' | 'destination'): Set<string> {
+    const rows = this.db
+      .prepare(
+        "SELECT source_pins,destination_pin FROM job_summaries WHERE status IN ('queued','running')",
+      )
+      .all();
+    return new Set(
+      rows.flatMap((row) =>
+        kind === 'source'
+          ? Object.values(JSON.parse(String(row.source_pins ?? '{}')) as Record<string, string>)
+          : row.destination_pin
+            ? [String(row.destination_pin)]
+            : [],
+      ),
+    );
+  }
+  hasActiveMemberJob(id: string): boolean {
+    return !!this.db
+      .prepare(
+        "SELECT 1 FROM job_summaries WHERE owner_id=? AND status IN ('queued','running') LIMIT 1",
+      )
+      .get(id);
+  }
+  private recoverableJobs(): Job[] {
+    return this.db
+      .prepare(
+        `SELECT jobs.payload FROM job_summaries
+      JOIN jobs USING(id)
+      WHERE job_summaries.status IN ('queued','running')
+        AND (job_summaries.status='running'
+          OR NOT EXISTS(SELECT 1 FROM job_queue WHERE job_id=jobs.id))`,
+      )
+      .all()
+      .map((row) => JSON.parse(String(row.payload)) as Job);
   }
   jobs(): Job[] {
     return this.db
@@ -656,6 +980,7 @@ export class Store {
         remove.run(id);
         result.removed_ids.push(id);
       }
+      if (result.removed_ids.length) this.jobRevision++;
       // Journals, subscription dedupe, identity links and alert receipts are separate
       // operational state. They deliberately survive removing a presentation report.
       return result;
@@ -666,6 +991,8 @@ export class Store {
     requests: JobRequest[],
     settings: Settings,
     beforePersist?: () => void,
+    submission?: MigrationSubmission,
+    sourceScope?: string,
   ): void {
     this.transaction(() => {
       beforePersist?.();
@@ -673,7 +1000,43 @@ export class Store {
       this.db
         .prepare('INSERT INTO job_queue VALUES (?,?)')
         .run(job.id, this.encrypt({ requests, settings }));
+      const sources = requests.flatMap(({ source_user_id }) =>
+        source_user_id ? [source_user_id] : [],
+      );
+      if (sources.length)
+        this.db
+          .prepare('INSERT INTO migration_submissions VALUES (?,?,?,?,?,?)')
+          .run(
+            job.id,
+            submission?.key ?? null,
+            submission?.owner ?? null,
+            submission?.requestHash ?? null,
+            JSON.stringify(sources),
+            sourceScope ?? null,
+          );
     });
+  }
+  migrationSubmission(key: string): { id: string; requestHash: string } | null {
+    const row = this.db
+      .prepare('SELECT job_id,request_hash FROM migration_submissions WHERE receipt_key=?')
+      .get(key);
+    return row ? { id: String(row.job_id), requestHash: String(row.request_hash) } : null;
+  }
+  latestMigrationSubmission(owner: string): string | null {
+    const row = this.db
+      .prepare(
+        'SELECT job_id FROM migration_submissions WHERE owner_scope=? ORDER BY rowid DESC LIMIT 1',
+      )
+      .get(owner);
+    return row ? String(row.job_id) : null;
+  }
+  migrationSources(id: string): { ids: string[]; scope: string } | null {
+    const row = this.db
+      .prepare('SELECT source_ids,source_scope FROM migration_submissions WHERE job_id=?')
+      .get(id);
+    return row && typeof row.source_scope === 'string'
+      ? { ids: JSON.parse(String(row.source_ids)) as string[], scope: row.source_scope }
+      : null;
   }
   queuedJobs(): QueuedJob[] {
     return this.db
@@ -758,17 +1121,21 @@ export class Store {
     serverUrl: string,
     message?: string,
   ): void {
-    this.db.prepare('INSERT OR REPLACE INTO credentials VALUES (?,?,?,?)').run(
-      jobId,
-      username,
-      this.encrypt({
+    this.db
+      .prepare(
+        'INSERT OR REPLACE INTO credentials (job_id,username,encrypted,expires) VALUES (?,?,?,?)',
+      )
+      .run(
+        jobId,
         username,
-        password,
-        server_url: serverUrl,
-        ...(message ? { message } : {}),
-      }),
-      Date.now() / 1000 + 86400,
-    );
+        this.encrypt({
+          username,
+          password,
+          server_url: serverUrl,
+          ...(message ? { message } : {}),
+        }),
+        Date.now() / 1000 + 86400,
+      );
   }
   saveBotMessage(jobId: string, message: BotMessageHistory): void {
     if (!this.db.prepare('SELECT 1 FROM jobs WHERE id=?').get(jobId))
@@ -822,33 +1189,76 @@ export class Store {
     return this.transaction(() => {
       const time = Date.now() / 1000;
       const values = this.db
-        .prepare('SELECT encrypted FROM credentials WHERE job_id=? AND expires>?')
+        .prepare(
+          'SELECT encrypted FROM credentials WHERE job_id=? AND expires>? AND reveal_session IS NULL',
+        )
         .all(jobId, time)
         .map((row) => this.decrypt<Credentials>(row.encrypted as Uint8Array));
-      this.db.prepare('DELETE FROM credentials WHERE job_id=? OR expires<=?').run(jobId, time);
+      this.db
+        .prepare(
+          'DELETE FROM credentials WHERE (job_id=? AND reveal_session IS NULL) OR expires<=?',
+        )
+        .run(jobId, time);
       return values;
     });
+  }
+  revealCredentials(jobId: string, sessionId: string): Credentials[] {
+    const owner = createHash('sha256').update(sessionId).digest('hex');
+    return this.transaction(() => {
+      const time = Date.now() / 1000;
+      this.db
+        .prepare(
+          'UPDATE credentials SET reveal_session=?, expires=MIN(expires,?) WHERE job_id=? AND expires>? AND reveal_session IS NULL',
+        )
+        .run(owner, time + credentialRecoverySeconds, jobId, time);
+      return this.db
+        .prepare(
+          'SELECT encrypted FROM credentials WHERE job_id=? AND reveal_session=? AND expires>? ORDER BY username',
+        )
+        .all(jobId, owner, time)
+        .map((row) => this.decrypt<Credentials>(row.encrypted as Uint8Array));
+    });
+  }
+  consumeCredentialReceipt(jobId: string, sessionId: string): void {
+    const owner = createHash('sha256').update(sessionId).digest('hex');
+    this.db
+      .prepare('DELETE FROM credentials WHERE job_id=? AND reveal_session=?')
+      .run(jobId, owner);
+  }
+  discardSessionCredentialReceipts(sessionId: string): void {
+    const owner = createHash('sha256').update(sessionId).digest('hex');
+    this.db.prepare('DELETE FROM credentials WHERE reveal_session=?').run(owner);
   }
   link(id: string, slot = 1): Link | null {
     return (
       (this.db
-        .prepare('SELECT * FROM links WHERE discord_user_id=? AND membership_slot=?')
+        .prepare(
+          'SELECT discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled FROM links WHERE discord_user_id=? AND membership_slot=?',
+        )
         .get(String(id), slot) as unknown as Link) ?? null
     );
   }
   linkForRemote(id: string): Link | null {
     return (
-      (this.db.prepare('SELECT * FROM links WHERE remote_id=?').get(id) as unknown as Link) ?? null
+      (this.db
+        .prepare(
+          'SELECT discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled FROM links WHERE remote_id=?',
+        )
+        .get(id) as unknown as Link) ?? null
     );
   }
   links(): Link[] {
     return this.db
-      .prepare('SELECT * FROM links ORDER BY discord_user_id,membership_slot')
+      .prepare(
+        'SELECT discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled FROM links ORDER BY discord_user_id,membership_slot',
+      )
       .all() as unknown as Link[];
   }
   linksForMember(id: string): Link[] {
     return this.db
-      .prepare('SELECT * FROM links WHERE discord_user_id=? ORDER BY membership_slot')
+      .prepare(
+        'SELECT discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled FROM links WHERE discord_user_id=? ORDER BY membership_slot',
+      )
       .all(String(id)) as unknown as Link[];
   }
   saveLink(
@@ -865,9 +1275,16 @@ export class Store {
       const previous = this.link(discordId, slot);
       this.db
         .prepare(
-          'INSERT INTO links (discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled) VALUES (?,?,?,?,?,NULL) ON CONFLICT(discord_user_id,membership_slot) DO UPDATE SET username=excluded.username, remote_id=excluded.remote_id, disabled_by_jellyport=excluded.disabled_by_jellyport, pending_disabled=NULL',
+          'INSERT INTO links (discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled,discord_authority) VALUES (?,?,?,?,?,NULL,?) ON CONFLICT(discord_user_id,membership_slot) DO UPDATE SET username=excluded.username, remote_id=excluded.remote_id, disabled_by_jellyport=excluded.disabled_by_jellyport, pending_disabled=NULL',
         )
-        .run(String(discordId), slot, username, remoteId, Number(disabled));
+        .run(
+          String(discordId),
+          slot,
+          username,
+          remoteId,
+          Number(disabled),
+          previous ? null : discordAuthority(this.settings()),
+        );
       if (previous && previous.remote_id !== remoteId)
         this.deleteAccountIdentityBinding('link', previous.remote_id);
       this.saveAccountIdentityBinding('link', remoteId, remoteId, username);
@@ -877,15 +1294,90 @@ export class Store {
       throw error;
     }
   }
+  linkAuthorities(discordId: string): Array<string | null> {
+    return this.db
+      .prepare(
+        'SELECT discord_authority FROM links WHERE discord_user_id=? ORDER BY membership_slot',
+      )
+      .all(discordId)
+      .map((row) => row.discord_authority as string | null);
+  }
+  approveLinkAuthority(link: Link, settings: Settings): void {
+    const updated = this.db
+      .prepare(
+        'UPDATE links SET discord_authority=? WHERE discord_user_id=? AND membership_slot=? AND remote_id=? AND username=?',
+      )
+      .run(
+        discordAuthority(settings),
+        link.discord_user_id,
+        link.membership_slot,
+        link.remote_id,
+        link.username,
+      );
+    if (updated.changes !== 1)
+      throw new Error('The linked account changed. Review this household again.');
+  }
   setLinkPending(discordId: string, disabled: boolean | null, slot = 1): void {
     this.db
       .prepare('UPDATE links SET pending_disabled=? WHERE discord_user_id=? AND membership_slot=?')
       .run(disabled === null ? null : Number(disabled), String(discordId), slot);
   }
+  private householdAccessKey(discordId: string, settings: Settings): string {
+    const auth = this.authState();
+    return createHash('sha256')
+      .update(
+        JSON.stringify([
+          discordId,
+          settings.jellyfin_url,
+          settings.emby_url,
+          auth?.kind === 'configured' ? auth.serverId : null,
+        ]),
+      )
+      .digest('hex');
+  }
+  householdAccessChanges(discordId: string, settings: Settings): HouseholdAccessChange[] {
+    const owner = this.householdAccessKey(discordId, settings);
+    return this.db
+      .prepare(
+        `SELECT id,encrypted FROM household_access_history
+      WHERE owner_key=? ORDER BY at DESC,id DESC LIMIT 50`,
+      )
+      .all(owner)
+      .map((row) => {
+        const saved = this.decrypt<{ owner: string; change: HouseholdAccessChange }>(
+          row.encrypted as Uint8Array,
+        );
+        if (saved.owner !== owner || saved.change.id !== row.id)
+          throw new Error('The saved household access history belongs to another record.');
+        return saved.change;
+      });
+  }
+  saveHouseholdAccessChange(
+    discordId: string,
+    settings: Settings,
+    input: Pick<HouseholdAccessChange, 'kind' | 'username' | 'disabled'>,
+  ): void {
+    const owner = this.householdAccessKey(discordId, settings);
+    const change = { ...input, id: randomUUID(), at: new Date().toISOString() };
+    this.transaction(() => {
+      this.db
+        .prepare('INSERT INTO household_access_history VALUES (?,?,?,?)')
+        .run(change.id, owner, change.at, this.encrypt({ owner, change }));
+      this.db
+        .prepare(
+          `DELETE FROM household_access_history WHERE id IN (
+        SELECT id FROM household_access_history WHERE owner_key=? ORDER BY at DESC,id DESC LIMIT -1 OFFSET 50
+      )`,
+        )
+        .run(owner);
+    });
+  }
   subscription(id: string): SubscriptionEvent | null {
     const row = this.db.prepare('SELECT payload FROM subscriptions WHERE id=?').get(id);
-    if (!row) return null;
-    const event = JSON.parse(row.payload as string) as SubscriptionEvent & {
+    return row ? this.decodeSubscription(row.payload as string) : null;
+  }
+  private decodeSubscription(payload: string): SubscriptionEvent {
+    const event = JSON.parse(payload) as SubscriptionEvent & {
       _stripe_entitlement_encrypted?: string;
     };
     if (event._stripe_entitlement_encrypted !== undefined) {
@@ -902,32 +1394,28 @@ export class Store {
     }
     return event;
   }
+  subscriptionsForMember(discordId: string, source?: string, limit = -1): SubscriptionEvent[] {
+    const filter = "json_extract(payload,'$.discord_user_id')=?";
+    const order = "ORDER BY json_extract(payload,'$.created_at') DESC LIMIT ?";
+    const rows =
+      source === undefined
+        ? this.db
+            .prepare(`SELECT payload FROM subscriptions WHERE ${filter} ${order}`)
+            .all(discordId, limit)
+        : this.db
+            .prepare(
+              `SELECT payload FROM subscriptions WHERE ${filter} AND json_extract(payload,'$.source')=? ${order}`,
+            )
+            .all(discordId, source, limit);
+    return rows.map((row) => this.decodeSubscription(row.payload as string));
+  }
   subscriptions(): SubscriptionEvent[] {
     return this.db
       .prepare(
         "SELECT payload FROM subscriptions ORDER BY json_extract(payload,'$.created_at') DESC",
       )
       .all()
-      .map((row) => {
-        const event = JSON.parse(row.payload as string) as SubscriptionEvent & {
-          _stripe_entitlement_encrypted?: string;
-        };
-        if (event._stripe_entitlement_encrypted !== undefined) {
-          if (typeof event._stripe_entitlement_encrypted !== 'string')
-            throw new Error('The saved Stripe entitlement could not be verified.');
-          const saved = this.decrypt<{
-            event_id: string;
-            fact: NonNullable<SubscriptionEvent['stripe_entitlement']>;
-          }>(Buffer.from(event._stripe_entitlement_encrypted, 'base64'));
-          if (saved.event_id !== event.id || saved.fact?.event_id !== event.id)
-            throw new Error(
-              'The saved Stripe entitlement belongs to a different subscription event.',
-            );
-          event.stripe_entitlement = saved.fact;
-          delete event._stripe_entitlement_encrypted;
-        }
-        return event;
-      });
+      .map((row) => this.decodeSubscription(row.payload as string));
   }
   saveSubscription(event: SubscriptionEvent): void {
     const { stripe_entitlement, ...payload } = event as SubscriptionEvent & {

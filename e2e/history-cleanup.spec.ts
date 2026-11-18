@@ -1,34 +1,28 @@
-import { test, expect, navigate, expectContainedLayout } from './fixtures';
+import { test, expect, navigate, expectContainedLayout, mockActivity } from './fixtures';
 
 test('Activity exposes bulk and per-report deletion while protecting active rows and canceled reviews', async ({
   page,
   mutations,
 }, info) => {
   const now = new Date().toISOString();
-  await page.route('**/api/jobs', async (route) =>
-    route.fulfill({
-      json: {
-        jobs: [
-          {
-            id: 'synthetic-finished-report',
-            kind: 'migrate',
-            status: 'partial',
-            created_at: now,
-            finished_at: now,
-            results: [{ username: 'Synthetic completed member', status: 'completed' }],
-          },
-          {
-            id: 'synthetic-active-report',
-            kind: 'migrate',
-            status: 'running',
-            created_at: '2000-01-01T00:00:00Z',
-            progress: { total: 1, processed: 0 },
-            results: [{ username: 'Synthetic active member', status: 'running' }],
-          },
-        ],
-      },
-    }),
-  );
+  await mockActivity(page, [
+    {
+      id: 'synthetic-finished-report',
+      kind: 'migrate',
+      status: 'partial',
+      created_at: now,
+      finished_at: now,
+      results: [{ username: 'Synthetic completed member', status: 'completed' }],
+    },
+    {
+      id: 'synthetic-active-report',
+      kind: 'migrate',
+      status: 'running',
+      created_at: '2000-01-01T00:00:00Z',
+      progress: { total: 1, processed: 0 },
+      results: [{ username: 'Synthetic active member', status: 'running' }],
+    },
+  ]);
   await page.goto('/#/activity');
   await expect(
     page.getByRole('heading', { name: 'Activity', level: 1, exact: true }),
@@ -132,10 +126,16 @@ test('clears a reviewed report after credentials are consumed, preserving the me
     .getByRole('dialog', { name: 'Reveal new account credentials?' })
     .getByRole('button', { name: 'Reveal credentials', exact: true })
     .click();
+  const consumed = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'DELETE' &&
+      new URL(response.url()).pathname === `/api/jobs/${id}/credentials/receipt`,
+  );
   await page
     .getByRole('dialog', { name: 'New account credentials', exact: true })
     .getByRole('button', { name: 'Close dialog', exact: true })
     .click();
+  expect((await consumed).ok()).toBe(true);
   await page.getByRole('button', { name: 'View operation details' }).click();
   details = page.getByRole('dialog', { name: 'Operation details' });
   await details.getByRole('button', { name: 'Delete report…', exact: true }).click();

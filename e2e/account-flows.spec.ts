@@ -17,6 +17,42 @@ test('creates an independent account and reveals its credentials only on request
   const confirmation = page.getByRole('dialog', { name: 'Reveal new account credentials?' });
   await expect(confirmation).toContainText('one-time view');
   expect(mutations.filter((request) => request.endsWith('/credentials'))).toEqual([]);
+  let forwarded!: () => void;
+  let dropResponse!: () => void;
+  const firstReceived = new Promise<void>((resolve) => {
+    forwarded = resolve;
+  });
+  const drop = new Promise<void>((resolve) => {
+    dropResponse = resolve;
+  });
+  await page.route(
+    '**/api/jobs/*/credentials',
+    async (route) => {
+      const response = await route.fetch();
+      expect(response.ok()).toBe(true);
+      forwarded();
+      await drop;
+      await route.abort();
+    },
+    { times: 1 },
+  );
+  await confirmation.getByRole('button', { name: 'Reveal credentials', exact: true }).click();
+  try {
+    await firstReceived;
+    await expect(confirmation.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    await expect(confirmation.getByRole('button', { name: 'Close dialog' })).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await expect(confirmation).toBeVisible();
+  } finally {
+    dropResponse();
+  }
+  await expect(confirmation.getByRole('button', { name: 'Cancel' })).toBeEnabled();
+  await page.reload();
+  await navigate(page, 'Activity');
+  await page.getByRole('searchbox', { name: 'Search operations' }).fill(username);
+  const report = page.getByRole('row').filter({ hasText: username });
+  await report.getByRole('button', { name: 'View operation details', exact: true }).click();
+  await details.getByRole('button', { name: 'Reveal new credentials', exact: true }).click();
   await confirmation.getByRole('button', { name: 'Reveal credentials', exact: true }).click();
   const credentials = page.getByRole('dialog', { name: 'New account credentials', exact: true });
   await expect(credentials).toBeVisible();
@@ -25,10 +61,16 @@ test('creates an independent account and reveals its credentials only on request
     credentials.getByRole('button', { name: 'Copy credentials', exact: true }),
   ).toBeVisible();
   await expectContainedLayout(page);
+  const consumed = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'DELETE' &&
+      new URL(response.url()).pathname.endsWith('/credentials/receipt'),
+  );
   await credentials.getByRole('button', { name: 'Close dialog', exact: true }).click();
+  expect((await consumed).ok()).toBe(true);
   await expect(credentials).toHaveCount(0);
   expect(mutations.filter((request) => request === 'POST /api/accounts')).toHaveLength(1);
-  expect(mutations.filter((request) => request.endsWith('/credentials'))).toHaveLength(1);
+  expect(mutations.filter((request) => request.endsWith('/credentials'))).toHaveLength(2);
   const storage = await page.evaluate(() => ({
     local: { ...localStorage },
     session: { ...sessionStorage },

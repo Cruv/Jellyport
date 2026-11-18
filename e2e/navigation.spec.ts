@@ -1,4 +1,4 @@
-import { test, expect, navigate, expectContainedLayout } from './fixtures';
+import { test, expect, navigate, expectContainedLayout, mockActivity } from './fixtures';
 
 const pages = [
   ['Overview', '#/overview'],
@@ -142,22 +142,16 @@ test('back navigation dismisses a delete review and forward does not replay its 
   page,
   mutations,
 }) => {
-  await page.route('**/api/jobs', async (route) =>
-    route.fulfill({
-      json: {
-        jobs: [
-          {
-            id: 'synthetic-private-report',
-            kind: 'migrate',
-            status: 'completed',
-            created_at: '2000-01-01T00:00:00Z',
-            finished_at: '2000-01-02T00:00:00Z',
-            results: [],
-          },
-        ],
-      },
-    }),
-  );
+  await mockActivity(page, [
+    {
+      id: 'synthetic-private-report',
+      kind: 'migrate',
+      status: 'completed',
+      created_at: '2000-01-01T00:00:00Z',
+      finished_at: '2000-01-02T00:00:00Z',
+      results: [],
+    },
+  ]);
   await page.goto('/#/overview');
   await navigate(page, 'Activity');
   await page.getByRole('button', { name: 'Delete activity…', exact: true }).click();

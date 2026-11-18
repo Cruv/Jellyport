@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import {
   Client,
   Events,
@@ -28,6 +29,7 @@ import {
 } from './credential-message.js';
 import { discordCredentialContent } from './credentials.js';
 import { parseMee6Identity } from './mee6-identity.js';
+import { discordAuthority } from './discord-authority.js';
 import {
   parseConfiguredSubscriptionMessage,
   type SubscriptionMessagePattern,
@@ -59,6 +61,29 @@ export interface BotService {
 }
 
 type Settings = Partial<AppSettings>;
+const botConnectionFields = [
+  'discord_enabled',
+  'discord_bot_token',
+  'discord_guild_id',
+  'discord_admin_role_id',
+  'discord_member_role_id',
+  'discord_role_events',
+  'discord_message_events',
+  'discord_subscription_channel_id',
+  'discord_subscription_bot_id',
+  'new_subscriber_source',
+  'membership_tiers',
+] as const satisfies readonly (keyof AppSettings)[];
+const botRuntimeFields = [
+  'discord_emby_role_id',
+  'discord_jellyfin_role_id',
+  'discord_auto_role_sync',
+  'jellyfin_url',
+  'jellyfin_public_url',
+  'credential_message_template',
+  'bot_message_templates',
+  'subscription_message_patterns',
+] as const satisfies readonly (keyof AppSettings)[];
 type Identity = { id: string; username: string; joined_at?: string };
 type Authorization = { administrator: boolean; roleIds: Iterable<unknown>; adminRoleId?: unknown };
 type Eligibility = { bot: boolean; roleIds: Iterable<unknown>; memberRoleId?: unknown };
@@ -409,6 +434,29 @@ export class BotManager {
         ? { admin_alerts: this.service.adminAlerts.status(this.settings as AppSettings) }
         : {}),
     };
+  }
+  authority(): string {
+    return discordAuthority(this.settings);
+  }
+
+  applySettings(previous: AppSettings, settings: AppSettings): Promise<void> {
+    const changed = (field: keyof AppSettings) =>
+      !isDeepStrictEqual(previous[field], settings[field]);
+    if (
+      (previous.discord_enabled || settings.discord_enabled) &&
+      (botConnectionFields.some(changed) ||
+        !isDeepStrictEqual(botIntents(previous), botIntents(settings)))
+    )
+      return this.restart(settings);
+    if (!botRuntimeFields.some(changed)) return Promise.resolve();
+    const operation = this.changing.then(() => {
+      this.settings = { ...settings };
+      if (this.adminAlertTimer) clearInterval(this.adminAlertTimer);
+      this.adminAlertTimer = null;
+      if (this.client?.isReady()) this.startAdminAlerts(this.client);
+    });
+    this.changing = operation.catch(() => {});
+    return operation;
   }
 
   restart(settings: Settings): Promise<void> {
@@ -928,7 +976,12 @@ export class BotManager {
     return { id: member.id, username: member.user.username, roles: [...member.roles.cache.keys()] };
   }
 
-  async updateTagRoles(userId: string, add: string[], remove: string[]): Promise<void> {
+  async updateTagRoles(
+    userId: string,
+    add: string[],
+    remove: string[],
+    guard?: () => void,
+  ): Promise<void> {
     if (
       !Array.isArray(add) ||
       !Array.isArray(remove) ||
@@ -975,6 +1028,7 @@ export class BotManager {
         this.checkActive();
         if (this.client !== context.client || this.settings !== context.settings)
           throw new Stopped();
+        guard?.();
         if (!member.roles.cache.has(id))
           await this.wait(member.roles.add(id, 'Jellyport media account organization'), 20_000);
       }
@@ -982,6 +1036,7 @@ export class BotManager {
         this.checkActive();
         if (this.client !== context.client || this.settings !== context.settings)
           throw new Stopped();
+        guard?.();
         if (member.roles.cache.has(id))
           await this.wait(member.roles.remove(id, 'Jellyport media account organization'), 20_000);
       }
@@ -1696,6 +1751,7 @@ export class BotManager {
         ...parsed,
         id: message.id,
         guild_id: message.guild.id,
+        discord_authority: discordAuthority(settings),
         discord_user_id: identity?.id ?? null,
         username: identity?.username ?? parsed.username,
         source: 'mee6_message',
@@ -1731,6 +1787,7 @@ export class BotManager {
       await this.service.recordSubscription({
         id: randomUUID(),
         guild_id: after.guild.id,
+        discord_authority: discordAuthority(settings),
         discord_user_id: after.id,
         username: after.user.username,
         action: hasRole ? 'subscribe' : 'expire',
@@ -1755,6 +1812,7 @@ export class BotManager {
       await this.service.recordSubscription({
         id: randomUUID(),
         guild_id: member.guild.id,
+        discord_authority: discordAuthority(this.settings),
         discord_user_id: member.id,
         username: member.user.username,
         action: 'expire',

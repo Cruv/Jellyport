@@ -308,6 +308,14 @@ test('complimentary policy saves without media writes and paid slots downgrade a
         admin.servers.users.jellyfin.find((user) => user.Id === slot.remote_id)?.Policy?.IsDisabled,
     ),
   ).toEqual([false, true, true]);
+  await page.getByRole('button', { name: 'Open household timeline', exact: true }).click();
+  const timeline = page.getByRole('dialog', { name: 'Household timeline for crew_owner' });
+  await expect(timeline).toContainText('Sloop · Active · 1 slot');
+  await expect(timeline).toContainText('crew_owner_2');
+  await expect(timeline).toContainText('Disabled by Jellyport');
+  await expect(timeline).toContainText('Membership account operation');
+  await expectContainedLayout(page);
+  await timeline.getByRole('button', { name: 'Close dialog' }).click();
   expect((await queueMembership(page, admin, 'galleon')).status).toBe('completed');
   expect(
     [1, 2, 3].map((slot) => admin.app.jellyport.store.link(paidOwner, slot)?.remote_id),

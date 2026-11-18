@@ -19,11 +19,12 @@
     "build": "npm run typecheck && tsc -p tsconfig.build.json && vite build",
     "start": "node dist/server/index.js",
     "benchmark:destination": "node --import tsx scripts/benchmark-destination.ts",
-    "benchmark:jellyfin-import": "node --import tsx scripts/benchmark-jellyfin-import.ts"
+    "benchmark:jellyfin-import": "node --import tsx scripts/benchmark-jellyfin-import.ts",
+    "backup:verify": "node --import tsx server/verify-backup-cli.ts"
   },
   "dependencies": {
     "@fastify/cookie": "11.1.5",
-    "@fastify/static": "10.1.8",
+    "@fastify/static": "10.1.11",
     "discord.js": "14.27.0",
     "dotenv": "18.0.9",
     "fastify": "5.12.7",

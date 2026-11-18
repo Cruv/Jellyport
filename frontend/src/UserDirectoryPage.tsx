@@ -153,6 +153,10 @@ export default function UserDirectoryPage({
     autoSync: !!settings.discord_auto_role_sync,
     embyOnly: settings.discord_emby_only_role === true,
   });
+  const [roleRevisions, setRoleRevisions] = useWorkspaceDraftState(
+    'organization.settingRevisions',
+    settings.field_revisions,
+  );
   const [preview, setPreview] = useState<DiscordTagPreview | null>(null);
   const organizationInvite = safeUrl(settings.bot_organization_invite_url);
   const mounted = useRef(true);
@@ -460,18 +464,48 @@ export default function UserDirectoryPage({
   function saveRoles(event: FormEvent) {
     event.preventDefault();
     void run(async (signal) => {
-      await api('/api/settings', {
+      const values = {
+        discord_emby_role_id: embyRole,
+        discord_jellyfin_role_id: jellyfinRole,
+        discord_auto_role_sync: autoSync,
+        discord_emby_only_role: embyOnly,
+      };
+      const previous = {
+        discord_emby_role_id: savedRoles.embyRole,
+        discord_jellyfin_role_id: savedRoles.jellyfinRole,
+        discord_auto_role_sync: savedRoles.autoSync,
+        discord_emby_only_role: savedRoles.embyOnly,
+      };
+      const fields = (Object.keys(values) as (keyof typeof values)[]).filter(
+        (key) => values[key] !== previous[key],
+      );
+      const saved = await api<Settings>('/api/settings', {
         method: 'PUT',
-        body: {
-          discord_emby_role_id: embyRole,
-          discord_jellyfin_role_id: jellyfinRole,
-          discord_auto_role_sync: autoSync,
-          discord_emby_only_role: embyOnly,
-        },
+        body: roleRevisions
+          ? {
+              changes: Object.fromEntries(fields.map((key) => [key, values[key]])),
+              expected_revisions: Object.fromEntries(
+                fields.map((key) => [key, roleRevisions[key] ?? '0']),
+              ),
+            }
+          : values,
         signal,
       });
       if (!mounted.current || signal.aborted) return;
-      setSavedRoles({ embyRole, jellyfinRole, autoSync, embyOnly });
+      const current = saved?.field_revisions
+        ? {
+            embyRole: saved.discord_emby_role_id || '',
+            jellyfinRole: saved.discord_jellyfin_role_id || '',
+            autoSync: !!saved.discord_auto_role_sync,
+            embyOnly: !!saved.discord_emby_only_role,
+          }
+        : { embyRole, jellyfinRole, autoSync, embyOnly };
+      setSavedRoles(current);
+      setEmbyRole(current.embyRole);
+      setJellyfinRole(current.jellyfinRole);
+      setAutoSync(current.autoSync);
+      setEmbyOnly(current.embyOnly);
+      setRoleRevisions(saved?.field_revisions);
       setPreview(null);
       notify('Discord organization settings saved.');
     }, true);

@@ -186,3 +186,29 @@ sudo chmod 700 /path/to/jellyport
 ```
 
 For bind-mount deployments, stop Jellyport in Portainer and copy the complete host data directory to a new backup location. Restore the database and `secret.key` from the same backup while the service is stopped; retain any SQLite journal files present in the stopped backup. The key is required to decrypt saved server credentials and the Jellyfin pairing. Protect the backup as you would the live data directory. Start only one container against the restored data.
+
+### Verify a Jellyport backup offline
+
+Use a separately saved copy containing `jellyport.db`, its matching `secret.key`,
+and `jellyport.db-wal` if the backup includes one. Set `JELLYPORT_DATA_DIR` to the
+operating directory when running the source command so the verifier can reject it.
+
+```sh
+npm run backup:verify -- --backup /path/to/offline-copy --receipt /path/to/status/backup.verified
+```
+
+A built installation can run the same command with
+`node dist/server/verify-backup-cli.js`. The verifier checks SQLite integrity,
+tests the current schema against a scratch copy, and authenticates and decrypts
+saved encrypted database records. It outputs only the verification time and
+record count. A missing key, stale copy, incompatible database, or wrong key
+requires a new offline copy or the original matching key.
+
+The optional receipt stays outside both data directories. To show it in
+**Overview → Operations inbox**, configure `JELLYPORT_BACKUP_VERIFICATION_RECEIPT`
+with its path as seen by Jellyport. If containerized, make the receipt directory
+available via a read-only mount and give the Jellyport UID permission to read the
+receipt. The configured instance accepts only a receipt signed with its matching
+data key. This check covers Jellyport's SQLite records and encryption key.
+Media-server backups and the completeness of external history projections have
+their own import checks.

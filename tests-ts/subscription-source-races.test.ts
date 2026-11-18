@@ -282,7 +282,7 @@ describe('automatic subscription source changes', () => {
     store.saveSettings({ ...store.settings(), new_subscriber_source: 'stripe' });
     release.resolve();
     const event = await renewal;
-    expect(event.status).toBe('pending');
+    expect(event.status).toBe('failed');
     expect(event.job_id).toBeTruthy();
     expect(service.getJob(event.job_id!).results.some((result) => result.status === 'failed')).toBe(
       true,

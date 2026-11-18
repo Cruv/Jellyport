@@ -92,6 +92,7 @@ interface State {
   last_attempt_at: string | null;
   last_error: string | null;
   last_finished_at?: string | null;
+  last_successful_at?: string;
   last_outcome?: ImportOutcome;
   last_scheduled_date?: string;
   last_diagnostic?: DestinationCatalogDiagnostic;
@@ -361,7 +362,7 @@ export class DestinationCatalogs {
       return false;
     }
   }
-  async status() {
+  async status(observed?: { id?: string; version?: string }) {
     const available = await this.helper();
     const latest = this.state.generations[0];
     const record =
@@ -373,6 +374,10 @@ export class DestinationCatalogs {
         current(latest) &&
         new URL(latest.binding.url).toString() ===
           new URL(this.store.settings().jellyfin_url).toString() &&
+        (!observed?.id || latest.binding.server_id === observed.id) &&
+        (!observed?.version ||
+          normalizedServerVersion(latest.binding.version) ===
+            normalizedServerVersion(observed.version)) &&
         (await this.completeFile(latest));
     } catch {
       /* An expired/missing record remains visible, but cannot be selected. */
@@ -417,6 +422,7 @@ export class DestinationCatalogs {
         this.state.last_finished_at === undefined
           ? (this.state.generations[0]?.finished_at ?? null)
           : this.state.last_finished_at,
+      last_successful_at: this.state.last_successful_at ?? latest?.finished_at ?? null,
       last_error: this.state.last_error,
       error_code: this.state.last_error_code ?? null,
       diagnostic: this.state.last_diagnostic ?? null,
@@ -1411,6 +1417,7 @@ export class DestinationCatalogs {
               this.state.last_error = null;
             else {
               this.state.generations.unshift(value);
+              this.state.last_successful_at = value.finished_at;
               this.state.last_error = null;
               adopted = true;
             }

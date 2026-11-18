@@ -36,8 +36,8 @@ class FamilyBot implements BotAdapter {
   async membershipActive() {
     return this.present && this.active;
   }
-  async activeMembers() {
-    return this.present && this.active ? [{ id: owner, username: 'Jim' }] : [];
+  async activeMemberPage() {
+    return { members: this.present && this.active ? [{ id: owner, username: 'Jim' }] : [] };
   }
 }
 

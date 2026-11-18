@@ -498,6 +498,8 @@ describe('authenticated role routes', () => {
       payload.role_revision,
       payload.user_ids,
       payload.sections,
+      expect.any(Function),
+      undefined,
     );
   });
   it('rejects missing and out-of-scope default roles without changing stored settings', async () => {

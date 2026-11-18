@@ -101,12 +101,19 @@ async function fixture(source: 'stripe' | 'trusted_messages' = 'stripe') {
     onEntitlement,
   });
   resources.push({ directory, store, integration });
-  const configure = (extra: Partial<Parameters<StripeIntegration['configure']>[0]> = {}) =>
-    integration.configure({
+  const configure = (extra: Partial<Parameters<StripeIntegration['configure']>[0]> = {}) => {
+    const input = {
       sync_enabled: false,
       expected_revision: integration.status().revision,
       ...extra,
-    });
+    };
+    const review =
+      input.price_tiers && integration.priceTierImpact(input.expected_revision, input.price_tiers);
+    return integration.configure(
+      input,
+      review ? (current) => expect(current).toEqual(review) : undefined,
+    );
+  };
   await configure({ api_key: 'rk_live_syntheticOnly' });
   await integration.sync();
   await configure({ price_tiers: [{ price_id: 'price_member', tier_id: 'galleon' }] });

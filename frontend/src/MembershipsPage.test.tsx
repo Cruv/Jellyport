@@ -280,7 +280,7 @@ describe('membership task workflow', () => {
     expect(await within(dialog).findByText(/Brigantine · Active · 2 slots/)).toBeTruthy();
     expect(within(dialog).getByText('Jim source')).toBeTruthy();
     expect(within(dialog).getByText('Disabled Emby account Jim source')).toBeTruthy();
-    expect(within(dialog).getByText(/Invoice-backed paid through/)).toBeTruthy();
+    expect(within(dialog).getByText(/Current invoice-backed paid through/)).toBeTruthy();
     expect(within(dialog).getByRole('button', { name: 'Review Discord authority' })).toBeTruthy();
     const signal = f.requests.find(({ path }) => path.endsWith('/timeline'))?.options?.signal;
     fireEvent.click(within(dialog).getByRole('button', { name: 'Close dialog' }));

@@ -36,10 +36,12 @@ class MemberFixture implements BotAdapter {
   async membershipActive(id: string) {
     return this.members.get(id)?.active ?? false;
   }
-  async activeMembers() {
-    return [...this.members].flatMap(([id, member]) =>
-      member.active ? [{ id, username: member.username }] : [],
-    );
+  async activeMemberPage() {
+    return {
+      members: [...this.members].flatMap(([id, member]) =>
+        member.active ? [{ id, username: member.username }] : [],
+      ),
+    };
   }
 }
 

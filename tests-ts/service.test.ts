@@ -40,8 +40,8 @@ class FakeBot implements BotAdapter {
   async membershipActive(_id: string) {
     return this.active;
   }
-  async activeMembers() {
-    return this.members;
+  async activeMemberPage() {
+    return this.members ? { members: this.members } : null;
   }
 }
 describe('account migration and subscription safety', () => {
@@ -664,6 +664,7 @@ describe('account migration and subscription safety', () => {
           {
             source_user_id: 'e-river',
             migration_scope: legacyScope,
+            migration_source: { server_id: 'demo-emby', user_id: 'e-river', username: 'river' },
             migration_destination: {
               server_id: 'demo-jellyfin',
               target_user_id: 'j-river',
@@ -711,6 +712,7 @@ describe('account migration and subscription safety', () => {
       [
         {
           source_user_id: 'e-river',
+          migration_source: { server_id: 'demo-emby', user_id: 'e-river', username: 'river' },
           migration_destination: {
             server_id: 'demo-jellyfin',
             target_user_id: 'j-river',
@@ -2110,9 +2112,11 @@ describe('account migration and subscription safety', () => {
     expect(bot.delivered).toEqual([]);
     expect(store.takeCredentials(job.id)[0]?.username).toBe('mapped.alias');
   });
-  it('recovers an explicitly inspected uncertain mapped creation and then pins its target ID', async () => {
+  it('recovers a mapped account after Emby is replaced and requires a fresh review for history', async () => {
     approveMapping('e-sam', 'recover.alias');
     let first = true;
+    let replaceEmby = false;
+    const sourceReads = vi.fn();
     service.clientFactory = (...args) => {
       const client = servers.factory(...args);
       if (args[2] === 'jellyfin') {
@@ -2125,6 +2129,13 @@ describe('account migration and subscription safety', () => {
           }
           return created;
         };
+      } else if (replaceEmby) {
+        client.systemInfo = async () => ({ Id: 'replacement', Version: '4.10.2.0' });
+        const migrationState = client.migrationState!.bind(client);
+        client.migrationState = async (...params) => {
+          sourceReads();
+          return migrationState(...params);
+        };
       }
       return client;
     };
@@ -2135,8 +2146,12 @@ describe('account migration and subscription safety', () => {
     const target = servers.users.jellyfin.find((user) => user.Name === 'recover.alias')!;
     const info = await service.recoveryInfo('recover.alias');
     expect(info.eligible).toBe(true);
+    const targetHistory = structuredClone(servers.userData[target.Id]);
+    replaceEmby = true;
     const recovered = await finish(await service.recoverAccount('recover.alias', target.Id));
     expect(recovered.status).toBe('completed');
+    expect(sourceReads).not.toHaveBeenCalled();
+    expect(servers.userData[target.Id]).toEqual(targetHistory);
     expect(service.mappings.getForSource('e-sam', store.settings())?.target_user_id).toBe(
       target.Id,
     );

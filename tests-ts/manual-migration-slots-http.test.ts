@@ -69,7 +69,7 @@ async function fixture() {
     validateRecipient: vi.fn(async () => {}),
     sendCredentials: vi.fn(async () => {}),
     membershipActive: async () => true,
-    activeMembers: async () => [],
+    activeMemberPage: async () => ({ members: [] }),
   };
   service.memberships.save(
     {
@@ -189,6 +189,8 @@ describe('reviewed manual migration account slots', () => {
           target_user_id: null,
         },
       },
+      undefined,
+      'demo-emby',
     );
   });
 

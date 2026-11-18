@@ -30,16 +30,16 @@ for (const subscriptionSource of ['stripe', 'trusted_messages'] as const)
       automation_enabled: false,
     });
     await stripe.sync();
-    await stripe.linkCustomer({
-      customer_id: 'cus_Crew0',
-      discord_user_id: paidOwner,
-      expected_revision: stripe.status().revision,
-    });
     await stripe.configure({
       expected_revision: stripe.status().revision,
       sync_enabled: true,
       automation_enabled: false,
       price_tiers: [{ price_id: 'price_Crew', tier_id: 'galleon' }],
+    });
+    await stripe.linkCustomer({
+      customer_id: 'cus_Crew0',
+      discord_user_id: paidOwner,
+      expected_revision: stripe.status().revision,
     });
     expect(service.memberships.get(paidOwner, store.settings())).toBeNull();
     // Stripe may confirm access before MEE6 assigns its subscriber role. The
@@ -280,11 +280,11 @@ test('differently named migration accounts can be explicitly grouped under one D
     await expect(tray.getByText('1 active', { exact: true })).toBeVisible();
     await tray.getByText('Operations tray', { exact: true }).click();
     await expect(tray.getByRole('button', { name: /running/ })).toBeVisible();
-    await expect(tray.getByRole('textbox', { name: 'Migration submission receipt' })).toHaveValue(
+    await expect(tray.getByRole('textbox', { name: 'Operation submission receipt' })).toHaveValue(
       String(receipt),
     );
     const lookup = page.waitForRequest(
-      (request) => new URL(request.url()).pathname === `/api/migrations/receipts/${receipt}`,
+      (request) => new URL(request.url()).pathname === `/api/jobs/receipts/${receipt}`,
     );
     await tray.getByRole('button', { name: 'Find operation' }).click();
     await lookup;

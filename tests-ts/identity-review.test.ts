@@ -74,8 +74,8 @@ class IdentityBot implements BotAdapter {
   async membershipActive(id: string) {
     return this.members.some((value) => value.id === id);
   }
-  async activeMembers() {
-    return this.members.map(({ id, username }) => ({ id, username }));
+  async activeMemberPage() {
+    return { members: this.members.map(({ id, username }) => ({ id, username })) };
   }
 }
 

@@ -284,6 +284,7 @@ it.each(
       users: [],
       mode: 'merge',
       migration_scope: expected,
+      source_server_id: 'demo-emby',
       destination_server_id: 'fixture-jellyfin',
     });
     const started = await app.inject({
@@ -737,6 +738,7 @@ it.each(['watched_only', 'played_favorites'] as const)(
       users: [{ source_user_id: 'fixture-source', mapping_revision: null }] as never,
       mode: 'merge',
       migration_scope: scope,
+      source_server_id: 'demo-emby',
       destination_server_id: 'fixture-jellyfin',
     });
     const migrate = vi

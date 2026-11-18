@@ -73,6 +73,7 @@ interface State {
   generations: string[];
   last_attempt_at: string | null;
   last_finished_at: string | null;
+  last_successful_at?: string;
   last_error: string | null;
   last_outcome?: ImportOutcome;
   last_scheduled_date?: string;
@@ -285,12 +286,23 @@ export class SourceSnapshots {
         : {}),
     };
   }
-  async status() {
+  async status(observed?: { id?: string; version?: string }) {
     const records: SnapshotMetadata[] = [];
+    let usable = false;
+    const settings = this.store.settings();
     if (this.key)
       for (const id of this.state.generations)
         try {
-          records.push(this.metadata(await this.result(id)));
+          const result = await this.result(id);
+          const record = this.metadata(result);
+          records.push(record);
+          if (id === this.state.generations[0])
+            usable =
+              Date.parse(record.expires_at) > Date.now() &&
+              Date.parse(snapshotHistoryTime(result)) <= Date.now() + 60_000 &&
+              result.binding.url === sourceUrl(settings) &&
+              (!observed?.id || observed.id === result.binding.server_id) &&
+              (!observed?.version || observed.version === result.binding.version);
         } catch {
           /* Retained error is reported separately. */
         }
@@ -305,11 +317,17 @@ export class SourceSnapshots {
       next_run_at: dailyImportSchedule(this.state.config, this.state.last_scheduled_date)
         .next_run_at,
       available: helper !== null,
+      configured: !!this.key,
+      usable,
       capture_method: snapshotCaptureMethod(rememberedMethod),
       history_source_known: !this.key || rememberedMethod !== undefined,
       running: this.starting || !!this.state.active,
       last_attempt_at: this.state.last_attempt_at,
       last_finished_at: this.state.last_finished_at,
+      last_successful_at:
+        this.state.last_successful_at ??
+        records[0]?.finished_at ??
+        (this.state.last_outcome === 'succeeded' ? this.state.last_finished_at : null),
       last_error: this.state.last_error,
       last_outcome:
         this.starting || this.state.active
@@ -496,6 +514,7 @@ export class SourceSnapshots {
             ) {
               this.state.generations.unshift(active.id);
               this.state.last_finished_at = result.finished_at;
+              this.state.last_successful_at = result.finished_at;
             }
             this.state.last_error = null;
           } else

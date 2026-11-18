@@ -17,7 +17,7 @@ type Account = {
   username: string;
   slot: number;
 };
-type Household = {
+export type Household = {
   discord_user_id: string;
   username: string;
   tier_id: string | null;
@@ -57,7 +57,7 @@ export class DiscordAuthorityReviews {
     ).length;
   }
 
-  private households(settings: Settings): Household[] {
+  households(settings: Settings, only?: ReadonlySet<string>): Household[] {
     const rows = new Map<string, Household>();
     const get = (id: string, username: string) => {
       let row = rows.get(id);
@@ -89,11 +89,13 @@ export class DiscordAuthorityReviews {
         row.accounts.push(account);
     };
     for (const member of this.service.memberships.list(settings)) {
+      if (only && !only.has(member.discord_user_id)) continue;
       const row = get(member.discord_user_id, member.base_username);
       row.tier_id = member.tier_id;
       row.slots = member.account_limit;
     }
     for (const link of this.service.store.links()) {
+      if (only && !only.has(link.discord_user_id)) continue;
       const row = get(link.discord_user_id, link.username);
       if (!row.tier_id) row.slots = Math.max(row.slots, link.membership_slot);
       addAccount(link.discord_user_id, {
@@ -103,15 +105,17 @@ export class DiscordAuthorityReviews {
         slot: link.membership_slot,
       });
     }
-    for (const owner of this.service.mediaOwnerships.list(settings))
+    for (const owner of this.service.mediaOwnerships.list(settings)) {
+      if (only && !only.has(owner.discord_user_id)) continue;
       addAccount(owner.discord_user_id, {
         kind: owner.kind,
         id: owner.account_id,
         username: owner.username,
         slot: owner.slot,
       });
+    }
     for (const mapping of this.service.mappings.list(settings)) {
-      if (!mapping.discord_user_id) continue;
+      if (!mapping.discord_user_id || (only && !only.has(mapping.discord_user_id))) continue;
       const slot = mapping.membership_slot ?? 1;
       addAccount(mapping.discord_user_id, {
         kind: 'emby',
@@ -126,8 +130,10 @@ export class DiscordAuthorityReviews {
         slot,
       });
     }
-    for (const customer of this.stripe.approvedCustomerOwners())
+    for (const customer of this.stripe.approvedCustomerOwners()) {
+      if (only && !only.has(customer.discord_user_id)) continue;
       get(customer.discord_user_id, customer.username).customers++;
+    }
     return [...rows.values()].sort((a, b) => a.discord_user_id.localeCompare(b.discord_user_id));
   }
 

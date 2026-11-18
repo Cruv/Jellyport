@@ -53,8 +53,8 @@ class OrganizationBot implements BotAdapter {
   async membershipActive(_id: string) {
     return false;
   }
-  async activeMembers() {
-    return [];
+  async activeMemberPage() {
+    return { members: [] };
   }
 }
 
@@ -737,6 +737,35 @@ describe('user directory and informational Discord organization', () => {
     updateSettings({ discord_auto_role_sync: true });
     await organization.reconcile();
     expect(bot.updateTagRoles).toHaveBeenCalledExactlyOnceWith(owner, [jellyfinRole], []);
+    expect(mediaWrites).toEqual([]);
+  });
+
+  it('rotates a bounded set of Discord owners for automatic organization upkeep', async () => {
+    updateSettings({ discord_auto_role_sync: true });
+    const settings = store.settings();
+    for (let index = 0; index < 22; index++) {
+      const discordId = String(600000000 + index);
+      const username = `synthetic-${index}`;
+      service.memberships.save(
+        {
+          discord_user_id: discordId,
+          base_username: username,
+          tier_id: 'sloop',
+          account_limit: 1,
+          provision_jellyfin: false,
+        },
+        settings,
+      );
+      bot.members.set(discordId, { username, roles: [] });
+    }
+    await organization.reconcile();
+    expect(bot.memberTagState).toHaveBeenCalledTimes(16);
+    await organization.reconcile();
+    expect(bot.memberTagState).toHaveBeenCalledTimes(22);
+    expect(new Set(bot.memberTagState.mock.calls.map(([id]) => id)).size).toBe(22);
+    await organization.reconcile();
+    expect(bot.memberTagState).toHaveBeenCalledTimes(38);
+    expect(bot.updateTagRoles).not.toHaveBeenCalled();
     expect(mediaWrites).toEqual([]);
   });
 

@@ -23,7 +23,7 @@ const Context = createContext<{
   snapshot: WorkflowReadinessSnapshot | null;
   loading: boolean;
   error: string;
-  check: (refresh?: boolean) => Promise<void>;
+  check: (refresh?: boolean) => Promise<WorkflowReadinessSnapshot | undefined>;
   repair: (route: WorkspaceRoute) => void;
 } | null>(null);
 
@@ -51,8 +51,8 @@ export function WorkflowProvider({
   const [setupData, setSetupData] = useState<{ settings: Settings; users: Users } | null>(null);
   const [setupError, setSetupError] = useState('');
   const mounted = useRef(true);
-  const pending = useRef<Promise<void> | null>(null);
-  const queuedRefresh = useRef<Promise<void> | null>(null);
+  const pending = useRef<Promise<WorkflowReadinessSnapshot | undefined> | null>(null);
+  const queuedRefresh = useRef<Promise<WorkflowReadinessSnapshot | undefined> | null>(null);
   const setupGeneration = useRef(0);
   const setupController = useRef<AbortController | null>(null);
   const checkedAt = useRef(0);
@@ -65,14 +65,14 @@ export function WorkflowProvider({
     };
   }, []);
   const check = useCallback(
-    async (refresh = false): Promise<void> => {
+    async (refresh = false): Promise<WorkflowReadinessSnapshot | undefined> => {
       if (!enabled) return;
       if (pending.current) {
         if (!refresh) return pending.current;
         if (!queuedRefresh.current) {
           queuedRefresh.current = pending.current.then(async () => {
             queuedRefresh.current = null;
-            await check(true);
+            return check(true);
           });
         }
         return queuedRefresh.current;
@@ -107,6 +107,7 @@ export function WorkflowProvider({
             setSnapshot(result);
             setError('');
             checkedAt.current = Date.now();
+            return result;
           }
         } catch (reason) {
           if (mounted.current && !controller.signal.aborted) {
@@ -124,7 +125,7 @@ export function WorkflowProvider({
       })();
       pending.current = task;
       try {
-        await task;
+        return await task;
       } finally {
         if (pending.current === task) pending.current = null;
       }
@@ -254,13 +255,19 @@ export function useWorkflowAction(action: WorkflowAction) {
 export default function WorkflowRequirements({
   action,
   compact = false,
+  onReady,
 }: {
   action: WorkflowAction;
   compact?: boolean;
+  onReady?: () => void | Promise<void>;
 }) {
   const context = useContext(Context);
   const readiness = useWorkflowAction(action);
   if (!context) return null;
+  const retry = async () => {
+    const result = await context.check(true);
+    if (result?.actions[action]?.ready) await onReady?.();
+  };
   if (readiness.loading && !readiness.state)
     return (
       <div className="workflow-check" role="status">
@@ -271,7 +278,7 @@ export default function WorkflowRequirements({
     return (
       <Callout warning title="Check requirements before continuing.">
         {readiness.error || 'Requirements have not been checked.'}{' '}
-        <button className="text-button" type="button" onClick={() => void context.check(true)}>
+        <button className="text-button" type="button" onClick={() => void retry()}>
           Check again
         </button>
       </Callout>
@@ -305,7 +312,7 @@ export default function WorkflowRequirements({
           </li>
         ))}
       </ul>
-      <button type="button" className="text-button" onClick={() => void context.check(true)}>
+      <button type="button" className="text-button" onClick={() => void retry()}>
         Check requirements again
       </button>
     </section>

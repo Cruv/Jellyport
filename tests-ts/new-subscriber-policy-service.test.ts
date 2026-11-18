@@ -25,8 +25,8 @@ class SignupBot implements BotAdapter {
   async membershipActive(_id: string) {
     return this.active;
   }
-  async activeMembers() {
-    return [{ id: owner, username: this.username }];
+  async activeMemberPage() {
+    return { members: [{ id: owner, username: this.username }] };
   }
 }
 

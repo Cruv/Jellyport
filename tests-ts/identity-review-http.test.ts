@@ -100,7 +100,7 @@ async function fixture(demo = false) {
       validateRecipient: async () => {},
       sendCredentials,
       membershipActive: async () => true,
-      activeMembers: async () => [],
+      activeMemberPage: async () => ({ members: [] }),
       listIdentityMembers,
     } satisfies BotAdapter;
   const anonymous = await app.inject('/api/session');

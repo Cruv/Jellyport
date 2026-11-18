@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import type { Store } from './store.js';
 import { ServiceError } from './errors.js';
-import { stripeBillingDecisions } from './stripe-entitlements.js';
+import { freshStripeInvoice, stripeBillingDecisions } from './stripe-entitlements.js';
 import type { StripePaidPeriod, StripeSnapshot } from './stripe-client.js';
 
 export interface StripeRoleCleanupAdapter {
@@ -53,7 +53,12 @@ interface CleanupState {
   scope: string;
   revision: string;
   role_ids: string[];
-  proof: { revision: string; authority: string; observed_at: number; expired: string[] } | null;
+  proof: {
+    revision: string;
+    authority: string;
+    observed_at: number;
+    expired: Array<{ id: string; observed_at: number }>;
+  } | null;
   last_run: string | null;
   last_error: string | null;
   removed_roles: number;
@@ -61,7 +66,6 @@ interface CleanupState {
   members: MemberReceipt[];
   cursor: number;
 }
-const freshMs = 30 * 60_000;
 const maxMembersPerPass = 25;
 const maxMembers = 10_000;
 const snowflake = (value: unknown): value is string =>
@@ -212,13 +216,17 @@ export class StripeRoleCleanup {
     links: Array<{ customer_id: string; discord_user_id: string }>,
     prices: Array<{ price_id: string; tier_id: string }>,
     periods: Map<string, StripePaidPeriod | null>,
+    observedByOwner?: ReadonlyMap<string, number>,
   ): void {
     if (!this.enabled(generation)) return;
     if (snapshot.mode !== 'live') {
       this.invalidateProof('Role cleanup requires verified live Stripe billing.');
       return;
     }
-    const decisions = stripeBillingDecisions(snapshot, links, prices, periods, this.now());
+    const time = this.now();
+    const decisions = stripeBillingDecisions(snapshot, links, prices, periods, time).filter(
+      ({ owner }) => freshStripeInvoice(observedByOwner?.get(owner) ?? time, time),
+    );
     // A genuinely paid renewal starts a new access cycle. MEE6 restoring its
     // subscriber roles is expected, rather than a competing expired-role readd.
     // Pending uncertain writes remain available for later observation.
@@ -235,8 +243,10 @@ export class StripeRoleCleanup {
     this.state!.proof = {
       revision: randomUUID(),
       authority: this.authority(),
-      observed_at: this.now(),
-      expired: decisions.filter((fact) => fact.action === 'expire').map((fact) => fact.owner),
+      observed_at: time,
+      expired: decisions
+        .filter((fact) => fact.action === 'expire')
+        .map(({ owner }) => ({ id: owner, observed_at: observedByOwner?.get(owner) ?? time })),
     };
     this.state!.last_error = null;
     this.persist();
@@ -264,15 +274,15 @@ export class StripeRoleCleanup {
     const state = this.state,
       proof = state.proof!,
       adapter = this.adapter;
+    const observations = new Map(proof.expired.map(({ id, observed_at }) => [id, observed_at]));
     const guard = (id?: string) => {
       if (
         this.state !== state ||
         !this.enabled(generation) ||
         state.proof !== proof ||
         proof.authority !== this.authority() ||
-        this.now() < proof.observed_at ||
-        this.now() - proof.observed_at > freshMs ||
-        (id && adapter.isExempt(id))
+        !freshStripeInvoice(proof.observed_at, this.now()) ||
+        (id && (adapter.isExempt(id) || !freshStripeInvoice(observations.get(id)!, this.now())))
       )
         throw new ServiceError(
           'Role cleanup stopped because billing, ownership, exemptions or configuration changed.',
@@ -305,7 +315,9 @@ export class StripeRoleCleanup {
           throw new ServiceError(
             'The Discord bot cannot manage every configured cleanup role. Review its role order and permissions.',
           );
-        const ids = proof.expired;
+        const ids = proof.expired
+          .filter(({ observed_at }) => freshStripeInvoice(observed_at, this.now()))
+          .map(({ id }) => id);
         const start = state.cursor % Math.max(ids.length, 1);
         const deadline = this.now() + 60_000;
         let mutations = 0;
@@ -399,7 +411,8 @@ export class StripeRoleCleanup {
             // Never turn a stale scope or newly exempt member into an action
             // failure that might later retry against a different authority.
             guard();
-            if (adapter.isExempt(id)) continue;
+            if (adapter.isExempt(id) || !freshStripeInvoice(observations.get(id)!, this.now()))
+              continue;
             receipt.failures++;
             receipt.retry_at = this.now() + 60_000 * 5 ** (receipt.failures - 1);
             this.report(

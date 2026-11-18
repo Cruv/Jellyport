@@ -81,7 +81,7 @@ describe('membership assignment during reviewed migration', () => {
       validateRecipient: vi.fn(async () => {}),
       sendCredentials: vi.fn(async () => {}),
       membershipActive: async () => true,
-      activeMembers: async () => [],
+      activeMemberPage: async () => ({ members: [] }),
     };
     lookup = vi.fn(async () => billing());
     service.reviewStripeMigrationMembership = lookup;

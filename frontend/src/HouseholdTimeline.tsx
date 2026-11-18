@@ -145,8 +145,8 @@ export default function HouseholdTimeline({
             )}
             {timeline.stripe.invoice && (
               <p>
-                Invoice-backed paid through {date(timeline.stripe.invoice.paid_through)} · observed{' '}
-                {date(timeline.stripe.invoice.observed_at)}
+                Current invoice-backed paid through {date(timeline.stripe.invoice.paid_through)} ·
+                observed {date(timeline.stripe.invoice.observed_at)}
               </p>
             )}
             {timeline.stripe.subscriptions.length > 0 && (
@@ -185,6 +185,12 @@ export default function HouseholdTimeline({
                             : `${entry.disabled ? 'Disabled' : 'Enabled'} ${serverLabel[entry.kind]} account ${entry.username}`}
                     </strong>
                     <span className="section-note">{date(entry.at)}</span>
+                    {entry.type === 'subscription' && entry.invoice && (
+                      <span className="section-note">
+                        Historical invoice paid through {date(entry.invoice.paid_through)} ·
+                        observed {date(entry.invoice.observed_at)}
+                      </span>
+                    )}
                     {(entry.type === 'subscription' || entry.type === 'membership') && (
                       <span className="button-row">
                         <Status

@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { Settings } from './types.js';
 
+export const DISCORD_DISCOVERY_PAGE_SIZE = 50;
+
 export function discordAuthority(settings: Partial<Settings>): string {
   return createHash('sha256')
     .update(

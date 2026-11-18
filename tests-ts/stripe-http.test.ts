@@ -10,11 +10,11 @@ const directories: string[] = [];
 const apps: JellyportApp[] = [];
 const member = '234567890123456789';
 const key = 'rk_test_syntheticKeyOnly123';
-async function fixture(demo = false, live = false) {
+async function fixture(demo = false, live = false, paid = false) {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-stripe-http-'));
   directories.push(directory);
   const identity = {
-    serverId: 'test-jellyfin',
+    serverId: 'demo-jellyfin',
     userId: 'admin',
     username: 'admin',
     accessToken: 'synthetic-admin-token',
@@ -29,11 +29,11 @@ async function fixture(demo = false, live = false) {
         id: 'sub_Crew',
         customer_id: 'cus_Crew',
         customer_email: 'synthetic@example.test',
-        status: live ? 'canceled' : 'active',
+        status: live && !paid ? 'canceled' : 'active',
         ...(live
           ? {
               created: Math.floor(Date.now() / 1000) - 100_000,
-              ended_at: Math.floor(Date.now() / 1000) - 100,
+              ...(paid ? {} : { ended_at: Math.floor(Date.now() / 1000) - 100 }),
             }
           : {}),
         collection_method: 'charge_automatically',
@@ -70,7 +70,7 @@ async function fixture(demo = false, live = false) {
         created: Math.floor(Date.now() / 1000) - 100_000,
         paid_at: Math.floor(Date.now() / 1000) - 1,
         start: Math.floor(Date.now() / 1000) - 90_000,
-        end: Math.floor(Date.now() / 1000) - 3600,
+        end: Math.floor(Date.now() / 1000) + (paid ? 3600 : -3600),
       }),
     }),
   });
@@ -102,7 +102,7 @@ async function fixture(demo = false, live = false) {
     validateRecipient: async () => {},
     sendCredentials: async () => {},
     membershipActive: async () => true,
-    activeMembers: async () => [],
+    activeMemberPage: async () => ({ members: [] }),
   };
   const session = await app.inject('/api/session');
   const login = await app.inject({
@@ -127,7 +127,7 @@ async function fixture(demo = false, live = false) {
       headers,
       payload: { api_key: key, sync_enabled: false, expected_revision: revision() },
     });
-  return { app, store, headers, revision, configure, snapshot };
+  return { app, store, headers, revision, configure, snapshot, servers };
 }
 afterEach(async () => {
   for (const app of apps.splice(0)) await app.close();
@@ -340,6 +340,9 @@ describe('private Stripe integration HTTP boundary', () => {
       ).statusCode,
     ).toBe(200);
     await app.jellyport.stripe.sync();
+    expect(
+      (await config({ price_tiers: [{ price_id: 'price_Crew', tier_id: 'sloop' }] })).statusCode,
+    ).toBe(200);
     await app.jellyport.stripe.linkCustomer({
       customer_id: 'cus_Crew',
       discord_user_id: member,
@@ -404,4 +407,164 @@ describe('private Stripe integration HTTP boundary', () => {
     expect(response.statusCode).toBe(422);
     expect(app.jellyport.stripe.status().configured).toBe(false);
   });
+
+  it.each([false, true])(
+    'reviews a live price downgrade, rejects stale approvals, and applies only the reviewed slots (%s)',
+    async (replaceAfterApproval) => {
+      const { app, store, headers, revision, servers } = await fixture(false, true, true);
+      const { stripe, service } = app.jellyport;
+      store.saveSettings({
+        ...store.settings(),
+        new_subscriber_source: 'stripe',
+        template_user_id: 'template',
+        auto_provision: false,
+        auto_disable: true,
+      });
+      const config = (body: Record<string, unknown>) =>
+        app.inject({
+          method: 'POST',
+          url: '/api/stripe/config',
+          headers,
+          payload: { sync_enabled: false, expected_revision: revision(), ...body },
+        });
+      expect((await config({ api_key: 'rk_live_syntheticKeyOnly123' })).statusCode).toBe(200);
+      const before = [{ price_id: 'price_Crew', tier_id: 'galleon' }];
+      const after = [{ price_id: 'price_Crew', tier_id: 'sloop' }];
+      expect((await config({ price_tiers: before })).statusCode).toBe(200);
+      await stripe.sync();
+      await stripe.linkCustomer({
+        customer_id: 'cus_Crew',
+        discord_user_id: member,
+        expected_revision: revision(),
+      });
+      service.memberships.save(
+        {
+          discord_user_id: member,
+          base_username: 'synthetic-member',
+          tier_id: 'galleon',
+          account_limit: 3,
+        },
+        store.settings(),
+      );
+      for (const slot of [1, 2, 3]) {
+        const account = {
+          Id: `reviewed-slot-${slot}`,
+          Name: slot === 1 ? 'synthetic-member' : `synthetic-member_${slot}`,
+          Policy: { IsAdministrator: false, IsDisabled: false },
+        };
+        servers.users.jellyfin.push(account);
+        store.saveLink(member, account.Name, account.Id, false, slot);
+      }
+      expect((await config({ automation_enabled: true })).statusCode).toBe(200);
+      await stripe.sync();
+
+      const timeline = async () =>
+        (
+          await app.inject({
+            url: `/api/memberships/${member}/timeline`,
+            headers,
+          })
+        ).json();
+      expect((await timeline()).stripe.invoice?.tier_id).toBe('galleon');
+      const denied = await config({ price_tiers: after });
+      expect(denied.statusCode).toBe(400);
+      expect(denied.json().detail).toContain('exact account slots');
+      expect(stripe.status().price_tiers).toEqual(before);
+      expect(service.memberships.get(member, store.settings())?.account_limit).toBe(3);
+
+      const review = async () =>
+        app.inject({
+          method: 'POST',
+          url: '/api/stripe/config/price-review',
+          headers,
+          payload: { expected_revision: revision(), price_tiers: after },
+        });
+      const first = await review();
+      expect(first.statusCode, first.body).toBe(200);
+      expect(first.headers['cache-control']).toBe('no-store');
+      expect(first.json()).toMatchObject({
+        revision: revision(),
+        mappings: [
+          {
+            price_id: 'price_Crew',
+            previous_tier_id: 'galleon',
+            tier_id: 'sloop',
+            account_limit: 1,
+          },
+        ],
+        affected: [
+          {
+            discord_user_id: member,
+            slots: 3,
+            price_ids: ['price_Crew'],
+            accounts: [1, 2, 3].map((slot) => ({
+              kind: 'jellyfin',
+              id: `reviewed-slot-${slot}`,
+              slot,
+            })),
+          },
+        ],
+      });
+      store.saveLink(member, 'synthetic-member_3', 'replacement-slot-3', false, 3);
+      expect(
+        (await config({ price_tiers: after, price_review_token: first.json().review_token }))
+          .statusCode,
+      ).toBe(400);
+      store.saveLink(member, 'synthetic-member_3', 'reviewed-slot-3', false, 3);
+      expect(
+        (await config({ price_tiers: after, price_review_token: first.json().review_token }))
+          .statusCode,
+      ).toBe(400);
+
+      const revised = (await review()).json();
+      await stripe.sync();
+      expect(
+        (await config({ price_tiers: after, price_review_token: revised.review_token })).statusCode,
+      ).toBe(400);
+      const valid = (await review()).json();
+      const accepted = await config({ price_tiers: after, price_review_token: valid.review_token });
+      expect(accepted.statusCode, accepted.body).toBe(200);
+      expect((await timeline()).stripe.invoice).toBeNull();
+      expect((await timeline()).milestones).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'subscription',
+            invoice: expect.objectContaining({ tier_id: 'galleon' }),
+          }),
+        ]),
+      );
+
+      if (replaceAfterApproval) {
+        const slot3 = servers.users.jellyfin.find(({ Id }) => Id === 'reviewed-slot-3')!;
+        slot3.Id = 'replacement-slot-3';
+        store.saveLink(member, slot3.Name, slot3.Id, false, 3);
+      }
+      store.saveSettings({ ...store.settings(), auto_provision: true });
+      await stripe.sync();
+      expect(
+        service.memberships.get(member, store.settings())?.account_limit,
+        JSON.stringify(
+          store
+            .subscriptions()
+            .map(({ error, result, status, tier_id }) => ({ error, result, status, tier_id })),
+        ),
+      ).toBe(replaceAfterApproval ? 3 : 1);
+      expect(
+        store.linksForMember(member).map(({ disabled_by_jellyport }) => disabled_by_jellyport),
+      ).toEqual(replaceAfterApproval ? [0, 0, 0] : [0, 1, 1]);
+      if (!replaceAfterApproval) expect((await timeline()).stripe.invoice?.tier_id).toBe('sloop');
+
+      stripe.unlinkCustomer({ customer_id: 'cus_Crew', expected_revision: revision() });
+      const unlinked = await timeline();
+      expect(unlinked.stripe).toMatchObject({ customer_count: 0, invoice: null });
+      expect(unlinked.milestones).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'subscription',
+            invoice: expect.objectContaining({ tier_id: 'galleon' }),
+          }),
+        ]),
+      );
+    },
+  );
 });

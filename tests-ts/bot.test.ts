@@ -1554,9 +1554,9 @@ describe('Private credential delivery and membership', () => {
     expect(await manager.membershipActive('22')).toBeNull();
   });
 
-  it('scans membership only when opted in and filters bots, guilds and roles', async () => {
-    const { manager, guild, settings } = await fixture();
-    expect(await manager.activeMembers()).toBeNull();
+  it('discovers subscribers only when opted in and filters bots, guilds and roles', async () => {
+    const { manager, guild } = await fixture();
+    expect(await manager.activeMemberPage()).toBeNull();
     expect(guild.members.list).not.toHaveBeenCalled();
     const records = [
       member(),
@@ -1568,20 +1568,30 @@ describe('Private credential delivery and membership', () => {
     enabled.guild.members.list.mockResolvedValue(
       new Collection(records.map((item) => [item.id, item])),
     );
-    expect(await enabled.manager.activeMembers()).toEqual([{ id: '22', username: 'jlogan35' }]);
+    expect(await enabled.manager.activeMemberPage()).toEqual({
+      members: [{ id: '22', username: 'jlogan35' }],
+    });
   });
 
-  it('returns unknown instead of a partial membership list after pagination failure', async () => {
+  it('reads one uncached page and advances past ineligible members without assuming absence', async () => {
     const { manager, guild } = await fixture({ discord_role_events: true });
     const page = new Collection(
-      Array.from({ length: 1000 }, (_, index) => {
-        const item = member(String(index + 1000), `user${index}`);
+      Array.from({ length: 50 }, (_, index) => {
+        const item = member(String(index + 1000), `user${index}`, { roles: [] });
         return [item.id, item] as const;
       }),
     );
     guild.members.list.mockResolvedValueOnce(page).mockRejectedValueOnce(new Error('secret-token'));
-    expect(await manager.activeMembers()).toBeNull();
-    expect(guild.members.list.mock.calls[1]![0]).toEqual({ limit: 1000, after: '1999' });
+    expect(await manager.activeMemberPage()).toEqual({ members: [], next: '1049' });
+    expect(guild.members.list).toHaveBeenCalledExactlyOnceWith({ limit: 50, cache: false });
+    expect(await manager.activeMemberPage('1049')).toBeNull();
+    expect(guild.members.list.mock.calls[1]![0]).toEqual({
+      limit: 50,
+      cache: false,
+      after: '1049',
+    });
+    guild.members.list.mockResolvedValueOnce(page);
+    expect(await manager.activeMemberPage('1049')).toBeNull();
   });
 });
 

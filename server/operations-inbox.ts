@@ -17,6 +17,7 @@ export interface InboxItem {
   detail?: string;
   attention: boolean;
   next_run_at?: string | null;
+  last_successful_at?: string | null;
   repair?: Repair;
   job_id?: string;
 }
@@ -28,8 +29,16 @@ export async function operationsInbox(
   stripe: StripeIntegration,
   identityGaps: number | null,
   authorityHolds: number,
+  sessionId: string,
+  observed: {
+    emby?: { id?: string; version?: string };
+    jellyfin?: { id?: string; version?: string };
+  },
 ): Promise<InboxItem[]> {
-  const [emby, jellyfin] = await Promise.all([source.status(), destination.status()]);
+  const [emby, jellyfin] = await Promise.all([
+    source.status(observed.emby),
+    destination.status(observed.jellyfin),
+  ]);
   const items: InboxItem[] = [];
   const deadline = Date.now() + 12 * 60 * 60_000;
   for (const [repair, name, status, expiry, configured] of [
@@ -38,7 +47,7 @@ export async function operationsInbox(
       'Emby saved history',
       emby,
       emby.records[0]?.expires_at,
-      emby.available || emby.config.enabled || !!emby.records.length || !!emby.last_attempt_at,
+      emby.configured || emby.config.enabled || !!emby.records.length || !!emby.last_attempt_at,
     ],
     [
       'jellyfin_history',
@@ -57,19 +66,22 @@ export async function operationsInbox(
       ? (status.last_error ?? 'The most recent import needs review.')
       : expired
         ? 'The latest import has expired.'
-        : expiring
-          ? 'The latest import expires within 12 hours.'
-          : status.running
-            ? 'Import in progress.'
-            : status.available
-              ? 'Helper available.'
-              : 'The helper is unavailable.';
+        : !status.usable
+          ? 'No usable saved history is available. Check the import.'
+          : expiring
+            ? 'The latest import expires within 12 hours.'
+            : status.running
+              ? 'Import in progress.'
+              : status.available
+                ? 'Helper available.'
+                : 'The helper is unavailable.';
     items.push({
       id: repair,
       title: name,
       detail,
-      attention: failed || expiring || !status.available,
+      attention: failed || expiring || !status.available || !status.usable,
       next_run_at: status.next_run_at,
+      last_successful_at: status.last_successful_at,
       repair,
     });
   }
@@ -126,11 +138,16 @@ export async function operationsInbox(
       attention: true,
       job_id: job.id,
     });
-  for (const row of store.jobsAwaitingCredentials(6))
+  for (const row of store.jobsAwaitingCredentials(6, sessionId))
     items.push({
       id: `credentials:${row.id}`,
-      title: 'Credentials await delivery',
-      detail: `${row.count} account${row.count === 1 ? '' : 's'} with a one-time reveal available.`,
+      title: row.available ? 'Credentials await delivery' : 'Credential reveal claimed',
+      detail: [
+        row.available ? `${row.available} available to reveal in this session.` : '',
+        row.claimed_elsewhere ? `${row.claimed_elsewhere} claimed in another session.` : '',
+      ]
+        .filter(Boolean)
+        .join(' '),
       attention: true,
       job_id: row.id,
     });

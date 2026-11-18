@@ -31,8 +31,8 @@ class OwnershipBot implements BotAdapter {
   async membershipActive(_id: string) {
     return true;
   }
-  async activeMembers() {
-    return [];
+  async activeMemberPage() {
+    return { members: [] };
   }
 }
 

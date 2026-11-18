@@ -43,7 +43,7 @@ The migration wizard uses four steps: **Owners → Billing → Accounts → Revi
 
 An unmapped source can also select an existing, enabled, unprotected Jellyfin destination in the wizard. This pins exact source and destination server IDs, account IDs and names, preserves the destination's credentials and preferences, and creates the new mapping only on acceptance. Existing confirmed mappings and ownership cannot be reassigned through this flow. Local accounts can remain independent of Discord.
 
-Each accepted migration also pins the Jellyfin server identity and the exact destination account ID or the absence of the reviewed username. Jellyport checks that pin during acceptance, at provisioning, and before batches of history updates. A replaced account, a newly occupied name, or changed protection requires a fresh review. Older queued migration requests that lack a destination pin stop at the affected account. Direct API and Discord submissions capture the same destination pin at admission.
+Each review pins the Emby server ID, exact account ID and name, plus the Jellyfin server ID and exact destination account or expected absence. Acceptance verifies both pins. Queued execution verifies the source before reading and again before writing history, and checks the destination at provisioning and before batches of history updates. A server replacement at the same URL, an account replacement, a newly occupied name, or changed protection requires a fresh review. Older queued migrations without both pins stop at the affected account. Direct API and Discord submissions capture both pins at admission.
 
 One final acceptance rechecks session ownership, billing proofs, account identities, occupied slots and local revisions. Stripe customer links, new global price mappings, membership decisions, new source approvals, target mapping and queued work persist in one local transaction. Cancellation or failed admission leaves none of those relationship changes behind. New memberships keep general provisioning off and only selected accounts migrate. After successful acceptance, confirmed decisions remain even if later media work fails or is canceled. Customer-list refresh is a bounded read-only operation with no billing automation, media writes or library scans.
 
@@ -136,6 +136,12 @@ The human review pause is excluded. Bulk timing is the whole job, never an avera
 per user. Direct API calls and older jobs without a linked review explicitly lack
 that combined timing. Use **Refresh review** after expiration; changing the selected
 users, mappings or saved generations requires a matching current review.
+Refreshing an open review retains its played-only or played-and-favorites scope.
+A follow-up from Activity also retains the original job and exact Emby source
+bindings. It requires a new destination review and excludes completed accounts.
+Older reports without exact source evidence require manual account selection.
+A mapped account can recover its inspected Jellyfin setup separately from
+transferring Emby history. Use a fresh migration review for that transfer.
 
 From 0.24.0, reports separate matching coverage from execution outcome. Coverage is
 `matched / (matched + unmatched + ambiguous)` over identifiable source items;

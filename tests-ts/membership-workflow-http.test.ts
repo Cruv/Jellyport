@@ -99,7 +99,7 @@ async function fixture(withTarget = false) {
     validateRecipient: vi.fn(async () => {}),
     sendCredentials: vi.fn(async () => {}),
     membershipActive: async () => true,
-    activeMembers: async () => [],
+    activeMemberPage: async () => ({ members: [] }),
   };
   vi.spyOn(service as unknown as { schedule: () => void }, 'schedule').mockImplementation(() => {});
   if (withTarget)

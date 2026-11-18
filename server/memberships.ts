@@ -197,6 +197,19 @@ export class Memberships {
           a.discord_user_id.localeCompare(b.discord_user_id),
       );
   }
+  reconciliationPage(settings: Settings, after: string, limit: number) {
+    const server = scope(this.store, settings);
+    if (!server) return { owners: [], next: '' };
+    const page = this.store.membershipRecordsPage<Membership>(after, limit + 1);
+    return {
+      owners: page
+        .slice(0, limit)
+        .map(({ id, value }) => this.record(id, value))
+        .filter((member) => sameScope(member, server))
+        .map((member) => member.discord_user_id),
+      next: page.length > limit ? page[limit - 1]!.id : '',
+    };
+  }
   get(discordId: string, settings: Settings): Membership | null {
     const server = scope(this.store, settings);
     if (!server) return null;

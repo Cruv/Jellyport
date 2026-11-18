@@ -200,7 +200,7 @@ describe('private administrator bot message archive', () => {
         recipientIdentity: async (id) => ({ id, username: 'fresh_owner' }),
         validateRecipient: async () => {},
         membershipActive: async () => true,
-        activeMembers: async () => [],
+        activeMemberPage: async () => ({ members: [] }),
         sendCredentials: async (_id, _username, _password, _url, _required, content) => ({
           content: discordCredentialContent(content!),
           message_id: '200001',

@@ -200,15 +200,24 @@ npm run backup:verify -- --backup /path/to/offline-copy --receipt /path/to/statu
 A built installation can run the same command with
 `node dist/server/verify-backup-cli.js`. The verifier checks SQLite integrity,
 tests the current schema against a scratch copy, and authenticates and decrypts
-saved encrypted database records. It outputs only the verification time and
-record count. A missing key, stale copy, incompatible database, or wrong key
-requires a new offline copy or the original matching key.
+saved encrypted database records. If a WAL is present, it validates the header
+and every retained frame, requires a final commit, and confirms SQLite replayed
+that entire chain on scratch storage. Empty or ambiguous WALs, including old
+frames left after reuse, require a fresh offline backup or a cleanly checkpointed
+copy. The verifier reports the verification time and record count.
+[SQLite WAL format](https://www.sqlite.org/fileformat2.html#the_write_ahead_log)
+
+This establishes integrity and replay through the last commit in the supplied
+files. SQLite metadata alone cannot establish freshness or detect a missing WAL
+or an omitted suffix of whole transactions. To confirm completeness against the
+original snapshot, use an independently recorded file list and hashes collected
+when the backup was made.
 
 The optional receipt stays outside both data directories. To show it in
 **Overview → Operations inbox**, configure `JELLYPORT_BACKUP_VERIFICATION_RECEIPT`
 with its path as seen by Jellyport. If containerized, make the receipt directory
 available via a read-only mount and give the Jellyport UID permission to read the
 receipt. The configured instance accepts only a receipt signed with its matching
-data key. This check covers Jellyport's SQLite records and encryption key.
-Media-server backups and the completeness of external history projections have
-their own import checks.
+data key. Receipts from the earlier verifier require a new verification for
+Overview because they lack the WAL integrity check. Media-server backups and
+external history projections have their own import checks.

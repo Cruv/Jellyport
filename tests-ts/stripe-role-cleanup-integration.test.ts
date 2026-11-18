@@ -190,6 +190,7 @@ describe('independent Stripe role cleanup integration', () => {
     ).toHaveLength(1);
 
     await f.integration.stop();
+    f.advance(60_000);
     f.paid.mockClear();
     const restarted = new StripeIntegration(f.store, f.options);
     try {
@@ -200,6 +201,13 @@ describe('independent Stripe role cleanup integration', () => {
       });
       expect(f.paid.mock.calls.map(([id]) => id)).toEqual(['sub_batch25', 'sub_batch26']);
       expect(f.onEntitlement).toHaveBeenCalledTimes(27);
+      const firstFact = f.onEntitlement.mock.calls[0]![0];
+      expect(() => restarted.assertEntitlement(firstFact)).not.toThrow();
+      expect(restarted.householdEvidence(owner).invoice).toEqual({
+        paid_through: firstFact.paid_through,
+        observed_at: firstFact.observed_at,
+        tier_id: firstFact.tier_id,
+      });
       f.paid.mockImplementation(async (id) => {
         if (id === 'sub_batch0') throw new StripeClientError('network');
         return periods.get(id) ?? null;
@@ -212,6 +220,11 @@ describe('independent Stripe role cleanup integration', () => {
       });
       expect(() => restarted.assertEntitlement(f.onEntitlement.mock.calls[0]![0])).toThrow();
       expect(() => restarted.assertEntitlement(f.onEntitlement.mock.calls[1]![0])).not.toThrow();
+      expect(() => restarted.assertEntitlement(f.onEntitlement.mock.calls[25]![0])).not.toThrow();
+      f.advance(30 * 60_000 + 1);
+      expect(() => restarted.assertEntitlement(f.onEntitlement.mock.calls[25]![0])).toThrow(
+        'expired',
+      );
     } finally {
       await restarted.stop();
     }

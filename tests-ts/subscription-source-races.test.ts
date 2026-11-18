@@ -23,8 +23,8 @@ class SourceBot implements BotAdapter {
     return { enabled: true, connected: true };
   }
   async validateRecipient(_id: string) {}
-  async activeMembers() {
-    return [];
+  async activeMemberPage() {
+    return { members: [] };
   }
 }
 describe('automatic subscription source changes', () => {

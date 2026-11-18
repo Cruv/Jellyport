@@ -39,6 +39,7 @@ export interface JellyfinAuthentication {
     accessToken: string,
     expectedServerId: string,
     expectedUserId: string,
+    signal?: AbortSignal,
   ): Promise<JellyfinIdentity>;
   signOut(baseUrl: string, accessToken: string): Promise<void>;
   validateApiKey(
@@ -167,18 +168,23 @@ export class JellyfinAuthClient implements JellyfinAuthentication {
       body?: unknown;
       deviceId?: string;
       decode?: boolean;
+      signal?: AbortSignal;
     } = {},
   ): Promise<unknown> {
     const address = new URL(`${normalizeJellyfinUrl(baseUrl)}/${path}`);
     if (options.accessToken !== undefined && !token(options.accessToken))
       throw new JellyfinAuthError('The Jellyfin session is invalid. Sign in again.', 401);
     const controller = new AbortController();
+    const cancel = () => controller.abort(options.signal?.reason);
+    options.signal?.addEventListener('abort', cancel, { once: true });
     const deadline = Date.now() + this.timeoutMs;
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     timer.unref();
     let response: Response | undefined;
     let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
+      if (options.signal?.aborted) cancel();
+      controller.signal.throwIfAborted();
       const pending = this.transport(address.toString(), {
         method,
         redirect: 'manual',
@@ -267,6 +273,7 @@ export class JellyfinAuthClient implements JellyfinAuthentication {
       );
     } finally {
       clearTimeout(timer);
+      options.signal?.removeEventListener('abort', cancel);
       // Do not await cancellation: a stalled custom response must not bypass the deadline.
       if (reader) {
         void reader.cancel().catch(() => {});
@@ -324,17 +331,18 @@ export class JellyfinAuthClient implements JellyfinAuthentication {
     accessToken: string,
     expectedServerId: string,
     expectedUserId: string,
+    signal?: AbortSignal,
   ): Promise<JellyfinIdentity> {
     if (!identifier(expectedServerId) || !identifier(expectedUserId) || !token(accessToken))
       throw new JellyfinAuthError('The Jellyfin session is invalid. Sign in again.', 401);
     // Check the pinned server before sending its token, including after a server URL changes.
-    const info = await this.request(baseUrl, 'GET', 'System/Info/Public');
+    const info = await this.request(baseUrl, 'GET', 'System/Info/Public', { signal });
     if (!isObject(info) || !identifier(info.Id) || info.Id !== expectedServerId)
       throw new JellyfinAuthError(
         'The connected Jellyfin server does not match this installation.',
         502,
       );
-    return this.currentIdentity(baseUrl, accessToken, expectedServerId, expectedUserId);
+    return this.currentIdentity(baseUrl, accessToken, expectedServerId, expectedUserId, signal);
   }
 
   private async currentIdentity(
@@ -342,9 +350,10 @@ export class JellyfinAuthClient implements JellyfinAuthentication {
     accessToken: string,
     expectedServerId: string,
     expectedUserId: string,
+    signal?: AbortSignal,
   ): Promise<JellyfinIdentity> {
     const current = administrator(
-      await this.request(baseUrl, 'GET', 'Users/Me', { accessToken }),
+      await this.request(baseUrl, 'GET', 'Users/Me', { accessToken, signal }),
       expectedServerId,
     );
     if (current.userId !== expectedUserId)

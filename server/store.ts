@@ -20,6 +20,7 @@ import type {
   JobRequest,
   JobHistoryCleanupResult,
   JobHistoryCleanupSkipReason,
+  MigrationSourceBinding,
   SubscriptionEvent,
 } from './service.js';
 export { DEFAULT_SETTINGS } from './types.js';
@@ -60,6 +61,12 @@ export interface Credentials {
   message?: string;
 }
 const credentialRecoverySeconds = 90;
+const credentialSession = (sessionId: string) =>
+  createHash('sha256').update(sessionId).digest('hex');
+const credentialCounts = (own: unknown, other: unknown) => ({
+  available: Number(own ?? 0),
+  claimed_elsewhere: Number(other ?? 0),
+});
 export interface QueuedJob {
   job: Job;
   requests: JobRequest[];
@@ -216,9 +223,21 @@ export class Store {
         job_id TEXT PRIMARY KEY, receipt_key TEXT UNIQUE, owner_scope TEXT,
         request_hash TEXT, source_ids TEXT NOT NULL, source_scope TEXT
       );
+      CREATE TABLE IF NOT EXISTS migration_source_bindings (
+        job_id TEXT PRIMARY KEY, encrypted BLOB NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS migration_submissions_owner ON migration_submissions(owner_scope);
       CREATE TRIGGER IF NOT EXISTS migration_submissions_delete AFTER DELETE ON jobs
         BEGIN DELETE FROM migration_submissions WHERE job_id=OLD.id; END;
+      CREATE TABLE IF NOT EXISTS account_job_submissions (
+        job_id TEXT PRIMARY KEY, receipt_key TEXT NOT NULL UNIQUE,
+        owner_scope TEXT NOT NULL, request_hash TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS account_job_submissions_owner ON account_job_submissions(owner_scope);
+      CREATE TRIGGER IF NOT EXISTS account_job_submissions_delete AFTER DELETE ON jobs
+        BEGIN DELETE FROM account_job_submissions WHERE job_id=OLD.id; END;
+      CREATE TRIGGER IF NOT EXISTS migration_source_bindings_delete AFTER DELETE ON jobs
+        BEGIN DELETE FROM migration_source_bindings WHERE job_id=OLD.id; END;
       CREATE TABLE IF NOT EXISTS migration_playlists (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS user_mappings (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
       CREATE TABLE IF NOT EXISTS account_roles (id TEXT PRIMARY KEY, encrypted BLOB NOT NULL);
@@ -238,6 +257,10 @@ export class Store {
       CREATE INDEX IF NOT EXISTS credentials_expiry ON credentials(expires);
       CREATE INDEX IF NOT EXISTS subscriptions_job_id ON subscriptions(json_extract(payload,'$.job_id'));
       CREATE INDEX IF NOT EXISTS subscriptions_member ON subscriptions(json_extract(payload,'$.discord_user_id'),json_extract(payload,'$.source'));
+      CREATE INDEX IF NOT EXISTS subscriptions_role_reconciliation ON subscriptions(
+        json_extract(payload,'$.discord_user_id'),json_extract(payload,'$.discord_authority'),
+        json_extract(payload,'$.action'),json_extract(payload,'$.status')
+      ) WHERE json_extract(payload,'$.source')='role_reconciliation';
       CREATE INDEX IF NOT EXISTS subscriptions_status ON subscriptions(json_extract(payload,'$.status'));
     `);
     const columns = this.db.prepare('PRAGMA table_info(links)').all();
@@ -505,6 +528,15 @@ export class Store {
       .all()
       .map((row) => ({
         id: row.id as string,
+        value: this.decrypt<T>(row.encrypted as Uint8Array),
+      }));
+  }
+  membershipRecordsPage<T>(after: string, limit: number): Array<{ id: string; value: T }> {
+    return this.db
+      .prepare('SELECT id,encrypted FROM memberships WHERE id>? ORDER BY id LIMIT ?')
+      .all(after, limit)
+      .map((row) => ({
+        id: String(row.id),
         value: this.decrypt<T>(row.encrypted as Uint8Array),
       }));
   }
@@ -797,16 +829,31 @@ export class Store {
         .get(status)?.n,
     );
   }
-  jobsAwaitingCredentials(limit: number): Array<{ id: string; count: number }> {
+  jobsAwaitingCredentials(limit: number, sessionId: string) {
+    const owner = credentialSession(sessionId);
     return this.db
       .prepare(
-        `SELECT credentials.job_id AS id, COUNT(*) AS n
+        `SELECT credentials.job_id AS id,
+        SUM(reveal_session IS NULL OR reveal_session=?) AS own,
+        SUM(reveal_session IS NOT NULL AND reveal_session<>?) AS other
       FROM credentials JOIN job_summaries ON job_summaries.id=credentials.job_id
       WHERE credentials.expires>? AND job_summaries.status NOT IN ('queued','running')
       GROUP BY credentials.job_id ORDER BY MIN(credentials.expires),credentials.job_id LIMIT ?`,
       )
-      .all(Date.now() / 1000, limit)
-      .map((row) => ({ id: String(row.id), count: Number(row.n) }));
+      .all(owner, owner, Date.now() / 1000, limit)
+      .map((row) => ({ id: String(row.id), ...credentialCounts(row.own, row.other) }));
+  }
+  jobCredentialAvailability(jobId: string, sessionId: string) {
+    const owner = credentialSession(sessionId);
+    const row = this.db
+      .prepare(
+        `SELECT
+      SUM(reveal_session IS NULL OR reveal_session=?) AS own,
+      SUM(reveal_session IS NOT NULL AND reveal_session<>?) AS other
+      FROM credentials WHERE job_id=? AND expires>?`,
+      )
+      .get(owner, owner, jobId, Date.now() / 1000);
+    return credentialCounts(row?.own, row?.other);
   }
   uncertainDeliveries(limit: number): string[] {
     return this.db
@@ -815,7 +862,7 @@ export class Store {
       WHERE status='uncertain' AND created_ms>?
       GROUP BY job_id ORDER BY MAX(created_ms) DESC LIMIT ?`,
       )
-      .all(Date.now() - (this.settings().bot_message_retention_days ?? 30) * 86_400_000, limit)
+      .all(this.botMessageCutoff(), limit)
       .map(({ job_id }) => String(job_id));
   }
   jobSummaries({
@@ -1000,6 +1047,10 @@ export class Store {
       this.db
         .prepare('INSERT INTO job_queue VALUES (?,?)')
         .run(job.id, this.encrypt({ requests, settings }));
+      if (submission && job.kind !== 'migrate')
+        this.db
+          .prepare('INSERT INTO account_job_submissions VALUES (?,?,?,?)')
+          .run(job.id, submission.key, submission.owner, submission.requestHash);
       const sources = requests.flatMap(({ source_user_id }) =>
         source_user_id ? [source_user_id] : [],
       );
@@ -1008,12 +1059,23 @@ export class Store {
           .prepare('INSERT INTO migration_submissions VALUES (?,?,?,?,?,?)')
           .run(
             job.id,
-            submission?.key ?? null,
-            submission?.owner ?? null,
-            submission?.requestHash ?? null,
+            job.kind === 'migrate' ? (submission?.key ?? null) : null,
+            job.kind === 'migrate' ? (submission?.owner ?? null) : null,
+            job.kind === 'migrate' ? (submission?.requestHash ?? null) : null,
             JSON.stringify(sources),
             sourceScope ?? null,
           );
+      const bindings = requests.flatMap(({ migration_source }) =>
+        migration_source ? [[migration_source.user_id, migration_source] as const] : [],
+      );
+      if (bindings.length && bindings.length === sources.length)
+        this.db.prepare('INSERT INTO migration_source_bindings VALUES (?,?)').run(
+          job.id,
+          this.encrypt({
+            bindings: Object.fromEntries(bindings),
+            migration_scope: job.migration_scope,
+          }),
+        );
     });
   }
   migrationSubmission(key: string): { id: string; requestHash: string } | null {
@@ -1021,6 +1083,24 @@ export class Store {
       .prepare('SELECT job_id,request_hash FROM migration_submissions WHERE receipt_key=?')
       .get(key);
     return row ? { id: String(row.job_id), requestHash: String(row.request_hash) } : null;
+  }
+  accountJobSubmission(key: string): { id: string; requestHash: string } | null {
+    const row = this.db
+      .prepare('SELECT job_id,request_hash FROM account_job_submissions WHERE receipt_key=?')
+      .get(key);
+    return row ? { id: String(row.job_id), requestHash: String(row.request_hash) } : null;
+  }
+  latestJobSubmission(owner: string): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT job_summaries.id FROM (
+      SELECT job_id FROM account_job_submissions WHERE owner_scope=?
+      UNION ALL SELECT job_id FROM migration_submissions WHERE owner_scope=?
+    ) AS receipts JOIN job_summaries ON job_summaries.id=receipts.job_id
+      ORDER BY job_summaries.created_at DESC,job_summaries.id DESC LIMIT 1`,
+      )
+      .get(owner, owner);
+    return row ? String(row.id) : null;
   }
   latestMigrationSubmission(owner: string): string | null {
     const row = this.db
@@ -1030,12 +1110,27 @@ export class Store {
       .get(owner);
     return row ? String(row.job_id) : null;
   }
-  migrationSources(id: string): { ids: string[]; scope: string } | null {
+  migrationSources(id: string): {
+    ids: string[];
+    scope: string;
+    bindings: Record<string, MigrationSourceBinding>;
+    migration_scope?: Job['migration_scope'];
+  } | null {
     const row = this.db
-      .prepare('SELECT source_ids,source_scope FROM migration_submissions WHERE job_id=?')
+      .prepare(
+        `SELECT source_ids,source_scope,encrypted FROM migration_submissions
+        JOIN migration_source_bindings USING(job_id) WHERE job_id=?`,
+      )
       .get(id);
     return row && typeof row.source_scope === 'string'
-      ? { ids: JSON.parse(String(row.source_ids)) as string[], scope: row.source_scope }
+      ? {
+          ids: JSON.parse(String(row.source_ids)) as string[],
+          scope: row.source_scope,
+          ...this.decrypt<{
+            bindings: Record<string, MigrationSourceBinding>;
+            migration_scope?: Job['migration_scope'];
+          }>(row.encrypted as Uint8Array),
+        }
       : null;
   }
   queuedJobs(): QueuedJob[] {
@@ -1164,14 +1259,16 @@ export class Store {
       .run(message.id, jobId, timestamp, message.status, this.encrypt(message));
   }
   botMessages(jobId: string): BotMessageHistory[] {
-    const days = this.settings().bot_message_retention_days ?? 30;
-    const cutoff = days > 0 ? Date.now() - days * 86400_000 : -Number.MAX_VALUE;
     return this.db
       .prepare(
         'SELECT encrypted FROM bot_message_history WHERE job_id=? AND created_ms>? ORDER BY created_ms,id LIMIT 1000',
       )
-      .all(jobId, cutoff)
+      .all(jobId, this.botMessageCutoff())
       .map((row) => this.decrypt<BotMessageHistory>(row.encrypted as Uint8Array));
+  }
+  private botMessageCutoff() {
+    const days = this.settings().bot_message_retention_days ?? 30;
+    return days > 0 ? Date.now() - days * 86400_000 : -Number.MAX_VALUE;
   }
   pruneBotMessages(): void {
     const days = this.settings().bot_message_retention_days ?? 30;
@@ -1203,7 +1300,7 @@ export class Store {
     });
   }
   revealCredentials(jobId: string, sessionId: string): Credentials[] {
-    const owner = createHash('sha256').update(sessionId).digest('hex');
+    const owner = credentialSession(sessionId);
     return this.transaction(() => {
       const time = Date.now() / 1000;
       this.db
@@ -1220,13 +1317,13 @@ export class Store {
     });
   }
   consumeCredentialReceipt(jobId: string, sessionId: string): void {
-    const owner = createHash('sha256').update(sessionId).digest('hex');
+    const owner = credentialSession(sessionId);
     this.db
       .prepare('DELETE FROM credentials WHERE job_id=? AND reveal_session=?')
       .run(jobId, owner);
   }
   discardSessionCredentialReceipts(sessionId: string): void {
-    const owner = createHash('sha256').update(sessionId).digest('hex');
+    const owner = credentialSession(sessionId);
     this.db.prepare('DELETE FROM credentials WHERE reveal_session=?').run(owner);
   }
   link(id: string, slot = 1): Link | null {
@@ -1260,6 +1357,14 @@ export class Store {
         'SELECT discord_user_id,membership_slot,username,remote_id,disabled_by_jellyport,pending_disabled FROM links WHERE discord_user_id=? ORDER BY membership_slot',
       )
       .all(String(id)) as unknown as Link[];
+  }
+  linkOwnerPage(after: string, limit: number): string[] {
+    return this.db
+      .prepare(
+        'SELECT DISTINCT discord_user_id FROM links WHERE discord_user_id>? ORDER BY discord_user_id LIMIT ?',
+      )
+      .all(after, limit)
+      .map((row) => String(row.discord_user_id));
   }
   saveLink(
     discordId: string,
@@ -1408,6 +1513,25 @@ export class Store {
             )
             .all(discordId, source, limit);
     return rows.map((row) => this.decodeSubscription(row.payload as string));
+  }
+  hasRoleReconciliationEvent(
+    discordId: string,
+    authority: string,
+    action: SubscriptionEvent['action'],
+    pendingOnly: boolean,
+  ): boolean {
+    const statuses = pendingOnly ? "IN ('pending','processing','failed')" : "<>'ignored'";
+    return !!this.db
+      .prepare(
+        `SELECT 1 FROM subscriptions
+      WHERE json_extract(payload,'$.source')='role_reconciliation'
+        AND json_extract(payload,'$.discord_user_id')=?
+        AND json_extract(payload,'$.discord_authority')=?
+        AND json_extract(payload,'$.action')=?
+        AND json_extract(payload,'$.status') ${statuses}
+      LIMIT 1`,
+      )
+      .get(discordId, authority, action);
   }
   subscriptions(): SubscriptionEvent[] {
     return this.db

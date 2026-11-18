@@ -28,8 +28,8 @@ class MembershipBot implements BotAdapter {
   async membershipActive(_id: string) {
     return this.active;
   }
-  async activeMembers() {
-    return [];
+  async activeMemberPage() {
+    return { members: [] };
   }
 }
 describe('review regressions and durable job recovery', () => {

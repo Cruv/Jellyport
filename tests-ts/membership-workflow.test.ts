@@ -69,7 +69,7 @@ describe('read-only membership workflow and reviewed ownership reuse', () => {
       validateRecipient: vi.fn(async () => {}),
       sendCredentials: vi.fn(async () => {}),
       membershipActive: async () => true,
-      activeMembers: async () => [],
+      activeMemberPage: async () => ({ members: [] }),
     } satisfies BotAdapter;
     schedule = vi
       .spyOn(service as unknown as { schedule: (...args: unknown[]) => void }, 'schedule')

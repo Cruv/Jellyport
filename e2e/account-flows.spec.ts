@@ -8,8 +8,39 @@ test('creates an independent account and reveals its credentials only on request
   await page.goto('/');
   await navigate(page, 'Create account');
   const username = `browser-test-${info.project.name}`;
+  let acceptedJob = '';
+  let submissionReceipt = '';
+  await page.route(
+    '**/api/accounts',
+    async (route) => {
+      const response = await route.fetch();
+      expect(response.status()).toBe(202);
+      const { id } = await response.json();
+      acceptedJob = id;
+      submissionReceipt = route.request().headers()['x-jellyport-submission']!;
+      await route.abort();
+    },
+    { times: 1 },
+  );
   await page.getByRole('textbox', { name: 'Username', exact: true }).fill(username);
   await page.getByRole('main').getByRole('button', { name: 'Create account', exact: true }).click();
+  await expect(
+    page.getByText(
+      'Could not reach Jellyport. Check that the application is running and try again.',
+      { exact: true },
+    ),
+  ).toBeVisible();
+  expect(submissionReceipt).toMatch(/^[a-f\d-]{36}$/);
+  await page.reload();
+  await page.getByText('Operations tray', { exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'Operation submission receipt' })).toHaveValue(
+    submissionReceipt,
+  );
+  const lookup = page.waitForResponse(
+    (response) => new URL(response.url()).pathname === `/api/jobs/receipts/${submissionReceipt}`,
+  );
+  await page.getByRole('button', { name: 'Find operation' }).click();
+  expect(await (await lookup).json()).toEqual({ job_id: acceptedJob });
   const details = page.getByRole('dialog', { name: 'Operation details' });
   await expect(details).toBeVisible();
   await expect(details).toContainText(username);

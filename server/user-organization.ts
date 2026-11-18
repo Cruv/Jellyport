@@ -47,6 +47,7 @@ interface TagPlan {
   unlinked: number;
   unavailable: number;
   fingerprint: string;
+  nextOwner?: string;
 }
 interface Review {
   plan: TagPlan;
@@ -59,6 +60,7 @@ const fingerprint = (value: unknown) =>
 export class UserOrganization {
   private reviews = new Map<string, Review>();
   private applying = false;
+  private automaticCursor = { scope: '', after: '' };
   constructor(readonly service: Service) {}
   private bot(): BotAdapter {
     const bot = this.service.bot;
@@ -304,22 +306,30 @@ export class UserOrganization {
       throw new ServiceError('Choose different Emby and Jellyfin organization roles.');
     return selected;
   }
-  private async plan(): Promise<TagPlan> {
+  private async plan(after?: string): Promise<TagPlan> {
     const settings = this.service.store.settings();
     const selected = await this.validatedTagRoles(settings);
     const bot = this.bot();
     const directory = await this.directory(true);
     const linked = directory.users.filter((user) => user.discord_user_id);
-    if (linked.length > 1000)
+    if (after === undefined && linked.length > 1000)
       throw new ServiceError(
         'Role organization is limited to 1,000 linked Discord members per review.',
       );
+    const limit = 16;
+    const pending =
+      after === undefined
+        ? linked
+        : linked
+            .filter((user) => user.discord_user_id! > after)
+            .sort((a, b) => (a.discord_user_id! < b.discord_user_id! ? -1 : 1));
+    const selectedOwners = after === undefined ? pending : pending.slice(0, limit);
     const changes: TagChange[] = [];
     let unchanged = 0,
       unavailable = 0;
-    for (let start = 0; start < linked.length; start += 10) {
+    for (let start = 0; start < selectedOwners.length; start += 10) {
       const batch = await Promise.all(
-        linked.slice(start, start + 10).map(async (row) => {
+        selectedOwners.slice(start, start + 10).map(async (row) => {
           const member = await bot.memberTagState!(row.discord_user_id!);
           if (member === null) return null; // Confirmed guild departure, not an API failure.
           if (member.id !== row.discord_user_id)
@@ -361,6 +371,9 @@ export class UserOrganization {
       unlinked: directory.users.filter((user) => !user.discord_user_id).length,
       unavailable,
       fingerprint: fingerprint({ settings, directory }),
+      ...(after !== undefined
+        ? { nextOwner: pending.length > limit ? selectedOwners.at(-1)!.discord_user_id! : '' }
+        : {}),
     };
   }
   async preview() {
@@ -568,7 +581,18 @@ export class UserOrganization {
     if (this.service.demo || !settings.discord_auto_role_sync || this.applying) return;
     this.applying = true;
     try {
-      await this.write(await this.plan(), settings);
+      const scope = fingerprint([
+        settings.discord_guild_id,
+        settings.discord_emby_role_id,
+        settings.discord_jellyfin_role_id,
+        settings.emby_url,
+        settings.jellyfin_url,
+        this.service.store.authState(),
+      ]);
+      if (this.automaticCursor.scope !== scope) this.automaticCursor = { scope, after: '' };
+      const plan = await this.plan(this.automaticCursor.after);
+      this.automaticCursor.after = plan.nextOwner ?? '';
+      await this.write(plan, settings);
     } finally {
       this.applying = false;
     }

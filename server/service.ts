@@ -27,6 +27,7 @@ import {
   statePlan,
   hasMigrationState,
   migrateItemState,
+  prepareMigrationCapabilities,
   migrationDetails,
   migrationWarning,
   type MigrationDetails,
@@ -92,6 +93,7 @@ import { MediaOwnerships, type MediaOwnership } from './media-ownership.js';
 import { NewSubscriberPolicy } from './new-subscriber-policy.js';
 import { isDeferredStripeExpiry, type StripeEntitlementFact } from './stripe-entitlements.js';
 import {
+  DISCORD_DISCOVERY_PAGE_SIZE,
   discordAuthority,
   discordAuthorityState,
   type DiscordAuthorityState,
@@ -129,10 +131,12 @@ export interface JobRequest {
   migration_scope?: MigrationScope;
   username?: string;
   source_user_id?: string;
+  migration_source?: MigrationSourceBinding;
   migration_destination?: MigrationDestination;
   source_ownership?: { server_id?: string; identity_hash: string | null };
   discord_user_id?: string | null;
   recover_target_id?: string;
+  recovery_mapping_source_id?: string;
   mapping_id?: string;
   mapping_revision?: string;
   role_id?: string;
@@ -265,6 +269,7 @@ export interface JobResult extends Partial<JobStats> {
   ambiguous_items?: MigrationAmbiguitySummary[];
 }
 export interface Job {
+  follow_up_job_id?: string;
   destination_catalog_id?: string;
   elapsed_ms?: number;
   /** Trusted server-side review preparation, excluding time spent reading the review. */
@@ -394,7 +399,10 @@ export interface BotAdapter {
     guard: () => void,
   ): Promise<void>;
   membershipActive(id: string): Promise<boolean | null>;
-  activeMembers(): Promise<Array<{ id: string; username: string }> | null>;
+  activeMemberPage?(after?: string): Promise<{
+    members: Array<{ id: string; username: string }>;
+    next?: string;
+  } | null>;
   searchMembers?(query: string): Promise<DiscordMemberSearchResult>;
   listIdentityMembers?(): Promise<IdentityRoster>;
 }
@@ -427,6 +435,7 @@ interface MigrationPreviewOptions {
   progress?: (processed: number, total: number) => void;
   migration_scope?: MigrationScope;
   use_snapshots?: boolean;
+  follow_up?: { job_id: string; sources: Record<string, MigrationSourceBinding> };
 }
 interface PreviewUser {
   membership_slot?: number;
@@ -544,6 +553,11 @@ export interface MigrationDestination {
   username: string;
   source_username: string;
 }
+export interface MigrationSourceBinding {
+  server_id: string;
+  user_id: string;
+  username: string;
+}
 export function now(): string {
   return new Date().toISOString();
 }
@@ -660,6 +674,13 @@ export class Service {
   private readonly destinationCatalogs: MigrationCatalogCache;
   private readonly destinationCacheHit: (items: number) => void;
   private readonly subscriptionMutex = new Mutex();
+  private reconciliationTask: Promise<void> | null = null;
+  private reconciliationCursor = {
+    scope: '',
+    links: '',
+    memberships: '',
+    roster: undefined as string | undefined,
+  };
   private readonly clients = new Set<MediaAPI>();
   private stopping = false;
   readonly demo: boolean;
@@ -826,6 +847,20 @@ export class Service {
       .update(JSON.stringify([normalizeJellyfinUrl(settings.emby_url), serverId]))
       .digest('hex');
   }
+  private assertMigrationSource(
+    binding: MigrationSourceBinding,
+    serverId: unknown,
+    account: MediaUser,
+  ): void {
+    if (
+      serverId !== binding.server_id ||
+      account.Id !== binding.user_id ||
+      account.Name !== binding.username
+    )
+      throw new ServiceError(
+        'The reviewed Emby server or source account changed. Prepare a new migration review.',
+      );
+  }
   async verifyFollowUpSource(scope: string): Promise<void> {
     const settings = this.store.settings();
     const info = await this.withClient(settings, 'emby', (client) => client.systemInfo());
@@ -881,6 +916,7 @@ export class Service {
       const configured = Boolean(settings[`${kind}_url`] && settings[`${kind}_api_key`]);
       const result: Record<string, unknown> = { configured, connected: false };
       let count = 0;
+      let observed: { id?: string; version?: string } | undefined;
       if (configured)
         try {
           const { info, users } = await this.withClient(settings, kind, async (client) => {
@@ -888,6 +924,10 @@ export class Service {
             return { info, users: await client.users() };
           });
           count = users.length;
+          observed = {
+            id: typeof info.Id === 'string' ? info.Id : undefined,
+            version: typeof info.Version === 'string' ? info.Version : undefined,
+          };
           Object.assign(result, {
             connected: true,
             name: info.ServerName ?? kind,
@@ -897,7 +937,7 @@ export class Service {
           if (!(error instanceof MediaError || error instanceof ServiceError)) throw error;
           result.error = `Unable to authenticate to ${kind === 'emby' ? 'Emby' : 'Jellyfin'}. Check URL, API key and network access.`;
         }
-      return { connection: result, count };
+      return { connection: result, count, observed };
     };
     const [emby, jellyfin] = await Promise.all([check('emby'), check('jellyfin')]);
     return {
@@ -908,6 +948,7 @@ export class Service {
       },
       emby_users: emby.count,
       jellyfin_users: jellyfin.count,
+      observed: { emby: emby.observed, jellyfin: jellyfin.observed },
     };
   }
   private async template(client: MediaAPI, settings: Settings): Promise<ProvisioningDefaults> {
@@ -1093,8 +1134,9 @@ export class Service {
       );
   }
   private requestMapping(request: JobRequest, settings: Settings): UserMapping | null {
-    if (!request.source_user_id) return null;
-    const mapping = this.mappings.getForSource(request.source_user_id, settings);
+    const sourceId = request.source_user_id ?? request.recovery_mapping_source_id;
+    if (!sourceId) return null;
+    const mapping = this.mappings.getForSource(sourceId, settings);
     if (request.mapping_id || request.mapping_revision) {
       if (
         !mapping ||
@@ -1328,7 +1370,9 @@ export class Service {
     users: PreviewUser[];
     mode: 'merge';
     migration_scope: MigrationScope;
+    source_server_id: string;
     destination_server_id: string;
+    follow_up_job_id?: string;
     source_snapshot_ids?: Record<string, string>;
     history_only_targets?: Record<string, ReviewedHistoryTarget>;
     household_targets?: Record<string, ReviewedHouseholdAccount>;
@@ -1370,20 +1414,12 @@ export class Service {
           const registeredSources = this.mediaOwnerships
             .list(settings)
             .filter((owner) => owner.kind === 'emby');
-          const snapshotInfo =
-            options.use_snapshots || registeredSources.length ? await emby.systemInfo() : null;
-          if (
-            registeredSources.length &&
-            (typeof snapshotInfo?.Id !== 'string' || !snapshotInfo.Id)
-          )
-            throw new ServiceError(
-              'The Emby server identity could not be verified for account ownership.',
-            );
-          if (
-            options.use_snapshots &&
-            snapshotInfo &&
-            (!supportedSnapshotVersion(snapshotInfo.Version) || typeof snapshotInfo.Id !== 'string')
-          )
+          const sourceInfo = await emby.systemInfo();
+          checkCanceled();
+          const sourceServerId = sourceInfo.Id;
+          if (typeof sourceServerId !== 'string' || !sourceServerId)
+            throw new ServiceError('The Emby source server identity could not be verified.');
+          if (options.use_snapshots && !supportedSnapshotVersion(sourceInfo.Version))
             throw new ServiceError(
               'Database snapshots require a verified supported Emby connection.',
             );
@@ -1396,11 +1432,17 @@ export class Service {
               throw new ServiceError(
                 'Emby returned a different source account. Reload the user list.',
               );
+            if (options.follow_up) {
+              const original = options.follow_up.sources[sourceId];
+              if (!original)
+                throw new ServiceError('The original Emby source binding is unavailable.');
+              this.assertMigrationSource(original, sourceServerId, sourceUser);
+            }
             const mapping = this.mappings.getForSource(sourceId, settings);
             if (mapping && sourceUser.Name !== mapping.source_username)
               throw new ServiceError('The mapped Emby account was renamed. Review its mapping.');
             const registeredOwner = registeredSources.find(
-              (owner) => owner.account_id === sourceId && owner.server_id === snapshotInfo?.Id,
+              (owner) => owner.account_id === sourceId && owner.server_id === sourceServerId,
             );
             if (registeredOwner && registeredOwner.username !== sourceUser.Name)
               throw new ServiceError(
@@ -1456,16 +1498,12 @@ export class Service {
             // catalog crawl, decrypts history, or reads playlists on either server.
             let snapshot: SnapshotMetadata | undefined;
             if (options.use_snapshots) {
-              if (!snapshotInfo)
-                throw new ServiceError(
-                  'Saved snapshot identity is unavailable. Review a new preview.',
-                );
               const saved = await this.sourceSnapshots.select(
                 sourceId,
                 settings,
-                snapshotInfo.Id as string,
+                sourceServerId,
                 captureId,
-                snapshotInfo.Version as string,
+                sourceInfo.Version as string,
               );
               checkCanceled();
               captureId = saved.id;
@@ -1528,21 +1566,15 @@ export class Service {
             Pick<ReviewedHouseholdAccount, 'source_username' | 'server_id'>
           > = {};
           if (Object.keys(suggestions).length || users.some((user) => !user.history_only)) {
-            const info = snapshotInfo ?? (await emby.systemInfo());
-            checkCanceled();
-            if (typeof info.Id !== 'string' || !info.Id)
-              throw new ServiceError(
-                'The Emby server identity could not be verified for account owner review.',
-              );
             for (const user of users) {
               if (!user.history_only)
                 ownerAssignmentSources[user.source_user_id] = {
                   source_username: user.source_username,
-                  server_id: info.Id,
+                  server_id: sourceServerId,
                 };
               const suggested = suggestions[user.source_user_id];
               if (!suggested) continue;
-              householdTargets[user.source_user_id] = { ...suggested, server_id: info.Id };
+              householdTargets[user.source_user_id] = { ...suggested, server_id: sourceServerId };
               user.discord_user_id = suggested.discord_user_id;
               user.discord_username = suggested.discord_username;
               user.membership_slot = suggested.slot;
@@ -1556,7 +1588,9 @@ export class Service {
             users,
             mode: 'merge',
             migration_scope: scope,
+            source_server_id: sourceServerId,
             destination_server_id: destinationServerId,
+            ...(options.follow_up ? { follow_up_job_id: options.follow_up.job_id } : {}),
             ...(Object.keys(householdTargets).length
               ? { household_targets: householdTargets }
               : {}),
@@ -1921,6 +1955,7 @@ export class Service {
     discordUserId?: string | null,
     authorize: () => void = () => {},
     signal?: AbortSignal,
+    submission?: MigrationSubmission,
   ): Promise<Job> {
     const { member, guard } = await this.prepareAccountCreation(
       { username, discord_user_id: discordUserId },
@@ -1928,13 +1963,20 @@ export class Service {
       signal,
     );
     guard();
-    return this.queue('create', [
-      {
-        username,
-        discord_user_id: discordUserId,
-        ...(member ? { membership_slot: 1, membership_revision: member.revision } : {}),
-      },
-    ]);
+    return this.queue(
+      'create',
+      [
+        {
+          username,
+          discord_user_id: discordUserId,
+          ...(member ? { membership_slot: 1, membership_revision: member.revision } : {}),
+        },
+      ],
+      undefined,
+      undefined,
+      undefined,
+      submission,
+    );
   }
   private assertCloneSource(
     user: MediaUser,
@@ -2035,6 +2077,7 @@ export class Service {
   async cloneAccounts(
     reviewed: StoredCloneReview,
     acceptGuard: () => void = () => {},
+    submission?: MigrationSubmission,
   ): Promise<Job> {
     if (this.demo) throw new ServiceError('Demo account cloning is read-only.');
     const input: CloneAccountsInput = {
@@ -2076,6 +2119,10 @@ export class Service {
         },
         migration_scope: 'watched_only',
       })),
+      undefined,
+      undefined,
+      undefined,
+      submission,
     );
   }
   async renameAccount(input: { user_id: string; expected_username: string; username: string }) {
@@ -3079,6 +3126,8 @@ export class Service {
             );
           const selectedSource = matchingSources[0];
           if (selectedSource) {
+            if (!newSubscriber && !sourceServerId)
+              throw new ServiceError('The Emby source server identity could not be verified.');
             const owner = sourceServerId
               ? this.mediaOwnerships.get('emby', sourceServerId, selectedSource.Id, settings)
               : null;
@@ -3101,6 +3150,11 @@ export class Service {
             ...(!newSubscriber && selectedSource
               ? {
                   source_user_id: selectedSource.Id,
+                  migration_source: {
+                    server_id: sourceServerId!,
+                    user_id: selectedSource.Id,
+                    username: selectedSource.Name,
+                  },
                   migration_destination: {
                     server_id: info.Id,
                     target_user_id: target?.Id ?? null,
@@ -3523,7 +3577,7 @@ export class Service {
       reason: ['clone_uncertain', 'clone_incomplete'].includes(local?.status ?? '')
         ? 'This account is an incomplete clone. Inspect its identity and restrictions in Jellyfin before continuing, or choose a fresh clone username. Default account recovery cannot replace its restrictions.'
         : eligible
-          ? 'Inspect this Jellyfin account. Recovery will reset its password and apply your account defaults; watch history is preserved.'
+          ? 'Recovery resets this Jellyfin account’s password and applies your account defaults. A separate migration review can transfer Emby history.'
           : 'Recovery is available only for an incomplete Jellyport creation with an existing, unprotected Jellyfin account.',
     };
   }
@@ -3531,6 +3585,8 @@ export class Service {
     username: string,
     targetUserId: string,
     discordUserId?: string | null,
+    authorize: () => void = () => {},
+    submission?: MigrationSubmission,
   ): Promise<Job> {
     const settings = this.store.settings();
     const info = await this.recoveryInfo(username);
@@ -3605,23 +3661,33 @@ export class Service {
           'Configuration changed during recovery preparation. Review the account again.',
         );
     }
-    return this.queue('recover', [
-      {
-        username,
-        discord_user_id: discordUserId,
-        recover_target_id: targetUserId,
-        membership_slot: slot,
-        ...(member ? { membership_revision: member.revision } : {}),
-        ...(mapping
-          ? {
-              source_user_id: mapping.source_user_id,
-              migration_destination: migrationDestination,
-              mapping_id: mapping.id,
-              mapping_revision: mapping.revision,
-            }
-          : {}),
-      },
-    ]);
+    authorize();
+    return this.queue(
+      'recover',
+      [
+        {
+          username,
+          discord_user_id: discordUserId,
+          recover_target_id: targetUserId,
+          membership_slot: slot,
+          ...(member ? { membership_revision: member.revision } : {}),
+          ...(mapping
+            ? {
+                // Recovery approves the existing Jellyfin account. Retain its
+                // mapping for ownership checks without authorizing source reads.
+                recovery_mapping_source_id: mapping.source_user_id,
+                migration_destination: migrationDestination,
+                mapping_id: mapping.id,
+                mapping_revision: mapping.revision,
+              }
+            : {}),
+        },
+      ],
+      undefined,
+      undefined,
+      undefined,
+      submission,
+    );
   }
   private membershipReviewSettings(): string {
     return createHash('sha256')
@@ -4010,6 +4076,8 @@ export class Service {
     reviewedTargets?: Record<string, ReviewedMigrationTarget>,
     reviewedDestinations?: Record<string, MigrationDestination>,
     submission?: MigrationSubmission,
+    reviewedSourceServerId?: string,
+    followUpJob?: string,
   ): Promise<Job> {
     admissionGuard?.();
     const requestedAt = now();
@@ -4425,18 +4493,21 @@ export class Service {
         'Configuration changed during migration preparation. Prepare a new review.',
       );
     const sourceNames = new Map<string, string>();
-    let sourceScope: string | undefined;
-    await this.withClient(settings, 'emby', async (client) => {
-      // Existing ownership verification owns the identity read when applicable.
-      if (!ownershipServerId && !confirmsMigrationOwner) {
-        const info = await client.systemInfo();
-        if (typeof info.Id === 'string' && info.Id)
-          sourceScope = this.migrationSourceScope(settings, info.Id);
-        else if (submission)
-          throw new ServiceError(
-            'The Emby server identity could not be verified. Prepare a new migration review.',
-          );
-      }
+    const sourceServerId = await this.withClient(settings, 'emby', async (client) => {
+      const observedServerId =
+        ownershipServerId && !reviewedSourceServerId
+          ? ownershipServerId
+          : (await client.systemInfo()).Id;
+      admissionGuard?.();
+      if (typeof observedServerId !== 'string' || !observedServerId)
+        throw new ServiceError(
+          'The Emby server identity could not be verified. Prepare a new migration review.',
+        );
+      if (
+        (reviewedSourceServerId && observedServerId !== reviewedSourceServerId) ||
+        (ownershipServerId && observedServerId !== ownershipServerId)
+      )
+        throw new ServiceError('The reviewed Emby server changed. Prepare a new migration review.');
       for (const id of sourceUserIds) {
         const live = await client.user(id);
         admissionGuard?.();
@@ -4448,7 +4519,9 @@ export class Service {
           );
         sourceNames.set(id, live.Name);
       }
+      return observedServerId;
     });
+    const sourceScope = this.migrationSourceScope(settings, sourceServerId);
     const destinationCatalogPin = await this.withClient(settings, 'jellyfin', async (client) => {
       const info = await client.systemInfo();
       admissionGuard?.();
@@ -4541,6 +4614,11 @@ export class Service {
           username,
           source_username: sourceName,
         };
+        request.migration_source = {
+          server_id: sourceServerId,
+          user_id: id,
+          username: sourceName,
+        };
         if (proof || explicit)
           explicitTargets.set(id, {
             serverId: info.Id,
@@ -4581,7 +4659,7 @@ export class Service {
         'Configuration changed during migration preparation. Prepare a new review.',
       );
     if (!ownershipServerId && confirmsMigrationOwner) {
-      ownershipServerId = await readOwnershipServerId();
+      ownershipServerId = sourceServerId;
       admissionGuard?.();
       if (!sameReviewSettings(settings, this.store.settings()))
         throw new ServiceError(
@@ -4594,7 +4672,6 @@ export class Service {
           identity_hash: request.source_ownership?.identity_hash ?? null,
         };
     }
-    if (ownershipServerId) sourceScope = this.migrationSourceScope(settings, ownershipServerId);
     for (const request of requests)
       if (ownershipServerId) this.sourceOwnership(request, settings, ownershipServerId);
     const allOwners = this.mediaOwnerships.list(settings);
@@ -4775,6 +4852,7 @@ export class Service {
         submission,
         sourceScope,
         destinationCatalogPin,
+        followUpJob,
       );
       // queue() has committed, and its worker starts on a later microtask.
       // Publish only the already-persisted Stripe state; no external action or
@@ -4864,6 +4942,8 @@ export class Service {
     roleRevision: string,
     userIds: string[],
     sections: RoleSection[],
+    authorize: () => void = () => {},
+    submission?: MigrationSubmission,
   ): Promise<Job> {
     if (
       !userIds.length ||
@@ -4912,7 +4992,8 @@ export class Service {
         requests.push(request);
       }
       for (const request of requests) this.assertRoleUpdate(request, settings);
-      return this.queue('role_update', requests);
+      authorize();
+      return this.queue('role_update', requests, undefined, undefined, undefined, submission);
     });
   }
   private async oneRoleUpdate(
@@ -5007,6 +5088,7 @@ export class Service {
     submission?: MigrationSubmission,
     sourceScope?: string,
     destinationCatalogPin?: string | null,
+    followUpJob?: string,
   ): Job {
     if (this.stopping) throw new ServiceError('The app is stopping. Retry after it restarts.');
     const owners = this.mediaOwnerships.list(this.store.settings());
@@ -5060,6 +5142,7 @@ export class Service {
           }
         : {}),
       ...(scope ? { migration_scope: scope } : {}),
+      ...(followUpJob ? { follow_up_job_id: followUpJob } : {}),
       ...(kind === 'membership'
         ? { membership_discord_user_id: requests[0]?.discord_user_id ?? undefined }
         : {}),
@@ -5895,9 +5978,20 @@ export class Service {
     destinationContext: DestinationCatalogContext,
   ): Promise<void> {
     const migrationPin = request.migration_destination;
+    const sourcePin = request.migration_source;
     if (request.source_user_id && !migrationPin)
       throw new ServiceError(
         'This queued account has no reviewed Jellyfin destination. Prepare a new migration review.',
+      );
+    if (
+      request.source_user_id &&
+      (!sourcePin?.server_id ||
+        sourcePin.user_id !== request.source_user_id ||
+        !sourcePin.username ||
+        sourcePin.username !== migrationPin?.source_username)
+    )
+      throw new ServiceError(
+        'This queued account has no verified Emby source binding. Prepare a new migration review.',
       );
     const withMutation = <T>(action: () => Promise<T>): Promise<T> =>
       request.source_user_id
@@ -5956,7 +6050,11 @@ export class Service {
         );
       this.assertMembershipRequest(request, settings);
       if (!request.history_only_target) this.assertDefaultRole(template, request, settings);
-      this.assertMapping(mapping, request.source_user_id, settings);
+      this.assertMapping(
+        mapping,
+        request.source_user_id ?? request.recovery_mapping_source_id,
+        settings,
+      );
       this.assertDestinationMapping(mapping, destinationId, username, settings);
       if (sourceOwnershipServerId)
         registeredSource.value = this.sourceOwnership(request, settings, sourceOwnershipServerId);
@@ -5998,21 +6096,32 @@ export class Service {
           settings,
           'emby',
           async (emby) => {
+            const info = await emby.systemInfo();
+            this.checkJobStopped(job);
+            if (info.Id !== sourcePin!.server_id)
+              throw new ServiceError(
+                'The reviewed Emby server changed. Prepare a new migration review.',
+              );
+            const sourceUser = await emby.user(sourcePin!.user_id);
+            this.checkJobStopped(job);
+            this.assertMigrationSource(sourcePin!, info.Id, sourceUser);
+            sourceOwnershipServerId = sourcePin!.server_id;
+            registeredSource.value = this.sourceOwnership(
+              request,
+              settings,
+              sourceOwnershipServerId,
+            );
             if (!request.source_snapshot_id) {
               if (!emby.catalogItems || !emby.migrationState)
                 throw new ServiceError(
                   'This source client cannot perform bounded history reads. Use a saved snapshot or update the source integration.',
                 );
-              const info = await emby.systemInfo();
-              this.checkJobStopped(job);
-              if (typeof info.Id !== 'string' || !info.Id || typeof info.Version !== 'string')
-                throw new ServiceError('The Emby source identity could not be verified.');
-              sourceOwnershipServerId = info.Id;
-              registeredSource.value = this.sourceOwnership(request, settings, info.Id);
+              if (typeof info.Version !== 'string')
+                throw new ServiceError('The Emby source version could not be verified.');
               const key = MigrationCatalogCache.key(
                 settings.emby_url,
                 settings.emby_api_key,
-                info.Id,
+                sourceOwnershipServerId,
                 info.Version,
               );
               if (catalogContext.key && catalogContext.key !== key)
@@ -6039,6 +6148,7 @@ export class Service {
                 scope,
                 items,
                 this.jobControllers.get(job.id)?.signal,
+                sourceUser,
               );
               source.catalog = {
                 captured_at: new Date(catalogContext.value.capturedAt).toISOString(),
@@ -6046,15 +6156,12 @@ export class Service {
               };
               return source;
             }
-            const info = await emby.systemInfo();
-            if (!supportedSnapshotVersion(info.Version) || typeof info.Id !== 'string')
+            if (!supportedSnapshotVersion(info.Version))
               throw new ServiceError('Emby version or identity changed. Review a new preview.');
-            sourceOwnershipServerId = info.Id;
-            registeredSource.value = this.sourceOwnership(request, settings, info.Id);
             const selected = await this.sourceSnapshots.select(
               request.source_user_id!,
               settings,
-              info.Id,
+              sourceOwnershipServerId,
               request.source_snapshot_id,
               info.Version,
             );
@@ -6070,6 +6177,7 @@ export class Service {
                 this.jobControllers.get(job.id)?.signal,
               ),
               this.jobControllers.get(job.id)?.signal,
+              sourceUser,
             );
             const historyWarnings = snapshotHistoryWarnings(selected.metadata.diagnostics);
             historyWarnings.forEach((warning) => informationalWarnings.add(warning));
@@ -6733,6 +6841,27 @@ export class Service {
           informationalWarning(
             'Result details are limited to 200 unmatched items, 200 ambiguous items, and 20 candidates per item. Full counts are shown; migration checks every item.',
           );
+        // Capability discovery and source identity reads can wait on remote I/O.
+        // Finish them before taking the mutation lock, then repeat local guards
+        // and check live destination identity immediately before writing.
+        const capabilities = await prepareMigrationCapabilities(jellyfin);
+        guard();
+        await this.withClient(
+          settings,
+          'emby',
+          async (emby) => {
+            const info = await emby.systemInfo();
+            guard();
+            if (info.Id !== sourcePin!.server_id)
+              throw new ServiceError(
+                'The reviewed Emby server changed. Prepare a new migration review.',
+              );
+            const account = await emby.user(sourcePin!.user_id);
+            guard();
+            this.assertMigrationSource(sourcePin!, info.Id, account);
+          },
+          this.jobControllers.get(job.id)?.signal,
+        );
         phase('transferring_history');
         Object.assign(job.progress, {
           phase: 'transferring_history',
@@ -6784,6 +6913,7 @@ export class Service {
           result.applied = await withMutation(() =>
             migrateItemState(jellyfin, target.Id, plan, details, guard, () => {}, {
               migration_scope: scope,
+              capabilities,
               before_write: beforeHistoryWrite,
               expectation: (target, patch, unsupported) => {
                 const expected = captureExpectation(target, patch, scope);
@@ -7095,7 +7225,8 @@ export class Service {
             requests.every(
               (request) =>
                 request.access_disabled !== undefined ||
-                (request.source_user_id && !request.migration_destination),
+                (request.source_user_id &&
+                  (!request.migration_destination || !request.migration_source)),
             )
               ? null
               : await this.template(jellyfin, settings);
@@ -7997,19 +8128,52 @@ export class Service {
     }
   }
   async reconcileMemberships(): Promise<void> {
+    if (this.reconciliationTask) return this.reconciliationTask;
+    const task = this.reconcileMembershipPass();
+    this.reconciliationTask = task;
+    try {
+      await task;
+    } finally {
+      this.reconciliationTask = null;
+    }
+  }
+
+  private async reconcileMembershipPass(): Promise<void> {
     const settings = this.store.settings();
     const bot = this.bot;
-    if (!settings.discord_role_events || !settings.discord_member_role_id || !bot) return;
+    if (this.stopping || !settings.discord_role_events || !settings.discord_member_role_id || !bot)
+      return;
     const authority = discordAuthority(settings);
+    const roleScope = (value: Settings) =>
+      JSON.stringify([
+        discordAuthority(value),
+        value.jellyfin_url,
+        value.discord_role_events,
+        value.discord_enabled,
+        value.auto_disable,
+        value.auto_provision,
+        value.new_subscriber_source,
+      ]);
+    const scope = roleScope(settings);
     const stillCurrent = () =>
-      authority === discordAuthority(this.store.settings()) &&
+      !this.stopping &&
+      this.bot === bot &&
+      roleScope(this.store.settings()) === scope &&
       (!bot.authority || bot.authority() === authority);
     if (!stillCurrent()) return;
-    const memberIds = new Set([
-      ...this.store.links().map((link) => link.discord_user_id),
-      ...this.memberships.list(settings).map((member) => member.discord_user_id),
-    ]);
+    if (this.reconciliationCursor.scope !== scope)
+      this.reconciliationCursor = { scope, links: '', memberships: '', roster: undefined };
+    const cursor = this.reconciliationCursor;
+    // Each indexed source advances independently. A membership in a different
+    // scope or a duplicate link cannot hide owners on later pages.
+    const limit = 16;
+    const linked = this.store.linkOwnerPage(cursor.links, limit + 1);
+    const memberships = this.memberships.reconciliationPage(settings, cursor.memberships, limit);
+    cursor.links = linked.length > limit ? linked[limit - 1]! : '';
+    cursor.memberships = memberships.next;
+    const memberIds = new Set([...linked.slice(0, limit), ...memberships.owners]);
     for (const memberId of memberIds) {
+      if (!stillCurrent()) return;
       const links = this.store.linksForMember(memberId);
       const member = this.memberships.get(memberId, settings);
       if (
@@ -8035,17 +8199,7 @@ export class Service {
         : links.some((link) => !link.disabled_by_jellyport);
       if ((active && !needsRenewal) || (!active && !needsExpiration)) continue;
       const action = active ? 'subscribe' : 'expire';
-      if (
-        this.store
-          .subscriptionsForMember(memberId, 'role_reconciliation')
-          .some(
-            (event) =>
-              event.discord_authority === authority &&
-              event.action === action &&
-              ['pending', 'processing', 'failed'].includes(event.status),
-          )
-      )
-        continue;
+      if (this.store.hasRoleReconciliationEvent(memberId, authority, action, true)) continue;
       await this.recordSubscription({
         id: `reconcile-${randomUUID()}`,
         action,
@@ -8056,11 +8210,18 @@ export class Service {
         emitted_at: now(),
       });
     }
-    if (settings.auto_provision) {
-      const members = await bot.activeMembers();
+    if (settings.auto_provision && bot.activeMemberPage && stillCurrent()) {
+      const page = await bot.activeMemberPage(cursor.roster);
       if (!stillCurrent()) return;
-      if (members === null) return;
-      for (const member of members) {
+      if (
+        !page ||
+        page.members.length > DISCORD_DISCOVERY_PAGE_SIZE ||
+        (page.next && page.next === cursor.roster)
+      )
+        return;
+      cursor.roster = page.next;
+      for (const member of page.members) {
+        if (!stillCurrent()) return;
         const known = this.memberships.get(member.id, settings);
         if (
           known?.access_mode === 'complimentary' ||
@@ -8071,14 +8232,7 @@ export class Service {
           continue;
         if (
           this.store.link(member.id) ||
-          this.store
-            .subscriptionsForMember(member.id, 'role_reconciliation')
-            .some(
-              (event) =>
-                event.discord_authority === authority &&
-                event.action === 'subscribe' &&
-                event.status !== 'ignored',
-            )
+          this.store.hasRoleReconciliationEvent(member.id, authority, 'subscribe', false)
         )
           continue;
         await this.recordSubscription({

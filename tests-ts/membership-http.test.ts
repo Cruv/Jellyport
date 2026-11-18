@@ -93,7 +93,7 @@ async function fixture(demo = false) {
       deliveries.push({ username, password });
     },
     membershipActive: async () => true,
-    activeMembers: async () => [{ id: owner, username: 'Jim' }],
+    activeMemberPage: async () => ({ members: [{ id: owner, username: 'Jim' }] }),
   } satisfies BotAdapter;
   const anonymous = await app.inject('/api/session');
   const login = await app.inject({
@@ -251,10 +251,14 @@ describe('administrator membership HTTP endpoints', () => {
         { kind: 'emby', username: 'River source', identity: 'confirmed', slot: 1 },
         { kind: 'jellyfin', username: 'river', identity: 'confirmed', slot: 1 },
       ],
-      stripe: { invoice: { paid_through: paidThrough, observed_at: observed } },
+      stripe: { invoice: null },
       milestones: expect.arrayContaining([
         expect.objectContaining({ type: 'access', disabled: true, username: 'river' }),
-        expect.objectContaining({ type: 'subscription', job_id: 'fixture-membership-operation' }),
+        expect.objectContaining({
+          type: 'subscription',
+          job_id: 'fixture-membership-operation',
+          invoice: { paid_through: paidThrough, observed_at: observed, tier_id: 'brigantine' },
+        }),
       ]),
     });
     expect(response.body).not.toMatch(

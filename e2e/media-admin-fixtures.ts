@@ -276,7 +276,7 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
         validateRecipient: async () => {},
         sendCredentials: async () => {},
         membershipActive: async () => true,
-        activeMembers: async () => members,
+        activeMemberPage: async () => ({ members: members }),
         listIdentityMembers: async () => ({
           members: members.map((member) => ({ ...member, roles: [] })),
           complete: true,

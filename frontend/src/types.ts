@@ -459,6 +459,7 @@ export interface SourceSnapshotStatus extends ImportWorkflowStatus {
   records: SourceSnapshotMetadata[];
 }
 export interface Job {
+  credential_availability?: { available: number; claimed_elsewhere: number };
   outcome_status?: string;
   preview_timing?: {
     preview_id: string;
@@ -514,6 +515,7 @@ export interface Overview {
     detail?: string;
     attention: boolean;
     next_run_at?: string | null;
+    last_successful_at?: string | null;
     repair?:
       | 'emby_history'
       | 'jellyfin_history'

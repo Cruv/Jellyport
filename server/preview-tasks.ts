@@ -51,6 +51,7 @@ export class PreviewTasks<T> {
     ids: string[],
     migrationScope: MigrationScope = 'played_favorites',
     useSnapshots = false,
+    run = this.run,
   ): PreviewTask<T> {
     if (!['complete', 'watched_only', 'played_favorites'].includes(migrationScope))
       throw new ServiceError('Choose a valid migration scope.');
@@ -104,7 +105,7 @@ export class PreviewTasks<T> {
     void Promise.resolve()
       .then(() => {
         entry.controller.signal.throwIfAborted();
-        return this.run([...ids], {
+        return run([...ids], {
           migration_scope: migrationScope === 'complete' ? 'watched_only' : migrationScope,
           use_snapshots: useSnapshots,
           signal: entry.controller.signal,

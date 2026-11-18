@@ -914,40 +914,48 @@ describe('React account safeguards', () => {
     expect((screen.getByLabelText('Username') as HTMLInputElement).value).toBe('');
   });
 
-  it('keeps a persistent last-known-status warning when job polling fails, then reconciles on refresh', async () => {
-    let poll: (() => Promise<void>) | undefined;
-    const realInterval = globalThis.setInterval;
-    vi.spyOn(globalThis, 'setInterval').mockImplementation(((
+  it('discovers external work at idle cadence and recovers when a status response hangs', async () => {
+    const timers = new Map<number, () => void>();
+    const realTimeout = globalThis.setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
       callback: TimerHandler,
-      timeout?: number,
+      delay?: number,
       ...args: unknown[]
     ) => {
-      if (timeout === 3000) {
-        poll = callback as () => Promise<void>;
-        return 999 as unknown as ReturnType<typeof setInterval>;
+      if (delay === 3000 || delay === 8000 || delay === 20_000) {
+        timers.set(delay, callback as () => void);
+        return 999 as unknown as ReturnType<typeof setTimeout>;
       }
-      return realInterval(callback, timeout, ...args);
-    }) as typeof setInterval);
+      return realTimeout(callback, delay, ...args);
+    }) as typeof setTimeout);
     const active = { ...job, status: 'running', results: [] };
-    responses['/api/overview'] = { ...overview, recent_jobs: [active] };
-    responses['/api/jobs'] = { jobs: [active] };
     render(<App />);
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
-    await waitFor(() => expect(poll).toBeTypeOf('function'));
+    await waitFor(() => expect(timers.has(20_000)).toBe(true));
+    responses['/api/jobs'] = { jobs: [active] };
+    await act(async () => timers.get(20_000)!());
     await screen.findByText('1 active');
-    statuses['/api/jobs/live'] = 503;
-    responses['/api/jobs'] = { detail: 'Synthetic temporary failure' };
-    await act(async () => {
-      await poll!();
-    });
+    const original = fetch;
+    let heldSignal: AbortSignal | null | undefined;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((path: string, options?: RequestInit) => {
+        if (path === '/api/jobs/live') {
+          heldSignal = options?.signal;
+          return new Promise<Response>(() => {});
+        }
+        return original(path, options);
+      }),
+    );
+    await act(async () => timers.get(3000)!());
+    expect(heldSignal?.aborted).toBe(false);
+    await act(async () => timers.get(8000)!());
+    expect(heldSignal?.aborted).toBe(true);
     expect(screen.getByText('Activity updates paused.')).toBeTruthy();
     expect(screen.getByText(/The last known operation status is shown/)).toBeTruthy();
-    expect(requests.filter((r) => r.options?.method === 'POST')).toHaveLength(0);
-    statuses['/api/jobs/live'] = 200;
+    vi.stubGlobal('fetch', original);
     responses['/api/jobs'] = { jobs: [job] };
-    await act(async () => {
-      await poll!();
-    });
+    await act(async () => timers.get(3000)!());
     await waitFor(() => expect(screen.queryByText('Activity updates paused.')).toBeNull());
     fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
     await screen.findByRole('button', { name: 'Delete activity…' });
@@ -2728,6 +2736,43 @@ describe('React account safeguards', () => {
     const attempts = requests.filter(({ path }) => path === '/api/migrations');
     expect(JSON.parse(String(attempts[1].options?.body)).preview_id).toBe('refreshed-preview');
   });
+  it('keeps the original job and watched-only scope when refreshing a follow-up review', async () => {
+    prepareRunningPreview();
+    const originalId = 'job-1';
+    const watched = {
+      ...readyPreviewTask,
+      preview: { ...readyPreviewTask.preview, migration_scope: 'watched_only' },
+    };
+    responses['/api/migrations/preview'] = watched;
+    responses['/api/jobs/job-1'] = { ...job, kind: 'migrate', status: 'failed' };
+    responses['/api/jobs/job-1/follow-up'] = {
+      source_user_ids: ['e-alex', 'e-river'],
+      migration_scope: 'watched_only',
+      use_snapshots: false,
+    };
+    fireEvent.click(
+      within(await openJob()).getByRole('button', { name: 'Review remaining accounts' }),
+    );
+    await finishMigrationWizard(
+      await screen.findByRole('dialog', { name: 'Review your migration' }),
+    );
+    responses['/api/migrations/preview'] = { ...watched, id: 'refreshed-follow-up' };
+    fireEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', {
+        name: 'Discard this draft and refresh the review',
+      }),
+    );
+    await screen.findByRole('dialog');
+    await finishMigrationWizard();
+    const previews = requests.filter(({ path }) => path === '/api/migrations/preview');
+    expect(previews.map(({ options }) => JSON.parse(String(options?.body)))).toEqual(
+      Array.from({ length: 2 }, () => ({
+        source_user_ids: ['e-alex', 'e-river'],
+        migration_scope: 'watched_only',
+        follow_up_job_id: originalId,
+      })),
+    );
+  });
   it('shows durable combined timing for the whole accepted job and excludes human review wait', async () => {
     responses['/api/jobs/job-1'] = {
       ...job,
@@ -3423,27 +3468,28 @@ describe('React account safeguards', () => {
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
-    const table = await screen.findByRole('table');
+    const table = () => screen.getByRole('table');
     const filter = screen.getByRole('combobox', { name: 'Status' });
     expect(within(filter).queryByRole('option', { name: 'Succeeded with warnings' })).toBeNull();
     fireEvent.change(filter, { target: { value: 'completed' } });
-    await waitFor(() => expect(within(table).getAllByRole('row')).toHaveLength(3));
-    expect(within(table).getByText('verified-history-user')).toBeTruthy();
-    expect(within(table).getByText('ordinary-completed-user')).toBeTruthy();
-    expect(within(table).getAllByText('Completed')).toHaveLength(2);
-    expect(within(table).queryByText('Succeeded with warnings')).toBeNull();
-    expect(within(table).queryByText('legacy-review-user')).toBeNull();
-    expect(within(table).queryByText('failed-history-user')).toBeNull();
+    await screen.findByText('ordinary-completed-user');
+    expect(within(table()).getAllByRole('row')).toHaveLength(3);
+    expect(within(table()).getByText('verified-history-user')).toBeTruthy();
+    expect(within(table()).getByText('ordinary-completed-user')).toBeTruthy();
+    expect(within(table()).getAllByText('Completed')).toHaveLength(2);
+    expect(within(table()).queryByText('Succeeded with warnings')).toBeNull();
+    expect(within(table()).queryByText('legacy-review-user')).toBeNull();
+    expect(within(table()).queryByText('failed-history-user')).toBeNull();
     fireEvent.change(filter, { target: { value: 'partial' } });
-    await waitFor(() => expect(within(table).getAllByRole('row')).toHaveLength(2));
-    expect(within(table).getByText('legacy-review-user')).toBeTruthy();
-    expect(within(table).getByText('Needs review')).toBeTruthy();
-    expect(within(table).queryByText('verified-history-user')).toBeNull();
-    expect(within(table).queryByText('ordinary-completed-user')).toBeNull();
+    await waitFor(() => expect(within(table()).getAllByRole('row')).toHaveLength(2));
+    expect(within(table()).getByText('legacy-review-user')).toBeTruthy();
+    expect(within(table()).getByText('Needs review')).toBeTruthy();
+    expect(within(table()).queryByText('verified-history-user')).toBeNull();
+    expect(within(table()).queryByText('ordinary-completed-user')).toBeNull();
     fireEvent.change(filter, { target: { value: 'failed' } });
-    await waitFor(() => expect(within(table).getAllByRole('row')).toHaveLength(2));
-    await within(table).findByText('failed-history-user');
-    expect(within(table).getByText('Failed')).toBeTruthy();
+    await waitFor(() => expect(within(table()).getAllByRole('row')).toHaveLength(2));
+    await screen.findByText('failed-history-user');
+    expect(within(table()).getByText('Failed')).toBeTruthy();
     expect(jobs).toEqual(before);
     expect(
       requests.filter((request) => request.options?.method && request.options.method !== 'GET'),
@@ -4430,5 +4476,104 @@ it('keeps the reviewed Emby selection while a replacement roster is unavailable'
   expect(screen.getByRole('button', { name: 'Preview migration (1)' })).toHaveProperty(
     'disabled',
     true,
+  );
+});
+
+it('binds Activity actions to the query, status, and page that returned each row', async () => {
+  responses['/api/jobs'] = {
+    jobs: Array.from({ length: 28 }, (_, index) => ({
+      ...job,
+      id: `report-${index}`,
+      results: [{ status: 'completed', username: `Account ${index}` }],
+    })),
+  };
+  const original = fetch;
+  let failedQuery!: (response: Response) => void;
+  let staleDetail!: (response: Response) => void;
+  vi.stubGlobal(
+    'fetch',
+    vi.fn((path: string, options?: RequestInit) => {
+      const url = new URL(path, 'https://synthetic.invalid');
+      if (url.pathname === '/api/jobs' && url.searchParams.get('query') === 'new query')
+        return new Promise<Response>((resolve) => {
+          failedQuery = resolve;
+        });
+      if (url.pathname === '/api/jobs/report-0')
+        return new Promise<Response>((resolve) => {
+          staleDetail = resolve;
+        });
+      return original(path, options);
+    }),
+  );
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+  const originalRow = await screen.findByRole('row', { name: /Account 0/ });
+  fireEvent.click(within(originalRow).getByRole('button', { name: 'View operation details' }));
+  fireEvent.change(screen.getByRole('searchbox', { name: 'Search operations' }), {
+    target: { value: 'new query' },
+  });
+  expect(screen.queryByRole('row', { name: /Account 0/ })).toBeNull();
+  expect(screen.getByRole('button', { name: 'Delete activity…' })).toHaveProperty('disabled', true);
+  await act(async () =>
+    failedQuery(new Response(JSON.stringify({ detail: 'New query failed.' }), { status: 503 })),
+  );
+  await screen.findByText('New query failed.');
+  await act(async () => staleDetail(new Response(JSON.stringify({ ...job, id: 'report-0' }))));
+  expect(screen.queryByRole('dialog')).toBeNull();
+  expect(screen.queryByRole('button', { name: 'View operation details' })).toBeNull();
+  fireEvent.change(screen.getByRole('searchbox', { name: 'Search operations' }), {
+    target: { value: '' },
+  });
+  await screen.findByRole('row', { name: /Account 0/ });
+  fireEvent.click(screen.getByRole('button', { name: 'Next page' }));
+  expect(screen.queryByRole('row', { name: /Account 0/ })).toBeNull();
+  await screen.findByRole('row', { name: /Account 25/ });
+  fireEvent.change(screen.getByRole('combobox', { name: 'Status' }), {
+    target: { value: 'failed' },
+  });
+  expect(screen.queryByRole('row', { name: /Account 25/ })).toBeNull();
+  await screen.findByText('No matching operations');
+});
+
+it('refreshes the Emby roster in place after readiness succeeds and retains selections on read failure', async () => {
+  const initial = { emby: [{ Id: 'e-one', Name: 'Synthetic One' }], jellyfin: [] };
+  responses['/api/users'] = initial;
+  const readiness = responses['/api/workflow-readiness'] as {
+    actions: Record<string, { ready: boolean; blockers: unknown[]; warnings: string[] }>;
+  };
+  responses['/api/workflow-readiness/refresh'] = structuredClone(readiness);
+  readiness.actions.migrate = {
+    ready: false,
+    blockers: [
+      { code: 'emby', message: 'Verify Emby again.', route: { page: 'settings', tab: 'media' } },
+    ],
+    warnings: [],
+  };
+  render(<App />);
+  const navigation = within(await screen.findByRole('complementary', { name: 'Main navigation' }));
+  fireEvent.click(navigation.getByRole('button', { name: 'Migrate users' }));
+  const selected = await screen.findByRole('checkbox', { name: 'Select Synthetic One' });
+  fireEvent.click(selected);
+  await screen.findByText('Verify Emby again.');
+  statuses['/api/users'] = 502;
+  responses['/api/users'] = { detail: 'The refreshed Emby roster is unavailable.' };
+  fireEvent.click(screen.getByRole('button', { name: 'Check requirements again' }));
+  await screen.findByText(/The refreshed Emby roster is unavailable/);
+  expect(selected).toHaveProperty('checked', true);
+  expect(screen.getByRole('button', { name: 'Preview migration (1)' })).toHaveProperty(
+    'disabled',
+    true,
+  );
+  statuses['/api/users'] = 200;
+  responses['/api/users'] = {
+    ...initial,
+    emby: [...initial.emby, { Id: 'e-two', Name: 'Synthetic Two' }],
+  };
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh Emby users' }));
+  await screen.findByRole('checkbox', { name: 'Select Synthetic Two' });
+  expect(selected).toHaveProperty('checked', true);
+  expect(screen.getByRole('button', { name: 'Preview migration (1)' })).toHaveProperty(
+    'disabled',
+    false,
   );
 });

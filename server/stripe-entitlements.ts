@@ -35,25 +35,44 @@ interface Activation {
   error: string | null;
 }
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+export function stripeAuthorityScope(store: Store): string {
+  const settings = store.settings();
+  const auth = store.authState();
+  return digest([
+    settings.discord_enabled,
+    settings.discord_guild_id,
+    settings.discord_member_role_id,
+    settings.new_subscriber_source,
+    settings.emby_url,
+    settings.jellyfin_url,
+    auth?.kind === 'configured' ? auth.serverId : null,
+    (settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS)
+      .map((tier) => [tier.id, tier.account_limit])
+      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+  ]);
+}
 export function stripeAuthority(
   links: Array<{ customer_id: string; discord_user_id: string }>,
   prices: Array<{ price_id: string; tier_id: string }>,
   store: Store,
 ): string {
   return digest([
+    stripeAuthorityScope(store),
     links
       .map((link) => [link.customer_id, link.discord_user_id])
       .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
     prices
       .map((price) => [price.price_id, price.tier_id])
       .sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
-    (store.settings().membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS)
-      .map((tier) => [tier.id, tier.account_limit])
-      .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
   ]);
 }
 const iso = (seconds: number) => new Date(seconds * 1000).toISOString();
-const freshMs = 30 * 60_000;
+export const stripeInvoiceFreshMs = 30 * 60_000;
+export function freshStripeInvoice(observedAt: number, now: number): boolean {
+  return (
+    Number.isFinite(observedAt) && observedAt <= now && now - observedAt <= stripeInvoiceFreshMs
+  );
+}
 /** Older releases saved an untouched pending event and marked its receipt for
  * review. The exact pending expiry shape proves processing never started. */
 export function isDeferredStripeExpiry(event: SubscriptionEvent | null): boolean {
@@ -243,7 +262,7 @@ export class StripeEntitlements {
       !snapshot ||
       snapshot.mode !== 'live' ||
       !Number.isFinite(Date.parse(lastSync ?? '')) ||
-      this.now() - Date.parse(lastSync!) > freshMs
+      this.now() - Date.parse(lastSync!) > stripeInvoiceFreshMs
     )
       throw new ServiceError(
         'Sync a live Stripe connection successfully before enabling billing automation.',
@@ -272,13 +291,6 @@ export class StripeEntitlements {
     this.state.latest = [];
     this.persist();
   }
-  invalidateProof(): void {
-    if (this.state?.latest.length) {
-      this.state.latest = [];
-      this.state.checked_at = null;
-      this.persist();
-    }
-  }
   /** Aggregate every subscription belonging to every approved customer for an
    * owner. Unmapped/multiple/unknown billing never becomes an expiry decision. */
   prepare(
@@ -287,6 +299,7 @@ export class StripeEntitlements {
     links: Array<{ customer_id: string; discord_user_id: string }>,
     priceTiers: Array<{ price_id: string; tier_id: string }>,
     periods: Map<string, StripePaidPeriod | null>,
+    observedByOwner?: ReadonlyMap<string, number>,
   ): StripeEntitlementFact[] {
     if (!this.enabled(generation) || snapshot.mode !== 'live') return [];
     const state = this.state!,
@@ -302,6 +315,8 @@ export class StripeEntitlements {
       period,
       tier,
     } of stripeBillingDecisions(snapshot, links, priceTiers, periods, time)) {
+      const observedAt = observedByOwner?.get(owner) ?? time;
+      if (!freshStripeInvoice(observedAt, time)) continue;
       const event_id = `stripe-${digest([generation, owner, action, subscriptions.map((sub) => sub.id).sort(), period.invoice_id, period.end, tier])}`;
       facts.push({
         provider: 'stripe',
@@ -315,7 +330,7 @@ export class StripeEntitlements {
         price_id: period.price_id,
         created_at: iso(subscription.created!),
         paid_through: iso(period.end),
-        observed_at: new Date(time).toISOString(),
+        observed_at: new Date(observedAt).toISOString(),
         activation_revision: state.revision,
         generation,
         authority_revision: authorityRevision,
@@ -377,8 +392,7 @@ export class StripeEntitlements {
       state.revision !== fact.activation_revision ||
       !current ||
       digest({ ...current, observed_at: fact.observed_at }) !== digest(fact) ||
-      !Number.isFinite(Date.parse(state.checked_at ?? '')) ||
-      this.now() - Date.parse(state.checked_at!) > freshMs
+      !freshStripeInvoice(Date.parse(current.observed_at), this.now())
     )
       throw new ServiceError(
         'Stripe entitlement evidence changed or expired. Refresh billing and review the member.',

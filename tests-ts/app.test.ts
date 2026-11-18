@@ -3,8 +3,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
 import { createApp, type JellyportApp } from '../server/main.js';
-import { JellyfinAuthError, type JellyfinAuthentication } from '../server/jellyfin-auth.js';
+import {
+  JellyfinAuthError,
+  normalizeJellyfinUrl,
+  type JellyfinAuthentication,
+} from '../server/jellyfin-auth.js';
 import { DemoServers } from '../server/demo.js';
 import { Store } from '../server/store.js';
 import { DEFAULT_SETTINGS } from '../server/types.js';
@@ -450,6 +455,7 @@ it.each(['complete', 'watched_only'] as const)(
           users: [],
           mode: 'merge',
           migration_scope: 'watched_only',
+          source_server_id: 'demo-emby',
           destination_server_id: 'demo-jellyfin',
         };
       });
@@ -500,6 +506,7 @@ it.each([
       users: [],
       mode: 'merge',
       migration_scope: expected,
+      source_server_id: 'demo-emby',
       destination_server_id: 'demo-jellyfin',
     });
     const migrate = vi.spyOn(app.jellyport.service, 'migrateUsers').mockResolvedValue({
@@ -640,6 +647,8 @@ it('passes protected-account pins only from the session-owned review and rejects
         source_username: preview.users[0]!.source_username,
       },
     },
+    undefined,
+    preview.source_server_id,
   );
   expect(
     (await app.inject({ url: `/api/migrations/preview/${review.id}`, headers })).statusCode,
@@ -678,6 +687,37 @@ it.each([
     expect(servers.played['unreviewed-replacement']).toBeUndefined();
   },
 );
+
+it('rejects a same-URL Emby replacement before accepting an unchanged source account', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const servers = new DemoServers();
+  let embyId = 'reviewed-emby';
+  app.jellyport.service.clientFactory = (...args) => {
+    const client = servers.factory(...args);
+    if (args[2] === 'emby') {
+      const systemInfo = client.systemInfo.bind(client);
+      client.systemInfo = async () => ({ ...(await systemInfo()), Id: embyId });
+    }
+    return client;
+  };
+  const review = await readyPreview(app, headers, ['e-river']);
+  expect(review.preview.users[0]).toMatchObject({
+    source_user_id: 'e-river',
+    source_username: 'river',
+  });
+  embyId = 'replacement-emby';
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/migrations',
+    headers,
+    payload: { source_user_ids: ['e-river'], preview_id: review.id },
+  });
+  expect(response.statusCode).toBe(400);
+  expect(review.preview.source_server_id).toBe('reviewed-emby');
+  expect(response.json().detail).toContain('reviewed Emby server changed');
+  expect(app.jellyport.store.jobs()).toEqual([]);
+});
 
 it('passes household ownership only from its session-owned review and rejects client-supplied household proofs', async () => {
   const app = await setup();
@@ -738,6 +778,8 @@ it('passes household ownership only from its session-owned review and rejects cl
         source_username: 'alex',
       },
     },
+    undefined,
+    preview.source_server_id,
   );
 });
 
@@ -994,6 +1036,7 @@ it('discards ready history previews when integration settings change', async () 
     users: [],
     mode: 'merge',
     migration_scope: 'watched_only',
+    source_server_id: 'demo-emby',
     destination_server_id: 'test-server',
   });
   const started = await app.inject({
@@ -1351,11 +1394,11 @@ it('uses recorded source identities for a fresh follow-up and excludes successfu
   };
   store.saveQueuedJob(
     job,
-    [
-      { username: 'Same display name', source_user_id: 'finished-source' },
-      { username: 'Same display name', source_user_id: 'partial-source' },
-      { username: 'Never started', source_user_id: 'unstarted-source' },
-    ],
+    ['finished-source', 'partial-source', 'unstarted-source'].map((id) => ({
+      username: id,
+      source_user_id: id,
+      migration_source: { server_id: 'original-emby', user_id: id, username: id },
+    })),
     store.settings(),
     undefined,
     { key: 'synthetic-opaque-key', owner: 'synthetic-owner-key', requestHash: 'synthetic-proof' },
@@ -1404,4 +1447,130 @@ it('uses recorded source identities for a fresh follow-up and excludes successfu
   expect(changedSource.statusCode).toBe(400);
   expect(changedSource.json().detail).toContain('original Emby server changed');
   expect(store.jobCount()).toBe(1);
+});
+
+it('preserves the original source binding and watched-only scope through follow-up approval and execution', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const store = app.jellyport.store;
+  const servers = new DemoServers();
+  let embyId = 'original-emby';
+  app.jellyport.service.clientFactory = (...args) => {
+    const client = servers.factory(...args);
+    if (args[2] === 'emby') {
+      const read = client.systemInfo.bind(client);
+      client.systemInfo = async () => ({ ...(await read()), Id: embyId });
+    }
+    return client;
+  };
+  const timestamp = new Date().toISOString();
+  const job = {
+    id: 'original-watched-only',
+    kind: 'migrate',
+    status: 'queued',
+    created_at: timestamp,
+    updated_at: timestamp,
+    progress: { processed: 0, total: 1 },
+    migration_scope: 'watched_only' as const,
+    results: [],
+  };
+  const settings = store.settings();
+  const scope = createHash('sha256')
+    .update(JSON.stringify([normalizeJellyfinUrl(settings.emby_url), embyId]))
+    .digest('hex');
+  store.saveQueuedJob(
+    job,
+    [
+      {
+        source_user_id: 'e-river',
+        migration_source: { server_id: embyId, user_id: 'e-river', username: 'river' },
+      },
+    ],
+    settings,
+    undefined,
+    undefined,
+    scope,
+  );
+  expect(store.claimQueuedJob(job.id)).toBe(true);
+  store.saveJob({ ...job, status: 'failed' });
+  const payload = {
+    source_user_ids: ['e-river'],
+    migration_scope: 'watched_only',
+    follow_up_job_id: job.id,
+  };
+  const start = (body: typeof payload) =>
+    app.inject({ method: 'POST', url: '/api/migrations/preview', headers, payload: body });
+  expect((await start({ ...payload, migration_scope: 'played_favorites' })).statusCode).toBe(400);
+  const started = await start(payload);
+  expect(started.statusCode).toBe(202);
+  const id = started.json().id as string;
+  await vi.waitFor(async () => {
+    const response = await app.inject({ url: `/api/migrations/preview/${id}`, headers });
+    expect(response.json()).toMatchObject({
+      status: 'ready',
+      preview: {
+        follow_up_job_id: job.id,
+        migration_scope: 'watched_only',
+        source_server_id: 'original-emby',
+      },
+    });
+  });
+  const approve = () =>
+    app.inject({
+      method: 'POST',
+      url: '/api/migrations',
+      headers,
+      payload: { source_user_ids: ['e-river'], migration_scope: 'watched_only', preview_id: id },
+    });
+  embyId = 'replacement-emby';
+  const rejected = await approve();
+  expect(rejected.statusCode).toBe(400);
+  expect(rejected.json().detail).toMatch(/reviewed Emby server changed/i);
+  expect(store.jobCount()).toBe(1);
+  embyId = 'original-emby';
+  servers.userData['e-river'] = { '3': { IsFavorite: true } };
+  const accepted = await approve();
+  expect(accepted.statusCode).toBe(202);
+  const queued = accepted.json();
+  expect(queued).toMatchObject({ migration_scope: 'watched_only', follow_up_job_id: job.id });
+  await app.jellyport.service.jobTasks.get(queued.id);
+  expect(store.job(queued.id)).toMatchObject({
+    status: 'completed',
+    migration_scope: 'watched_only',
+  });
+  expect(servers.userData['j-river']?.['3']).toBeUndefined();
+});
+
+it('returns the same durable creation job for a recovered or concurrent submission', async () => {
+  const app = await setup();
+  const headers = await login(app);
+  const receipt = 'a0000000-1234-4abc-8123-000000000000';
+  const submit = (username: string) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/accounts',
+      headers: { ...headers, 'x-jellyport-submission': receipt },
+      payload: { username },
+    });
+  const [lost, parallel] = await Promise.all([
+    submit('receipt-account'),
+    submit('receipt-account'),
+  ]);
+  expect(lost.statusCode).toBe(202);
+  expect(parallel.statusCode).toBe(202);
+  const id = lost.json().id as string;
+  expect(parallel.json().id).toBe(id);
+  await app.jellyport.service.jobTasks.get(id);
+  const original = await app.inject({
+    url: `/api/jobs/receipts/${receipt}`,
+    headers: await login(app),
+  });
+  expect(original.json()).toEqual({ job_id: id });
+  expect((await app.inject({ url: '/api/jobs/receipts/latest', headers })).json()).toEqual({
+    job_id: id,
+  });
+  expect((await submit('receipt-account')).json().id).toBe(id);
+  expect((await submit('different-account')).statusCode).toBe(409);
+  expect((await app.inject(`/api/jobs/receipts/${receipt}`)).statusCode).toBe(401);
+  expect(app.jellyport.store.jobCount()).toBe(1);
 });

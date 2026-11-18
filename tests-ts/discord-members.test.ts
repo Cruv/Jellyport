@@ -33,7 +33,7 @@ async function fixture() {
     validateRecipient: async () => {},
     sendCredentials: async () => {},
     membershipActive: async () => true,
-    activeMembers: async () => [],
+    activeMemberPage: async () => ({ members: [] }),
     searchMembers: vi.fn<NonNullable<BotAdapter['searchMembers']>>(async () =>
       structuredClone(result),
     ),

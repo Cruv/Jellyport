@@ -22,6 +22,7 @@ export function householdTimeline(service: Service, stripe: StripeIntegration, d
       ? store.linksForMember(discordId)
       : [];
   const billing = stripe.householdEvidence(discordId);
+  const authority = service.discordAuthorityState(discordId, settings);
   const accounts = new Map<string, HouseholdAccount>();
   const key = (kind: MediaKind, id: string) => `${kind}:${id}`;
   for (const account of approved) {
@@ -79,7 +80,6 @@ export function householdTimeline(service: Service, stripe: StripeIntegration, d
   }
   const events = store.subscriptionsForMember(discordId, undefined, 50);
   const linkedOperations = new Set(events.map((event) => event.job_id));
-  const invoice = events.find((event) => event.stripe_entitlement)?.stripe_entitlement;
   const milestones = [
     ...approved.map((account) => ({
       key: `${account.kind}:${account.account_id}`,
@@ -97,6 +97,13 @@ export function householdTimeline(service: Service, stripe: StripeIntegration, d
       status: event.stripe_expiry_deferred ? 'deferred' : event.status,
       source: event.source ?? null,
       job_id: event.report_cleared ? undefined : event.job_id,
+      invoice: event.stripe_entitlement
+        ? {
+            paid_through: event.stripe_entitlement.paid_through,
+            observed_at: event.stripe_entitlement.observed_at,
+            tier_id: event.stripe_entitlement.tier_id,
+          }
+        : undefined,
     })),
     ...store
       .householdJobSummaries(discordId)
@@ -127,7 +134,7 @@ export function householdTimeline(service: Service, stripe: StripeIntegration, d
       billing.username ??
       links[0]?.username ??
       null,
-    authority: service.discordAuthorityState(discordId, settings),
+    authority,
     membership: membership
       ? {
           access_mode: membership.access_mode,
@@ -147,13 +154,7 @@ export function householdTimeline(service: Service, stripe: StripeIntegration, d
       last_sync: billing.last_sync,
       complete: billing.complete,
       subscriptions: billing.subscriptions,
-      invoice: invoice
-        ? {
-            paid_through: invoice.paid_through,
-            observed_at: invoice.observed_at,
-            tier_id: invoice.tier_id,
-          }
-        : null,
+      invoice: authority === 'current' ? billing.invoice : null,
     },
     milestones,
   };

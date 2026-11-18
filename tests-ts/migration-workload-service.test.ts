@@ -105,66 +105,168 @@ describe('playback-conscious migration orchestration', () => {
     return { select, items };
   }
 
-  it.each(['source history', 'destination state', 'independent verification'])(
-    'completes unrelated access changes while %s is stalled',
-    async (stage) => {
-      const entered = deferred();
-      const release = deferred();
-      releases.push(release.resolve);
-      servers.users.jellyfin.push({
-        Id: 'unrelated',
-        Name: 'separate',
-        Policy: { IsAdministrator: false, IsDisabled: false },
-      });
-      const factory = service.clientFactory;
-      let destinationReads = 0;
-      const stall = async () => {
-        entered.resolve();
-        await release.promise;
-      };
-      service.clientFactory = (...args) => {
-        const client = factory(...args);
-        if (args[2] === 'emby' && stage === 'source history') {
-          const read = client.migrationState!.bind(client);
-          client.migrationState = async (...params) => {
-            await stall();
-            return read(...params);
-          };
-        }
-        if (args[2] === 'jellyfin') {
-          const read = client.destinationItems!.bind(client);
-          client.destinationItems = async (...params) => {
-            destinationReads++;
-            if (
-              (stage === 'destination state' && destinationReads === 1) ||
-              (stage === 'independent verification' && destinationReads === 2)
-            )
-              await stall();
-            return read(...params);
-          };
-        }
-        return client;
-      };
-      const migration = await service.migrateUsers(['e-river']);
-      await entered.promise;
-      const access = service.setAccountAccess({
-        kind: 'jellyfin',
-        user_id: 'unrelated',
-        disabled: true,
-        expected_username: 'separate',
-        expected_profile_revision: '',
-      });
-      try {
-        const result = await Promise.race([access, delay(1500, null, { ref: false })]);
-        expect(result).toMatchObject({ disabled: true });
-        expect(service.getJob(migration.id).status).toBe('running');
-      } finally {
-        release.resolve();
-        await access;
+  it.each([
+    'source history',
+    'destination state',
+    'independent verification',
+    'capability negotiation',
+  ])('completes unrelated access changes while %s is stalled', async (stage) => {
+    const entered = deferred();
+    const release = deferred();
+    releases.push(release.resolve);
+    servers.users.jellyfin.push({
+      Id: 'unrelated',
+      Name: 'separate',
+      Policy: { IsAdministrator: false, IsDisabled: false },
+    });
+    const factory = service.clientFactory;
+    let destinationReads = 0;
+    const stall = async () => {
+      entered.resolve();
+      await release.promise;
+    };
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      if (args[2] === 'emby' && stage === 'source history') {
+        const read = client.migrationState!.bind(client);
+        client.migrationState = async (...params) => {
+          await stall();
+          return read(...params);
+        };
       }
-      expect((await finish(migration)).status).toBe('completed');
+      if (args[2] === 'jellyfin') {
+        if (stage === 'capability negotiation') {
+          const readCapabilities = client.migrationCapabilities!.bind(client);
+          client.migrationCapabilities = async () => {
+            await stall();
+            return readCapabilities();
+          };
+        }
+        const read = client.destinationItems!.bind(client);
+        client.destinationItems = async (...params) => {
+          destinationReads++;
+          if (
+            (stage === 'destination state' && destinationReads === 1) ||
+            (stage === 'independent verification' && destinationReads === 2)
+          )
+            await stall();
+          return read(...params);
+        };
+      }
+      return client;
+    };
+    const migration = await service.migrateUsers(['e-river']);
+    await entered.promise;
+    const access = service.setAccountAccess({
+      kind: 'jellyfin',
+      user_id: 'unrelated',
+      disabled: true,
+      expected_username: 'separate',
+      expected_profile_revision: '',
+    });
+    try {
+      const result = await Promise.race([access, delay(1500, null, { ref: false })]);
+      expect(result).toMatchObject({ disabled: true });
+      expect(service.getJob(migration.id).status).toBe('running');
+    } finally {
+      release.resolve();
+      await access;
+    }
+    expect((await finish(migration)).status).toBe('completed');
+  });
+
+  it.each([true, false])(
+    'prevents a durable migration with source pin present=%s from using a replacement Emby server',
+    async (pinned) => {
+      await service.stop();
+      const timestamp = new Date().toISOString();
+      const queued: Job = {
+        id: 'retained-migration',
+        kind: 'migrate',
+        status: 'queued',
+        created_at: timestamp,
+        updated_at: timestamp,
+        progress: { processed: 0, total: 1 },
+        results: [],
+      };
+      store.saveQueuedJob(
+        queued,
+        [
+          {
+            source_user_id: 'e-river',
+            ...(pinned
+              ? {
+                  migration_source: {
+                    server_id: 'fixture-source',
+                    user_id: 'e-river',
+                    username: 'river',
+                  },
+                }
+              : {}),
+            migration_destination: {
+              server_id: 'demo-jellyfin',
+              target_user_id: 'j-river',
+              username: 'river',
+              source_username: 'river',
+            },
+          },
+        ],
+        store.settings(),
+      );
+      const reads = vi.fn();
+      const factory = service.clientFactory;
+      store.close();
+      store = new Store(directory);
+      service = new Service(store, {
+        clientFactory: (...args) => {
+          const client = factory(...args);
+          if (args[2] === 'emby') {
+            client.systemInfo = async () => ({ Id: 'replacement-emby', Version: sourceVersion });
+            const state = client.migrationState!.bind(client);
+            client.migrationState = async (...params) => {
+              reads();
+              return state(...params);
+            };
+          }
+          return client;
+        },
+      });
+      const originalHistory = structuredClone(servers.userData['j-river']);
+      await service.start();
+      const result = await finish(queued);
+      expect(result.status).toBe('failed');
+      expect(result.results[0]?.error).toMatch(
+        pinned ? /reviewed Emby server changed/ : /no verified Emby source binding/,
+      );
+      expect(reads).not.toHaveBeenCalled();
+      expect(servers.userData['j-river']).toEqual(originalHistory);
     },
   );
+  it('rechecks the source binding after history preparations and before writing', async () => {
+    const factory = service.clientFactory;
+    let replaceSource = false;
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      if (args[2] === 'jellyfin') {
+        const read = client.migrationCapabilities!.bind(client);
+        client.migrationCapabilities = async () => {
+          replaceSource = true;
+          return read();
+        };
+      } else if (replaceSource) {
+        client.systemInfo = async () => ({ Id: 'replacement-emby', Version: sourceVersion });
+      }
+      return client;
+    };
+    const before = structuredClone(servers.userData['j-river']);
+    const job = await finish(await service.migrateUsers(['e-river']));
+    expect(replaceSource).toBe(true);
+    expect(job.results[0]).toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('reviewed Emby server changed'),
+    });
+    expect(servers.userData['j-river']).toEqual(before);
+  });
 
   it('does not use an account that appeared after the reviewed absence was queued', async () => {
     const entered = deferred();

@@ -77,7 +77,7 @@ async function fixture() {
     validateRecipient: vi.fn(async () => {}),
     sendCredentials: vi.fn(async () => {}),
     membershipActive: async () => true,
-    activeMembers: async () => [],
+    activeMemberPage: async () => ({ members: [] }),
   };
   service.bot = bot;
   const base = Math.floor(Date.now() / 1000);

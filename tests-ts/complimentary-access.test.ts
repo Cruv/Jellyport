@@ -56,8 +56,8 @@ class MembershipBot implements BotAdapter {
     this.membershipLookups.push(id);
     return this.present && this.paid;
   }
-  async activeMembers() {
-    return this.present && this.paid ? [{ id: owner, username: 'Jim' }] : [];
+  async activeMemberPage() {
+    return { members: this.present && this.paid ? [{ id: owner, username: 'Jim' }] : [] };
   }
 }
 

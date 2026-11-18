@@ -61,6 +61,7 @@ import {
   type HistoryCleanupResult,
 } from './types';
 import { WorkflowProvider } from './WorkflowRequirements';
+import { operationPollDelay, readOperationStatus } from './operation-polling';
 
 const pages: Record<Page, { title: string; icon: string }> = {
   overview: { title: 'Overview', icon: 'grid' },
@@ -96,7 +97,13 @@ function accountMessage(credential: Credential): string {
 }
 type CleanupCandidate = Pick<Job, 'id' | 'status' | 'created_at' | 'updated_at' | 'finished_at'>;
 type Dialog =
-  | { kind: 'preview'; preview: Preview; previewId: string; reviewElapsedMs?: number }
+  | {
+      kind: 'preview';
+      preview: Preview;
+      previewId: string;
+      reviewElapsedMs?: number;
+      followUpJob?: string;
+    }
   | { kind: 'job'; job: Job }
   | { kind: 'reveal'; jobId: string }
   | { kind: 'credentials'; jobId: string; credentials: Credential[] }
@@ -117,12 +124,31 @@ interface Toast {
 const message = (error: unknown) =>
   error instanceof Error ? error.message : 'The operation could not be completed.';
 const emptyUsers: Users = { emby: [], jellyfin: [] };
-const pendingSubmissionKey = 'jellyport:pending-migration-receipt';
+const pendingSubmissionKey = 'jellyport:pending-operation-receipt';
+const legacySubmissionKey = 'jellyport:pending-migration-receipt';
+const receiptPaths = new Set([
+  '/api/accounts',
+  '/api/accounts/clone',
+  '/api/accounts/recover',
+  '/api/account-roles/apply',
+]);
+function newSubmissionReceipt(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6]! & 0x0f) | 0x40;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
 function pendingSubmission(value?: string): string {
   try {
+    if (value !== undefined) sessionStorage.removeItem(legacySubmissionKey);
     if (value === '') sessionStorage.removeItem(pendingSubmissionKey);
     else if (value) sessionStorage.setItem(pendingSubmissionKey, value);
-    return sessionStorage.getItem(pendingSubmissionKey) ?? '';
+    return (
+      sessionStorage.getItem(pendingSubmissionKey) ??
+      sessionStorage.getItem(legacySubmissionKey) ??
+      ''
+    );
   } catch {
     return value ?? '';
   }
@@ -159,6 +185,8 @@ export default function App() {
   const [overview, setOverview] = useState<Overview | null>(null);
   const [users, setUsers] = useState<Users>(emptyUsers);
   const lastMigrationRoster = useRef<Users['emby']>([]);
+  const migrationRosterVersion = useRef(0);
+  const [migrationRosterPending, setMigrationRosterPending] = useState(false);
   const [mappings, setMappings] = useState<UserMapping[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [activityFilter, setActivityFilter] = useState<
@@ -169,12 +197,26 @@ export default function App() {
     page: 1,
   });
   const activityPageSize = activityFilter.pageSize ?? (compactRecords ? 5 : 25);
-  const [activity, setActivity] = useState<ActivityResults | null>(null);
+  const activityScope = new URLSearchParams({
+    limit: String(activityPageSize),
+    offset: String((activityFilter.page - 1) * activityPageSize),
+    status: activityFilter.status,
+    query: activityFilter.query,
+  }).toString();
+  const activityScopeRef = useRef(activityScope);
+  activityScopeRef.current = activityScope;
+  const [activity, setActivity] = useState<{ scope: string; result: ActivityResults } | null>(null);
   const [activityPending, setActivityPending] = useState(false);
-  const [activityError, setActivityError] = useState('');
+  const [activityError, setActivityError] = useState<{ scope: string; message: string } | null>(
+    null,
+  );
   const [activityRefresh, setActivityRefresh] = useState(0);
   const [live, setLive] = useState<LiveOperations | null>(null);
+  const wakeOperations = useRef<() => void>(() => {});
   const [receipt, setReceipt] = useState(pendingSubmission);
+  const pendingAccountSubmission = useRef<{ path: string; body: string; receipt: string } | null>(
+    null,
+  );
   const [followUp, setFollowUp] = useState<{
     job_id: string;
     source_user_ids: string[];
@@ -332,15 +374,20 @@ export default function App() {
     setOverview(null);
     setUsers(emptyUsers);
     lastMigrationRoster.current = [];
+    migrationRosterVersion.current++;
+    setMigrationRosterPending(false);
     setMappings([]);
     setMemberHandoff(undefined);
     setSettings(null);
     settingsSaveOwner.current = null;
     setSettingsSavePending(false);
     setActivity(null);
+    setActivityError(null);
+    setActivityPending(false);
     setActivityFilter({ query: '', status: 'all', page: 1 });
     setLive(null);
     setReceipt(pendingSubmission(''));
+    pendingAccountSubmission.current = null;
     setFollowUp(null);
     setEvents([]);
     setSelected(new Set());
@@ -374,13 +421,25 @@ export default function App() {
         if (options.body !== undefined) headers['Content-Type'] = 'application/json';
         if (options.method && options.method !== 'GET' && sessionRef.current?.csrf_token)
           headers['X-CSRF-Token'] = sessionRef.current.csrf_token;
+        const body = options.body === undefined ? undefined : JSON.stringify(options.body);
+        let submission: string | undefined;
+        if (options.method === 'POST' && body && receiptPaths.has(path)) {
+          const previous = pendingAccountSubmission.current;
+          submission =
+            previous?.path === path && previous.body === body
+              ? previous.receipt
+              : newSubmissionReceipt();
+          pendingAccountSubmission.current = { path, body, receipt: submission };
+          headers['X-Jellyport-Submission'] = submission;
+          setReceipt(pendingSubmission(submission));
+        }
         let response: Response;
         try {
           response = await fetch(path, {
             ...options,
             headers,
             credentials: 'same-origin',
-            body: options.body === undefined ? undefined : JSON.stringify(options.body),
+            body,
           });
         } catch (error) {
           if (error instanceof Error && error.name === 'AbortError') throw error;
@@ -430,6 +489,17 @@ export default function App() {
             typeof detail === 'string' ? detail : `Request failed (${response.status}).`,
             { cause: data },
           );
+        }
+        if (
+          submission &&
+          data &&
+          typeof data === 'object' &&
+          'id' in data &&
+          typeof data.id === 'string'
+        ) {
+          if (pendingAccountSubmission.current?.receipt === submission)
+            pendingAccountSubmission.current = null;
+          if (pendingSubmission() === submission) pendingSubmission('');
         }
         return data as T;
       } finally {
@@ -489,6 +559,38 @@ export default function App() {
     setUseSnapshots(saved);
     setSourceDefaults('ready');
   }
+  const refreshMigrationRoster = useCallback(
+    async (signal?: AbortSignal) => {
+      if (pageRef.current !== 'migrate' || !sessionRef.current?.authenticated) return;
+      const version = ++migrationRosterVersion.current;
+      setMigrationRosterPending(true);
+      const current = () =>
+        !signal?.aborted &&
+        version === migrationRosterVersion.current &&
+        pageRef.current === 'migrate' &&
+        !!sessionRef.current?.authenticated;
+      try {
+        const listed = await api<Users>('/api/users', { signal });
+        if (!current()) return;
+        if (!listed.errors?.emby) {
+          lastMigrationRoster.current = listed.emby;
+          const available = new Set(listed.emby.map(({ Id }) => Id));
+          setSelected((selection) => new Set([...selection].filter((id) => available.has(id))));
+        }
+        setUsers({ ...listed, emby: lastMigrationRoster.current });
+      } catch (error) {
+        if (current())
+          setUsers((previous) => ({
+            ...previous,
+            emby: lastMigrationRoster.current,
+            errors: { ...previous.errors, emby: message(error) },
+          }));
+      } finally {
+        if (current()) setMigrationRosterPending(false);
+      }
+    },
+    [api],
+  );
   const load = useCallback(
     async (target: Page, manual = false) => {
       if (target !== pageRef.current) return;
@@ -505,20 +607,11 @@ export default function App() {
           if (version === loadVersion.current && historyVersion === historyRevision.current)
             setOverview(value);
         } else if (target === 'migrate') {
-          const [value, summary] = await Promise.all([
-            api<Users>('/api/users'),
+          const [, summary] = await Promise.all([
+            refreshMigrationRoster(),
             api<Overview>('/api/overview'),
           ]);
-          if (version === loadVersion.current) {
-            const rosterUnavailable = !!value.errors?.emby;
-            if (!rosterUnavailable) lastMigrationRoster.current = value.emby;
-            setUsers({ ...value, emby: lastMigrationRoster.current });
-            setOverview(summary);
-            if (!rosterUnavailable) {
-              const availableIds = new Set(value.emby.map((user) => user.Id));
-              setSelected((current) => new Set([...current].filter((id) => availableIds.has(id))));
-            }
-          }
+          if (version === loadVersion.current) setOverview(summary);
         } else if (target === 'roles') {
           const [listed, configuration] = await Promise.all([
             api<Users>('/api/users'),
@@ -595,7 +688,7 @@ export default function App() {
         }
       }
     },
-    [api, notify],
+    [api, notify, refreshMigrationRoster],
   );
   useEffect(() => {
     const controller = new AbortController();
@@ -643,52 +736,71 @@ export default function App() {
   useEffect(() => {
     if (!session?.authenticated || page !== 'activity') return;
     const controller = new AbortController();
-    const { query, status, page: index } = activityFilter;
-    const params = new URLSearchParams({
-      limit: String(activityPageSize),
-      offset: String((index - 1) * activityPageSize),
-      status,
-      query,
-    });
+    const { page: index } = activityFilter;
     setActivityPending(true);
-    setActivityError('');
-    void api<ActivityResults>(`/api/jobs?${params}`, { signal: controller.signal })
+    setActivityError(null);
+    void readOperationStatus<ActivityResults>(api, `/api/jobs?${activityScope}`, controller.signal)
       .then((result) => {
-        if (controller.signal.aborted) return;
+        if (controller.signal.aborted || activityScopeRef.current !== activityScope) return;
         const lastPage = Math.max(1, Math.ceil(result.total / activityPageSize));
         if (index > lastPage) setActivityFilter((current) => ({ ...current, page: lastPage }));
-        else setActivity(result);
+        else setActivity({ scope: activityScope, result });
       })
       .catch((error) => {
-        if (!controller.signal.aborted) setActivityError(message(error));
+        if (!controller.signal.aborted)
+          setActivityError({ scope: activityScope, message: message(error) });
       })
       .finally(() => {
         if (!controller.signal.aborted) setActivityPending(false);
       });
     return () => controller.abort();
-  }, [activityFilter, activityPageSize, activityRefresh, api, page, session?.authenticated]);
+  }, [
+    activityScope,
+    activityFilter.page,
+    activityPageSize,
+    activityRefresh,
+    api,
+    page,
+    session?.authenticated,
+  ]);
   useEffect(() => {
     if (!session?.authenticated) return;
     const controller = new AbortController();
     let polling = false;
+    let wakePending = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let failures = 0;
     let previous: LiveOperations | undefined;
+    let reportRevision = '';
+    const displayedJob = () => {
+      const current = dialogRef.current;
+      return current?.kind === 'job' && activeJob(current.job) ? current.job : undefined;
+    };
     const poll = async () => {
-      if (polling || document.hidden) return;
+      if (polling || document.hidden || controller.signal.aborted) return;
       polling = true;
       const revision = historyRevision.current;
       try {
-        const next = await api<LiveOperations>('/api/jobs/live', { signal: controller.signal });
+        const next = await readOperationStatus<LiveOperations>(
+          api,
+          '/api/jobs/live',
+          controller.signal,
+        );
         if (controller.signal.aborted || revision !== historyRevision.current) return;
         if (
           !Array.isArray(next?.active) ||
           !Array.isArray(next.recent) ||
-          typeof next.revision !== 'string'
+          typeof next.revision !== 'string' ||
+          !Number.isSafeInteger(next.active_count)
         )
           throw new Error('Operation status is unavailable.');
-        setLive(next);
-        setPollPaused(false);
         if (previous && previous.revision !== next.revision && pageRef.current === 'activity')
           setActivityRefresh((current) => current + 1);
+        const finished = previous?.active.some((job) =>
+          next.recent.some((item) => item.id === job.id && !activeJob(item)),
+        );
+        previous = next;
+        setLive(next);
         setOverview((current) =>
           current
             ? {
@@ -698,61 +810,70 @@ export default function App() {
               }
             : current,
         );
-        const current = dialogRef.current;
-        if (
-          current?.kind === 'job' &&
-          activeJob(current.job) &&
-          previous?.revision !== next.revision
-        ) {
-          const version = dialogVersion.current;
-          const id = encodeURIComponent(current.job.id);
+        if (finished && pageRef.current === 'migrate')
+          void refreshMigrationRoster(controller.signal);
+
+        const current = displayedJob();
+        const version = dialogVersion.current;
+        const reportKey = `${version}:${next.revision}`;
+        if (current && reportRevision !== reportKey) {
+          const id = encodeURIComponent(current.id);
           const summary =
-            next.active.find((job) => job.id === current.job.id) ??
-            next.recent.find((job) => job.id === current.job.id) ??
-            (await api<Job>(`/api/jobs/${id}/summary`, { signal: controller.signal }));
+            next.active.find((job) => job.id === current.id) ??
+            next.recent.find((job) => job.id === current.id) ??
+            (await readOperationStatus<Job>(api, `/api/jobs/${id}/summary`, controller.signal));
           const sameRows =
             JSON.stringify(
-              current.job.results?.map(({ username, status }) => ({ username, status })) ?? [],
+              current.results?.map(({ username, status }) => ({ username, status })) ?? [],
             ) === JSON.stringify(summary.results ?? []);
           const job =
             activeJob(summary) && sameRows
               ? {
-                  ...current.job,
+                  ...current,
                   status: summary.status,
                   progress: summary.progress,
                   updated_at: summary.updated_at,
                   cancel_requested: summary.cancel_requested,
                 }
-              : await api<Job>(`/api/jobs/${id}`, { signal: controller.signal });
-          if (!controller.signal.aborted && version === dialogVersion.current)
+              : await readOperationStatus<Job>(api, `/api/jobs/${id}`, controller.signal);
+          if (!controller.signal.aborted && version === dialogVersion.current) {
             setDialog({ kind: 'job', job });
-        }
-        const finished = previous?.active.some((job) =>
-          next.recent.some((item) => item.id === job.id && !activeJob(item)),
-        );
-        previous = next;
-        if (finished && pageRef.current === 'migrate') {
-          const listed = await api<Users>('/api/users', { signal: controller.signal });
-          if (!controller.signal.aborted && pageRef.current === 'migrate') {
-            if (!listed.errors?.emby) lastMigrationRoster.current = listed.emby;
-            setUsers({ ...listed, emby: lastMigrationRoster.current });
+            reportRevision = reportKey;
           }
         }
+        failures = 0;
+        setPollPaused(false);
       } catch {
-        if (!controller.signal.aborted && sessionRef.current?.authenticated) setPollPaused(true);
+        if (!controller.signal.aborted && sessionRef.current?.authenticated) {
+          failures++;
+          setPollPaused(true);
+        }
       } finally {
         polling = false;
+        if (!controller.signal.aborted && !document.hidden) {
+          const wait = wakePending
+            ? 0
+            : operationPollDelay(!!previous?.active_count || !!displayedJob(), failures);
+          wakePending = false;
+          timer = setTimeout(() => void poll(), wait);
+        }
       }
     };
-    void poll();
-    const interval = setInterval(() => void poll(), 3000);
-    document.addEventListener('visibilitychange', poll);
+    const wake = () => {
+      clearTimeout(timer);
+      if (polling) wakePending = true;
+      else void poll();
+    };
+    wakeOperations.current = wake;
+    wake();
+    document.addEventListener('visibilitychange', wake);
     return () => {
       controller.abort();
-      clearInterval(interval);
-      document.removeEventListener('visibilitychange', poll);
+      clearTimeout(timer);
+      wakeOperations.current = () => {};
+      document.removeEventListener('visibilitychange', wake);
     };
-  }, [api, session?.authenticated]);
+  }, [api, refreshMigrationRoster, session?.authenticated]);
   const created = (job: Job) => {
     setLive((current) =>
       current && activeJob(job)
@@ -766,19 +887,23 @@ export default function App() {
     );
     setActivityRefresh((current) => current + 1);
     showDialog({ kind: 'job', job });
+    if (activeJob(job)) wakeOperations.current();
   };
-  const openJob = (id: string) => {
+  const openJob = (id: string, activityRowScope?: string) => {
     const version = dialogVersion.current;
     const generation = authGeneration.current;
     void work('job', async () => {
-      const value = await api<Job>(`/api/jobs/${encodeURIComponent(id)}`);
+      const value = await readOperationStatus<Job>(api, `/api/jobs/${encodeURIComponent(id)}`);
       if (
         version !== dialogVersion.current ||
         generation !== authGeneration.current ||
-        !sessionRef.current?.authenticated
+        !sessionRef.current?.authenticated ||
+        (activityRowScope !== undefined &&
+          (pageRef.current !== 'activity' || activityRowScope !== activityScopeRef.current))
       )
         return;
       showDialog({ kind: 'job', job: value });
+      if (activeJob(value)) wakeOperations.current();
       setPollPaused(false);
     });
   };
@@ -856,9 +981,11 @@ export default function App() {
           setPreviewProgress(task.progress);
           await nextPreviewPoll(controller.signal);
           if (!active()) return;
-          task = await api<PreviewTask>(`/api/migrations/preview/${encodeURIComponent(taskId)}`, {
-            signal: controller.signal,
-          });
+          task = await readOperationStatus<PreviewTask>(
+            api,
+            `/api/migrations/preview/${encodeURIComponent(taskId)}`,
+            controller.signal,
+          );
           if (!active()) return;
         }
         if (task.status === 'failed')
@@ -887,6 +1014,7 @@ export default function App() {
           kind: 'preview',
           previewId: task.id,
           reviewElapsedMs: task.elapsed_ms,
+          followUpJob,
           preview: {
             ...task.preview,
             // Preserve an older review's played-only approval; favorites require a current review.
@@ -942,8 +1070,9 @@ export default function App() {
     event.preventDefault();
     const value = receipt.trim();
     void work('receipt', async () => {
-      const result = await api<{ job_id: string }>(
-        `/api/migrations/receipts/${value ? encodeURIComponent(value) : 'latest'}`,
+      const result = await readOperationStatus<{ job_id: string }>(
+        api,
+        `/api/jobs/receipts/${value ? encodeURIComponent(value) : 'latest'}`,
       );
       if (value && value === pendingSubmission()) pendingSubmission('');
       openJob(result.job_id);
@@ -953,10 +1082,13 @@ export default function App() {
     if (dialog?.kind !== 'preview' || busyRef.current.has('migration')) return;
     const ids = dialog.preview.users.map((user) => user.source_user_id);
     const saved = !!dialog.preview.source_snapshot_ids;
+    const scope =
+      dialog.preview.migration_scope === 'played_favorites' ? 'played_favorites' : 'watched_only';
+    const originalJob = dialog.followUpJob;
     closeDialog();
     setSelected(new Set(ids));
     chooseHistorySource(saved);
-    preview(ids, saved);
+    preview(ids, saved, scope, originalJob);
   }
   function startMigration(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1071,7 +1203,17 @@ export default function App() {
         // A receipt whose acknowledgment was lost still expires on the server.
       });
   }
-  function reviewHistory(_filteredIds: string[], filtered = false, single?: Job) {
+  function reviewHistory(
+    _filteredIds: string[],
+    filtered = false,
+    single?: Job,
+    rowScope?: string,
+  ) {
+    if (
+      rowScope !== undefined &&
+      (pageRef.current !== 'activity' || rowScope !== activityScopeRef.current)
+    )
+      return;
     if (single) {
       showDialog({
         kind: 'cleanup',
@@ -1092,7 +1234,13 @@ export default function App() {
       const review = await api<{ all: CleanupCandidate[]; filtered: CleanupCandidate[] }>(
         `/api/jobs/cleanup-review?${params}`,
       );
-      if (version !== dialogVersion.current || !sessionRef.current?.authenticated) return;
+      if (
+        version !== dialogVersion.current ||
+        !sessionRef.current?.authenticated ||
+        (rowScope !== undefined &&
+          (pageRef.current !== 'activity' || rowScope !== activityScopeRef.current))
+      )
+        return;
       const candidates = new Map([...review.all, ...review.filtered].map((job) => [job.id, job]));
       showDialog({
         kind: 'cleanup',
@@ -1116,7 +1264,15 @@ export default function App() {
     const removed = new Set(result.removed_ids.filter((id) => requested.has(id)));
     historyRevision.current++;
     setActivity((current) =>
-      current ? { ...current, jobs: current.jobs.filter((job) => !removed.has(job.id)) } : current,
+      current
+        ? {
+            ...current,
+            result: {
+              ...current.result,
+              jobs: current.result.jobs.filter((job) => !removed.has(job.id)),
+            },
+          }
+        : current,
     );
     setActivityRefresh((current) => current + 1);
     setOverview((current) =>
@@ -1279,6 +1435,8 @@ export default function App() {
           setUseSnapshots={chooseHistorySource}
           busy={busy.has('preview')}
           navigate={navigate}
+          refreshRoster={refreshMigrationRoster}
+          rosterPending={migrationRosterPending}
         />
       </>
     );
@@ -1372,14 +1530,18 @@ export default function App() {
       <ActivityPage
         jobs={[]}
         navigate={navigate}
-        openJob={openJob}
+        openJob={(id) => openJob(id, activityScope)}
         refresh={() => void load(page, true)}
-        clearHistory={reviewHistory}
+        clearHistory={(ids, filtered, single) =>
+          reviewHistory(ids, filtered, single, activityScope)
+        }
         remote={{
           filter: { ...activityFilter, pageSize: activityPageSize },
-          result: activity,
-          pending: activityPending,
-          error: activityError,
+          result: activity?.scope === activityScope ? activity.result : null,
+          pending:
+            activityPending ||
+            (activity?.scope !== activityScope && activityError?.scope !== activityScope),
+          error: activityError?.scope === activityScope ? activityError.message : '',
           change: (filter) => {
             setActivityFilter(filter);
           },
@@ -1565,11 +1727,11 @@ export default function App() {
                       )}
                       <form className="operations-receipt" onSubmit={findSubmission}>
                         <label className="field">
-                          Migration submission receipt
+                          Operation submission receipt
                           <input
                             value={receipt}
                             maxLength={36}
-                            placeholder="Leave blank for your latest migration"
+                            placeholder="Leave blank for your latest submission"
                             onChange={(event) => setReceipt(event.target.value)}
                           />
                         </label>
@@ -1892,7 +2054,9 @@ function DialogContent({
         ));
     const mayHaveCredentials =
       !activeJob(job) &&
-      job.results?.some((result) => result.created && result.discord_delivery !== 'sent');
+      (job.credential_availability
+        ? job.credential_availability.available > 0
+        : job.results?.some((result) => result.created && result.discord_delivery !== 'sent'));
     return (
       <Modal
         title={
@@ -2043,6 +2207,11 @@ function DialogContent({
           </p>
         )}
         {job.error && <div className="error-block mt-15">{job.error}</div>}
+        {!!job.credential_availability?.claimed_elsewhere && (
+          <Callout warning title="Credential reveal claimed in another session.">
+            The session that claimed the reveal can recover it until the receipt expires.
+          </Callout>
+        )}
         {job.results?.map((result, index) => (
           <section className="job-result" key={index}>
             <div className="job-result-header">

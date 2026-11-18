@@ -31,8 +31,8 @@ class HouseholdBot implements BotAdapter {
   async membershipActive(_id: string) {
     return true;
   }
-  async activeMembers() {
-    return this.roster.members;
+  async activeMemberPage() {
+    return { members: this.roster.members };
   }
 }
 

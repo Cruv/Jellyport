@@ -16,11 +16,24 @@ The existing review-only connection remains the default. Saving a key, mapping p
 
 Changing a key, Discord server, paired media-server identity or selected billing source invalidates the old automation scope. Sync and review the new connection before enabling it again. Test-mode Stripe data never drives production membership changes.
 
+When a price mapping affects an approved household, **Save Stripe settings**
+opens an impact review with the current and proposed tiers, the Discord owners,
+and the exact media accounts and slots. Approval applies to the reviewed billing
+revision and household state. An account change after approval can hold a tier
+reduction for a new review. If a migration price would affect an already linked
+household, review the price in Settings before approving the migration.
+
 Stripe documents [restricted-key permissions](https://docs.stripe.com/keys/restricted-api-keys). The current API boundary uses `2025-06-30.basil`; all requests are bounded GETs with serial rate limiting, cancellation, timeouts and backoff.
 
 ## What counts as entitlement
 
 Jellyport checks the newest paid invoice for each approved subscription. It requires a complete invoice with one non-proration subscription line, quantity one, and matching customer, subscription and configured price. The invoice must be paid with no remaining amount. Its subscription-line service period determines the paid-through time; the invoice's general `period_end` does not.
+
+Verification rotates through bounded household batches. Complete invoice
+evidence stays available for up to 30 minutes from that household's check while
+its approved links, billing authority and subscription inventory still match.
+The household timeline keeps saved invoices in recent activity and shows current
+paid-through evidence separately.
 
 This follows Stripe's [invoice object](https://docs.stripe.com/api/invoices/object?api-version=2025-06-30.basil), [subscription line period](https://docs.stripe.com/api/invoice-line-item/object?api-version=2025-06-30.basil), and [newest-first invoice listing](https://docs.stripe.com/api/invoices/list?api-version=2025-06-30.basil). A subscription's `active` status alone is insufficient, particularly with invoice collection or delayed payment methods. See Stripe's [subscription lifecycle](https://docs.stripe.com/billing/subscriptions/overview).
 

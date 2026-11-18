@@ -418,3 +418,110 @@ it('pages and filters projected activity, with a bounded idle feed and full diag
   await app.inject({ url: '/api/overview?fresh=1', headers });
   expect(clientFactory).toHaveBeenCalledTimes(2);
 });
+
+it('reports missing imports, retained delivery uncertainty, and session-scoped reveal availability', async () => {
+  const { app, headers, signIn } = await fixture();
+  const { store, service } = app.jellyport;
+  store.saveSettings({ ...store.settings(), bot_message_retention_days: 0 });
+  const job = historicalJob('pending-synthetic-delivery');
+  store.saveJob(job);
+  store.saveCredentials(
+    job.id,
+    'Synthetic account',
+    'PRIVATE-REVEAL-CREDENTIAL',
+    'https://jellyfin.example',
+  );
+  store.saveBotMessage(job.id, {
+    id: 'old-uncertain-delivery',
+    kind: 'credentials',
+    status: 'uncertain',
+    recipient_id: '100000',
+    membership_slot: 1,
+    account_username: 'Synthetic account',
+    content: 'PRIVATE-DISCORD-DELIVERY',
+    created_at: '2020-01-01T00:00:00Z',
+  });
+  const imported = '2026-11-17T01:00:00Z';
+  const next = '2026-11-19T01:00:00Z';
+  const destination = await service.destinationSnapshots.status();
+  vi.spyOn(service.destinationSnapshots, 'status').mockResolvedValue({
+    ...destination,
+    configured: true,
+    available: true,
+    usable: false,
+    last_successful_at: imported,
+    next_run_at: next,
+  });
+  const inspect = (credentials = headers) =>
+    app.inject({ url: '/api/overview', headers: credentials });
+  const first = await inspect();
+  expect(first.json().inbox).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        repair: 'jellyfin_history',
+        attention: true,
+        last_successful_at: imported,
+        next_run_at: next,
+      }),
+      expect.objectContaining({ title: 'Check credential delivery', job_id: job.id }),
+      expect.objectContaining({
+        title: 'Credentials await delivery',
+        detail: expect.stringContaining('available to reveal in this session'),
+      }),
+    ]),
+  );
+  const claim = await app.inject({
+    method: 'POST',
+    url: `/api/jobs/${job.id}/credentials`,
+    headers,
+    payload: { recoverable: true },
+  });
+  expect(claim.json().credentials).toHaveLength(1);
+  const otherLogin = await signIn();
+  const cookie = otherLogin.cookies[0]!;
+  const other = {
+    ...headers,
+    cookie: `${cookie.name}=${cookie.value}`,
+    'x-csrf-token': otherLogin.json().csrf_token as string,
+  };
+  const otherInbox = await inspect(other);
+  expect(otherInbox.json().inbox).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        title: 'Credential reveal claimed',
+        detail: '1 claimed in another session.',
+        job_id: job.id,
+      }),
+    ]),
+  );
+  const ownReport = await app.inject({ url: `/api/jobs/${job.id}`, headers });
+  const otherReport = await app.inject({ url: `/api/jobs/${job.id}`, headers: other });
+  expect(ownReport.json().credential_availability).toEqual({ available: 1, claimed_elsewhere: 0 });
+  expect(otherReport.json().credential_availability).toEqual({
+    available: 0,
+    claimed_elsewhere: 1,
+  });
+  expect(first.body + otherInbox.body + ownReport.body + otherReport.body).not.toMatch(
+    /PRIVATE-(REVEAL|DISCORD)/,
+  );
+});
+
+it('revalidates Jellyfin authority on every live status read and rejects a revoked session', async () => {
+  const { app, headers, authClient, revoke } = await fixture();
+  vi.mocked(authClient.validateSession).mockClear();
+  expect((await app.inject({ url: '/api/jobs/live', headers })).statusCode).toBe(200);
+  expect((await app.inject({ url: '/api/jobs/live', headers })).statusCode).toBe(200);
+  expect(authClient.validateSession).toHaveBeenCalledTimes(2);
+  expect(
+    vi
+      .mocked(authClient.validateSession)
+      .mock.calls.every((call) => call[4] instanceof AbortSignal),
+  ).toBe(true);
+  revoke();
+  const rejected = await app.inject({ url: '/api/jobs/live', headers });
+  expect(rejected.statusCode).toBe(401);
+  expect(rejected.json()).not.toHaveProperty('active');
+  expect(authClient.validateSession).toHaveBeenCalledTimes(3);
+  expect((await app.inject({ url: '/api/jobs/live', headers })).statusCode).toBe(401);
+  expect(authClient.validateSession).toHaveBeenCalledTimes(3);
+});

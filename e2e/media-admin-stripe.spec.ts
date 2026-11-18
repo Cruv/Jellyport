@@ -48,16 +48,16 @@ test('subscriber role cleanup can remove expired roles while media automation st
     automation_enabled: false,
   });
   await stripe.sync();
-  await stripe.linkCustomer({
-    customer_id: 'cus_Crew0',
-    discord_user_id: paidOwner,
-    expected_revision: stripe.status().revision,
-  });
   await stripe.configure({
     expected_revision: stripe.status().revision,
     sync_enabled: true,
     automation_enabled: false,
     price_tiers: [{ price_id: 'price_Crew', tier_id: 'sloop' }],
+  });
+  await stripe.linkCustomer({
+    customer_id: 'cus_Crew0',
+    discord_user_id: paidOwner,
+    expected_revision: stripe.status().revision,
   });
   await page.goto('/#/settings/stripe');
   await expect(page.getByText('Live restricted key saved', { exact: true })).toBeVisible();

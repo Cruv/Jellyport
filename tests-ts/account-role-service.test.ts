@@ -226,7 +226,7 @@ describe('saved role provisioning and controlled account updates', () => {
         delivered.push(id);
       },
       membershipActive: async () => true,
-      activeMembers: async () => [],
+      activeMemberPage: async () => ({ members: [] }),
     } satisfies BotAdapter;
     return delivered;
   }

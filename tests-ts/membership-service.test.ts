@@ -22,8 +22,8 @@ class MemberBot implements BotAdapter {
   async membershipActive(_id: string) {
     return this.active;
   }
-  async activeMembers() {
-    return this.active ? [{ id: owner, username: this.username }] : [];
+  async activeMemberPage() {
+    return { members: this.active ? [{ id: owner, username: this.username }] : [] };
   }
   async sendCredentials(recipient: string, username: string, password: string, url: string) {
     this.delivered.push({ recipient, username, password, url });

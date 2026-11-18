@@ -106,7 +106,7 @@ async function apiFixture(demo = false) {
     validateRecipient: vi.fn(async () => {}),
     sendCredentials: vi.fn(async () => {}),
     membershipActive: async () => false,
-    activeMembers: async () => [],
+    activeMemberPage: async () => ({ members: [] }),
   } satisfies BotAdapter;
   app.jellyport.service.bot = bot;
   const anonymous = await app.inject('/api/session');

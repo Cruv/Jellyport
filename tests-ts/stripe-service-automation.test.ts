@@ -26,8 +26,8 @@ class BillingBot implements BotAdapter {
   async membershipActive() {
     return false;
   }
-  async activeMembers() {
-    return [];
+  async activeMemberPage() {
+    return { members: [] };
   }
 }
 describe('Stripe-first membership automation without MEE6', () => {
@@ -576,11 +576,14 @@ describe('Stripe-first membership automation without MEE6', () => {
     await newSubscription();
     await stripe.sync();
     const fact = store.subscriptions()[0]!.stripe_entitlement!;
-    await stripe.configure({
+    const update = {
       sync_enabled: true,
       expected_revision: stripe.status().revision,
       price_tiers: [{ price_id: 'price_member', tier_id: 'galleon' }],
-    });
+    };
+    await expect(stripe.configure(update)).rejects.toThrow('exact account slots');
+    const review = stripe.priceTierImpact(update.expected_revision, update.price_tiers);
+    await stripe.configure(update, (current) => expect(current).toEqual(review));
     expect(() => stripe.assertEntitlement(fact)).toThrow('changed');
   });
   it('preserves the active policy when a replacement-key automation request is rejected', async () => {

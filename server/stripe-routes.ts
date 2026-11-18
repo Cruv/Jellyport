@@ -1,13 +1,30 @@
+import { createHash } from 'node:crypto';
+import type { FastifyRequest } from 'fastify';
 import type { JellyportApp } from './main.js';
-import type { StripeIntegration } from './stripe-integration.js';
+import type {
+  StripeIntegration,
+  StripeIntegrationConfiguration,
+  StripePriceTierImpact,
+} from './stripe-integration.js';
+import type { DiscordAuthorityReviews, Household } from './discord-authority-routes.js';
 import { ServiceError } from './errors.js';
+import { WorkflowReviews } from './workflow-reviews.js';
+import { discordAuthority } from './discord-authority.js';
+
+export interface StripePriceReview extends Omit<StripePriceTierImpact, 'affected'> {
+  affected: Array<Household & { price_ids: string[] }>;
+  review_token: string;
+  expires_at: string;
+}
 
 /** Uses the central administrator/CSRF hooks. Billing details never have a public route. */
 export function registerStripeRoutes(
   app: JellyportApp,
   stripe: StripeIntegration,
   demo: boolean,
-  listCleanupRoles?: () => Promise<{
+  authority: DiscordAuthorityReviews,
+  reviewOwner: (request: FastifyRequest) => string,
+  listCleanupRoles: () => Promise<{
     roles: Array<{ id: string; name: string; manageable: boolean }>;
     can_manage_roles: boolean;
   }>,
@@ -16,18 +33,100 @@ export function registerStripeRoutes(
     if (demo) throw new ServiceError('Stripe connections cannot be changed in demo mode.');
   };
   const revision = { type: 'string', minLength: 1, maxLength: 128 };
+  const priceTiers = {
+    type: 'array',
+    maxItems: 100,
+    items: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['price_id', 'tier_id'],
+      properties: {
+        price_id: { type: 'string', pattern: '^price_[A-Za-z0-9]+$', maxLength: 128 },
+        tier_id: { type: 'string', minLength: 1, maxLength: 64 },
+      },
+    },
+  };
+  const priceReviews = new WorkflowReviews<string>();
+  const priceReviewScope = 'stripe-price-change';
+  const reviewedImpact = (impact: StripePriceTierImpact) => {
+    const { store } = authority.service;
+    const settings = store.settings();
+    const linkedPrices = new Map(
+      impact.affected.map(({ discord_user_id, price_ids }) => [discord_user_id, price_ids]),
+    );
+    const affected = authority
+      .households(settings, new Set(linkedPrices.keys()))
+      .map((household) => ({
+        ...household,
+        accounts: [...household.accounts].sort(
+          (a, b) =>
+            a.slot - b.slot ||
+            a.kind.localeCompare(b.kind) ||
+            String(a.id).localeCompare(String(b.id)) ||
+            a.username.localeCompare(b.username),
+        ),
+        price_ids: linkedPrices.get(household.discord_user_id)!,
+      }));
+    if (affected.length !== linkedPrices.size)
+      throw new ServiceError(
+        'An affected Stripe household could not be resolved. Review saved ownership first.',
+      );
+    const plan = { ...impact, affected };
+    const memberships = affected.map(
+      ({ discord_user_id }) =>
+        authority.service.memberships.get(discord_user_id, settings)?.revision ?? null,
+    );
+    const context = createHash('sha256')
+      .update(
+        JSON.stringify([
+          discordAuthority(settings),
+          settings.new_subscriber_source,
+          settings.emby_url,
+          settings.jellyfin_url,
+          store.authState(),
+          plan,
+          memberships,
+        ]),
+      )
+      .digest('hex');
+    return { plan, context };
+  };
   app.get('/api/stripe/status', async () => stripe.status());
   app.get('/api/stripe/cleanup-roles', async () => {
     writable();
-    if (!listCleanupRoles)
-      throw new ServiceError('Connect the Discord bot before choosing cleanup roles.');
     return listCleanupRoles();
   });
   app.get('/api/stripe/subscriptions', async () => ({
     subscriptions: stripe.subscriptions(),
     revision: stripe.status().revision,
   }));
-  app.post<{ Body: Parameters<StripeIntegration['configure']>[0] }>(
+  app.post<{
+    Body: {
+      expected_revision: string;
+      price_tiers: NonNullable<StripeIntegrationConfiguration['price_tiers']>;
+    };
+  }>(
+    '/api/stripe/config/price-review',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['expected_revision', 'price_tiers'],
+          properties: { expected_revision: revision, price_tiers: priceTiers },
+        },
+      },
+    },
+    async (request): Promise<StripePriceReview> => {
+      writable();
+      const owner = reviewOwner(request);
+      const { plan, context } = reviewedImpact(
+        stripe.priceTierImpact(request.body.expected_revision, request.body.price_tiers),
+      );
+      return { ...plan, ...priceReviews.save(owner, priceReviewScope, context) };
+    },
+  );
+  app.post<{ Body: StripeIntegrationConfiguration & { price_review_token?: string } }>(
     '/api/stripe/config',
     {
       schema: {
@@ -47,26 +146,26 @@ export function registerStripeRoutes(
               items: { type: 'string', pattern: '^[1-9][0-9]{0,19}$' },
             },
             expected_revision: revision,
-            price_tiers: {
-              type: 'array',
-              maxItems: 100,
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                required: ['price_id', 'tier_id'],
-                properties: {
-                  price_id: { type: 'string', pattern: '^price_[A-Za-z0-9]+$', maxLength: 128 },
-                  tier_id: { type: 'string', minLength: 1, maxLength: 64 },
-                },
-              },
-            },
+            price_tiers: priceTiers,
+            price_review_token: { type: 'string', format: 'uuid' },
           },
         },
       },
     },
     async (request) => {
       writable();
-      return stripe.configure(request.body);
+      const { price_review_token: token, ...configuration } = request.body;
+      return stripe.configure(configuration, (impact) => {
+        if (!token)
+          throw new ServiceError(
+            'Review the affected households and exact account slots before saving Stripe price changes.',
+          );
+        const approved = priceReviews.take(reviewOwner(request), priceReviewScope, token);
+        if (approved !== reviewedImpact(impact).context)
+          throw new ServiceError(
+            'The Stripe price review changed. Review the affected households and slots again.',
+          );
+      });
     },
   );
   app.post('/api/stripe/sync', async (_request, reply) => {

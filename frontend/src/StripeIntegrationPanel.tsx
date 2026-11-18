@@ -7,6 +7,7 @@ import {
   useIdentityRolePolling,
 } from './IdentityReviewPanel';
 import type { IdentityReviewApplyResult } from '../../server/identity-review-types';
+import type { StripePriceReview } from '../../server/stripe-routes';
 import { Pagination, TabPanel, Tabs, usePagination } from './ui-layout';
 import { date, num, type Api, type DiscordMember, type MembershipTier, type Notify } from './types';
 
@@ -129,6 +130,8 @@ export default function StripeIntegrationPanel({
   );
   const [reviewRevision, setReviewRevision] = useState('');
   const [disconnectRevision, setDisconnectRevision] = useState<string | null>(null);
+  const [priceReview, setPriceReview] = useState<StripePriceReview | null>(null);
+  const pendingPriceSave = useRef<{ body: Record<string, unknown>; message: string } | null>(null);
   const [member, setMember] = useState<DiscordMember | null>(null);
   const key = useRef<HTMLInputElement | null>(null);
   const initialized = useRef(false);
@@ -208,6 +211,7 @@ export default function StripeIntegrationPanel({
   useEffect(() => {
     if (!active || demo) return;
     mounted.current = true;
+    setPriceReview(null);
     void read();
     const field = key.current;
     return () => {
@@ -216,6 +220,7 @@ export default function StripeIntegrationPanel({
       version.current++;
       controller.current?.abort();
       changing.current = false;
+      pendingPriceSave.current = null;
       if (field) field.value = '';
       if (key.current) key.current.value = '';
     };
@@ -273,7 +278,31 @@ export default function StripeIntegrationPanel({
     const current = ++version.current;
     setBusy(kind);
     setError('');
+    let reviewingPrice = !!body.price_review_token;
     try {
+      if (kind === 'save' && !body.price_review_token) {
+        const rows = body.price_tiers as StripeIntegrationStatus['price_tiers'];
+        const approved = new Map(
+          status.price_tiers.map(({ price_id, tier_id }) => [price_id, tier_id]),
+        );
+        const changed =
+          rows.length !== approved.size ||
+          rows.some(({ price_id, tier_id }) => approved.get(price_id) !== tier_id);
+        if (changed && status.mode === 'live' && !!status.linked_customer_count) {
+          reviewingPrice = true;
+          const plan = await api<StripePriceReview>('/api/stripe/config/price-review', {
+            method: 'POST',
+            body: { expected_revision: body.expected_revision, price_tiers: rows },
+            signal: abort.signal,
+          });
+          if (!mounted.current || abort.signal.aborted || current !== version.current) return;
+          if (plan.affected.length) {
+            pendingPriceSave.current = { body, message };
+            setPriceReview(plan);
+            return;
+          }
+        }
+      }
       const value = await api<StripeIntegrationStatus>(path, {
         method,
         body,
@@ -301,11 +330,13 @@ export default function StripeIntegrationPanel({
         setMember(null);
       }
       notify(message);
-    } catch {
+    } catch (reason: unknown) {
       if (!mounted.current || abort.signal.aborted || current !== version.current) return;
       const detail =
         kind === 'save'
-          ? 'Stripe settings could not be saved. Refresh to check the saved configuration, then re-enter the key if needed.'
+          ? reviewingPrice && reason instanceof Error
+            ? reason.message
+            : 'Stripe settings could not be saved. Refresh to check the saved configuration, then re-enter the key if needed.'
           : 'The Stripe action could not be completed. Refresh the latest data before retrying.';
       setError(detail);
       notify(detail, true);
@@ -471,6 +502,12 @@ export default function StripeIntegrationPanel({
     cleanupRoleQuery,
   );
   const suggested = status?.hints.find((hint) => hint.id === review?.proposed_discord_id);
+  const tierLabel = (id: string | null) =>
+    tiers.find((tier) => tier.id === id)?.name ?? id ?? 'Unassigned';
+  function closePriceReview() {
+    pendingPriceSave.current = null;
+    setPriceReview(null);
+  }
 
   return (
     <div className="settings-group" aria-label="Stripe billing integration">
@@ -1459,6 +1496,100 @@ export default function StripeIntegrationPanel({
           </div>
         </section>
       </TabPanel>
+      {priceReview && active && (
+        <Modal
+          title="Review Stripe price changes"
+          description="Confirm the prices, households and exact account slots affected by this save."
+          close={closePriceReview}
+          wide
+          footer={
+            <>
+              <button className="btn btn-quiet" type="button" onClick={closePriceReview}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-primary"
+                type="button"
+                disabled={demo || !!busy || status?.revision !== priceReview.revision}
+                onClick={() => {
+                  const pending = pendingPriceSave.current;
+                  const token = priceReview.review_token;
+                  closePriceReview();
+                  if (pending)
+                    void mutate(
+                      'save',
+                      '/api/stripe/config',
+                      { ...pending.body, price_review_token: token },
+                      pending.message,
+                    );
+                }}
+              >
+                Approve price changes
+              </button>
+            </>
+          }
+        >
+          <div className="form-stack">
+            <p>
+              Verified billing can apply the new allowance. Review which accounts use slots above
+              it.
+            </p>
+            <ul className="account-slot-list">
+              {priceReview.mappings.map(
+                ({ price_id, previous_tier_id, tier_id, account_limit }) => (
+                  <li key={price_id} className="text-break">
+                    <strong>{prices.find(([id]) => id === price_id)?.[1] ?? price_id}</strong>
+                    <span>
+                      {tierLabel(previous_tier_id)} → {tierLabel(tier_id)}
+                      {account_limit !== null &&
+                        ` · ${account_limit} ${account_limit === 1 ? 'slot' : 'slots'}`}
+                    </span>
+                  </li>
+                ),
+              )}
+            </ul>
+            <p>{num(priceReview.affected.length)} affected households</p>
+            {priceReview.affected.map((household) => (
+              <section key={household.discord_user_id} className="summary-card form-stack">
+                <h3>{household.username}</h3>
+                <p className="section-note text-break">
+                  {household.discord_user_id} · {household.slots} saved slots
+                </p>
+                {household.price_ids.map((id) => {
+                  const change = priceReview.mappings.find(({ price_id }) => price_id === id);
+                  if (!change) return null;
+                  return (
+                    <p key={id} className="text-break">
+                      {tierLabel(change.tier_id)}{' '}
+                      {change.account_limit !== null &&
+                        `· ${change.account_limit} proposed ${change.account_limit === 1 ? 'slot' : 'slots'}`}
+                    </p>
+                  );
+                })}
+                <ul className="account-slot-list">
+                  {household.accounts.map((account) => (
+                    <li
+                      key={JSON.stringify([
+                        account.kind,
+                        account.id,
+                        account.slot,
+                        account.username,
+                      ])}
+                      className="text-break"
+                    >
+                      <strong>{account.username}</strong>
+                      <span>
+                        {account.kind === 'emby' ? 'Emby' : 'Jellyfin'} · Slot {account.slot}{' '}
+                        {account.id && `· ${account.id}`}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            ))}
+          </div>
+        </Modal>
+      )}
       {disconnectRevision && active && (
         <Modal
           title="Disconnect Stripe?"

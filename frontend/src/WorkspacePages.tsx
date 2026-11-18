@@ -133,6 +133,9 @@ export function OverviewPage({
                   <strong>{item.title}</strong>
                   {item.attention && <span className="status warn">Needs attention</span>}
                   {item.detail && <p>{item.detail}</p>}
+                  {item.last_successful_at && (
+                    <p>Last successful import {date(item.last_successful_at)}</p>
+                  )}
                   {item.next_run_at && <p>Next run {date(item.next_run_at)}</p>}
                 </div>
                 {item.job_id ? (
@@ -265,6 +268,8 @@ export function MigratePage({
   setUseSnapshots,
   busy,
   navigate,
+  refreshRoster,
+  rosterPending,
 }: {
   users: Users;
   overview: Overview;
@@ -277,6 +282,8 @@ export function MigratePage({
   setUseSnapshots: (value: boolean) => void;
   busy: boolean;
   navigate: (page: Page) => void;
+  refreshRoster?: () => Promise<void>;
+  rosterPending?: boolean;
 }) {
   const taskReadiness = useWorkflowAction(useSnapshots ? 'migrate_saved' : 'migrate');
   const filtered = users.emby.filter((user) =>
@@ -304,6 +311,7 @@ export function MigratePage({
               !taskReadiness.ready ||
               !!users.errors?.emby ||
               !!users.errors?.jellyfin ||
+              rosterPending ||
               !selected.size ||
               selected.size > 100 ||
               busy
@@ -316,7 +324,10 @@ export function MigratePage({
           </button>
         }
       />
-      <WorkflowRequirements action={useSnapshots ? 'migrate_saved' : 'migrate'} />
+      <WorkflowRequirements
+        action={useSnapshots ? 'migrate_saved' : 'migrate'}
+        onReady={refreshRoster}
+      />
       <div className="steps" aria-label="Migration steps">
         <span className="step active" aria-current="step">
           <span className="step-number">1</span>Select users
@@ -331,6 +342,16 @@ export function MigratePage({
         </span>
       </div>
       <UserWarnings users={users} />
+      {users.errors?.emby && taskReadiness.ready && refreshRoster && (
+        <button
+          type="button"
+          className="btn btn-quiet"
+          disabled={rosterPending}
+          onClick={() => void refreshRoster()}
+        >
+          {rosterPending ? 'Refreshing Emby users…' : 'Refresh Emby users'}
+        </button>
+      )}
       {!taskReadiness.managed &&
         !(overview.connections.emby.connected && overview.connections.jellyfin.connected) && (
           <Callout icon="warning" warning title="Both servers need to be connected.">
@@ -1232,9 +1253,11 @@ export function ActivityPage({
                 : 'View results or delete individual reports below.'}
             </p>
           </div>
-          <span className="status">
-            {num(total)} {total === 1 ? 'operation' : 'operations'}
-          </span>
+          {(!remote || remote.result) && (
+            <span className="status">
+              {num(total)} {total === 1 ? 'operation' : 'operations'}
+            </span>
+          )}
         </div>
         <div className="view-toolbar">
           <label className="field toolbar-search">
@@ -1275,9 +1298,9 @@ export function ActivityPage({
             {remote.error}
           </p>
         )}
-        {remote?.pending && !remote.result ? (
+        {remote?.pending && !remote.result && !remote.error ? (
           <p role="status">Loading operations…</p>
-        ) : (
+        ) : remote?.error && !remote.result ? null : (
           <JobsTable
             jobs={pagination.items}
             filtered={query.trim() !== '' || status !== 'all'}

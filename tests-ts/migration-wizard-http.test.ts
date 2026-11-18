@@ -119,7 +119,7 @@ async function fixture() {
     validateRecipient: vi.fn(async () => {}),
     sendCredentials: vi.fn(async () => {}),
     membershipActive: async () => true,
-    activeMembers: async () => [],
+    activeMemberPage: async () => ({ members: [] }),
   };
   await stripe.configure({
     api_key: 'rk_live_syntheticWizardOnly',

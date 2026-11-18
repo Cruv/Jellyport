@@ -29,7 +29,7 @@ import {
 } from './credential-message.js';
 import { discordCredentialContent } from './credentials.js';
 import { parseMee6Identity } from './mee6-identity.js';
-import { discordAuthority } from './discord-authority.js';
+import { DISCORD_DISCOVERY_PAGE_SIZE, discordAuthority } from './discord-authority.js';
 import {
   parseConfiguredSubscriptionMessage,
   type SubscriptionMessagePattern,
@@ -1250,45 +1250,49 @@ export class BotManager {
     }
   }
 
-  private async listMembers(deadline: AbortSignal): Promise<GuildMember[]> {
-    const guild = this.guild();
-    const client = this.client;
-    const result: GuildMember[] = [];
-    let after: string | undefined;
-    // REST pagination is fresh; gateway fetch() can return stale member/role snapshots.
-    for (;;) {
+  async activeMemberPage(after?: string): Promise<{ members: Identity[]; next?: string } | null> {
+    const settings = this.settings;
+    const role = snowflake(settings.discord_member_role_id);
+    if (
+      !settings.discord_role_events ||
+      !role ||
+      (after !== undefined && snowflake(after) !== after)
+    )
+      return null;
+    try {
+      const guild = this.guild();
+      const client = this.client;
+      // A single fresh REST page advances by the highest raw member ID, even
+      // when there are no eligible subscribers in the page.
+      const limit = DISCORD_DISCOVERY_PAGE_SIZE;
       const page = await this.wait(
-        guild.members.list({ limit: 1000, ...(after ? { after } : {}) }),
+        guild.members.list({ limit, cache: false, ...(after ? { after } : {}) }),
         20_000,
-        deadline,
       );
       this.checkActive();
-      if (client !== this.client) throw new Stopped();
-      result.push(...page.values());
-      if (page.size < 1000) return result;
-      const ids = [...page.keys()].map((id) => snowflake(id));
-      if (ids.some((id) => !id)) throw new Error('Invalid membership page');
-      let last = '0';
-      for (const id of ids) if (id && BigInt(id) > BigInt(last)) last = id;
-      if (after && BigInt(last) <= BigInt(after)) throw new Error('Invalid membership page');
-      after = last;
-    }
-  }
-
-  async activeMembers(): Promise<Identity[] | null> {
-    const role = snowflake(this.settings.discord_member_role_id);
-    if (!this.settings.discord_role_events || !role) return null;
-    try {
-      const members = await this.listMembers(AbortSignal.timeout(30_000));
-      return members
+      if (client !== this.client || settings !== this.settings || page.size > limit) return null;
+      let last = after ?? '0';
+      for (const [key, member] of page) {
+        const id = snowflake(member.id);
+        if (
+          !id ||
+          snowflake(key) !== id ||
+          snowflake(member.user.id) !== id ||
+          (after && BigInt(id) <= BigInt(after))
+        )
+          return null;
+        if (BigInt(id) > BigInt(last)) last = id;
+      }
+      const members = [...page.values()]
         .filter((member) =>
-          recipientEligible(member.guild.id, this.settings.discord_guild_id, {
+          recipientEligible(member.guild.id, settings.discord_guild_id, {
             bot: member.user.bot,
             roleIds: member.roles.cache.keys(),
             memberRoleId: role,
           }),
         )
         .map((member) => ({ id: member.id, username: member.user.username }));
+      return { members, ...(page.size === limit ? { next: last } : {}) };
     } catch {
       return null;
     }

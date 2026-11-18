@@ -9,6 +9,7 @@ import {
   type MediaUser,
   type MediaUserDataPatch,
   type MediaPlaylist,
+  type MigrationCapabilities,
 } from './media.js';
 import { MediaError, ServiceError } from './errors.js';
 import type { Store } from './store.js';
@@ -252,6 +253,7 @@ export async function readMigrationSource(
   scope: MigrationScope = 'complete',
   savedItems?: MediaItem[],
   signal?: AbortSignal,
+  verifiedUser?: MediaUser,
 ): Promise<SourceSnapshot> {
   if (!Array.isArray(savedItems))
     throw new ServiceError(
@@ -259,7 +261,7 @@ export async function readMigrationSource(
     );
   const check = () => signal?.throwIfAborted();
   check();
-  const user = await emby.user(sourceId);
+  const user = verifiedUser ?? (await emby.user(sourceId));
   check();
   const items = savedItems;
   const result: SourceSnapshot = { user, items, playlists: [], warnings: [] };
@@ -317,6 +319,22 @@ export async function readMigrationSource(
   return result;
 }
 
+export async function prepareMigrationCapabilities(
+  jellyfin: MediaAPI,
+): Promise<MigrationCapabilities | null> {
+  try {
+    return (
+      (await jellyfin.migrationCapabilities?.()) ?? {
+        userData: false,
+        privatePlaylists: false,
+        playlistDuplicates: false,
+      }
+    );
+  } catch {
+    return null;
+  }
+}
+
 export async function migrateItemState(
   jellyfin: MediaAPI,
   userId: string,
@@ -331,6 +349,7 @@ export async function migrateItemState(
     progress?: (processed: number, total: number, updated: number) => void;
     migration_scope?: MigrationScope;
     expectation?: (target: MediaItem, patch: MediaUserDataPatch, unsupported: string[]) => void;
+    capabilities?: MigrationCapabilities | null;
   } = {},
 ): Promise<number> {
   const concurrency = options.concurrency ?? 6;
@@ -344,10 +363,11 @@ export async function migrateItemState(
   // cancellation timer for more than 1,000 matches across the whole pool.
   const yieldInterval = Math.min(250, Math.floor(1000 / concurrency));
   stopped();
-  let capabilities = { userData: false };
-  try {
-    if (jellyfin.migrationCapabilities) capabilities = await jellyfin.migrationCapabilities();
-  } catch {
+  const capabilities =
+    options.capabilities === undefined
+      ? await prepareMigrationCapabilities(jellyfin)
+      : options.capabilities;
+  if (!capabilities) {
     stopped();
     migrationWarning(
       details,
@@ -418,7 +438,7 @@ export async function migrateItemState(
         options.expectation?.(target, {}, []);
         return false;
       }
-      const supported = capabilities.userData && !!jellyfin.updateUserData;
+      const supported = capabilities?.userData && !!jellyfin.updateUserData;
       options.expectation?.(target, patch, supported ? [] : Object.keys(patch));
       if (!supported)
         throw new ServiceError(

@@ -166,6 +166,65 @@ const tab = (name: string) => fireEvent.click(screen.getByRole('tab', { name }))
 const save = () => fireEvent.submit(screen.getByRole('form', { name: 'Stripe connection' }));
 
 describe('Stripe integration settings', () => {
+  it('previews effective price changes and saves only after approving the exact household slots', async () => {
+    const live = {
+      ...cleanupStatus,
+      linked_customer_count: 1,
+      price_tiers: [{ price_id: 'price_synthetic', tier_id: 'galleon' }],
+    };
+    const change = { price_id: 'price_synthetic', tier_id: 'sloop' };
+    const { api } = page(live, [row], async <T,>(path: string, options?: ApiOptions) => {
+      if (path === '/api/stripe/config/price-review')
+        return {
+          revision: live.revision,
+          mappings: [{ ...change, previous_tier_id: 'galleon', account_limit: 1 }],
+          affected: [
+            {
+              discord_user_id: '123456789012345678',
+              username: 'Synthetic household',
+              slots: 3,
+              accounts: [
+                { kind: 'jellyfin', id: 'exact-slot-3', username: 'synthetic-third', slot: 3 },
+              ],
+              price_ids: [change.price_id],
+            },
+          ],
+          review_token: 'one-use-synthetic-review',
+        } as T;
+      if (path === '/api/stripe/config' && options?.method === 'POST')
+        return { ...live, price_tiers: [change], revision: 'revision-saved' } as T;
+      return live as T;
+    });
+    await screen.findByText('Live restricted key saved');
+    const select = screen.getByLabelText('price_synthetic', { selector: 'select' });
+    fireEvent.change(select, { target: { value: 'sloop' } });
+    const save = () =>
+      fireEvent.click(screen.getByRole('button', { name: 'Save Stripe settings' }));
+    save();
+    let dialog = await screen.findByRole('dialog', { name: 'Review Stripe price changes' });
+    expect(within(dialog).getByText('Synthetic household')).toBeTruthy();
+    expect(within(dialog).getByText(/Slot 3.*exact-slot-3/)).toBeTruthy();
+    expect(vi.mocked(api).mock.calls.some(([path]) => path === '/api/stripe/config')).toBe(false);
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(vi.mocked(api).mock.calls.some(([path]) => path === '/api/stripe/config')).toBe(false);
+
+    save();
+    dialog = await screen.findByRole('dialog', { name: 'Review Stripe price changes' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Approve price changes' }));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        '/api/stripe/config',
+        expect.objectContaining({
+          method: 'POST',
+          body: expect.objectContaining({
+            expected_revision: live.revision,
+            price_tiers: [change],
+            price_review_token: 'one-use-synthetic-review',
+          }),
+        }),
+      ),
+    );
+  });
   it.each(['Connection', 'Role cleanup'])(
     'turns cleanup off when periodic billing refresh is disabled from %s',
     async (section) => {

@@ -39,7 +39,7 @@ node --import tsx scripts/benchmark-discord-reconciliation.ts
 | Synthetic fixture | Baseline | Implementation |
 | --- | ---: | ---: |
 | 60 seconds idle, empty operation feed | 20 polls, 1,680 payload bytes, 20 public server identity reads, 20 administrator reads | 3 polls, 252 payload bytes, 3 public server identity reads, 3 administrator reads |
-| 60 seconds active, one queued operation | 20 polls, 10,520 payload bytes, 40 upstream authentication reads | 20 polls, 10,520 payload bytes, 40 upstream authentication reads |
+| 60 seconds active, one running operation | 20 polls, 10,520 payload bytes, 40 upstream authentication reads | 20 polls, 10,520 payload bytes, 40 upstream authentication reads |
 | Authenticated local processing of the idle schedule | 4.347 ms | 1.332 ms |
 | Authenticated local processing of the active schedule | 3.056 ms | 4.058 ms |
 | Discord pass with 40 link-only owners, 40 membership-only owners, and a 2,500-member roster | 80 exact owner reads plus 3 roster reads covering 2,500 rows, 16.384 ms | 32 exact owner reads plus 1 roster read covering 50 rows, 4.293 ms |

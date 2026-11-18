@@ -318,11 +318,18 @@ describe('administrator activity retention HTTP endpoints', () => {
       payload: { retention_days: 30 },
     });
     expect(saved.statusCode).toBe(200);
+    const settings = await app.inject({ url: '/api/settings', headers });
+    expect(settings.statusCode).toBe(200);
     const response = await app.inject({
       method: 'PUT',
       url: '/api/settings',
       headers,
-      payload: { jellyfin_public_url: 'https://watch.example' },
+      payload: {
+        changes: { jellyfin_public_url: 'https://watch.example' },
+        expected_revisions: {
+          jellyfin_public_url: settings.json().field_revisions.jellyfin_public_url ?? '0',
+        },
+      },
     });
     expect(response.statusCode).toBe(200);
     expect(app.jellyport.store.settings()).toMatchObject({
@@ -335,9 +342,13 @@ describe('administrator activity retention HTTP endpoints', () => {
         method: 'PUT',
         url: '/api/settings',
         headers,
-        payload: { activity_retention_days },
+        payload: {
+          changes: { activity_retention_days },
+          expected_revisions: { activity_retention_days: '0' },
+        },
       });
       expect(rejected.statusCode).toBe(400);
+      expect(rejected.json().detail).toBe('Unknown setting supplied.');
       expect(app.jellyport.service.jobRetentionStatus().retention_days).toBe(30);
     }
   });

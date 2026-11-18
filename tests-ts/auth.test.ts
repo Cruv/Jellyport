@@ -768,31 +768,30 @@ describe('configured Jellyfin administrator sessions', () => {
     });
     expect(initial.json().jellyfin_api_key).toBeUndefined();
     expect(initial.body).not.toContain(value.behavior.keys[0]!);
-    for (const payload of [
-      { jellyfin_url: 'https://other-server.test' },
-      { jellyfin_api_key: 'replacement-secret' },
-    ]) {
-      expect(
-        (
-          await value.app.inject({
-            method: 'PUT',
-            url: '/api/settings',
-            headers: requestHeaders,
-            payload,
-          })
-        ).statusCode,
-      ).toBe(400);
-    }
-    const updated = await value.app.inject({
-      method: 'PUT',
-      url: '/api/settings',
-      headers: requestHeaders,
-      payload: {
-        jellyfin_url: `${SERVER_URL}/`,
-        jellyfin_api_key: '',
-        emby_api_key: 'emby-sensitive-key',
-        emby_url: 'http://emby:8096',
-      },
+    const revisions = initial.json().field_revisions as Record<string, string>;
+    const save = (changes: Record<string, unknown>) =>
+      value.app.inject({
+        method: 'PUT',
+        url: '/api/settings',
+        headers: requestHeaders,
+        payload: {
+          changes,
+          expected_revisions: Object.fromEntries(
+            Object.keys(changes).map((key) => [key, revisions[key] ?? '0']),
+          ),
+        },
+      });
+    const serverChange = await save({ jellyfin_url: 'https://other-server.test' });
+    expect(serverChange.statusCode).toBe(400);
+    expect(serverChange.json().detail).toMatch(/managed by administrator sign-in/);
+    const keyChange = await save({ jellyfin_api_key: 'replacement-secret' });
+    expect(keyChange.statusCode).toBe(400);
+    expect(keyChange.json().detail).toMatch(/Use Replace Jellyfin API key/);
+    const updated = await save({
+      jellyfin_url: `${SERVER_URL}/`,
+      jellyfin_api_key: '',
+      emby_api_key: 'emby-sensitive-key',
+      emby_url: 'http://emby:8096',
     });
     expect(updated.statusCode).toBe(200);
     expect(updated.body).not.toContain('emby-sensitive-key');

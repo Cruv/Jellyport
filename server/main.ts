@@ -1044,44 +1044,37 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         expected_revisions: expectedRevisions,
         authority_review_token: authorityReviewToken,
       } = request.body;
-      const versioned = changes !== undefined || expectedRevisions !== undefined;
       if (
-        versioned &&
-        (!changes ||
-          typeof changes !== 'object' ||
-          Array.isArray(changes) ||
-          !expectedRevisions ||
-          typeof expectedRevisions !== 'object' ||
-          Array.isArray(expectedRevisions) ||
-          Object.keys(request.body).some(
-            (key) => !['changes', 'expected_revisions', 'authority_review_token'].includes(key),
-          ))
+        !changes ||
+        typeof changes !== 'object' ||
+        Array.isArray(changes) ||
+        !expectedRevisions ||
+        typeof expectedRevisions !== 'object' ||
+        Array.isArray(expectedRevisions) ||
+        Object.keys(request.body).some(
+          (key) => !['changes', 'expected_revisions', 'authority_review_token'].includes(key),
+        )
       )
-        throw new ServiceError('Submit changed settings with their current field revisions.');
-      const incoming = versioned
-        ? { ...(changes as Record<string, unknown>) }
-        : { ...request.body };
-      delete incoming.authority_review_token;
+        throw new ServiceError(
+          'Reload Jellyport to save changed settings with current field revisions.',
+        );
+      const incoming = { ...(changes as Record<string, unknown>) };
       if (Object.keys(incoming).some((key) => !Object.hasOwn(DEFAULT_SETTINGS, key)))
         throw new ServiceError('Unknown setting supplied.');
       for (const key of SECRET_FIELDS) if (incoming[key] === '') delete incoming[key];
-      if (versioned) {
-        const fields = Object.keys(incoming);
-        const expected = expectedRevisions as Record<string, unknown>;
-        if (
-          fields.some((key) => !Object.hasOwn(expected, key) || typeof expected[key] !== 'string')
-        )
-          throw new ServiceError('Refresh Settings before submitting changed fields.');
-        const current = store.settingRevisions();
-        const conflicts = fields.filter((key) => expected[key] !== (current[key] ?? '0'));
-        if (conflicts.length)
-          return reply.code(409).send({
-            detail:
-              'Another save changed the same settings. Review the conflicts before saving again.',
-            conflicts,
-            field_revisions: Object.fromEntries(conflicts.map((key) => [key, current[key] ?? '0'])),
-          });
-      }
+      const fields = Object.keys(incoming);
+      const expected = expectedRevisions as Record<string, unknown>;
+      if (fields.some((key) => !Object.hasOwn(expected, key) || typeof expected[key] !== 'string'))
+        throw new ServiceError('Refresh Settings before submitting changed fields.');
+      const current = store.settingRevisions();
+      const conflicts = fields.filter((key) => expected[key] !== (current[key] ?? '0'));
+      if (conflicts.length)
+        return reply.code(409).send({
+          detail:
+            'Another save changed the same settings. Review the conflicts before saving again.',
+          conflicts,
+          field_revisions: Object.fromEntries(conflicts.map((key) => [key, current[key] ?? '0'])),
+        });
       const binding = store.authState();
       if (binding?.kind === 'configured') {
         if (

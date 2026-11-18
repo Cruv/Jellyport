@@ -85,6 +85,25 @@ async function login(app: JellyportApp) {
     'x-csrf-token': response.json().csrf_token as string,
   };
 }
+async function saveSettings(
+  app: JellyportApp,
+  headers: Awaited<ReturnType<typeof login>>,
+  changes: Record<string, unknown>,
+) {
+  const current = await app.inject({ url: '/api/settings', headers });
+  const { field_revisions } = current.json<{ field_revisions: Record<string, string> }>();
+  return app.inject({
+    method: 'PUT',
+    url: '/api/settings',
+    headers,
+    payload: {
+      changes,
+      expected_revisions: Object.fromEntries(
+        Object.keys(changes).map((key) => [key, field_revisions[key] ?? '0']),
+      ),
+    },
+  });
+}
 async function readyPreview(
   app: JellyportApp,
   headers: Awaited<ReturnType<typeof login>>,
@@ -298,20 +317,13 @@ it('sets security headers and secure session attributes', async () => {
 it('validates saved settings and preserves blank secrets without exposing them', async () => {
   const app = await setup(false);
   const headers = await login(app);
-  let response = await app.inject({
-    method: 'PUT',
-    url: '/api/settings',
-    headers,
-    payload: { emby_url: 'https://emby.example/', emby_api_key: 'secret-key' },
+  let response = await saveSettings(app, headers, {
+    emby_url: 'https://emby.example/',
+    emby_api_key: 'secret-key',
   });
   expect(response.statusCode).toBe(200);
   expect(response.body).not.toContain('secret-key');
-  response = await app.inject({
-    method: 'PUT',
-    url: '/api/settings',
-    headers,
-    payload: { emby_api_key: '' },
-  });
+  response = await saveSettings(app, headers, { emby_api_key: '' });
   expect(response.statusCode).toBe(200);
   expect(app.jellyport.store.settings().emby_api_key).toBe('secret-key');
   expect(app.jellyport.store.settings().emby_url).toBe('https://emby.example');
@@ -322,9 +334,7 @@ it('validates saved settings and preserves blank secrets without exposing them',
     { jellyfin_url: 'https://user:password@example.com' },
     { path_mappings: [{ source: '', target: '/media' }] },
   ]) {
-    expect(
-      (await app.inject({ method: 'PUT', url: '/api/settings', headers, payload })).statusCode,
-    ).toBe(400);
+    expect((await saveSettings(app, headers, payload)).statusCode).toBe(400);
   }
 });
 
@@ -357,6 +367,18 @@ it('merges independent settings drafts and rejects only conflicting fields from 
   expect(responses.map((response) => response.statusCode)).toEqual([200, 200]);
   const result = (await get(second)).json();
   expect(result).toMatchObject({ password_length: 16, bot_message_retention_days: 45 });
+  const staleClient = await app.inject({
+    method: 'PUT',
+    url: '/api/settings',
+    headers: second,
+    payload: { password_length: 12, bot_message_retention_days: 30 },
+  });
+  expect(staleClient.statusCode).toBe(400);
+  expect(staleClient.json().detail).toContain('current field revisions');
+  expect((await get(second)).json()).toMatchObject({
+    password_length: 16,
+    bot_message_retention_days: 45,
+  });
   expect(result.field_revisions.bot_message_retention_days).not.toBe(
     initial.bot_message_retention_days,
   );
@@ -984,12 +1006,7 @@ it('discards ready history previews when integration settings change', async () 
   await vi.waitFor(async () =>
     expect((await app.inject({ url, headers })).json().status).toBe('ready'),
   );
-  const updated = await app.inject({
-    method: 'PUT',
-    url: '/api/settings',
-    headers,
-    payload: { emby_url: 'https://emby.example' },
-  });
+  const updated = await saveSettings(app, headers, { emby_url: 'https://emby.example' });
   expect(updated.statusCode).toBe(200);
   expect((await app.inject({ url, headers })).statusCode).toBe(404);
 });

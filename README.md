@@ -342,7 +342,7 @@ Tier names, exact trusted MEE6 plan names, and account limits are configurable i
 
 Existing installations retain their data and primary account links when updating. Saved links and mappings become slot 1; an update alone does not create extra accounts. Review a member's tier under **Memberships** to add or change their allowance.
 
-New passwords are encrypted and retained for up to 24 hours. After the job finishes, the web app offers a one-time reveal; revealing consumes the stored credential record. Successful Discord delivery removes that record immediately. If delivery fails, credentials remain available for the one-time reveal until expiration. Existing accounts have no new password to reveal or send.
+New passwords are encrypted and retained for up to 24 hours. After the job finishes, the web app offers a one-time reveal. Successful Discord delivery removes the stored credential record immediately. If delivery fails, the record remains available for reveal until expiration.
 
 New credential DMs have a separate encrypted delivery record. **Activity → operation details → View bot messages** shows the recipient, account and delivery outcome. **Settings → Discord → Messages** controls delivery history retention (30 days by default; zero keeps it until activity deletion). For undelivered credentials, use **Reveal new credentials** in the operation. If the response is lost, the same signed-in session can retry within 90 seconds, until the receipt is dismissed or expires.
 

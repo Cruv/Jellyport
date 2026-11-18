@@ -11,6 +11,28 @@ import type { BotAdapter } from '../server/service.js';
 const owner = '123456789';
 const directories: string[] = [];
 const apps: JellyportApp[] = [];
+async function saveSettings(
+  app: JellyportApp,
+  headers: Record<string, string>,
+  changes: Record<string, unknown>,
+  authorityReviewToken?: string,
+) {
+  const settings = await app.inject({ url: '/api/settings', headers });
+  expect(settings.statusCode).toBe(200);
+  const revisions = settings.json<{ field_revisions: Record<string, string> }>().field_revisions;
+  return app.inject({
+    method: 'PUT',
+    url: '/api/settings',
+    headers,
+    payload: {
+      changes,
+      expected_revisions: Object.fromEntries(
+        Object.keys(changes).map((key) => [key, revisions[key] ?? '0']),
+      ),
+      ...(authorityReviewToken ? { authority_review_token: authorityReviewToken } : {}),
+    },
+  });
+}
 async function fixture(demo = false) {
   const directory = mkdtempSync(join(tmpdir(), 'jellyport-membership-http-'));
   directories.push(directory);
@@ -262,13 +284,7 @@ describe('administrator membership HTTP endpoints', () => {
       store.saveLink(owner, 'river', 'j-river');
       const target = servers.users.jellyfin.find((user) => user.Id === 'j-river')!;
       const changes = { [field]: '200003' };
-      const save = (token?: string) =>
-        app.inject({
-          method: 'PUT',
-          url: '/api/settings',
-          headers,
-          payload: { ...changes, ...(token ? { authority_review_token: token } : {}) },
-        });
+      const save = (token?: string) => saveSettings(app, headers, changes, token);
       expect((await save()).statusCode).toBe(400);
       const preview = await app.inject({
         method: 'POST',
@@ -361,15 +377,13 @@ describe('administrator membership HTTP endpoints', () => {
       expect(response.statusCode).toBe(rejected.status);
       expect(service.newSubscriberPolicy.activation(store.settings())).toBeNull();
     }
-    const backdated = await app.inject({
-      method: 'PUT',
-      url: '/api/settings',
-      headers,
-      payload: { ...payload, new_subscriber_enabled_at: '2000-01-01T00:00:00.000Z' },
+    const backdated = await saveSettings(app, headers, {
+      ...payload,
+      new_subscriber_enabled_at: '2000-01-01T00:00:00.000Z',
     });
     expect(backdated.statusCode).toBe(400);
     expect(service.newSubscriberPolicy.activation(store.settings())).toBeNull();
-    const saved = await app.inject({ method: 'PUT', url: '/api/settings', headers, payload });
+    const saved = await saveSettings(app, headers, payload);
     expect(saved.statusCode).toBe(200);
     expect(saved.headers['cache-control']).toBe('no-store');
     expect(saved.json()).toMatchObject({ auto_create_new_subscribers: true });
@@ -548,23 +562,16 @@ describe('administrator membership HTTP endpoints', () => {
         ],
       },
     ]) {
-      const response = await app.inject({ method: 'PUT', url: '/api/settings', headers, payload });
+      const response = await saveSettings(app, headers, payload);
       expect(response.statusCode).toBe(400);
       expect(app.jellyport.store.settings()).toEqual(before);
     }
-    const base = await app.inject({
-      method: 'PUT',
-      url: '/api/settings',
-      headers,
-      payload: { discord_application_id: '999999999' },
-    });
+    const base = await saveSettings(app, headers, { discord_application_id: '999999999' });
     expect(base.statusCode).toBe(200);
     expect(new URL(base.json().bot_invite_url).searchParams.get('permissions')).toBe('68608');
-    const tagged = await app.inject({
-      method: 'PUT',
-      url: '/api/settings',
-      headers,
-      payload: { discord_emby_role_id: '444444444', discord_jellyfin_role_id: '555555555' },
+    const tagged = await saveSettings(app, headers, {
+      discord_emby_role_id: '444444444',
+      discord_jellyfin_role_id: '555555555',
     });
     expect(tagged.statusCode).toBe(200);
     expect(new URL(tagged.json().bot_invite_url).searchParams.get('permissions')).toBe('268504064');

@@ -20,6 +20,26 @@ const settings: Settings = {
   jellyfin_api_key: 'private-api-key',
   template_user_id: 'template',
 };
+async function saveSettings(
+  app: JellyportApp,
+  headers: Record<string, string>,
+  changes: Record<string, unknown>,
+) {
+  const settings = await app.inject({ url: '/api/settings', headers });
+  expect(settings.statusCode).toBe(200);
+  const revisions = settings.json<{ field_revisions: Record<string, string> }>().field_revisions;
+  return app.inject({
+    method: 'PUT',
+    url: '/api/settings',
+    headers,
+    payload: {
+      changes,
+      expected_revisions: Object.fromEntries(
+        Object.keys(changes).map((key) => [key, revisions[key] ?? '0']),
+      ),
+    },
+  });
+}
 function directory() {
   const value = mkdtempSync(join(tmpdir(), 'jellyport-roles-'));
   directories.push(value);
@@ -487,21 +507,14 @@ describe('authenticated role routes', () => {
     const foreign = { ...saved, id: randomUUID(), server_id: 'another-server' };
     app.jellyport.store.saveAccountRoleRecord(foreign.id, foreign);
     for (const defaultRoleId of [randomUUID(), foreign.id]) {
-      const response = await app.inject({
-        method: 'PUT',
-        url: '/api/settings',
-        headers,
-        payload: { default_role_id: defaultRoleId },
-      });
+      const response = await saveSettings(app, headers, { default_role_id: defaultRoleId });
       expect(response.statusCode).toBe(400);
       expect(response.json().detail).toMatch(/role saved for this Jellyfin server/);
       expect(app.jellyport.store.settings()).toEqual(before);
     }
-    const accepted = await app.inject({
-      method: 'PUT',
-      url: '/api/settings',
-      headers,
-      payload: { default_role_id: saved.id, template_user_id: '' },
+    const accepted = await saveSettings(app, headers, {
+      default_role_id: saved.id,
+      template_user_id: '',
     });
     expect(accepted.statusCode).toBe(200);
     expect(accepted.json()).toMatchObject({ default_role_id: saved.id, template_user_id: '' });
@@ -597,12 +610,7 @@ describe('authenticated role routes', () => {
       payload: input(),
     });
     expect(saved.statusCode).toBe(200);
-    const selected = await app.inject({
-      method: 'PUT',
-      url: '/api/settings',
-      headers,
-      payload: { default_role_id: saved.json().id },
-    });
+    const selected = await saveSettings(app, headers, { default_role_id: saved.json().id });
     expect(selected.statusCode).toBe(200);
     expect(app.jellyport.store.settings().default_role_id).toBe(saved.json().id);
   });

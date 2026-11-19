@@ -180,6 +180,7 @@ beforeEach(() => {
       ),
     },
     '/api/overview': overview,
+    '/api/overview/inbox': { inbox: [] },
     '/api/jobs': { jobs: [job] },
     '/api/jobs/job-1': job,
     '/api/jobs/job-1/credentials': {
@@ -4455,29 +4456,53 @@ it('enables account creation after a successful requirements refresh with an old
   expect(requests.some((request) => request.path === '/api/accounts')).toBe(false);
 });
 
-it('keeps the reviewed Emby selection while a replacement roster is unavailable', async () => {
-  const roster = { emby: [{ Id: 'e-fixture', Name: 'synthetic-emby-user' }], jellyfin: [] };
-  responses['/api/users'] = roster;
-  render(<App />);
-  const navigation = within(await screen.findByRole('complementary', { name: 'Main navigation' }));
-  fireEvent.click(navigation.getByRole('button', { name: 'Migrate users' }));
-  fireEvent.click(await screen.findByRole('checkbox', { name: 'Select synthetic-emby-user' }));
-  fireEvent.click(navigation.getByRole('button', { name: 'Overview' }));
-  await screen.findByRole('heading', { name: 'Overview' });
-  responses['/api/users'] = {
-    emby: [],
-    jellyfin: [],
-    errors: { emby: 'Emby roster read failed.' },
-  };
-  fireEvent.click(navigation.getByRole('button', { name: 'Migrate users' }));
-  expect(
-    await screen.findByRole('checkbox', { name: 'Select synthetic-emby-user' }),
-  ).toHaveProperty('checked', true);
-  expect(screen.getByRole('button', { name: 'Preview migration (1)' })).toHaveProperty(
-    'disabled',
-    true,
-  );
-});
+it.each(['Emby', 'Jellyfin'] as const)(
+  'retries a failed %s roster in place and preserves the selection',
+  async (provider) => {
+    const kind = provider === 'Emby' ? 'emby' : 'jellyfin';
+    const roster = {
+      emby: [{ Id: 'e-fixture', Name: 'synthetic-emby-user' }],
+      jellyfin: [{ Id: 'j-fixture', Name: 'synthetic-emby-user' }],
+    };
+    responses['/api/users'] = roster;
+    render(<App />);
+    const navigation = within(
+      await screen.findByRole('complementary', { name: 'Main navigation' }),
+    );
+    fireEvent.click(navigation.getByRole('button', { name: 'Migrate users' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: 'Select synthetic-emby-user' }));
+    fireEvent.click(navigation.getByRole('button', { name: 'Overview' }));
+    await screen.findByRole('heading', { name: 'Overview' });
+    responses['/api/users'] = {
+      ...roster,
+      [kind]: [],
+      errors: { [kind]: `${provider} roster read failed.` },
+    };
+    fireEvent.click(navigation.getByRole('button', { name: 'Migrate users' }));
+    expect(
+      await screen.findByRole('checkbox', { name: 'Select synthetic-emby-user' }),
+    ).toHaveProperty('checked', true);
+    expect(screen.getByRole('button', { name: 'Preview migration (1)' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    responses['/api/users'] = {
+      ...roster,
+      emby: [...roster.emby, { Id: 'e-recovered', Name: 'synthetic-new-user' }],
+    };
+    fireEvent.click(screen.getByRole('button', { name: `Refresh ${provider} users` }));
+    await screen.findByRole('checkbox', { name: 'Select synthetic-new-user' });
+    expect(screen.getByRole('checkbox', { name: 'Select synthetic-emby-user' })).toHaveProperty(
+      'checked',
+      true,
+    );
+    expect(screen.queryByText(`${provider} users could not be loaded.`)).toBeNull();
+    expect(screen.getByRole('button', { name: 'Preview migration (1)' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+  },
+);
 
 it('binds Activity actions to the query, status, and page that returned each row', async () => {
   responses['/api/jobs'] = {
@@ -4569,11 +4594,47 @@ it('refreshes the Emby roster in place after readiness succeeds and retains sele
     ...initial,
     emby: [...initial.emby, { Id: 'e-two', Name: 'Synthetic Two' }],
   };
-  fireEvent.click(screen.getByRole('button', { name: 'Refresh Emby users' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Refresh user rosters' }));
   await screen.findByRole('checkbox', { name: 'Select Synthetic Two' });
   expect(selected).toHaveProperty('checked', true);
   expect(screen.getByRole('button', { name: 'Preview migration (1)' })).toHaveProperty(
     'disabled',
     false,
   );
+});
+
+it('refreshes only the visible Overview inbox and retains its last state across a failed poll', async () => {
+  const healthy = {
+    id: 'jellyfin_history',
+    title: 'Jellyfin matching backup',
+    detail: 'Helper available.',
+    attention: false,
+  };
+  responses['/api/overview'] = { ...overview, inbox: [healthy] };
+  responses['/api/overview/inbox'] = {
+    inbox: [{ ...healthy, detail: 'The latest import has expired.', attention: true }],
+  };
+  statuses['/api/overview/inbox'] = 503;
+  vi.useFakeTimers();
+  const view = render(<App />);
+  try {
+    await act(async () => {});
+    expect(screen.getByText('Helper available.')).toBeTruthy();
+    await act(async () => vi.advanceTimersByTimeAsync(29_999));
+    expect(requests.filter(({ path }) => path === '/api/overview/inbox')).toHaveLength(0);
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(screen.getByText('Helper available.')).toBeTruthy();
+    statuses['/api/overview/inbox'] = 200;
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(screen.getByText('The latest import has expired.')).toBeTruthy();
+    expect(requests.filter(({ path }) => path === '/api/overview/inbox')).toHaveLength(2);
+    expect(requests.filter(({ path }) => path === '/api/overview')).toHaveLength(1);
+    expect(requests.some(({ path }) => path === '/api/users')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(requests.filter(({ path }) => path === '/api/overview/inbox')).toHaveLength(2);
+  } finally {
+    view.unmount();
+    vi.useRealTimers();
+  }
 });

@@ -93,6 +93,7 @@ export class WorkflowReadiness {
           (async () => {
             const info = await client.systemInfo();
             if (!active || this.closed) throw new Error('canceled');
+            this.service.noteMediaObservation(settings, kind, info);
             if (
               typeof info.Id !== 'string' ||
               !info.Id ||

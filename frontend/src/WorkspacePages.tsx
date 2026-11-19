@@ -270,6 +270,7 @@ export function MigratePage({
   navigate,
   refreshRoster,
   rosterPending,
+  rosterError,
 }: {
   users: Users;
   overview: Overview;
@@ -282,10 +283,21 @@ export function MigratePage({
   setUseSnapshots: (value: boolean) => void;
   busy: boolean;
   navigate: (page: Page) => void;
-  refreshRoster?: () => Promise<void>;
+  refreshRoster?: () => Promise<boolean | undefined>;
   rosterPending?: boolean;
+  rosterError?: string;
 }) {
   const taskReadiness = useWorkflowAction(useSnapshots ? 'migrate_saved' : 'migrate');
+  const rosterUnavailable = rosterError || users.errors?.emby || users.errors?.jellyfin;
+  const rosterLabel =
+    rosterError || (users.errors?.emby && users.errors?.jellyfin)
+      ? 'user rosters'
+      : users.errors?.jellyfin
+        ? 'Jellyfin users'
+        : 'Emby users';
+  async function retryRoster() {
+    if ((await refreshRoster?.()) && !taskReadiness.ready) await taskReadiness.refresh();
+  }
   const filtered = users.emby.filter((user) =>
     user.Name.toLowerCase().includes(search.trim().toLowerCase()),
   );
@@ -309,8 +321,7 @@ export function MigratePage({
             onClick={preview}
             disabled={
               !taskReadiness.ready ||
-              !!users.errors?.emby ||
-              !!users.errors?.jellyfin ||
+              !!rosterUnavailable ||
               rosterPending ||
               !selected.size ||
               selected.size > 100 ||
@@ -326,7 +337,9 @@ export function MigratePage({
       />
       <WorkflowRequirements
         action={useSnapshots ? 'migrate_saved' : 'migrate'}
-        onReady={refreshRoster}
+        onReady={async () => {
+          await refreshRoster?.();
+        }}
       />
       <div className="steps" aria-label="Migration steps">
         <span className="step active" aria-current="step">
@@ -342,14 +355,19 @@ export function MigratePage({
         </span>
       </div>
       <UserWarnings users={users} />
-      {users.errors?.emby && taskReadiness.ready && refreshRoster && (
+      {rosterError && (
+        <Callout icon="warning" warning title="User rosters could not be loaded.">
+          {rosterError}
+        </Callout>
+      )}
+      {rosterUnavailable && refreshRoster && (
         <button
           type="button"
           className="btn btn-quiet"
           disabled={rosterPending}
-          onClick={() => void refreshRoster()}
+          onClick={() => void retryRoster()}
         >
-          {rosterPending ? 'Refreshing Emby users…' : 'Refresh Emby users'}
+          {rosterPending ? `Refreshing ${rosterLabel}…` : `Refresh ${rosterLabel}`}
         </button>
       )}
       {!taskReadiness.managed &&
@@ -1511,7 +1529,9 @@ export function SubscriptionsPage({
                                   disabled={busy}
                                   onClick={() => review(event)}
                                 >
-                                  Review
+                                  {event.stripe_price_review_required
+                                    ? 'Review household'
+                                    : 'Review'}
                                 </button>
                               </div>
                             ) : event.job_id ? (

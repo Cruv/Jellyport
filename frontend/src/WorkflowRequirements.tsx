@@ -249,6 +249,7 @@ export function useWorkflowAction(action: WorkflowAction) {
     loading: context?.loading ?? false,
     state: context?.snapshot?.actions[action],
     error: context?.error ?? '',
+    refresh: () => context?.check(true),
   };
 }
 

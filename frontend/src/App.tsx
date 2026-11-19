@@ -124,13 +124,20 @@ interface Toast {
 const message = (error: unknown) =>
   error instanceof Error ? error.message : 'The operation could not be completed.';
 const emptyUsers: Users = { emby: [], jellyfin: [] };
-const pendingSubmissionKey = 'jellyport:pending-operation-receipt';
-const legacySubmissionKey = 'jellyport:pending-migration-receipt';
+const pendingReceiptsKey = 'jellyport:pending-operation-receipts';
+const legacyReceiptKeys = [
+  'jellyport:pending-operation-receipt',
+  'jellyport:pending-migration-receipt',
+];
+const opaqueReceipt = /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/;
+const membershipAcceptPath = '/api/memberships/workflow/accept';
 const receiptPaths = new Set([
   '/api/accounts',
   '/api/accounts/clone',
   '/api/accounts/recover',
   '/api/account-roles/apply',
+  '/api/memberships/provision',
+  membershipAcceptPath,
 ]);
 function newSubmissionReceipt(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -139,18 +146,30 @@ function newSubmissionReceipt(): string {
   const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
-function pendingSubmission(value?: string): string {
+function readPendingReceipts(): string[] {
   try {
-    if (value !== undefined) sessionStorage.removeItem(legacySubmissionKey);
-    if (value === '') sessionStorage.removeItem(pendingSubmissionKey);
-    else if (value) sessionStorage.setItem(pendingSubmissionKey, value);
-    return (
-      sessionStorage.getItem(pendingSubmissionKey) ??
-      sessionStorage.getItem(legacySubmissionKey) ??
-      ''
+    const saved: unknown = JSON.parse(sessionStorage.getItem(pendingReceiptsKey) ?? '[]');
+    return Array.from(
+      new Set(
+        [
+          ...(Array.isArray(saved) ? saved : []),
+          ...legacyReceiptKeys.map((key) => sessionStorage.getItem(key)),
+        ].filter(
+          (value): value is string => typeof value === 'string' && opaqueReceipt.test(value),
+        ),
+      ),
     );
   } catch {
-    return value ?? '';
+    return [];
+  }
+}
+function storePendingReceipts(receipts: string[]) {
+  try {
+    if (receipts.length) sessionStorage.setItem(pendingReceiptsKey, JSON.stringify(receipts));
+    else sessionStorage.removeItem(pendingReceiptsKey);
+    for (const key of legacyReceiptKeys) sessionStorage.removeItem(key);
+  } catch {
+    // Receipt lookup stays available in the tray when storage is disabled.
   }
 }
 const nextPreviewPoll = (signal: AbortSignal) =>
@@ -184,9 +203,10 @@ export default function App() {
   const [loginError, setLoginError] = useState('');
   const [overview, setOverview] = useState<Overview | null>(null);
   const [users, setUsers] = useState<Users>(emptyUsers);
-  const lastMigrationRoster = useRef<Users['emby']>([]);
+  const lastMigrationRoster = useRef<Pick<Users, 'emby' | 'jellyfin'>>(emptyUsers);
   const migrationRosterVersion = useRef(0);
   const [migrationRosterPending, setMigrationRosterPending] = useState(false);
+  const [migrationRosterError, setMigrationRosterError] = useState('');
   const [mappings, setMappings] = useState<UserMapping[]>([]);
   const [settings, setSettings] = useState<Settings | null>(null);
   const [activityFilter, setActivityFilter] = useState<
@@ -213,9 +233,32 @@ export default function App() {
   const [activityRefresh, setActivityRefresh] = useState(0);
   const [live, setLive] = useState<LiveOperations | null>(null);
   const wakeOperations = useRef<() => void>(() => {});
-  const [receipt, setReceipt] = useState(pendingSubmission);
-  const pendingAccountSubmission = useRef<{ path: string; body: string; receipt: string } | null>(
-    null,
+  const [pendingReceipts, setPendingReceipts] = useState(readPendingReceipts);
+  const pendingReceiptsRef = useRef(pendingReceipts);
+  const [receipt, setReceipt] = useState(pendingReceipts[0] ?? '');
+  const pendingJobRequests = useRef(new Map<string, string>());
+  const updatePendingReceipts = useCallback((receipts: string[]) => {
+    storePendingReceipts(receipts);
+    pendingReceiptsRef.current = receipts;
+    setPendingReceipts(receipts);
+  }, []);
+  const rememberReceipt = useCallback(
+    (value: string) => {
+      if (!opaqueReceipt.test(value)) return;
+      updatePendingReceipts([value, ...pendingReceiptsRef.current.filter((id) => id !== value)]);
+      setReceipt(value);
+    },
+    [updatePendingReceipts],
+  );
+  const resolveReceipt = useCallback(
+    (value: string) => {
+      for (const [request, id] of pendingJobRequests.current)
+        if (id === value) pendingJobRequests.current.delete(request);
+      const remaining = pendingReceiptsRef.current.filter((id) => id !== value);
+      updatePendingReceipts(remaining);
+      setReceipt((current) => (current === value ? (remaining[0] ?? '') : current));
+    },
+    [updatePendingReceipts],
   );
   const [followUp, setFollowUp] = useState<{
     job_id: string;
@@ -291,6 +334,7 @@ export default function App() {
   const [memberHandoff, setMemberHandoff] = useState<{
     id: string;
     username: string;
+    tier_id?: string;
     key: number;
   }>();
   const notify = useCallback((text: string, error = false) => {
@@ -373,9 +417,10 @@ export default function App() {
     setLoadedPage(null);
     setOverview(null);
     setUsers(emptyUsers);
-    lastMigrationRoster.current = [];
+    lastMigrationRoster.current = emptyUsers;
     migrationRosterVersion.current++;
     setMigrationRosterPending(false);
+    setMigrationRosterError('');
     setMappings([]);
     setMemberHandoff(undefined);
     setSettings(null);
@@ -386,8 +431,9 @@ export default function App() {
     setActivityPending(false);
     setActivityFilter({ query: '', status: 'all', page: 1 });
     setLive(null);
-    setReceipt(pendingSubmission(''));
-    pendingAccountSubmission.current = null;
+    updatePendingReceipts([]);
+    setReceipt('');
+    pendingJobRequests.current.clear();
     setFollowUp(null);
     setEvents([]);
     setSelected(new Set());
@@ -398,7 +444,7 @@ export default function App() {
     setToasts([]);
     setMobileOpen(false);
     closeDialog(true);
-  }, [cancelPreview, closeDialog]);
+  }, [cancelPreview, closeDialog, updatePendingReceipts]);
   const acceptSession = useCallback((value: Session) => {
     sessionRef.current = value;
     setSession(value);
@@ -424,14 +470,11 @@ export default function App() {
         const body = options.body === undefined ? undefined : JSON.stringify(options.body);
         let submission: string | undefined;
         if (options.method === 'POST' && body && receiptPaths.has(path)) {
-          const previous = pendingAccountSubmission.current;
-          submission =
-            previous?.path === path && previous.body === body
-              ? previous.receipt
-              : newSubmissionReceipt();
-          pendingAccountSubmission.current = { path, body, receipt: submission };
+          const request = `${path}\n${body}`;
+          submission = pendingJobRequests.current.get(request) ?? newSubmissionReceipt();
+          pendingJobRequests.current.set(request, submission);
           headers['X-Jellyport-Submission'] = submission;
-          setReceipt(pendingSubmission(submission));
+          rememberReceipt(submission);
         }
         let response: Response;
         try {
@@ -444,7 +487,9 @@ export default function App() {
         } catch (error) {
           if (error instanceof Error && error.name === 'AbortError') throw error;
           throw new Error(
-            'Could not reach Jellyport. Check that the application is running and try again.',
+            path === membershipAcceptPath
+              ? 'Could not reach Jellyport. Check the Operations tray for the job before reviewing again.'
+              : 'Could not reach Jellyport. Check that the application is running and try again.',
           );
         }
         let data: unknown;
@@ -456,7 +501,9 @@ export default function App() {
             // Never turn an unreadable success into a fabricated typed object.
             if (error instanceof Error && error.name === 'AbortError') throw error;
             throw new Error(
-              'Jellyport’s response could not be read. Refresh to check its status before retrying.',
+              path === membershipAcceptPath
+                ? 'Jellyport’s response could not be read. Check the Operations tray for the job before reviewing again.'
+                : 'Jellyport’s response could not be read. Refresh to check its status before retrying.',
             );
           }
           // Failed responses can have empty/non-JSON bodies; keep their status and
@@ -470,6 +517,8 @@ export default function App() {
         if (!response.ok) {
           if (response.status === 401 && path !== '/api/login' && path !== '/api/setup/connect')
             clearSession();
+          if (submission && [400, 403, 422, 429].includes(response.status))
+            resolveReceipt(submission);
           const body =
             data && typeof data === 'object'
               ? (data as { detail?: unknown; error?: unknown; message?: unknown })
@@ -494,12 +543,10 @@ export default function App() {
           submission &&
           data &&
           typeof data === 'object' &&
-          'id' in data &&
-          typeof data.id === 'string'
+          (('id' in data && typeof data.id === 'string') ||
+            (path === membershipAcceptPath && 'job' in data))
         ) {
-          if (pendingAccountSubmission.current?.receipt === submission)
-            pendingAccountSubmission.current = null;
-          if (pendingSubmission() === submission) pendingSubmission('');
+          resolveReceipt(submission);
         }
         return data as T;
       } finally {
@@ -509,7 +556,7 @@ export default function App() {
         }
       }
     },
-    [clearSession],
+    [clearSession, rememberReceipt, resolveReceipt],
   );
   const work = useCallback(
     async (key: string, operation: () => Promise<void>) => {
@@ -571,20 +618,26 @@ export default function App() {
         !!sessionRef.current?.authenticated;
       try {
         const listed = await api<Users>('/api/users', { signal });
-        if (!current()) return;
+        if (!current()) return false;
         if (!listed.errors?.emby) {
-          lastMigrationRoster.current = listed.emby;
           const available = new Set(listed.emby.map(({ Id }) => Id));
           setSelected((selection) => new Set([...selection].filter((id) => available.has(id))));
         }
-        setUsers({ ...listed, emby: lastMigrationRoster.current });
+        lastMigrationRoster.current = {
+          emby: listed.errors?.emby ? lastMigrationRoster.current.emby : listed.emby,
+          jellyfin: listed.errors?.jellyfin
+            ? lastMigrationRoster.current.jellyfin
+            : listed.jellyfin,
+        };
+        setUsers({ ...listed, ...lastMigrationRoster.current });
+        setMigrationRosterError('');
+        return !listed.errors?.emby && !listed.errors?.jellyfin;
       } catch (error) {
-        if (current())
-          setUsers((previous) => ({
-            ...previous,
-            emby: lastMigrationRoster.current,
-            errors: { ...previous.errors, emby: message(error) },
-          }));
+        if (current()) {
+          setUsers((previous) => ({ ...previous, ...lastMigrationRoster.current }));
+          setMigrationRosterError(message(error));
+        }
+        return false;
       } finally {
         if (current()) setMigrationRosterPending(false);
       }
@@ -763,6 +816,61 @@ export default function App() {
     page,
     session?.authenticated,
   ]);
+  useEffect(() => {
+    if (
+      !session?.authenticated ||
+      page !== 'overview' ||
+      loadedPage !== 'overview' ||
+      loading ||
+      pageError
+    )
+      return;
+    const controller = new AbortController();
+    const interval = 30_000;
+    let nextAt = Date.now() + interval;
+    let polling = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function poll() {
+      if (polling || document.hidden || controller.signal.aborted) return;
+      polling = true;
+      nextAt = Date.now() + interval;
+      const load = loadVersion.current;
+      const history = historyRevision.current;
+      try {
+        const result = await readOperationStatus<Pick<Overview, 'inbox' | 'backup_verification'>>(
+          api,
+          '/api/overview/inbox',
+          controller.signal,
+        );
+        if (
+          controller.signal.aborted ||
+          pageRef.current !== 'overview' ||
+          load !== loadVersion.current ||
+          history !== historyRevision.current ||
+          !Array.isArray(result?.inbox)
+        )
+          return;
+        setOverview((current) => (current ? { ...current, ...result } : current));
+      } catch {
+        // Keep the last successful inbox and retry on the next bounded check.
+      } finally {
+        polling = false;
+        schedule();
+      }
+    }
+    function schedule() {
+      clearTimeout(timer);
+      if (!polling && !document.hidden && !controller.signal.aborted)
+        timer = setTimeout(() => void poll(), Math.max(0, nextAt - Date.now()));
+    }
+    schedule();
+    document.addEventListener('visibilitychange', schedule);
+    return () => {
+      controller.abort();
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', schedule);
+    };
+  }, [api, loadedPage, loading, page, pageError, session?.authenticated]);
   useEffect(() => {
     if (!session?.authenticated) return;
     const controller = new AbortController();
@@ -1074,7 +1182,7 @@ export default function App() {
         api,
         `/api/jobs/receipts/${value ? encodeURIComponent(value) : 'latest'}`,
       );
-      if (value && value === pendingSubmission()) pendingSubmission('');
+      if (value) resolveReceipt(value);
       openJob(result.job_id);
     });
   }
@@ -1121,7 +1229,7 @@ export default function App() {
     });
     const ids = dialog.preview.users.map((user) => user.source_user_id);
     void work('migration', async () => {
-      setReceipt(pendingSubmission(dialog.previewId));
+      rememberReceipt(dialog.previewId);
       const job = await api<Job>('/api/migrations', {
         method: 'POST',
         body: {
@@ -1146,7 +1254,7 @@ export default function App() {
           ...(Object.keys(mappingRevisions).length ? { mapping_revisions: mappingRevisions } : {}),
         },
       });
-      if (pendingSubmission() === dialog.previewId) pendingSubmission('');
+      resolveReceipt(dialog.previewId);
       // The accepted job now owns its trusted review metadata and any selected snapshot pins.
       if (readyPreview.current?.id === dialog.previewId) readyPreview.current = null;
       setSelected(new Set());
@@ -1356,6 +1464,17 @@ export default function App() {
       }
     });
   }
+  function reviewSubscription(event: SubscriptionEvent) {
+    if (event.stripe_price_review_required && event.discord_user_id) {
+      setMemberHandoff({
+        id: event.discord_user_id,
+        username: event.username || event.discord_user_id,
+        tier_id: event.tier_id,
+        key: Date.now(),
+      });
+      navigate('memberships');
+    } else showDialog({ kind: 'event', event });
+  }
   function ignore(event: SubscriptionEvent) {
     void work('event', async () => {
       await api(`/api/subscriptions/${encodeURIComponent(event.id)}/ignore`, {
@@ -1437,6 +1556,7 @@ export default function App() {
           navigate={navigate}
           refreshRoster={refreshMigrationRoster}
           rosterPending={migrationRosterPending}
+          rosterError={migrationRosterError}
         />
       </>
     );
@@ -1493,7 +1613,7 @@ export default function App() {
         refresh={() => void load('memberships', true)}
         navigate={navigate}
         openJob={openJob}
-        review={(event) => showDialog({ kind: 'event', event })}
+        review={reviewSubscription}
         ignore={ignore}
         busy={busy.has('event')}
         focusMember={memberHandoff}
@@ -1555,7 +1675,7 @@ export default function App() {
         navigate={navigate}
         openJob={openJob}
         refresh={() => void load(page, true)}
-        review={(event) => showDialog({ kind: 'event', event })}
+        review={reviewSubscription}
         ignore={ignore}
         busy={busy.has('event')}
       />
@@ -1739,6 +1859,24 @@ export default function App() {
                           Find operation
                         </button>
                       </form>
+                      {pendingReceipts.length > 1 && (
+                        <div
+                          className="operations-receipt"
+                          role="group"
+                          aria-label="Pending submission receipts"
+                        >
+                          {pendingReceipts.map((id) => (
+                            <button
+                              className="text-button"
+                              key={id}
+                              type="button"
+                              onClick={() => setReceipt(id)}
+                            >
+                              Receipt ending in {id.slice(-8)}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   </details>
                   {page === 'migrate' && previewProgress && (

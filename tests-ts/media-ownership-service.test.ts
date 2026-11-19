@@ -250,6 +250,50 @@ describe('approved media ownership in existing migration workflows', () => {
     expect(bot.delivered).not.toHaveBeenCalled();
   });
 
+  it.each(['server', 'account name'] as const)(
+    'rejects a changed Emby %s during history collection before any destination side effect',
+    async (changed) => {
+      const source = servers.users.emby.find((user) => user.Id === 'e-alex')!;
+      source.Name = 'discord.user';
+      const targets = structuredClone(servers.users.jellyfin);
+      const history = structuredClone(servers.userData);
+      const factory = service.clientFactory;
+      let historyCollected = false;
+      service.clientFactory = (...args) => {
+        const client = factory(...args);
+        if (args[2] === 'emby') {
+          const state = client.migrationState!.bind(client);
+          client.migrationState = async (...params) => {
+            const history = await state(...params);
+            historyCollected = true;
+            if (changed === 'account name') source.Name = 'replacement-name';
+            return history;
+          };
+          const info = client.systemInfo.bind(client);
+          client.systemInfo = async () => {
+            const original = await info();
+            return historyCollected && changed === 'server'
+              ? { ...original, Id: 'replacement-emby' }
+              : original;
+          };
+        }
+        return client;
+      };
+      const result = await finish(await service.migrateUsers(['e-alex'], { 'e-alex': owner }));
+      expect(historyCollected).toBe(true);
+      expect(servers.users.jellyfin).toEqual(targets);
+      expect(servers.userData).toEqual(history);
+      expect(mediaWrites()).toEqual([]);
+      expect(store.account('discord.user')).toBeNull();
+      expect(store.takeCredentials(result.id)).toEqual([]);
+      expect(store.links()).toEqual([]);
+      expect(service.mediaOwnerships.list(store.settings())).toEqual([]);
+      expect(bot.delivered).not.toHaveBeenCalled();
+      expect(result.status).toBe('failed');
+      expect(result.results[0]?.error).toMatch(/reviewed Emby server|source account changed/);
+    },
+  );
+
   it('permits an explicitly approved migration and credential delivery for a verified source username exception', async () => {
     registered('emby', 'e-alex');
     const result = await finish(await service.migrateUsers(['e-alex'], { 'e-alex': owner }));

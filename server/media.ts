@@ -64,7 +64,7 @@ export interface MediaUser extends JsonObject {
 }
 export interface MediaAPI {
   close(): Promise<void>;
-  systemInfo(): Promise<JsonObject>;
+  systemInfo(options?: { signal?: AbortSignal; retry?: boolean }): Promise<JsonObject>;
   jellyfinBackups?(): Promise<JellyfinBackupManifest[]>;
   createJellyfinBackup?(): Promise<JellyfinBackupManifest>;
   jellyfinBackupTasks?(): Promise<JellyfinBackupTask[]>;
@@ -431,7 +431,7 @@ function validateImage(image: MediaUserImage): MediaUserImage {
 }
 
 /** Bounds custom transports and streams even when they ignore the fetch signal. */
-async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+export async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   if (signal.aborted) throw signal.reason;
   return new Promise<T>((resolve, reject) => {
     const abort = () => reject(signal.reason);
@@ -723,8 +723,10 @@ export class MediaClient implements MediaAPI {
     return value as MediaUser;
   }
 
-  async systemInfo(): Promise<JsonObject> {
-    return this.object(await this.request('GET', 'System/Info'));
+  async systemInfo(options?: { signal?: AbortSignal; retry?: boolean }): Promise<JsonObject> {
+    return this.object(
+      await this.request('GET', 'System/Info', undefined, undefined, true, undefined, options),
+    );
   }
   async jellyfinBackups(): Promise<JellyfinBackupManifest[]> {
     if (this.kind !== 'jellyfin')

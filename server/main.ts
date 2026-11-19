@@ -315,7 +315,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
           .digest('hex'),
     },
   });
-  service.verifyStripeEntitlement = (fact) => stripe.assertEntitlement(fact);
+  service.verifyStripeEntitlement = (fact, check) => stripe.assertEntitlement(fact, check);
   const discordAuthorityReviews = new DiscordAuthorityReviews(service, stripe);
   service.reviewStripeMigrationMembership = (id, signal, draft) =>
     stripe.reviewMembership(id, signal, draft);
@@ -1222,11 +1222,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     };
   });
   app.post('/api/connections/test', async () => service.connections());
-  app.get<{ Querystring: { fresh?: string } }>('/api/overview', async (request) => {
-    const { connections, emby_users, jellyfin_users, observed } = await service.overviewHealth(
-      request.query.fresh === '1',
-    );
-    const inbox = await operationsInbox(
+  const overviewInbox = async (request: FastifyRequest) => ({
+    inbox: await operationsInbox(
       store,
       service.sourceSnapshots,
       service.destinationSnapshots,
@@ -1234,7 +1231,29 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       identities.cachedAttention(),
       discordAuthorityReviews.attentionCount(),
       request.cookies[COOKIE]!,
-      observed,
+      service.observedMediaServers(),
+    ),
+    ...(demo
+      ? {}
+      : {
+          backup_verification: readBackupVerification(
+            store,
+            process.env.JELLYPORT_BACKUP_VERIFICATION_RECEIPT,
+          ),
+        }),
+  });
+  app.get('/api/overview/inbox', async (request) => {
+    const status = await overviewInbox(request);
+    for (const item of status.inbox) {
+      if (!item.last_successful_at) continue;
+      if (item.repair === 'emby_history') service.refreshCatalogObservation('emby');
+      if (item.repair === 'jellyfin_history') service.refreshCatalogObservation('jellyfin');
+    }
+    return status;
+  });
+  app.get<{ Querystring: { fresh?: string } }>('/api/overview', async (request) => {
+    const { connections, emby_users, jellyfin_users } = await service.overviewHealth(
+      request.query.fresh === '1',
     );
     return {
       counts: {
@@ -1245,15 +1264,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       connections,
       recent_jobs: store.jobSummaries({ limit: 6 }).jobs,
       pending_subscriptions: store.subscriptionCount('pending'),
-      inbox,
-      ...(demo
-        ? {}
-        : {
-            backup_verification: readBackupVerification(
-              store,
-              process.env.JELLYPORT_BACKUP_VERIFICATION_RECEIPT,
-            ),
-          }),
+      ...(await overviewInbox(request)),
       demo,
     };
   });
@@ -1628,11 +1639,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     createHash('sha256')
       .update(JSON.stringify([owner, receipt]))
       .digest('hex');
-  const pendingAccountSubmissions = new Map<string, { hash: string; job: Promise<Job> }>();
-  async function accountJob(
+  const pendingJobSubmissions = new Map<string, { hash: string; result: Promise<unknown> }>();
+  async function submitJob<Result>(
     request: FastifyRequest,
-    queue: (guard: () => void, submission?: MigrationSubmission) => Promise<Job>,
-  ): Promise<Job> {
+    queue: (guard: () => void, submission?: MigrationSubmission) => Promise<Result>,
+    replay: (job: Job) => Result,
+  ): Promise<Result> {
     const signed = session(request);
     const guard = () => {
       if (!signed?.authenticated || session(request) !== signed)
@@ -1666,23 +1678,28 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     const previous = store.accountJobSubmission(key) ?? store.migrationSubmission(key);
     if (previous) {
       sameRequest(previous.requestHash);
-      return service.getJob(previous.id);
+      return replay(service.getJob(previous.id));
     }
-    const pending = pendingAccountSubmissions.get(key);
+    const pending = pendingJobSubmissions.get(key);
     if (pending) {
+      // The same route and payload select the same result type.
       sameRequest(pending.hash);
-      const job = await pending.job;
+      const result = (await pending.result) as Result;
       guard();
-      return job;
+      return result;
     }
-    const job = queue(guard, { key, owner, requestHash });
-    pendingAccountSubmissions.set(key, { hash: requestHash, job });
+    const result = queue(guard, { key, owner, requestHash });
+    pendingJobSubmissions.set(key, { hash: requestHash, result });
     try {
-      return await job;
+      return await result;
     } finally {
-      pendingAccountSubmissions.delete(key);
+      pendingJobSubmissions.delete(key);
     }
   }
+  const accountJob = (
+    request: FastifyRequest,
+    queue: (guard: () => void, submission?: MigrationSubmission) => Promise<Job>,
+  ) => submitJob(request, queue, (job) => job);
   app.get('/api/jobs/receipts/latest', async (request, reply) => {
     const id = store.latestJobSubmission(submissionOwner(request));
     return id
@@ -2448,20 +2465,32 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
       },
     },
     async (request, reply) => {
-      const read = workflowRequest(request, reply);
-      try {
-        const reviewed = workflowReviews.take(
-          request.cookies[COOKIE]!,
-          read.context,
-          request.body.review_token,
-        );
-        const result = await service.applyMembershipWorkflow(reviewed, read.guard, read.signal);
-        return reply.code(result.job ? 202 : 200).send(result);
-      } catch (error) {
-        return read.fail(error);
-      } finally {
-        read.dispose();
-      }
+      type Result = { job: Job | null };
+      const result = await submitJob<Result>(
+        request,
+        async (_authorize, submission) => {
+          const read = workflowRequest(request, reply);
+          try {
+            const reviewed = workflowReviews.take(
+              request.cookies[COOKIE]!,
+              read.context,
+              request.body.review_token,
+            );
+            return await service.applyMembershipWorkflow(
+              reviewed,
+              read.guard,
+              read.signal,
+              submission,
+            );
+          } catch (error) {
+            return read.fail(error);
+          } finally {
+            read.dispose();
+          }
+        },
+        (job) => ({ job }),
+      );
+      return reply.code(result.job ? 202 : 200).send(result);
     },
   );
   app.post<{ Body: Parameters<Service['saveAccountProfile']>[0] }>(
@@ -2617,8 +2646,8 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         throw new ServiceError(
           'Review the account allowance and names before changing Jellyfin provisioning.',
         );
-      return reply.code(202).send(
-        await service.provisionMembership(
+      const job = await accountJob(request, (authorize, submission) =>
+        service.provisionMembership(
           input.discord_user_id,
           input.tier_id,
           input.expected_revision,
@@ -2629,8 +2658,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
                 usernames: input.expected_usernames!,
                 provision_jellyfin: input.provision_jellyfin,
               },
+          undefined,
+          undefined,
+          undefined,
+          { authorize, submission },
         ),
       );
+      return reply.code(202).send(job);
     },
   );
   app.post<{ Params: { event_id: string } }>(

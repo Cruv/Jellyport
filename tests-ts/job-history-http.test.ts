@@ -506,6 +506,167 @@ it('reports missing imports, retained delivery uncertainty, and session-scoped r
   );
 });
 
+it('refreshes inbox status from local evidence and newer server observations without media probes', async () => {
+  const { app, headers, clientFactory } = await fixture();
+  const { service } = app.jellyport;
+  const pathname = '/api/overview/inbox';
+  expect(
+    (await app.inject({ url: pathname, headers: { host: 'jellyport.example' } })).statusCode,
+  ).toBe(401);
+
+  let present = true;
+  let version = '12.2.0';
+  const reads = { systemInfo: 0, users: 0 };
+  service.clientFactory = (...args) => {
+    const client = clientFactory(...args);
+    const users = client.users.bind(client);
+    client.systemInfo = async () => {
+      reads.systemInfo++;
+      return { Id: 'synthetic-jellyfin', Version: version };
+    };
+    client.users = async () => {
+      reads.users++;
+      return users();
+    };
+    return client;
+  };
+  const destination = await service.destinationSnapshots.status();
+  const status = vi
+    .spyOn(service.destinationSnapshots, 'status')
+    .mockImplementation(async (observed) => ({
+      ...destination,
+      configured: true,
+      available: true,
+      usable: present && observed?.version === '12.2.0',
+    }));
+  const inspect = async (attention: boolean) => {
+    const result = await app.inject({ url: pathname, headers });
+    expect(result.statusCode).toBe(200);
+    expect(result.headers['cache-control']).toBe('no-store');
+    expect(result.json()).not.toHaveProperty('connections');
+    expect(result.json().inbox).toContainEqual(
+      expect.objectContaining({
+        repair: 'jellyfin_history',
+        attention,
+      }),
+    );
+  };
+  expect((await app.inject({ url: '/api/overview', headers })).statusCode).toBe(200);
+  clientFactory.mockClear();
+  await inspect(false);
+  present = false;
+  await inspect(true);
+  expect(clientFactory).not.toHaveBeenCalled();
+  expect(reads).toEqual({ systemInfo: 1, users: 1 });
+
+  present = true;
+  version = '12.3.0';
+  expect(
+    (
+      await app.inject({
+        method: 'POST',
+        url: '/api/workflow-readiness/refresh',
+        headers,
+        payload: {},
+      })
+    ).statusCode,
+  ).toBe(200);
+  clientFactory.mockClear();
+  await inspect(true);
+  expect(clientFactory).not.toHaveBeenCalled();
+  expect(reads).toEqual({ systemInfo: 2, users: 2 });
+  expect(status).toHaveBeenLastCalledWith(expect.objectContaining({ version: '12.3.0' }));
+});
+
+it('observes retained catalog providers at most once per five minutes without delaying inbox replies', async () => {
+  const { app, headers, clientFactory } = await fixture();
+  const { store, service } = app.jellyport;
+  store.saveSettings({
+    ...store.settings(),
+    emby_url: 'https://emby.example',
+    emby_api_key: 'SYNTHETIC-EMBY-KEY',
+  });
+  let time = Date.now();
+  vi.spyOn(Date, 'now').mockImplementation(() => time);
+  let release!: () => void;
+  const stalled = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let upgraded = false;
+  const reads = {
+    emby: { systemInfo: 0, users: 0 },
+    jellyfin: { systemInfo: 0, users: 0 },
+  };
+  service.clientFactory = (...args) => {
+    const client = clientFactory(...args);
+    const kind = args[2] ?? 'jellyfin';
+    const users = client.users.bind(client);
+    client.systemInfo = async (options) => {
+      reads[kind].systemInfo++;
+      if (upgraded) {
+        expect(options).toMatchObject({ retry: false, signal: expect.any(AbortSignal) });
+        await stalled;
+      }
+      return { Id: `synthetic-${kind}`, Version: upgraded ? '12.3.0' : '12.2.0' };
+    };
+    client.users = async () => {
+      reads[kind].users++;
+      return users();
+    };
+    return client;
+  };
+  const source = await service.sourceSnapshots.status();
+  const target = await service.destinationSnapshots.status();
+  const saved = {
+    configured: true,
+    available: true,
+    last_successful_at: new Date(time - 60_000).toISOString(),
+  };
+  vi.spyOn(service.sourceSnapshots, 'status').mockImplementation(async (observed) => ({
+    ...source,
+    ...saved,
+    usable: observed?.version === '12.2.0',
+  }));
+  vi.spyOn(service.destinationSnapshots, 'status').mockImplementation(async (observed) => ({
+    ...target,
+    ...saved,
+    usable: observed?.version === '12.2.0',
+  }));
+  const inbox = () => app.inject({ url: '/api/overview/inbox', headers });
+  const catalogStates = (response: Awaited<ReturnType<typeof inbox>>) =>
+    response
+      .json()
+      .inbox.filter(({ repair }: { repair: string }) =>
+        ['emby_history', 'jellyfin_history'].includes(repair),
+      )
+      .map(({ attention }: { attention: boolean }) => attention);
+  expect((await app.inject({ url: '/api/overview', headers })).statusCode).toBe(200);
+  time += 299_999;
+  expect(catalogStates(await inbox())).toEqual([false, false]);
+  expect(reads).toEqual({
+    emby: { systemInfo: 1, users: 1 },
+    jellyfin: { systemInfo: 1, users: 1 },
+  });
+  time++;
+  upgraded = true;
+  try {
+    // Both replies must finish while the upstream checks are still stalled.
+    expect(catalogStates(await inbox())).toEqual([false, false]);
+    expect(catalogStates(await inbox())).toEqual([false, false]);
+    expect(reads).toEqual({
+      emby: { systemInfo: 2, users: 1 },
+      jellyfin: { systemInfo: 2, users: 1 },
+    });
+  } finally {
+    release();
+  }
+  await vi.waitFor(async () => expect(catalogStates(await inbox())).toEqual([true, true]));
+  expect(reads).toEqual({
+    emby: { systemInfo: 2, users: 1 },
+    jellyfin: { systemInfo: 2, users: 1 },
+  });
+});
+
 it('revalidates Jellyfin authority on every live status read and rejects a revoked session', async () => {
   const { app, headers, authClient, revoke } = await fixture();
   vi.mocked(authClient.validateSession).mockClear();

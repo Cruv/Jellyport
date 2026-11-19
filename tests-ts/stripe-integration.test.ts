@@ -103,6 +103,38 @@ afterEach(async () => {
 });
 
 describe('read-only Stripe billing integration', () => {
+  it('requires reduction review for older configured mappings with unknown remap history', async () => {
+    const { store, configure } = fixture();
+    await configure();
+    await configure({ price_tiers: [{ price_id: 'price_Crew', tier_id: 'sloop' }] });
+    const readState = () =>
+      store.decrypt<Record<string, unknown>>(
+        store.db.prepare('SELECT encrypted FROM stripe_integration_state WHERE id=1').get()!
+          .encrypted as Uint8Array,
+      );
+    expect(readState().price_reduction_review_required).toBe(false);
+    const cutovers = [
+      { price_id: 'price_Crew', owners: [{ id: member, prior_slots: 3, scope: 'fixture' }] },
+    ];
+    const legacy: Record<string, unknown> = { ...readState(), price_cutovers: cutovers };
+    delete legacy.price_reduction_review_required;
+    store.db
+      .prepare('UPDATE stripe_integration_state SET encrypted=? WHERE id=1')
+      .run(store.encrypt(legacy));
+    const restarted = new StripeIntegration(store);
+    try {
+      expect(readState()).toMatchObject({
+        price_reduction_review_required: true,
+        price_cutovers: cutovers,
+      });
+      expect(restarted.status().price_tiers).toEqual([
+        { price_id: 'price_Crew', tier_id: 'sloop' },
+      ]);
+    } finally {
+      await restarted.stop();
+    }
+  });
+
   it('projects only the exact owner’s approved Stripe inventory without customer PII', async () => {
     const { integration, configure, setData } = fixture();
     setData(snapshot(2));

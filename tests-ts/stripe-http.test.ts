@@ -20,6 +20,10 @@ async function fixture(demo = false, live = false, paid = false) {
     accessToken: 'synthetic-admin-token',
   };
   const servers = new DemoServers();
+  const billing: { priceId: string; invoiceId: string; previousPriceId?: string } = {
+    priceId: 'price_Crew',
+    invoiceId: 'in_Crew',
+  };
   const snapshot = vi.fn(async (): Promise<StripeSnapshot> => ({
     mode: live ? 'live' : 'test',
     completed_at: new Date().toISOString(),
@@ -37,15 +41,39 @@ async function fixture(demo = false, live = false, paid = false) {
             }
           : {}),
         collection_method: 'charge_automatically',
+        latest_invoice_id: billing.invoiceId,
         cancel_at_period_end: false,
         pause_collection: false,
         items: live
-          ? [{ id: 'si_Crew', price_id: 'price_Crew', product_id: 'prod_Crew', quantity: 1 }]
+          ? [{ id: 'si_Crew', price_id: billing.priceId, product_id: 'prod_Crew', quantity: 1 }]
           : [],
         identity_candidates: [
           { discord_user_id: member, source: 'subscription_metadata', field: 'discord_user_id' },
         ],
       },
+      ...(billing.previousPriceId
+        ? [
+            {
+              id: 'sub_Previous',
+              customer_id: 'cus_Crew',
+              status: 'canceled',
+              created: Math.floor(Date.now() / 1000) - 200_000,
+              ended_at: Math.floor(Date.now() / 1000) - 3_600,
+              collection_method: 'charge_automatically' as const,
+              cancel_at_period_end: false,
+              pause_collection: false,
+              items: [
+                {
+                  id: 'si_Previous',
+                  price_id: billing.previousPriceId,
+                  product_id: 'prod_Crew',
+                  quantity: 1,
+                },
+              ],
+              identity_candidates: [],
+            },
+          ]
+        : []),
     ],
   }));
   const app = await createApp({
@@ -62,15 +90,15 @@ async function fixture(demo = false, live = false, paid = false) {
       mode: live ? 'live' : 'test',
       snapshot,
       checkoutIdentityCandidates: async () => [],
-      paidPeriod: async () => ({
-        invoice_id: 'in_Crew',
+      paidPeriod: async (id) => ({
+        invoice_id: id === 'sub_Previous' ? 'in_Previous' : billing.invoiceId,
         customer_id: 'cus_Crew',
-        subscription_id: 'sub_Crew',
-        price_id: 'price_Crew',
+        subscription_id: id,
+        price_id: id === 'sub_Previous' ? billing.previousPriceId! : billing.priceId,
         created: Math.floor(Date.now() / 1000) - 100_000,
         paid_at: Math.floor(Date.now() / 1000) - 1,
         start: Math.floor(Date.now() / 1000) - 90_000,
-        end: Math.floor(Date.now() / 1000) + (paid ? 3600 : -3600),
+        end: Math.floor(Date.now() / 1000) + (paid && id !== 'sub_Previous' ? 3600 : -3600),
       }),
     }),
   });
@@ -127,7 +155,7 @@ async function fixture(demo = false, live = false, paid = false) {
       headers,
       payload: { api_key: key, sync_enabled: false, expected_revision: revision() },
     });
-  return { app, store, headers, revision, configure, snapshot, servers };
+  return { app, store, headers, revision, configure, snapshot, servers, billing };
 }
 afterEach(async () => {
   for (const app of apps.splice(0)) await app.close();
@@ -408,9 +436,10 @@ describe('private Stripe integration HTTP boundary', () => {
     expect(app.jellyport.stripe.status().configured).toBe(false);
   });
 
-  it.each([false, true])(
+  it.each(['linked', 'replacement', 'unlinked'] as const)(
     'reviews a live price downgrade, rejects stale approvals, and applies only the reviewed slots (%s)',
-    async (replaceAfterApproval) => {
+    async (accountPlan) => {
+      const replaceAfterApproval = accountPlan === 'replacement';
       const { app, store, headers, revision, servers } = await fixture(false, true, true);
       const { stripe, service } = app.jellyport;
       store.saveSettings({
@@ -453,7 +482,21 @@ describe('private Stripe integration HTTP boundary', () => {
           Policy: { IsAdministrator: false, IsDisabled: false },
         };
         servers.users.jellyfin.push(account);
-        store.saveLink(member, account.Name, account.Id, false, slot);
+        if (accountPlan === 'unlinked' && slot > 1)
+          service.mediaOwnerships.save(
+            [
+              {
+                kind: 'jellyfin',
+                server_id: 'demo-jellyfin',
+                account_id: account.Id,
+                username: account.Name,
+                discord_user_id: member,
+                slot,
+              },
+            ],
+            store.settings(),
+          );
+        else store.saveLink(member, account.Name, account.Id, false, slot);
       }
       expect((await config({ automation_enabled: true })).statusCode).toBe(200);
       await stripe.sync();
@@ -505,16 +548,18 @@ describe('private Stripe integration HTTP boundary', () => {
           },
         ],
       });
-      store.saveLink(member, 'synthetic-member_3', 'replacement-slot-3', false, 3);
-      expect(
-        (await config({ price_tiers: after, price_review_token: first.json().review_token }))
-          .statusCode,
-      ).toBe(400);
-      store.saveLink(member, 'synthetic-member_3', 'reviewed-slot-3', false, 3);
-      expect(
-        (await config({ price_tiers: after, price_review_token: first.json().review_token }))
-          .statusCode,
-      ).toBe(400);
+      if (accountPlan !== 'unlinked') {
+        store.saveLink(member, 'synthetic-member_3', 'replacement-slot-3', false, 3);
+        expect(
+          (await config({ price_tiers: after, price_review_token: first.json().review_token }))
+            .statusCode,
+        ).toBe(400);
+        store.saveLink(member, 'synthetic-member_3', 'reviewed-slot-3', false, 3);
+        expect(
+          (await config({ price_tiers: after, price_review_token: first.json().review_token }))
+            .statusCode,
+        ).toBe(400);
+      }
 
       const revised = (await review()).json();
       await stripe.sync();
@@ -550,8 +595,32 @@ describe('private Stripe integration HTTP boundary', () => {
         ),
       ).toBe(replaceAfterApproval ? 3 : 1);
       expect(
-        store.linksForMember(member).map(({ disabled_by_jellyport }) => disabled_by_jellyport),
-      ).toEqual(replaceAfterApproval ? [0, 0, 0] : [0, 1, 1]);
+        store
+          .linksForMember(member)
+          .map(({ remote_id, disabled_by_jellyport }) => [remote_id, disabled_by_jellyport]),
+      ).toEqual([
+        ['reviewed-slot-1', 0],
+        ['reviewed-slot-2', replaceAfterApproval ? 0 : 1],
+        [
+          replaceAfterApproval ? 'replacement-slot-3' : 'reviewed-slot-3',
+          replaceAfterApproval ? 0 : 1,
+        ],
+      ]);
+      expect(
+        servers.users.jellyfin
+          .filter(({ Id }) => /^reviewed-slot-[23]$/.test(Id))
+          .map(({ Policy }) => Policy?.IsDisabled),
+      ).toEqual(replaceAfterApproval ? [false] : [true, true]);
+      const currentEvent = store
+        .subscriptionsForMember(member, 'stripe')
+        .find(({ tier_id }) => tier_id === 'sloop');
+      expect(currentEvent).toMatchObject(
+        replaceAfterApproval
+          ? { status: 'pending', stripe_price_review_required: true }
+          : { status: 'applied', job_id: expect.any(String) },
+      );
+      if (currentEvent?.job_id)
+        expect(service.getJob(currentEvent.job_id).status).toBe('completed');
       if (!replaceAfterApproval) expect((await timeline()).stripe.invoice?.tier_id).toBe('sloop');
 
       stripe.unlinkCustomer({ customer_id: 'cus_Crew', expected_revision: revision() });
@@ -565,6 +634,166 @@ describe('private Stripe integration HTTP boundary', () => {
           }),
         ]),
       );
+    },
+  );
+
+  it.each(['empty cached impact', 'unchanged fallback after removal'] as const)(
+    'holds a fresh price switch requiring a new exact-household review (%s)',
+    async (scenario) => {
+      const { app, store, headers, revision, servers, billing } = await fixture(false, true, true);
+      const { stripe, service } = app.jellyport;
+      store.saveSettings({
+        ...store.settings(),
+        new_subscriber_source: 'stripe',
+        template_user_id: 'template',
+        auto_provision: false,
+        auto_disable: true,
+      });
+      const post = (url: string, payload: Record<string, unknown>) =>
+        app.inject({ method: 'POST', url, headers, payload });
+      const config = (body: Record<string, unknown>) =>
+        post('/api/stripe/config', { sync_enabled: false, expected_revision: revision(), ...body });
+      const review = async (price_tiers: Array<{ price_id: string; tier_id: string }>) => {
+        const response = await post('/api/stripe/config/price-review', {
+          expected_revision: revision(),
+          price_tiers,
+        });
+        expect(response.statusCode, response.body).toBe(200);
+        return response.json();
+      };
+      expect((await config({ api_key: 'rk_live_syntheticKeyOnly123' })).statusCode).toBe(200);
+      const high = { price_id: 'price_Crew', tier_id: 'galleon' };
+      const low = { price_id: 'price_Low', tier_id: 'sloop' };
+      expect(
+        (await config({ price_tiers: [high, { ...low, tier_id: 'brigantine' }] })).statusCode,
+      ).toBe(200);
+      if (scenario === 'unchanged fallback after removal') billing.priceId = low.price_id;
+      await stripe.sync();
+      await stripe.linkCustomer({
+        customer_id: 'cus_Crew',
+        discord_user_id: member,
+        expected_revision: revision(),
+      });
+      service.memberships.save(
+        {
+          discord_user_id: member,
+          base_username: 'synthetic-member',
+          tier_id: 'galleon',
+          account_limit: 3,
+        },
+        store.settings(),
+      );
+      for (const slot of [1, 2, 3]) {
+        const account = {
+          Id: `cached-slot-${slot}`,
+          Name: `cached-slot-${slot}`,
+          Policy: { IsAdministrator: false, IsDisabled: false },
+        };
+        servers.users.jellyfin.push(account);
+        store.saveLink(member, account.Name, account.Id, false, slot);
+      }
+      const priceReview = await review([high, low]);
+      if (scenario === 'empty cached impact') {
+        expect(priceReview.affected).toEqual([]);
+        expect((await config({ price_tiers: [high, low] })).statusCode).toBe(200);
+        const row = store.db
+          .prepare('SELECT encrypted FROM stripe_integration_state WHERE id=1')
+          .get()!;
+        expect(store.decrypt(row.encrypted as Uint8Array)).toMatchObject({
+          price_cutovers: expect.arrayContaining([{ price_id: low.price_id, owners: [] }]),
+        });
+      } else {
+        expect(priceReview.affected[0].discord_user_id).toBe(member);
+        expect(
+          (await config({ price_tiers: [high, low], price_review_token: priceReview.review_token }))
+            .statusCode,
+        ).toBe(200);
+        billing.priceId = high.price_id;
+        await stripe.sync();
+        const remove = await review([low]);
+        expect(remove.affected[0]).toMatchObject({
+          discord_user_id: member,
+          price_ids: [high.price_id],
+        });
+        expect(
+          (await config({ price_tiers: [low], price_review_token: remove.review_token }))
+            .statusCode,
+        ).toBe(200);
+        // Another effective but unrelated mapping save cannot erase the hold.
+        expect(
+          (
+            await config({
+              price_tiers: [low, { price_id: 'price_Unrelated', tier_id: 'galleon' }],
+            })
+          ).statusCode,
+        ).toBe(200);
+      }
+      expect((await config({ automation_enabled: true })).statusCode).toBe(200);
+      store.saveSettings({ ...store.settings(), auto_provision: true });
+      billing.priceId = low.price_id;
+      const jobs = store.jobCount();
+      if (scenario === 'unchanged fallback after removal') {
+        billing.previousPriceId = high.price_id;
+        await stripe.sync();
+        expect(store.subscriptionsForMember(member, 'stripe')).toEqual([]);
+        expect(store.jobCount()).toBe(jobs);
+        billing.previousPriceId = undefined;
+      }
+      await stripe.sync();
+      expect(service.memberships.get(member, store.settings())?.account_limit).toBe(3);
+      expect(store.jobCount()).toBe(jobs);
+      expect(
+        servers.users.jellyfin
+          .filter(({ Id }) => Id.startsWith('cached-slot-'))
+          .map(({ Policy }) => Policy?.IsDisabled),
+      ).toEqual([false, false, false]);
+      const events = await app.inject({ url: '/api/subscriptions', headers });
+      expect(events.statusCode, events.body).toBe(200);
+      const held = events
+        .json()
+        .events.find(
+          ({ stripe_price_review_required }: { stripe_price_review_required?: boolean }) =>
+            stripe_price_review_required,
+        );
+      expect(held).toMatchObject({
+        discord_user_id: member,
+        tier_id: 'sloop',
+        account_limit: 1,
+        status: 'pending',
+        error: expect.stringContaining('exact account slots'),
+      });
+      expect(held).not.toHaveProperty('stripe_entitlement');
+      expect(await service.applySubscription(held.id)).toMatchObject({
+        status: 'pending',
+        stripe_price_review_required: true,
+      });
+      expect(store.jobCount()).toBe(jobs);
+
+      const membership = service.memberships.get(member, store.settings())!;
+      const manualReview = await post('/api/memberships/workflow/review', {
+        discord_user_id: member,
+        access_mode: 'subscription',
+        tier_id: 'sloop',
+        expected_revision: membership.revision,
+        provision_jellyfin: false,
+      });
+      expect(manualReview.statusCode, manualReview.body).toBe(200);
+      const accept = await post('/api/memberships/workflow/accept', {
+        review_token: manualReview.json().review_token,
+      });
+      expect(accept.statusCode, accept.body).toBe(202);
+      await vi.waitFor(() => expect(service.getJob(accept.json().job.id).status).toBe('completed'));
+      await stripe.sync();
+      expect(store.subscription(held.id)).toMatchObject({ status: 'applied', error: null });
+      expect(store.subscription(held.id)).not.toHaveProperty('stripe_price_review_required');
+
+      billing.invoiceId = 'in_Renewal';
+      await stripe.sync();
+      const renewal = store
+        .subscriptionsForMember(member, 'stripe')
+        .find(({ stripe_entitlement }) => stripe_entitlement?.invoice_id === 'in_Renewal');
+      expect(renewal).toMatchObject({ status: 'applied' });
+      expect(renewal).not.toHaveProperty('stripe_price_review_required');
     },
   );
 });

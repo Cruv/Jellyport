@@ -316,6 +316,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     },
   });
   service.verifyStripeEntitlement = (fact, check) => stripe.assertEntitlement(fact, check);
+  service.finishStripePriceReview = (fact) => stripe.finishPriceReview(fact);
   const discordAuthorityReviews = new DiscordAuthorityReviews(service, stripe);
   service.reviewStripeMigrationMembership = (id, signal, draft) =>
     stripe.reviewMembership(id, signal, draft);
@@ -590,6 +591,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     if (
       request.method === 'GET' &&
       (path === '/api/jobs' ||
+        path === '/api/overview/inbox' ||
         path.startsWith('/api/jobs/') ||
         path.startsWith('/api/migrations/preview/'))
     ) {
@@ -2382,6 +2384,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     properties: {
       discord_user_id: { type: 'string', pattern: '^[0-9]{5,22}$' },
       access_mode: { type: 'string', enum: ['subscription', 'complimentary'] },
+      stripe_price_review_event_id: { type: 'string', pattern: '^stripe-[a-f0-9]{64}$' },
       provision_jellyfin: { type: 'boolean' },
       tier_id: { type: 'string', pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$' },
       account_limit: { type: 'integer', minimum: 1, maximum: 3 },

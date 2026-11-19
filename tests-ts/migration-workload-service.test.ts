@@ -598,6 +598,54 @@ describe('playback-conscious migration orchestration', () => {
     expect(servers.played['j-river']).toEqual(new Set(['1', '2']));
   });
 
+  it.each(['catalog', 'user state'] as const)(
+    'rebuilds the source catalog after a replacement is detected during %s collection',
+    async (stage) => {
+      let replacement = false;
+      let firstJob = true;
+      servers.played['j-river'] = new Set(['existing-jellyfin-history']);
+      const catalog = vi.fn(async (): Promise<MediaItem[]> => {
+        const title = servers.media[firstJob ? 0 : 1]!;
+        if (firstJob && stage === 'catalog') replacement = true;
+        return [{ ...title, Id: 'overlapping-emby-id' }];
+      });
+      // Emby's user-state response supplies flags for IDs, and the client merges
+      // them with the catalog's metadata to determine the destination title.
+      const state = vi.fn(async (_id: string, items: MediaItem[]) => {
+        if (firstJob && stage === 'user state') replacement = true;
+        return items.map((item) => ({ ...item, UserData: { Played: true } }));
+      });
+      const factory = service.clientFactory;
+      service.clientFactory = (...args) => {
+        const client = factory(...args);
+        if (args[2] === 'emby') {
+          const info = client.systemInfo.bind(client);
+          client.systemInfo = async () => {
+            const current = await info();
+            return replacement ? { ...current, Id: 'replacement-emby' } : current;
+          };
+          client.catalogItems = catalog;
+          client.migrationState = state;
+        }
+        return client;
+      };
+
+      const rejected = await finish(await service.migrateUsers(['e-river']));
+      expect(rejected.status).toBe('failed');
+      expect(rejected.results[0]?.error).toContain('reviewed Emby server changed');
+      expect(servers.played['j-river']).toEqual(new Set(['existing-jellyfin-history']));
+      const rejectedStateReads = state.mock.calls.length;
+
+      firstJob = false;
+      replacement = false;
+      const completed = await finish(await service.migrateUsers(['e-river']));
+      expect(completed.status).toBe('completed');
+      expect(servers.played['j-river']).toEqual(new Set(['existing-jellyfin-history', '2']));
+      expect(catalog).toHaveBeenCalledTimes(2);
+      expect(rejectedStateReads).toBe(stage === 'catalog' ? 0 : 1);
+    },
+  );
+
   it('completes lightweight snapshot preview while an active migration owns history admission', async () => {
     const entered = deferred(),
       release = deferred();

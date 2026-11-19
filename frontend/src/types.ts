@@ -586,6 +586,7 @@ export interface PreviewTask {
 export interface SubscriptionEvent {
   id: string;
   stripe_price_review_required?: true;
+  stripe_price_review_accepted?: true;
   username?: string;
   discord_user_id?: string;
   action: string;
@@ -596,6 +597,7 @@ export interface SubscriptionEvent {
   tier_id?: string;
   account_limit?: number;
   error?: string;
+  result?: string;
   job_id?: string;
   report_cleared?: boolean;
 }

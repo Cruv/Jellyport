@@ -4,7 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp, type JellyportApp } from '../server/main.js';
 import { DemoServers } from '../server/demo.js';
+import { Service } from '../server/service.js';
+import { Store } from '../server/store.js';
 import type { StripeSnapshot } from '../server/stripe-client.js';
+import { StripeIntegration } from '../server/stripe-integration.js';
 
 const directories: string[] = [];
 const apps: JellyportApp[] = [];
@@ -155,7 +158,7 @@ async function fixture(demo = false, live = false, paid = false) {
       headers,
       payload: { api_key: key, sync_enabled: false, expected_revision: revision() },
     });
-  return { app, store, headers, revision, configure, snapshot, servers, billing };
+  return { app, store, headers, revision, configure, snapshot, servers, billing, directory };
 }
 afterEach(async () => {
   for (const app of apps.splice(0)) await app.close();
@@ -637,10 +640,23 @@ describe('private Stripe integration HTTP boundary', () => {
     },
   );
 
-  it.each(['empty cached impact', 'unchanged fallback after removal'] as const)(
+  it.each([
+    'empty cached impact',
+    'unchanged fallback after removal',
+    'verified higher renewal',
+    'approved Family exemption',
+    'independent Family exemption',
+    'already disabled outside Jellyport',
+    'queued review survives restart',
+    'queued review with changed event fails closed',
+  ] as const)(
     'holds a fresh price switch requiring a new exact-household review (%s)',
     async (scenario) => {
-      const { app, store, headers, revision, servers, billing } = await fixture(false, true, true);
+      const { app, store, headers, revision, servers, billing, directory } = await fixture(
+        false,
+        true,
+        true,
+      );
       const { stripe, service } = app.jellyport;
       store.saveSettings({
         ...store.settings(),
@@ -693,7 +709,7 @@ describe('private Stripe integration HTTP boundary', () => {
         store.saveLink(member, account.Name, account.Id, false, slot);
       }
       const priceReview = await review([high, low]);
-      if (scenario === 'empty cached impact') {
+      if (scenario !== 'unchanged fallback after removal') {
         expect(priceReview.affected).toEqual([]);
         expect((await config({ price_tiers: [high, low] })).statusCode).toBe(200);
         const row = store.db
@@ -770,22 +786,167 @@ describe('private Stripe integration HTTP boundary', () => {
       expect(store.jobCount()).toBe(jobs);
 
       const membership = service.memberships.get(member, store.settings())!;
-      const manualReview = await post('/api/memberships/workflow/review', {
+      const hasFamily =
+        scenario === 'approved Family exemption' || scenario === 'independent Family exemption';
+      if (hasFamily) {
+        const profile = await post('/api/account-profiles', {
+          kind: 'jellyfin',
+          user_id: 'cached-slot-3',
+          family: true,
+          owner_name: '',
+          notes: '',
+          expected_revision: '',
+        });
+        expect(profile.statusCode, profile.body).toBe(200);
+      }
+      const manual = {
         discord_user_id: member,
         access_mode: 'subscription',
         tier_id: 'sloop',
         expected_revision: membership.revision,
         provision_jellyfin: false,
-      });
+      };
+      const bound = { ...manual, stripe_price_review_event_id: held.id };
+      if (scenario === 'verified higher renewal') {
+        const approvePath = '/api/memberships/workflow/accept';
+        const reviewPath = '/api/memberships/workflow/review';
+        store.saveSettings({ ...store.settings(), auto_provision: false });
+        const pendingReview = await post(reviewPath, bound);
+        const wrongOwner = await post(reviewPath, {
+          ...bound,
+          discord_user_id: '234567890123456780',
+        });
+        const wrongTier = await post(reviewPath, { ...bound, tier_id: high.tier_id });
+        // The billing decision replaces the held event without revising the household.
+        billing.priceId = high.price_id;
+        billing.invoiceId = 'in_HigherRenewal';
+        await stripe.sync();
+        expect(store.subscription(held.id)).toMatchObject({ status: 'superseded', error: null });
+        expect(stripe.status().automation_review_count).toBe(1);
+        expect(service.memberships.get(member, store.settings())).toMatchObject({
+          account_limit: 3,
+          revision: membership.revision,
+        });
+        expect(pendingReview.statusCode, pendingReview.body).toBe(200);
+        expect(wrongOwner.statusCode, wrongOwner.body).toBe(400);
+        expect(wrongTier.statusCode, wrongTier.body).toBe(400);
+        const declined = await post(approvePath, {
+          review_token: pendingReview.json().review_token,
+        });
+        expect(declined.statusCode, declined.body).toBe(400);
+        expect(declined.json().detail).toContain('superseded');
+        const reopening = await post(reviewPath, bound);
+        expect(reopening.statusCode, reopening.body).toBe(400);
+        expect(store.jobCount()).toBe(jobs);
+        const independent = await post(reviewPath, manual);
+        expect(independent.statusCode, independent.body).toBe(200);
+        const manualAccept = await post(approvePath, {
+          review_token: independent.json().review_token,
+        });
+        expect(manualAccept.statusCode, manualAccept.body).toBe(202);
+        await vi.waitFor(() =>
+          expect(service.getJob(manualAccept.json().job.id).status).toBe('completed'),
+        );
+        expect(service.memberships.get(member, store.settings())?.account_limit).toBe(1);
+        expect(store.subscription(held.id)?.status).toBe('superseded');
+        return;
+      }
+      const independentFamily = scenario === 'independent Family exemption';
+      const alreadyDisabled = scenario === 'already disabled outside Jellyport';
+      if (alreadyDisabled)
+        servers.users.jellyfin.find(({ Id }) => Id === 'cached-slot-2')!.Policy!.IsDisabled = true;
+      const manualReview = await post(
+        '/api/memberships/workflow/review',
+        independentFamily ? manual : bound,
+      );
       expect(manualReview.statusCode, manualReview.body).toBe(200);
+      if (hasFamily)
+        expect(manualReview.json().accounts).toContainEqual(
+          expect.objectContaining({
+            target_user_id: 'cached-slot-3',
+            slot: 3,
+            action: 'family_preserved',
+          }),
+        );
+      const restart =
+        scenario === 'queued review survives restart' ||
+        scenario === 'queued review with changed event fails closed';
+      const queuedOnly = restart
+        ? vi.spyOn(store, 'claimQueuedJob').mockReturnValue(false)
+        : undefined;
       const accept = await post('/api/memberships/workflow/accept', {
         review_token: manualReview.json().review_token,
       });
       expect(accept.statusCode, accept.body).toBe(202);
-      await vi.waitFor(() => expect(service.getJob(accept.json().job.id).status).toBe('completed'));
+      if (queuedOnly) {
+        const jobId = accept.json().job.id;
+        await service.jobTasks.get(jobId);
+        queuedOnly.mockRestore();
+        expect(store.subscription(held.id)).toMatchObject({ status: 'processing', job_id: jobId });
+        const bot = service.bot;
+        apps.splice(apps.indexOf(app), 1);
+        await app.close();
+        const reopened = new Store(directory);
+        const resumed = new Service(reopened, { clientFactory: servers.factory });
+        const stripeAfterRestart = new StripeIntegration(reopened);
+        try {
+          const event = reopened.subscription(held.id)!;
+          expect(event).toMatchObject({ status: 'processing', job_id: jobId });
+          expect(
+            reopened
+              .queuedJobs()[0]
+              ?.requests.map((request) => request.stripe_price_review?.job_id),
+          ).toEqual([jobId, jobId, jobId]);
+          const changed = scenario === 'queued review with changed event fails closed';
+          if (changed) reopened.saveSubscription({ ...event, status: 'failed' });
+          resumed.bot = bot;
+          resumed.verifyStripeEntitlement = (fact, check) =>
+            stripeAfterRestart.assertEntitlement(fact, check);
+          resumed.finishStripePriceReview = (fact) => stripeAfterRestart.finishPriceReview(fact);
+          await resumed.start();
+          await resumed.jobTasks.get(jobId);
+          const report = resumed.getJob(jobId);
+          expect(report.status).toBe(changed ? 'failed' : 'completed');
+          if (changed)
+            expect(report.results.map(({ error }) => error)).toEqual(
+              Array(3).fill(expect.stringContaining('accepted Stripe event changed')),
+            );
+          expect(reopened.subscription(held.id)?.status).toBe(changed ? 'failed' : 'applied');
+          expect(
+            servers.users.jellyfin
+              .filter(({ Id }) => Id.startsWith('cached-slot-'))
+              .map(({ Policy }) => Policy?.IsDisabled),
+          ).toEqual(changed ? [false, false, false] : [false, true, true]);
+        } finally {
+          await resumed.stop();
+          await stripeAfterRestart.stop();
+          reopened.close();
+        }
+        return;
+      }
+      await vi.waitFor(() =>
+        expect(service.getJob(accept.json().job.id).status).toBe(
+          hasFamily ? 'partial' : 'completed',
+        ),
+      );
+      expect(
+        servers.users.jellyfin
+          .filter(({ Id }) => Id.startsWith('cached-slot-'))
+          .map(({ Policy }) => Policy?.IsDisabled),
+      ).toEqual([false, true, !hasFamily]);
+      if (!independentFamily)
+        expect(store.subscription(held.id)).toMatchObject({
+          status: 'applied',
+          job_id: accept.json().job.id,
+        });
       await stripe.sync();
       expect(store.subscription(held.id)).toMatchObject({ status: 'applied', error: null });
       expect(store.subscription(held.id)).not.toHaveProperty('stripe_price_review_required');
+      expect(stripe.status().automation_review_count).toBe(0);
+      if (alreadyDisabled) {
+        expect(store.link(member, 2)?.disabled_by_jellyport).toBe(0);
+        return;
+      }
 
       billing.invoiceId = 'in_Renewal';
       await stripe.sync();

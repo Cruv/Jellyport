@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { ServiceError, StripePriceReviewRequired } from './errors.js';
 import { DEFAULT_MEMBERSHIP_TIERS, Memberships } from './memberships.js';
 import { MediaOwnerships } from './media-ownership.js';
+import { AccountProfiles } from './account-profiles.js';
 import {
   canonicalMembershipAccessTargets,
   hasMembershipAccessAboveLimit,
@@ -1828,7 +1829,9 @@ export class StripeIntegration {
                   'Stripe automation stopped before additional access actions.',
                 );
               const deferred = fact.action === 'expire' && !this.store.settings().auto_disable;
-              if (!this.options.onEntitlement || !this.entitlements.claim(fact, deferred)) continue;
+              if (!this.options.onEntitlement) continue;
+              this.entitlements.supersedeHeldPriceReductions(fact);
+              if (!this.entitlements.claim(fact, deferred)) continue;
               try {
                 const result = await this.options.onEntitlement(fact);
                 this.entitlements.finish(
@@ -1914,6 +1917,9 @@ export class StripeIntegration {
     }
     await this.roleCleanup.reconcile(this.state.generation);
   }
+  finishPriceReview(fact: StripeEntitlementFact): void {
+    this.entitlements.finish(fact, true);
+  }
   assertEntitlement(fact: StripeEntitlementFact, check?: StripeEntitlementCheck): void {
     this.scope();
     if (
@@ -1953,12 +1959,18 @@ export class StripeIntegration {
       if (limit === undefined) throw new StripePriceReviewRequired();
       const links = this.store.linksForMember(owner);
       const ownership = new MediaOwnerships(this.store).forOwner(owner, settings);
+      const profiles = new AccountProfiles(this.store);
       const currentLimit = current?.account_limit ?? 1;
       if (
         currentLimit <= limit &&
         !check?.wouldDisable &&
         !check?.plannedReduction?.hasEnabledTarget &&
-        !hasMembershipAccessAboveLimit(links, ownership, limit)
+        !hasMembershipAccessAboveLimit(
+          links,
+          ownership,
+          limit,
+          (id) => profiles.get('jellyfin', id, settings)?.family === true,
+        )
       )
         return;
       const affectedTargets = membershipAccessTargets(links, ownership).filter(

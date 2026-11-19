@@ -1957,6 +1957,101 @@ describe('React account safeguards', () => {
     ).toEqual(['/api/subscriptions/entitlement-only-event/apply']);
   });
 
+  it('carries the exact held Stripe event into review and separates independent policy edits', async () => {
+    const owner = '123456789012345678';
+    const hold = `stripe-${'a'.repeat(64)}`;
+    responses['/api/subscriptions'] = {
+      events: [
+        {
+          id: hold,
+          username: 'synthetic-stripe-owner',
+          discord_user_id: owner,
+          action: 'subscribe',
+          source: 'stripe',
+          status: 'pending',
+          stripe_price_review_required: true,
+          tier_id: 'sloop',
+          account_limit: 1,
+          created_at: new Date().toISOString(),
+        },
+      ],
+    };
+    responses['/api/memberships'] = {
+      memberships: [
+        {
+          discord_user_id: owner,
+          base_username: 'synthetic-stripe-owner',
+          active: true,
+          access_mode: 'subscription',
+          tier_id: 'galleon',
+          account_limit: 3,
+          provision_jellyfin: false,
+          links: [],
+          revision: 'current-membership',
+        },
+      ],
+    };
+    const reviewPath = '/api/memberships/workflow/review';
+    responses[reviewPath] = {
+      discord_user_id: owner,
+      username: 'synthetic-stripe-owner',
+      access_mode: 'subscription',
+      tier_id: 'sloop',
+      account_limit: 1,
+      provision_jellyfin: false,
+      accounts: [],
+      warnings: [],
+      policy_only: true,
+      review_token: 'event-workflow-review',
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      stripe_price_review_event_id: hold,
+    };
+    const lastReview = () =>
+      JSON.parse(
+        String(requests.filter(({ path }) => path === reviewPath).at(-1)?.options?.body ?? '{}'),
+      );
+
+    window.history.replaceState(null, '', '#/memberships/events/review');
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Review household' }));
+    const tier = await screen.findByRole('combobox', { name: 'Membership tier' });
+    expect(tier).toHaveProperty('value', 'sloop');
+    expect(tier).toHaveProperty('disabled', true);
+    expect(screen.getByRole('combobox', { name: 'Access policy' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    await waitFor(() =>
+      expect(lastReview()).toMatchObject({
+        discord_user_id: owner,
+        tier_id: 'sloop',
+        stripe_price_review_event_id: hold,
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Overview' }));
+    await screen.findByRole('heading', { name: 'Overview', level: 1 });
+    fireEvent.click(screen.getByRole('button', { name: 'Memberships' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Accounts & access' }));
+    fireEvent.click(await screen.findByRole('tab', { name: 'Manage member' }));
+    expect(await screen.findByRole('combobox', { name: 'Membership tier' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Start independent policy edit' }));
+    expect(screen.getByRole('combobox', { name: 'Membership tier' })).toHaveProperty(
+      'disabled',
+      false,
+    );
+    fireEvent.change(screen.getByRole('combobox', { name: 'Membership tier' }), {
+      target: { value: 'galleon' },
+    });
+    await waitFor(() =>
+      expect(lastReview()).toMatchObject({ discord_user_id: owner, tier_id: 'galleon' }),
+    );
+    expect(lastReview()).not.toHaveProperty('stripe_price_review_event_id');
+  });
+
   it('states that manual cancellation approval disables access immediately before sending the request', async () => {
     const event = {
       id: 'event-1',

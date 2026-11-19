@@ -231,6 +231,7 @@ export function Status({ value, label }: { value?: string; label?: string }) {
     pending: 'Awaiting review',
     applied: 'Applied',
     ignored: 'Ignored',
+    superseded: 'Superseded',
     success: 'Completed',
     migrated: 'Migrated',
     created: 'Created',

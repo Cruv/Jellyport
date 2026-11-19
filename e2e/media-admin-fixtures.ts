@@ -36,6 +36,7 @@ export interface AdminFixture {
   activateStripeSubscription: () => void;
   setStripeSubscriptions: (subscriptions: StripeSubscription[]) => void;
   setStripeHttpTransport: (transport: NonNullable<StripeClientOptions['transport']>) => void;
+  onNextSessionValidation: (validate: (signal?: AbortSignal) => Promise<void>) => void;
 }
 
 // Writable end-to-end fixtures exercise the real HTTP handlers, Store and workers.
@@ -78,6 +79,7 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
       let stripeMigrationActive = false;
       let stripeSubscriptions: StripeSubscription[] | undefined;
       let stripeHttpTransport: StripeClientOptions['transport'];
+      let nextValidation: Parameters<AdminFixture['onNextSessionValidation']>[0] | undefined;
       const identity = {
         serverId: 'demo-jellyfin',
         userId: 'synthetic-admin',
@@ -89,7 +91,12 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
           if (username !== 'admin') throw new Error('Synthetic administrator required.');
           return identity;
         },
-        validateSession: async () => identity,
+        validateSession: async (_url, _token, _server, _user, signal) => {
+          const validate = nextValidation;
+          nextValidation = undefined;
+          if (validate) await validate(signal);
+          return identity;
+        },
         signOut: async () => {},
         validateApiKey: async () => ({ serverId: identity.serverId, apiKeyName: 'synthetic' }),
       };
@@ -324,6 +331,9 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
         },
         setStripeHttpTransport: (transport) => {
           stripeHttpTransport = transport;
+        },
+        onNextSessionValidation: (validate) => {
+          nextValidation = validate;
         },
       });
     } finally {

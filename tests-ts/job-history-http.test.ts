@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { get } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DemoServers } from '../server/demo.js';
@@ -667,22 +668,99 @@ it('observes retained catalog providers at most once per five minutes without de
   });
 });
 
-it('revalidates Jellyfin authority on every live status read and rejects a revoked session', async () => {
-  const { app, headers, authClient, revoke } = await fixture();
-  vi.mocked(authClient.validateSession).mockClear();
-  expect((await app.inject({ url: '/api/jobs/live', headers })).statusCode).toBe(200);
-  expect((await app.inject({ url: '/api/jobs/live', headers })).statusCode).toBe(200);
-  expect(authClient.validateSession).toHaveBeenCalledTimes(2);
-  expect(
-    vi
-      .mocked(authClient.validateSession)
-      .mock.calls.every((call) => call[4] instanceof AbortSignal),
-  ).toBe(true);
-  revoke();
-  const rejected = await app.inject({ url: '/api/jobs/live', headers });
-  expect(rejected.statusCode).toBe(401);
-  expect(rejected.json()).not.toHaveProperty('active');
-  expect(authClient.validateSession).toHaveBeenCalledTimes(3);
-  expect((await app.inject({ url: '/api/jobs/live', headers })).statusCode).toBe(401);
-  expect(authClient.validateSession).toHaveBeenCalledTimes(3);
+it.each([
+  ['/api/jobs/live', 'active'],
+  ['/api/overview/inbox', 'inbox'],
+])(
+  'revalidates Jellyfin authority on every %s read and rejects a revoked session',
+  async (url, privateField) => {
+    const { app, headers, authClient, revoke } = await fixture();
+    vi.mocked(authClient.validateSession).mockClear();
+    expect((await app.inject({ url, headers })).statusCode).toBe(200);
+    expect((await app.inject({ url, headers })).statusCode).toBe(200);
+    expect(authClient.validateSession).toHaveBeenCalledTimes(2);
+    expect(
+      vi
+        .mocked(authClient.validateSession)
+        .mock.calls.every((call) => call[4] instanceof AbortSignal),
+    ).toBe(true);
+    revoke();
+    const rejected = await app.inject({ url, headers });
+    expect(rejected.statusCode).toBe(401);
+    expect(rejected.json()).not.toHaveProperty(privateField);
+    expect(authClient.validateSession).toHaveBeenCalledTimes(3);
+    expect((await app.inject({ url, headers })).statusCode).toBe(401);
+    expect(authClient.validateSession).toHaveBeenCalledTimes(3);
+  },
+);
+
+function stallAuthorization(authClient: JellyfinAuthentication) {
+  let begin!: (signal: AbortSignal | undefined) => void;
+  const started = new Promise<AbortSignal | undefined>((resolve) => {
+    begin = resolve;
+  });
+  let stop!: () => void;
+  const pending = new Promise<never>((_resolve, reject) => {
+    stop = () => reject(new JellyfinAuthError('Jellyfin authorization paused.', 502));
+  });
+  vi.mocked(authClient.validateSession).mockImplementationOnce(
+    async (_url, _token, _serverId, _userId, signal) => {
+      begin(signal);
+      signal?.addEventListener('abort', stop, { once: true });
+      try {
+        return await pending;
+      } finally {
+        signal?.removeEventListener('abort', stop);
+      }
+    },
+  );
+  return { started, stop };
+}
+
+it('ends a stalled Overview inbox authorization at the live status deadline without revoking the session', async () => {
+  const { app, headers, authClient } = await fixture();
+  const stalled = stallAuthorization(authClient);
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const response = Promise.resolve(app.inject({ url: '/api/overview/inbox', headers }));
+  try {
+    const signal = await stalled.started;
+    await vi.advanceTimersByTimeAsync(7499);
+    expect(signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(signal?.aborted).toBe(true);
+    const rejected = await response;
+    expect(rejected.statusCode).toBe(502);
+    expect(rejected.json()).not.toHaveProperty('inbox');
+  } finally {
+    vi.useRealTimers();
+    stalled.stop();
+    await response;
+  }
+  expect(authClient.signOut).not.toHaveBeenCalled();
+  expect((await app.inject({ url: '/api/overview/inbox', headers })).statusCode).toBe(200);
+});
+
+it('cancels a disconnected Overview inbox authorization without canceling another status request', async () => {
+  const { app, headers, authClient } = await fixture();
+  const address = await app.listen({ host: '127.0.0.1', port: 0 });
+  const stalled = stallAuthorization(authClient);
+  const receive = vi.fn();
+  const request = get(`${address}/api/overview/inbox`, { headers, agent: false }, receive);
+  request.on('error', () => {});
+  const closed = new Promise<void>((resolve) => request.once('close', resolve));
+  try {
+    const signal = await stalled.started;
+    const another = await app.inject({ url: '/api/jobs/live', headers });
+    expect(another.statusCode).toBe(200);
+    request.destroy();
+    await closed;
+    await vi.waitFor(() => expect(signal?.aborted).toBe(true));
+    expect(receive).not.toHaveBeenCalled();
+  } finally {
+    request.destroy();
+    stalled.stop();
+    await closed;
+  }
+  expect(authClient.signOut).not.toHaveBeenCalled();
+  expect((await app.inject({ url: '/api/overview/inbox', headers })).statusCode).toBe(200);
 });

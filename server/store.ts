@@ -262,6 +262,9 @@ export class Store {
         json_extract(payload,'$.action'),json_extract(payload,'$.status')
       ) WHERE json_extract(payload,'$.source')='role_reconciliation';
       CREATE INDEX IF NOT EXISTS subscriptions_status ON subscriptions(json_extract(payload,'$.status'));
+      CREATE INDEX IF NOT EXISTS subscriptions_stripe_holds ON subscriptions(json_extract(payload,'$.discord_user_id'))
+        WHERE json_extract(payload,'$.source')='stripe' AND json_extract(payload,'$.status')='pending'
+          AND json_extract(payload,'$.stripe_price_review_required')=1;
     `);
     const columns = this.db.prepare('PRAGMA table_info(links)').all();
     if (!columns.some((row) => row.name === 'pending_disabled'))
@@ -379,6 +382,12 @@ export class Store {
         const job = event.job_id
           ? this.db.prepare('SELECT status FROM job_summaries WHERE id=?').get(event.job_id)
           : undefined;
+        if (
+          event.stripe_price_review_accepted &&
+          job?.status === 'queued' &&
+          this.db.prepare('SELECT 1 FROM job_queue WHERE job_id=?').get(event.job_id!)
+        )
+          continue;
         if (job?.status === 'canceled') {
           event.status = 'canceled';
           event.error = null;
@@ -409,7 +418,7 @@ export class Store {
   decrypt<T>(value: Uint8Array): T {
     return this.cipher.decrypt<T>(value);
   }
-  private transaction<T>(fn: () => T): T {
+  transaction<T>(fn: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const result = fn();
@@ -1481,6 +1490,12 @@ export class Store {
     const row = this.db.prepare('SELECT payload FROM subscriptions WHERE id=?').get(id);
     return row ? this.decodeSubscription(row.payload as string) : null;
   }
+  subscriptionForJob(id: string): SubscriptionEvent | null {
+    const row = this.db
+      .prepare("SELECT payload FROM subscriptions WHERE json_extract(payload,'$.job_id')=? LIMIT 1")
+      .get(id);
+    return row ? this.decodeSubscription(row.payload as string) : null;
+  }
   private decodeSubscription(payload: string): SubscriptionEvent {
     const event = JSON.parse(payload) as SubscriptionEvent & {
       _stripe_entitlement_encrypted?: string;
@@ -1513,6 +1528,16 @@ export class Store {
             )
             .all(discordId, source, limit);
     return rows.map((row) => this.decodeSubscription(row.payload as string));
+  }
+  heldStripePriceReviews(discordId: string): SubscriptionEvent[] {
+    return this.db
+      .prepare(
+        `SELECT payload FROM subscriptions
+      WHERE json_extract(payload,'$.discord_user_id')=? AND json_extract(payload,'$.source')='stripe'
+        AND json_extract(payload,'$.status')='pending' AND json_extract(payload,'$.stripe_price_review_required')=1`,
+      )
+      .all(discordId)
+      .map((row) => this.decodeSubscription(row.payload as string));
   }
   hasRoleReconciliationEvent(
     discordId: string,

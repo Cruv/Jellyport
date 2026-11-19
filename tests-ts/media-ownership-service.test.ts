@@ -294,6 +294,78 @@ describe('approved media ownership in existing migration workflows', () => {
     },
   );
 
+  it.each([
+    { server: 'Emby', phase: 'destination preparation', replaceAt: 1 },
+    { server: 'Emby', phase: 'final provisioning check', replaceAt: 3 },
+    { server: 'Jellyfin', phase: 'final Emby confirmation', replaceAt: 3 },
+  ])(
+    'rejects a $server replacement during $phase before any destination side effect',
+    async ({ server, replaceAt }) => {
+      const source = servers.users.emby.find((user) => user.Id === 'e-alex')!;
+      source.Name = 'discord.user';
+      const targets = structuredClone(servers.users.jellyfin);
+      const played = structuredClone(servers.played);
+      const history = structuredClone(servers.userData);
+      const factory = service.clientFactory;
+      let historyCollected = false;
+      let destinationRosterReads = 0;
+      let replacement = false;
+      service.clientFactory = (...args) => {
+        const client = factory(...args);
+        if (args[2] === 'emby') {
+          const state = client.migrationState!.bind(client);
+          client.migrationState = async (...params) => {
+            const items = await state(...params);
+            historyCollected = true;
+            return items;
+          };
+          const info = client.systemInfo.bind(client);
+          client.systemInfo = async () => {
+            const original = await info();
+            if (server === 'Jellyfin' && destinationRosterReads >= replaceAt) replacement = true;
+            return server === 'Emby' && replacement
+              ? { ...original, Id: 'replacement-emby' }
+              : original;
+          };
+        } else {
+          const users = client.users.bind(client);
+          client.users = async () => {
+            const roster = await users();
+            if (historyCollected && ++destinationRosterReads === replaceAt && server === 'Emby')
+              replacement = true;
+            return roster;
+          };
+          const info = client.systemInfo.bind(client);
+          client.systemInfo = async () => {
+            const original = await info();
+            return server === 'Jellyfin' && replacement
+              ? { ...original, Id: 'replacement-jellyfin' }
+              : original;
+          };
+        }
+        return client;
+      };
+
+      const result = await finish(await service.migrateUsers(['e-alex'], { 'e-alex': owner }));
+      expect(replacement).toBe(true);
+      expect(servers.users.jellyfin).toEqual(targets);
+      expect(servers.played).toEqual(played);
+      expect(servers.userData).toEqual(history);
+      expect(mediaWrites()).toEqual([]);
+      expect(store.account('discord.user')).toBeNull();
+      expect(store.takeCredentials(result.id)).toEqual([]);
+      expect(store.links()).toEqual([]);
+      expect(service.mediaOwnerships.list(store.settings())).toEqual([]);
+      expect(bot.delivered).not.toHaveBeenCalled();
+      expect(result.status).toBe('failed');
+      expect(result.results[0]?.error).toContain(
+        server === 'Emby'
+          ? 'reviewed Emby server changed'
+          : 'reviewed Jellyfin destination changed',
+      );
+    },
+  );
+
   it('permits an explicitly approved migration and credential delivery for a verified source username exception', async () => {
     registered('emby', 'e-alex');
     const result = await finish(await service.migrateUsers(['e-alex'], { 'e-alex': owner }));

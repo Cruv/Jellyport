@@ -104,7 +104,7 @@ type Dialog =
       reviewElapsedMs?: number;
       followUpJob?: string;
     }
-  | { kind: 'job'; job: Job }
+  | { kind: 'job'; job: Job; submissionReceipt?: string }
   | { kind: 'reveal'; jobId: string }
   | { kind: 'credentials'; jobId: string; credentials: Credential[] }
   | {
@@ -276,6 +276,10 @@ export default function App() {
   const [dialog, setDialog] = useState<Dialog | null>(null);
   const dialogRef = useRef(dialog);
   dialogRef.current = dialog;
+  const openedReceipt = dialog?.kind === 'job' ? dialog.submissionReceipt : undefined;
+  useEffect(() => {
+    if (session?.authenticated && openedReceipt) resolveReceipt(openedReceipt);
+  }, [openedReceipt, resolveReceipt, session?.authenticated]);
   const dialogVersion = useRef(0);
   const [busy, setBusy] = useState(new Set<string>());
   const busyRef = useRef(new Set<string>());
@@ -335,6 +339,7 @@ export default function App() {
     id: string;
     username: string;
     tier_id?: string;
+    stripe_price_review_event_id?: string;
     key: number;
   }>();
   const notify = useCallback((text: string, error = false) => {
@@ -945,7 +950,9 @@ export default function App() {
                 }
               : await readOperationStatus<Job>(api, `/api/jobs/${id}`, controller.signal);
           if (!controller.signal.aborted && version === dialogVersion.current) {
-            setDialog({ kind: 'job', job });
+            setDialog((current) =>
+              current?.kind === 'job' && current.job.id === job.id ? { ...current, job } : current,
+            );
             reportRevision = reportKey;
           }
         }
@@ -997,10 +1004,16 @@ export default function App() {
     showDialog({ kind: 'job', job });
     if (activeJob(job)) wakeOperations.current();
   };
-  const openJob = (id: string, activityRowScope?: string) => {
+  const openJob = (
+    id: string,
+    {
+      activityRowScope,
+      submissionReceipt,
+    }: { activityRowScope?: string; submissionReceipt?: string } = {},
+  ) => {
     const version = dialogVersion.current;
     const generation = authGeneration.current;
-    void work('job', async () => {
+    return work('job', async () => {
       const value = await readOperationStatus<Job>(api, `/api/jobs/${encodeURIComponent(id)}`);
       if (
         version !== dialogVersion.current ||
@@ -1010,7 +1023,8 @@ export default function App() {
           (pageRef.current !== 'activity' || activityRowScope !== activityScopeRef.current))
       )
         return;
-      showDialog({ kind: 'job', job: value });
+      if (value?.id !== id) throw new Error('Jellyport returned a different operation report.');
+      showDialog({ kind: 'job', job: value, submissionReceipt });
       if (activeJob(value)) wakeOperations.current();
       setPollPaused(false);
     });
@@ -1177,13 +1191,17 @@ export default function App() {
   function findSubmission(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const value = receipt.trim();
+    const version = dialogVersion.current;
     void work('receipt', async () => {
       const result = await readOperationStatus<{ job_id: string }>(
         api,
         `/api/jobs/receipts/${value ? encodeURIComponent(value) : 'latest'}`,
       );
-      if (value) resolveReceipt(value);
-      openJob(result.job_id);
+      if (version !== dialogVersion.current || !sessionRef.current?.authenticated) return;
+      if (typeof result?.job_id !== 'string' || !result.job_id)
+        throw new Error('The operation receipt could not be resolved.');
+      if (value && !pendingReceiptsRef.current.includes(value)) rememberReceipt(value);
+      await openJob(result.job_id, { submissionReceipt: value || undefined });
     });
   }
   function refreshPreview() {
@@ -1278,7 +1296,7 @@ export default function App() {
           : current,
       );
       setDialog((current) =>
-        current?.kind === 'job' && current.job.id === id ? { kind: 'job', job } : current,
+        current?.kind === 'job' && current.job.id === id ? { ...current, job } : current,
       );
       setPollPaused(false);
       notify(
@@ -1470,6 +1488,7 @@ export default function App() {
         id: event.discord_user_id,
         username: event.username || event.discord_user_id,
         tier_id: event.tier_id,
+        stripe_price_review_event_id: event.id,
         key: Date.now(),
       });
       navigate('memberships');
@@ -1650,7 +1669,7 @@ export default function App() {
       <ActivityPage
         jobs={[]}
         navigate={navigate}
-        openJob={(id) => openJob(id, activityScope)}
+        openJob={(id) => openJob(id, { activityRowScope: activityScope })}
         refresh={() => void load(page, true)}
         clearHistory={(ids, filtered, single) =>
           reviewHistory(ids, filtered, single, activityScope)

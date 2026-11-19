@@ -1482,6 +1482,7 @@ export function SubscriptionsPage({
                             <strong>{event.username || 'Discord member'}</strong>
                             <small>{event.discord_user_id}</small>
                             {event.error && <small className="red">{event.error}</small>}
+                            {event.status === 'superseded' && <small>{event.result}</small>}
                           </td>
                           <td data-label="Event">
                             <span>{names[event.action] || event.action}</span>
@@ -1524,15 +1525,17 @@ export function SubscriptionsPage({
                                     View operation
                                   </button>
                                 )}
-                                <button
-                                  className="btn btn-small btn-primary"
-                                  disabled={busy}
-                                  onClick={() => review(event)}
-                                >
-                                  {event.stripe_price_review_required
-                                    ? 'Review household'
-                                    : 'Review'}
-                                </button>
+                                {!event.stripe_price_review_accepted && (
+                                  <button
+                                    className="btn btn-small btn-primary"
+                                    disabled={busy}
+                                    onClick={() => review(event)}
+                                  >
+                                    {event.stripe_price_review_required
+                                      ? 'Review household'
+                                      : 'Review'}
+                                  </button>
+                                )}
                               </div>
                             ) : event.job_id ? (
                               <button

@@ -28,13 +28,18 @@ export function hasMembershipAccessAboveLimit(
   links: Link[],
   owners: MediaOwnership[],
   limit: number,
+  family: (accountId: string) => boolean = () => false,
 ) {
   return (
-    links.some((link) => link.membership_slot > limit && !link.disabled_by_jellyport) ||
+    links.some(
+      (link) =>
+        link.membership_slot > limit && !link.disabled_by_jellyport && !family(link.remote_id),
+    ) ||
     owners.some(
       (owner) =>
         owner.kind === 'jellyfin' &&
         owner.slot > limit &&
+        !family(owner.account_id) &&
         !links.some(
           (link) =>
             link.remote_id === owner.account_id &&

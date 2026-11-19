@@ -375,7 +375,7 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   expect(admin.writes).toHaveLength(writesBeforeReview);
 });
 
-test('the Operations tray recovers two lost job responses after a later success and reload', async ({
+test('the Operations tray retains exact receipts across a report failure, later success and reload', async ({
   page,
   admin,
   mutations,
@@ -436,6 +436,30 @@ test('the Operations tray recovers two lost job responses after a later success 
   await page.getByText('Operations tray', { exact: true }).click();
   const pending = page.getByRole('group', { name: 'Pending submission receipts' });
   await expect(pending.getByRole('button')).toHaveCount(2);
+  const first = lost[0]!;
+  const latest = await admin.client.get('/api/jobs/receipts/latest');
+  expect(latest.ok()).toBe(true);
+  expect(lost.map(({ id }) => id)).not.toContain((await latest.json()).job_id);
+  await pending
+    .getByRole('button', { name: `Receipt ending in ${first.receipt.slice(-8)}` })
+    .click();
+  await page.route(`**/api/jobs/${first.id}`, (route) => route.abort(), { times: 1 });
+  const failedDetail = page.waitForEvent(
+    'requestfailed',
+    (request) => new URL(request.url()).pathname === `/api/jobs/${first.id}`,
+  );
+  const firstLookup = page.waitForResponse(
+    (response) => new URL(response.url()).pathname === `/api/jobs/receipts/${first.receipt}`,
+  );
+  await page.getByRole('button', { name: 'Find operation' }).click();
+  expect(await (await firstLookup).json()).toEqual({ job_id: first.id });
+  expect((await failedDetail).method()).toBe('GET');
+  await expect(lostNotice).toBeVisible();
+  await expect(details).toHaveCount(0);
+
+  await page.reload();
+  await page.getByText('Operations tray', { exact: true }).click();
+  await expect(pending.getByRole('button')).toHaveCount(2);
   for (const [{ id, receipt }, username] of [
     [lost[0]!, 'crew_owner'],
     [lost[1]!, 'lost-synthetic-account'],
@@ -463,6 +487,55 @@ test('the Operations tray recovers two lost job responses after a later success 
       .filter(({ kind }) => kind === 'membership')
       .map(({ id }) => id),
   ).toEqual([lost[0]!.id]);
+});
+
+test('canceling the inbox fetch in the browser cancels stalled authorization', async ({
+  page,
+  admin,
+}) => {
+  await page.goto('/health');
+  let entered!: () => void;
+  let release!: () => void;
+  let upstreamAborted = false;
+  const pending = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  admin.onNextSessionValidation(async (signal) => {
+    signal?.addEventListener(
+      'abort',
+      () => {
+        upstreamAborted = true;
+        release();
+      },
+      { once: true },
+    );
+    entered();
+    await blocked;
+  });
+
+  const result = page.evaluate(async () => {
+    const controller = new AbortController();
+    window.addEventListener('cancel-inbox-fixture', () => controller.abort(), { once: true });
+    try {
+      return (await fetch('/api/overview/inbox', { signal: controller.signal })).status;
+    } catch (error) {
+      return error instanceof Error ? error.name : 'Fetch failed';
+    }
+  });
+  try {
+    await pending;
+    await page.evaluate(() => window.dispatchEvent(new Event('cancel-inbox-fixture')));
+    expect(await result).toBe('AbortError');
+    await expect.poll(() => upstreamAborted, { timeout: 3000 }).toBe(true);
+    expect((await admin.client.get('/api/jobs/live')).status()).toBe(200);
+  } finally {
+    release();
+  }
+  await page.goto('/#/overview');
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible();
 });
 
 test('subscription review provisions the trusted tier for an opted-in member and ignoring a later cancellation preserves access', async ({

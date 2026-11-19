@@ -41,6 +41,11 @@ interface Activation {
   error: string | null;
 }
 const digest = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+/** A still-fresh reread of the same paid decision keeps review evidence valid. */
+export function stripeDecisionKey(fact: StripeEntitlementFact): string {
+  const { observed_at: _observation, ...decision } = fact;
+  return digest(decision);
+}
 export function stripeAuthorityScope(store: Store): string {
   const settings = store.settings();
   const auth = store.authState();
@@ -96,7 +101,14 @@ export function isDeferredStripeExpiry(event: SubscriptionEvent | null): boolean
 }
 export function isHeldStripePriceReduction(event: SubscriptionEvent | null): boolean {
   return (
-    event?.status === 'pending' && event.stripe_price_review_required === true && !event.job_id
+    event?.source === 'stripe' &&
+    event.action === 'subscribe' &&
+    event.status === 'pending' &&
+    event.stripe_price_review_required === true &&
+    !event.job_id &&
+    event.stripe_entitlement?.event_id === event.id &&
+    event.stripe_entitlement.action === event.action &&
+    event.stripe_entitlement.discord_user_id === event.discord_user_id
   );
 }
 export interface StripeBillingDecision {
@@ -363,12 +375,16 @@ export class StripeEntitlements {
     const previous = this.state!.receipts.find((receipt) => receipt.id === fact.event_id);
     if (previous) {
       if (deferred) return false;
+      const event = previous.outcome === 'review' ? this.store.subscription(fact.event_id) : null;
+      if (event?.stripe_price_review_accepted && event.status === 'applied') {
+        this.finish(fact, true);
+        return false;
+      }
       const canRecheck =
         (fact.action === 'expire' && previous.outcome === 'deferred') ||
-        (previous.outcome === 'review' &&
-          (fact.action === 'expire' ? isDeferredStripeExpiry : isHeldStripePriceReduction)(
-            this.store.subscription(fact.event_id),
-          ));
+        (fact.action === 'expire'
+          ? isDeferredStripeExpiry(event)
+          : isHeldStripePriceReduction(event));
       if (!canRecheck) return false;
       previous.outcome = 'claimed';
       this.persist();
@@ -381,6 +397,35 @@ export class StripeEntitlements {
     this.state!.receipts.push({ id: fact.event_id, outcome: deferred ? 'deferred' : 'claimed' });
     this.persist();
     return true;
+  }
+  supersedeHeldPriceReductions(fact: StripeEntitlementFact): void {
+    this.assert(fact);
+    const held = this.store
+      .heldStripePriceReviews(fact.discord_user_id)
+      .filter((event) => event.id !== fact.event_id && isHeldStripePriceReduction(event));
+    if (!held.length) return;
+    const ids = new Set(held.map(({ id }) => id));
+    const receipts = this.state!.receipts;
+    try {
+      this.store.transaction(() => {
+        for (const event of held) {
+          event.status = 'superseded';
+          delete event.stripe_price_review_required;
+          event.error = null;
+          event.result = 'A newer verified Stripe billing decision replaced this held reduction.';
+          this.store.saveSubscription(event);
+        }
+        this.state!.receipts = receipts.map((receipt) =>
+          ids.has(receipt.id) && receipt.outcome === 'review'
+            ? { ...receipt, outcome: 'complete' }
+            : receipt,
+        );
+        this.persist();
+      });
+    } catch (error) {
+      this.state!.receipts = receipts;
+      throw error;
+    }
   }
   finish(fact: StripeEntitlementFact, succeeded: boolean | 'deferred'): void {
     if (!this.enabled(fact.generation)) return;
@@ -401,7 +446,7 @@ export class StripeEntitlements {
       state.error ||
       state.revision !== fact.activation_revision ||
       !current ||
-      digest({ ...current, observed_at: fact.observed_at }) !== digest(fact) ||
+      stripeDecisionKey(current) !== stripeDecisionKey(fact) ||
       !freshStripeInvoice(Date.parse(current.observed_at), this.now())
     )
       throw new ServiceError(

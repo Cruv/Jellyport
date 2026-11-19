@@ -71,7 +71,12 @@ export default function MembershipsPage({
   openJob?: (id: string) => void;
   embedded?: boolean;
   refreshKey?: number;
-  initialMember?: { id: string; username: string; tier_id?: string };
+  initialMember?: {
+    id: string;
+    username: string;
+    tier_id?: string;
+    stripe_price_review_event_id?: string;
+  };
   handoffKey?: number;
   onInitialMemberApplied?: () => void;
   active?: boolean;
@@ -100,6 +105,10 @@ export default function MembershipsPage({
     false,
   );
   const [tierId, setTierId] = useWorkspaceDraftState('memberships.tierId', tiers[0]?.id || '');
+  const [stripePriceReview, setStripePriceReview] = useWorkspaceDraftState<string | null>(
+    'memberships.stripePriceReview',
+    null,
+  );
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -205,6 +214,7 @@ export default function MembershipsPage({
             ? { account_limit: tier.account_limit }
             : { tier_id: tier.id }),
           provision_jellyfin: provisionJellyfin,
+          ...(stripePriceReview ? { stripe_price_review_event_id: stripePriceReview } : {}),
           ...(existing?.revision ? { expected_revision: existing.revision } : {}),
         }
       : null;
@@ -281,6 +291,7 @@ export default function MembershipsPage({
   function selectMember(value: DiscordMember | null) {
     setView('editor');
     setMember(value);
+    setStripePriceReview(null);
     setError('');
     setIdentityOpen(false);
     const saved = memberships.find((item) => item.discord_user_id === value?.id);
@@ -298,11 +309,17 @@ export default function MembershipsPage({
     handoff.current = key;
     selectMember({ ...initialMember, display_name: null, nickname: null, membership_active: null });
     if (tiers.some(({ id }) => id === initialMember.tier_id)) setTierId(initialMember.tier_id!);
+    if (initialMember.stripe_price_review_event_id) {
+      setAccessMode('subscription');
+      setTierId(initialMember.tier_id ?? '');
+      setStripePriceReview(initialMember.stripe_price_review_event_id);
+    }
     onInitialMemberApplied?.();
   }, [
     initialMember?.id,
     initialMember?.username,
     initialMember?.tier_id,
+    initialMember?.stripe_price_review_event_id,
     handoffKey,
     loaded,
     loading,
@@ -373,7 +390,7 @@ export default function MembershipsPage({
   }
 
   async function saveAccess() {
-    if (!member || !tier || !loaded || busyRef.current) return;
+    if (!member || !tier || !loaded || busyRef.current || stripePriceReview) return;
     busyRef.current = true;
     setBusy(true);
     setError('');
@@ -469,6 +486,7 @@ export default function MembershipsPage({
                 disabled={busy || loading}
                 onClick={() => {
                   setMember(null);
+                  setStripePriceReview(null);
                   setError('');
                   setAccessMode('subscription');
                   setTierId(tiers[0]?.id || '');
@@ -713,13 +731,27 @@ export default function MembershipsPage({
                       )}
                     </section>
                   )}
+                  {stripePriceReview && (
+                    <div className="support-note">
+                      <strong>Review verified Stripe access</strong>
+                      <p>This review uses the member and tier from the Stripe event.</p>
+                      <button
+                        type="button"
+                        className="text-button"
+                        disabled={busy}
+                        onClick={() => selectMember(member)}
+                      >
+                        Start independent policy edit
+                      </button>
+                    </div>
+                  )}
                   <div className="field-row">
                     <div className="field">
                       <label htmlFor="membership-access-mode">Access policy</label>
                       <select
                         id="membership-access-mode"
                         value={accessMode}
-                        disabled={busy || loading}
+                        disabled={busy || loading || !!stripePriceReview}
                         onChange={(event) =>
                           setAccessMode(event.target.value as 'subscription' | 'complimentary')
                         }
@@ -747,7 +779,7 @@ export default function MembershipsPage({
                           id="membership-tier"
                           value={tierId}
                           onChange={(event) => setTierId(event.target.value)}
-                          disabled={busy || loading}
+                          disabled={busy || loading || !!stripePriceReview}
                           required
                         >
                           {!tiers.some((item) => item.id === tierId) && (
@@ -819,14 +851,16 @@ export default function MembershipsPage({
                     </div>
                   )}
                   <div className="form-actions">
-                    <button
-                      className="btn"
-                      type="button"
-                      disabled={!member || !tier || !loaded || loading || busy}
-                      onClick={() => void saveAccess()}
-                    >
-                      Save access policy
-                    </button>
+                    {!stripePriceReview && (
+                      <button
+                        className="btn"
+                        type="button"
+                        disabled={!member || !tier || !loaded || loading || busy}
+                        onClick={() => void saveAccess()}
+                      >
+                        Save access policy
+                      </button>
+                    )}
                     <button
                       className="btn btn-primary"
                       type="submit"

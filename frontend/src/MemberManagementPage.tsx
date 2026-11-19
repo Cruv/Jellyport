@@ -36,7 +36,13 @@ export default function MemberManagementPage({
   review: (event: SubscriptionEvent) => void;
   ignore: (event: SubscriptionEvent) => void;
   busy: boolean;
-  focusMember?: { id: string; username: string; tier_id?: string; key: number };
+  focusMember?: {
+    id: string;
+    username: string;
+    tier_id?: string;
+    stripe_price_review_event_id?: string;
+    key: number;
+  };
   onFocusConsumed?: (key: number) => void;
 }) {
   const [identityVersion, setIdentityVersion] = useState(0);

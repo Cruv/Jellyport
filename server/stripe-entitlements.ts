@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import type { MembershipAccessTarget } from './membership-access-targets.js';
 import type { Store } from './store.js';
 import type { SubscriptionEvent } from './service.js';
 import type { StripePaidPeriod, StripeSnapshot, StripeSubscription } from './stripe-client.js';
@@ -22,6 +23,11 @@ export interface StripeEntitlementFact {
   generation: string;
   authority_revision: string;
   is_new: boolean;
+}
+export interface StripeEntitlementCheck {
+  evidenceOnly?: true;
+  plannedReduction?: { targets: MembershipAccessTarget[]; hasEnabledTarget: boolean };
+  wouldDisable?: true;
 }
 interface Activation {
   scope: string;
@@ -86,6 +92,11 @@ export function isDeferredStripeExpiry(event: SubscriptionEvent | null): boolean
     !event.job_id &&
     !event.error &&
     (event.stripe_expiry_deferred === true || event.result === undefined)
+  );
+}
+export function isHeldStripePriceReduction(event: SubscriptionEvent | null): boolean {
+  return (
+    event?.status === 'pending' && event.stripe_price_review_required === true && !event.job_id
   );
 }
 export interface StripeBillingDecision {
@@ -351,15 +362,14 @@ export class StripeEntitlements {
     this.assert(fact);
     const previous = this.state!.receipts.find((receipt) => receipt.id === fact.event_id);
     if (previous) {
-      if (deferred || fact.action !== 'expire') return false;
-      if (
-        previous.outcome !== 'deferred' &&
-        !(
-          previous.outcome === 'review' &&
-          isDeferredStripeExpiry(this.store.subscription(fact.event_id))
-        )
-      )
-        return false;
+      if (deferred) return false;
+      const canRecheck =
+        (fact.action === 'expire' && previous.outcome === 'deferred') ||
+        (previous.outcome === 'review' &&
+          (fact.action === 'expire' ? isDeferredStripeExpiry : isHeldStripePriceReduction)(
+            this.store.subscription(fact.event_id),
+          ));
+      if (!canRecheck) return false;
       previous.outcome = 'claimed';
       this.persist();
       return true;

@@ -5,6 +5,13 @@ export class ServiceError extends Error {
     this.name = 'ServiceError';
   }
 }
+export class StripePriceReviewRequired extends ServiceError {
+  constructor() {
+    super(
+      'The household was not covered by the current Stripe price review. Review its exact account slots before applying the tier reduction.',
+    );
+  }
+}
 export class MediaError extends Error {
   constructor(
     message: string,

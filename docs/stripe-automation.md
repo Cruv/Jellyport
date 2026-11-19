@@ -19,9 +19,17 @@ Changing a key, Discord server, paired media-server identity or selected billing
 When a price mapping affects an approved household, **Save Stripe settings**
 opens an impact review with the current and proposed tiers, the Discord owners,
 and the exact media accounts and slots. Approval applies to the reviewed billing
-revision and household state. An account change after approval can hold a tier
-reduction for a new review. If a migration price would affect an already linked
-household, review the price in Settings before approving the migration.
+revision and household state. After a remap, even one with no cached impact,
+fresh billing can identify an uncovered household or select a different price.
+Jellyport holds a reduction unless the current price review covers the household's
+exact affected slots. Configured mappings from older versions also require this
+check because their saved state lacks a record of earlier empty-impact remaps.
+Open **Memberships → Events → Review household** to see
+the member and proposed tier, then review the account plan before applying it.
+If the household already matches after review, the next verification of the
+same Stripe billing event clears its hold. If a migration price would affect an
+already linked household, review the price in Settings before approving the
+migration.
 
 Stripe documents [restricted-key permissions](https://docs.stripe.com/keys/restricted-api-keys). The current API boundary uses `2025-06-30.basil`; all requests are bounded GETs with serial rate limiting, cancellation, timeouts and backoff.
 

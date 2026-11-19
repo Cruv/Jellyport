@@ -7,7 +7,7 @@ import {
 } from './credentials.js';
 import type { BotMessageHistory, BotMessageReceipt } from './bot-messages.js';
 import { finishJob } from './job-recovery.js';
-import { MediaError, ServiceError } from './errors.js';
+import { MediaError, ServiceError, StripePriceReviewRequired } from './errors.js';
 import {
   caseFold,
   createMatcher,
@@ -35,6 +35,7 @@ import {
   type SourceSnapshot,
 } from './migration.js';
 import {
+  abortable,
   isObject,
   MediaClient,
   type ClientFactory,
@@ -43,11 +44,12 @@ import {
   type MediaItem,
   type MediaKind,
   type MediaUser,
+  type MigrationCapabilities,
   type DestinationReadEvent,
   type CatalogProgress,
 } from './media.js';
 import type { MigrationSubmission, Store } from './store.js';
-import type { Settings } from './types.js';
+import type { MediaServerObservation, Settings } from './types.js';
 import type { DiscordMemberSearchResult } from './discord-members.js';
 import { AccountRoles, type AccountRole, type RoleAssignment } from './account-roles.js';
 import { mergeRoleSection, type RoleSection } from './role-parameters.js';
@@ -90,8 +92,14 @@ import {
 } from './account-cloning.js';
 import { AccountRenames } from './account-rename.js';
 import { MediaOwnerships, type MediaOwnership } from './media-ownership.js';
+import { hasMembershipAccessAboveLimit } from './membership-access-targets.js';
 import { NewSubscriberPolicy } from './new-subscriber-policy.js';
-import { isDeferredStripeExpiry, type StripeEntitlementFact } from './stripe-entitlements.js';
+import {
+  isDeferredStripeExpiry,
+  isHeldStripePriceReduction,
+  type StripeEntitlementCheck,
+  type StripeEntitlementFact,
+} from './stripe-entitlements.js';
 import {
   DISCORD_DISCOVERY_PAGE_SIZE,
   discordAuthority,
@@ -323,6 +331,7 @@ export interface Job {
 export interface SubscriptionEvent {
   stripe_entitlement?: StripeEntitlementFact;
   stripe_expiry_deferred?: true;
+  stripe_price_review_required?: true;
   discord_authority?: string;
   id: string;
   action: 'subscribe' | 'cancel' | 'expire';
@@ -639,7 +648,7 @@ function previewItemSummary(item: MediaItem): MigrationItemSummary {
 
 /** Account jobs and subscription actions share a mutation lock released between users. */
 export class Service {
-  verifyStripeEntitlement?: (fact: StripeEntitlementFact) => void;
+  verifyStripeEntitlement?: (fact: StripeEntitlementFact, check?: StripeEntitlementCheck) => void;
   reviewStripeMigrationMembership?: (
     id: string,
     signal?: AbortSignal,
@@ -877,6 +886,75 @@ export class Service {
   async connections(): Promise<Record<string, unknown>> {
     return (await this.probeServers()).connections;
   }
+  private readonly mediaObservations: Partial<
+    Record<MediaKind, { connection: string; observed: MediaServerObservation }>
+  > = {};
+  private readonly catalogObservationChecks: Partial<
+    Record<MediaKind, { connection: string; attemptedAt: number; pending?: AbortController }>
+  > = {};
+  private mediaObservationConnection(settings: Settings, kind: MediaKind): string {
+    return createHash('sha256')
+      .update(JSON.stringify([settings[`${kind}_url`], settings[`${kind}_api_key`]]))
+      .digest('hex');
+  }
+  noteMediaObservation(settings: Settings, kind: MediaKind, info: JsonObject): void {
+    if (typeof info.Id !== 'string' || !info.Id) return;
+    const connection = this.mediaObservationConnection(settings, kind);
+    if (connection !== this.mediaObservationConnection(this.store.settings(), kind)) return;
+    this.mediaObservations[kind] = {
+      connection,
+      observed: {
+        id: info.Id,
+        version: typeof info.Version === 'string' ? info.Version : undefined,
+        observed_at: Date.now(),
+      },
+    };
+  }
+  observedMediaServers(): Partial<Record<MediaKind, MediaServerObservation>> {
+    const settings = this.store.settings();
+    const current = (kind: MediaKind) => {
+      const value = this.mediaObservations[kind];
+      if (value?.connection === this.mediaObservationConnection(settings, kind))
+        return value.observed;
+    };
+    return { emby: current('emby'), jellyfin: current('jellyfin') };
+  }
+  /** An open inbox can discover upstream incompatibility without waiting for a roster read. */
+  refreshCatalogObservation(kind: MediaKind): void {
+    if (this.stopping) return;
+    const settings = this.store.settings();
+    if (!settings[`${kind}_url`] || !settings[`${kind}_api_key`]) return;
+    const connection = this.mediaObservationConnection(settings, kind);
+    const observation = this.mediaObservations[kind];
+    const previous = this.catalogObservationChecks[kind];
+    const attemptedAt = Date.now();
+    const cutoff = attemptedAt - 5 * 60_000;
+    if (
+      previous?.pending ||
+      (previous?.connection === connection && previous.attemptedAt > cutoff) ||
+      (observation?.connection === connection && observation.observed.observed_at > cutoff)
+    )
+      return;
+    const pending = new AbortController();
+    const attempt = { connection, attemptedAt, pending: pending as AbortController | undefined };
+    this.catalogObservationChecks[kind] = attempt;
+    const signal = AbortSignal.any([pending.signal, AbortSignal.timeout(8_000)]);
+    void this.withClient(
+      settings,
+      kind,
+      async (client) => {
+        const info = await abortable(client.systemInfo({ signal, retry: false }), signal);
+        if (!this.stopping && !signal.aborted) this.noteMediaObservation(settings, kind, info);
+      },
+      signal,
+    )
+      .catch(() => {
+        // Preserve the most recent successful observation after transient failures.
+      })
+      .finally(() => {
+        attempt.pending = undefined;
+      });
+  }
   private overviewProbe?: {
     key: string;
     until: number;
@@ -916,18 +994,14 @@ export class Service {
       const configured = Boolean(settings[`${kind}_url`] && settings[`${kind}_api_key`]);
       const result: Record<string, unknown> = { configured, connected: false };
       let count = 0;
-      let observed: { id?: string; version?: string } | undefined;
       if (configured)
         try {
           const { info, users } = await this.withClient(settings, kind, async (client) => {
             const info = await client.systemInfo();
+            this.noteMediaObservation(settings, kind, info);
             return { info, users: await client.users() };
           });
           count = users.length;
-          observed = {
-            id: typeof info.Id === 'string' ? info.Id : undefined,
-            version: typeof info.Version === 'string' ? info.Version : undefined,
-          };
           Object.assign(result, {
             connected: true,
             name: info.ServerName ?? kind,
@@ -937,7 +1011,7 @@ export class Service {
           if (!(error instanceof MediaError || error instanceof ServiceError)) throw error;
           result.error = `Unable to authenticate to ${kind === 'emby' ? 'Emby' : 'Jellyfin'}. Check URL, API key and network access.`;
         }
-      return { connection: result, count, observed };
+      return { connection: result, count };
     };
     const [emby, jellyfin] = await Promise.all([check('emby'), check('jellyfin')]);
     return {
@@ -948,7 +1022,6 @@ export class Service {
       },
       emby_users: emby.count,
       jellyfin_users: jellyfin.count,
-      observed: { emby: emby.observed, jellyfin: jellyfin.observed },
     };
   }
   private async template(client: MediaAPI, settings: Settings): Promise<ProvisioningDefaults> {
@@ -2761,12 +2834,13 @@ export class Service {
       throw new ServiceError(
         'A previous automatic signup requires an explicit Jellyfin opt-in in Memberships before provisioning can continue.',
       );
+    let plannedReduction: StripeEntitlementCheck['plannedReduction'];
     const assertNewPolicy = () => {
       if (automaticSource !== undefined) {
         this.assertAutomaticSubscriptionSource(automaticSource);
         this.assertDiscordAuthority(discordId, settings);
       }
-      if (stripeEntitlement) this.assertStripeEntitlement(stripeEntitlement);
+      if (stripeEntitlement) this.assertStripeEntitlement(stripeEntitlement, { plannedReduction });
       if (!newSubscriber) return;
       this.newSubscriberPolicy.assertActive(settings, newSubscriber.revision);
       if (
@@ -3195,6 +3269,17 @@ export class Service {
         throw new ServiceError('A user mapping changed. Review and try again.');
     if (newSubscriber && settings.emby_url && settings.emby_api_key)
       assertNewSources(await this.withClient(settings, 'emby', (client) => client.users()));
+    const reductionRequests = requests.filter(({ access_disabled }) => access_disabled === true);
+    plannedReduction = {
+      targets: reductionRequests.map(({ membership_slot, username, target_user_id }) => [
+        membership_slot!,
+        username ?? '',
+        target_user_id ?? '',
+      ]),
+      hasEnabledTarget: reductionRequests.some(
+        ({ target_user_id }) => targetStates.get(target_user_id ?? '')?.disabled !== true,
+      ),
+    };
     assertNewPolicy();
     guard();
     return {
@@ -3336,6 +3421,7 @@ export class Service {
     reviewed: ReviewedMembershipWorkflow,
     authorize: () => void = () => {},
     signal?: AbortSignal,
+    submission?: MigrationSubmission,
   ): Promise<{ membership: Membership; job: Job | null }> {
     if (this.demo) throw new ServiceError('Demo memberships are read-only.');
     this.validateMembershipWorkflow(reviewed.input);
@@ -3367,7 +3453,14 @@ export class Service {
               'The reviewed accounts, ownership, or access policy changed. Review this member again.',
             );
           plan.assertCurrent();
-          return this.commitMembershipProvision(plan, input.discord_user_id);
+          return this.commitMembershipProvision(
+            plan,
+            input.discord_user_id,
+            undefined,
+            undefined,
+            undefined,
+            submission,
+          );
         }, signal),
       signal,
     );
@@ -3378,6 +3471,7 @@ export class Service {
     newSubscriber?: NewSubscriberGuard,
     stripeEntitlement?: StripeEntitlementFact,
     automaticSource?: string,
+    submission?: MigrationSubmission,
   ): { membership: Membership; job: Job | null } {
     plan.assertCurrent();
     plan.assertNewPolicy();
@@ -3416,18 +3510,31 @@ export class Service {
           }
         : {}),
     }));
-    const job = this.queue('membership', requests, undefined, undefined, (queuedRequests) => {
-      plan.assertCurrent();
-      plan.assertNewPolicy();
-      membership = this.memberships.saveInTransaction(
-        input,
-        plan.settings,
-        plan.existing?.revision,
-      );
-      for (const link of plan.adoptedLinks)
-        this.store.saveLink(discordId, link.username, link.remote_id, false, link.membership_slot);
-      for (const request of queuedRequests) request.membership_revision = membership.revision;
-    });
+    const job = this.queue(
+      'membership',
+      requests,
+      undefined,
+      undefined,
+      (queuedRequests) => {
+        plan.assertCurrent();
+        plan.assertNewPolicy();
+        membership = this.memberships.saveInTransaction(
+          input,
+          plan.settings,
+          plan.existing?.revision,
+        );
+        for (const link of plan.adoptedLinks)
+          this.store.saveLink(
+            discordId,
+            link.username,
+            link.remote_id,
+            false,
+            link.membership_slot,
+          );
+        for (const request of queuedRequests) request.membership_revision = membership.revision;
+      },
+      submission,
+    );
     if (newSubscriber) newSubscriber.enrolled_membership = structuredClone(membership!);
     return { membership: membership!, job };
   }
@@ -3440,6 +3547,7 @@ export class Service {
     newSubscriber?: NewSubscriberGuard,
     stripeEntitlement?: StripeEntitlementFact,
     automaticSource?: string,
+    delivery?: { authorize: () => void; submission?: MigrationSubmission },
   ): Promise<Job> {
     if (this.demo) throw new ServiceError('Demo memberships are read-only.');
     return this.membershipMutex.run(() =>
@@ -3452,6 +3560,8 @@ export class Service {
           newSubscriber,
           stripeEntitlement,
           automaticSource,
+          undefined,
+          delivery?.authorize,
         );
         const result = this.commitMembershipProvision(
           plan,
@@ -3459,6 +3569,7 @@ export class Service {
           newSubscriber,
           stripeEntitlement,
           automaticSource,
+          delivery?.submission,
         );
         if (!result.job) throw new ServiceError('No account changes were selected.');
         return result.job;
@@ -3488,6 +3599,7 @@ export class Service {
     slot: number,
     disabled: boolean,
     guard: () => void = () => {},
+    beforeDisable?: () => void,
   ): Promise<boolean> {
     let link = this.store.link(memberId, slot);
     if (!link) throw new ServiceError('The membership account link no longer exists.');
@@ -3534,6 +3646,7 @@ export class Service {
     if (disabled && !isDisabled) {
       policy.IsDisabled = true;
       ownershipGuard();
+      beforeDisable?.();
       await this.setAccess(jellyfin, target.Id, policy, memberId, true, slot);
       ownershipGuard();
       this.store.saveLink(memberId, link.username, target.Id, true, slot);
@@ -5514,6 +5627,7 @@ export class Service {
     settings: Settings,
     jellyfin: MediaAPI,
     context: { source?: MediaItem[]; key?: string },
+    capabilities: MigrationCapabilities | null,
   ): Promise<void> {
     const pin = request.clone_source!;
     const username = request.username!;
@@ -5770,6 +5884,7 @@ export class Service {
         () => {},
         {
           migration_scope: 'watched_only',
+          capabilities,
           before_write: beforeWrite,
           expectation: (item, patch, unsupported) => {
             const expectation = captureExpectation(item, patch, 'watched_only');
@@ -6071,6 +6186,21 @@ export class Service {
           );
       }
     };
+    const checkSource = () => {
+      this.checkJobStopped(job);
+      this.assertConnections(settings);
+    };
+    const readPinnedSource = async (emby: MediaAPI, check = checkSource) => {
+      check();
+      const info = await emby.systemInfo();
+      check();
+      if (info.Id !== sourcePin!.server_id)
+        throw new ServiceError('The reviewed Emby server changed. Prepare a new migration review.');
+      const account = await emby.user(sourcePin!.user_id);
+      check();
+      this.assertMigrationSource(sourcePin!, info.Id, account);
+      return { info, account };
+    };
     if (
       registeredAccounts.length ||
       request.source_ownership?.identity_hash ||
@@ -6096,15 +6226,7 @@ export class Service {
           settings,
           'emby',
           async (emby) => {
-            const info = await emby.systemInfo();
-            this.checkJobStopped(job);
-            if (info.Id !== sourcePin!.server_id)
-              throw new ServiceError(
-                'The reviewed Emby server changed. Prepare a new migration review.',
-              );
-            const sourceUser = await emby.user(sourcePin!.user_id);
-            this.checkJobStopped(job);
-            this.assertMigrationSource(sourcePin!, info.Id, sourceUser);
+            const { info, account: sourceUser } = await readPinnedSource(emby);
             sourceOwnershipServerId = sourcePin!.server_id;
             registeredSource.value = this.sourceOwnership(
               request,
@@ -6154,6 +6276,8 @@ export class Service {
                 captured_at: new Date(catalogContext.value.capturedAt).toISOString(),
                 items: catalogContext.value.items.length,
               };
+              // The same URL can serve a different database after the history read.
+              await readPinnedSource(emby);
               return source;
             }
             if (!supportedSnapshotVersion(info.Version))
@@ -6182,6 +6306,7 @@ export class Service {
             const historyWarnings = snapshotHistoryWarnings(selected.metadata.diagnostics);
             historyWarnings.forEach((warning) => informationalWarnings.add(warning));
             source.warnings.push(...historyWarnings);
+            await readPinnedSource(emby);
             return source;
           },
           this.jobControllers.get(job.id)?.signal,
@@ -6849,17 +6974,7 @@ export class Service {
         await this.withClient(
           settings,
           'emby',
-          async (emby) => {
-            const info = await emby.systemInfo();
-            guard();
-            if (info.Id !== sourcePin!.server_id)
-              throw new ServiceError(
-                'The reviewed Emby server changed. Prepare a new migration review.',
-              );
-            const account = await emby.user(sourcePin!.user_id);
-            guard();
-            this.assertMigrationSource(sourcePin!, info.Id, account);
-          },
+          (emby) => readPinnedSource(emby, guard),
           this.jobControllers.get(job.id)?.signal,
         );
         phase('transferring_history');
@@ -7231,7 +7346,7 @@ export class Service {
               ? null
               : await this.template(jellyfin, settings);
           for (const request of requests) {
-            const work = async () => {
+            const work = async (cloneCapabilities: MigrationCapabilities | null = null) => {
               this.checkJobStopped(job);
               const accountStarted = performance.now();
               const previousResults = job.results.length;
@@ -7263,6 +7378,12 @@ export class Service {
                       this.checkJobStopped(job);
                       this.assertMembershipRequest(request, settings);
                     },
+                    request.stripe_entitlement
+                      ? () =>
+                          this.assertStripeEntitlement(request.stripe_entitlement!, {
+                            wouldDisable: true,
+                          })
+                      : undefined,
                   );
                   job.results.push({
                     username: request.username!,
@@ -7284,7 +7405,14 @@ export class Service {
                       : {}),
                   });
                 } else if (job.kind === 'clone')
-                  await this.oneClone(job, request, settings, jellyfin, cloneContext);
+                  await this.oneClone(
+                    job,
+                    request,
+                    settings,
+                    jellyfin,
+                    cloneContext,
+                    cloneCapabilities,
+                  );
                 else if (job.kind === 'role_update')
                   await this.oneRoleUpdate(job, request, settings, jellyfin);
                 else
@@ -7337,8 +7465,17 @@ export class Service {
               delete job.progress.catalog_cache_hit;
               this.save(job);
             };
-            const runAccount = () =>
-              request.source_user_id ? work() : this.mutationMutex.run(work);
+            const runAccount = async () => {
+              if (request.source_user_id) return work();
+              if (!request.clone_source) return this.mutationMutex.run(work);
+              this.checkJobStopped(job);
+              this.assertConnections(settings);
+              const capabilities = await prepareMigrationCapabilities(jellyfin);
+              return this.mutationMutex.run(
+                () => work(capabilities),
+                this.jobControllers.get(job.id)?.signal,
+              );
+            };
             if (request.source_user_id || request.clone_source)
               await this.historyMutex.run(runAccount, this.jobControllers.get(job.id)?.signal);
             else await runAccount();
@@ -7381,6 +7518,7 @@ export class Service {
   }
   async stop(): Promise<void> {
     this.stopping = true;
+    for (const check of Object.values(this.catalogObservationChecks)) check.pending?.abort();
     for (const controller of this.jobControllers.values()) controller.abort(new StoppedError());
     this.sourceWorkload.close();
     this.sourceCatalogs.clear();
@@ -7390,12 +7528,32 @@ export class Service {
     await Promise.allSettled([...this.clients].map((client) => client.close()));
     await Promise.allSettled([...this.jobTasks.values()]);
   }
-  private assertStripeEntitlement(fact: StripeEntitlementFact): void {
+  private assertStripeEntitlement(
+    fact: StripeEntitlementFact,
+    check?: StripeEntitlementCheck,
+  ): void {
     if (this.store.settings().new_subscriber_source !== 'stripe' || !this.verifyStripeEntitlement)
       throw new ServiceError(
         'Select and connect the verified Stripe subscription source before applying billing access.',
       );
-    this.verifyStripeEntitlement(fact);
+    this.verifyStripeEntitlement(fact, check);
+  }
+  private holdStripePriceReview(event: SubscriptionEvent, error: StripePriceReviewRequired) {
+    const settings = this.store.settings();
+    const tier = (settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).find(
+      ({ id }) => id === event.stripe_entitlement?.tier_id,
+    );
+    if (tier) {
+      event.tier_id = tier.id;
+      event.account_limit = tier.account_limit;
+    }
+    if (event.discord_user_id)
+      event.username ??= this.memberships.get(event.discord_user_id, settings)?.base_username;
+    event.stripe_price_review_required = true;
+    event.status = 'pending';
+    event.error = error.message;
+    this.store.saveSubscription(event);
+    return event;
   }
   private assertAutomaticSubscriptionSource(source: string | null | undefined): void {
     if (this.store.settings().new_subscriber_source === 'stripe' && source !== 'stripe')
@@ -7404,7 +7562,6 @@ export class Service {
       );
   }
   async recordStripeEntitlement(fact: StripeEntitlementFact): Promise<void | 'deferred'> {
-    this.assertStripeEntitlement(fact);
     const event = await this.recordSubscription({
       id: fact.event_id,
       action: fact.action,
@@ -7429,7 +7586,7 @@ export class Service {
     if (incoming.source === 'stripe') {
       if (!incoming.stripe_entitlement)
         throw new ServiceError('Verified Stripe entitlement evidence is required.');
-      this.assertStripeEntitlement(incoming.stripe_entitlement);
+      this.assertStripeEntitlement(incoming.stripe_entitlement, { evidenceOnly: true });
       if (
         incoming.id !== incoming.stripe_entitlement.event_id ||
         incoming.action !== incoming.stripe_entitlement.action ||
@@ -7441,6 +7598,26 @@ export class Service {
     }
     const existing = this.store.subscription(String(incoming.id));
     if (existing) {
+      if (incoming.source === 'stripe' && isHeldStripePriceReduction(existing)) {
+        const fact = incoming.stripe_entitlement!;
+        const membership = this.memberships.get(fact.discord_user_id, settings);
+        if (
+          existing.discord_user_id === fact.discord_user_id &&
+          existing.tier_id === fact.tier_id &&
+          membership?.access_mode === 'subscription' &&
+          membership.tier_id === fact.tier_id &&
+          membership.account_limit === existing.account_limit &&
+          !this.isMembershipDowngrade(fact.discord_user_id, membership.account_limit, settings)
+        ) {
+          delete existing.stripe_price_review_required;
+          existing.status = 'applied';
+          existing.error = null;
+          existing.result =
+            'The reviewed household access already matches the verified Stripe tier.';
+          this.store.saveSubscription(existing);
+        }
+        return existing;
+      }
       if (incoming.source !== 'stripe' || !isDeferredStripeExpiry(existing)) return existing;
       // Replace saved proof only for the exact event that did not reach processing.
       // A failed/uncertain mutation remains in the reviewed recovery path.
@@ -7512,6 +7689,8 @@ export class Service {
           automatic = false;
       } catch (error) {
         if (!(error instanceof ServiceError)) throw error;
+        if (error instanceof StripePriceReviewRequired)
+          return this.holdStripePriceReview(event, error);
         event.error = error.message;
         automatic = false;
       }
@@ -7574,6 +7753,7 @@ export class Service {
       const event = this.store.subscription(id);
       if (!event) throw new ServiceError('Subscription event not found.');
       if (['applied', 'ignored', 'canceled', 'processing'].includes(event.status)) return event;
+      if (event.stripe_price_review_required) return event;
       const operationSettings = this.store.settings();
       let expiryMutationStarted = false;
       const assertSource = () => {
@@ -7630,7 +7810,13 @@ export class Service {
       if (event.source === 'stripe') {
         if (!event.stripe_entitlement)
           throw new ServiceError('Verified Stripe entitlement evidence is required.');
-        this.assertStripeEntitlement(event.stripe_entitlement);
+        try {
+          this.assertStripeEntitlement(event.stripe_entitlement);
+        } catch (error) {
+          if (error instanceof StripePriceReviewRequired && !event.job_id)
+            return this.holdStripePriceReview(event, error);
+          throw error;
+        }
         if (
           event.id !== event.stripe_entitlement.event_id ||
           event.action !== event.stripe_entitlement.action ||
@@ -7841,7 +8027,10 @@ export class Service {
               );
           } else if (
             (!existing || existing.provision_jellyfin === false) &&
-            !this.store.linksForMember(memberId).length
+            !this.store.linksForMember(memberId).length &&
+            !this.mediaOwnerships
+              .forOwner(memberId, settings)
+              .some(({ kind }) => kind === 'jellyfin')
           ) {
             // A subscription establishes entitlement. It must not silently opt a
             // new member into a second media server or start a history migration.
@@ -8020,6 +8209,8 @@ export class Service {
         if (event.status !== 'ignored') event.status = 'applied';
       } catch (error) {
         if (error instanceof SubscriptionSourceChanged) return holdForSourceReview();
+        if (error instanceof StripePriceReviewRequired && !event.job_id)
+          return this.holdStripePriceReview(event, error);
         if (
           error instanceof AutomaticDisablePaused &&
           !expiryMutationStarted &&
@@ -8091,9 +8282,11 @@ export class Service {
     const desired = limit ?? previous?.account_limit ?? 1;
     return (
       desired < (previous?.account_limit ?? 1) ||
-      this.store
-        .linksForMember(memberId)
-        .some((link) => link.membership_slot > desired && !link.disabled_by_jellyport)
+      hasMembershipAccessAboveLimit(
+        this.store.linksForMember(memberId),
+        this.mediaOwnerships.forOwner(memberId, settings),
+        desired,
+      )
     );
   }
   ignoreSubscription(id: string): SubscriptionEvent {

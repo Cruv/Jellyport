@@ -2,6 +2,7 @@ import type { DestinationCatalogs } from './destination-catalogs.js';
 import type { SourceSnapshots } from './source-snapshots.js';
 import type { StripeIntegration } from './stripe-integration.js';
 import type { Store } from './store.js';
+import type { MediaServerObservation } from './types.js';
 
 type Repair =
   | 'emby_history'
@@ -31,8 +32,8 @@ export async function operationsInbox(
   authorityHolds: number,
   sessionId: string,
   observed: {
-    emby?: { id?: string; version?: string };
-    jellyfin?: { id?: string; version?: string };
+    emby?: MediaServerObservation;
+    jellyfin?: MediaServerObservation;
   },
 ): Promise<InboxItem[]> {
   const [emby, jellyfin] = await Promise.all([

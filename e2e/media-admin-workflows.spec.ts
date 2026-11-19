@@ -375,6 +375,96 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   expect(admin.writes).toHaveLength(writesBeforeReview);
 });
 
+test('the Operations tray recovers two lost job responses after a later success and reload', async ({
+  page,
+  admin,
+  mutations,
+}) => {
+  test.setTimeout(60_000);
+  await page.goto('/#/memberships/accounts/list');
+  await page.getByRole('button', { name: 'Add member', exact: true }).click();
+  await chooseMember(page, 'crew_owner');
+  await page.getByRole('checkbox', { name: 'Enable Jellyfin account provisioning' }).check();
+  await page.getByRole('combobox', { name: 'Membership tier', exact: true }).selectOption('sloop');
+  await page.getByRole('button', { name: 'Review membership update', exact: true }).click();
+
+  const lost: Array<{ id: string; receipt: string }> = [];
+  const dropAccepted = (path: string) =>
+    page.route(
+      `**${path}`,
+      async (route) => {
+        const accepted = await route.fetch();
+        expect(accepted.status()).toBe(202);
+        const { job, id } = await accepted.json();
+        lost.push({
+          id: job?.id ?? id,
+          receipt: route.request().headers()['x-jellyport-submission']!,
+        });
+        await route.abort();
+      },
+      { times: 1 },
+    );
+  const lostNotice = page.locator('.toast').filter({ hasText: 'Could not reach Jellyport.' });
+  const acceptPath = '/api/memberships/workflow/accept';
+  await dropAccepted(acceptPath);
+  await page.getByRole('button', { name: 'Queue membership update', exact: true }).click();
+  await expect(lostNotice).toBeVisible();
+  await lostNotice.getByRole('button', { name: 'Dismiss notification' }).click();
+
+  await navigate(page, 'Create account');
+  const create = async (name: string) => {
+    await page.getByRole('textbox', { name: 'Username', exact: true }).fill(name);
+    await page
+      .getByRole('main')
+      .getByRole('button', { name: 'Create account', exact: true })
+      .click();
+  };
+  await dropAccepted('/api/accounts');
+  await create('lost-synthetic-account');
+  await expect(lostNotice).toBeVisible();
+  await create('later-synthetic-account');
+  const details = page.getByRole('dialog', { name: 'Operation details' });
+  await expect(details).toContainText('later-synthetic-account');
+  await details.getByRole('button', { name: 'Close dialog' }).click();
+
+  expect(lost).toHaveLength(2);
+  expect(lost.every(({ receipt }) => /^[a-f\d-]{36}$/.test(receipt))).toBe(true);
+  expect(
+    await page.evaluate(() => sessionStorage.getItem('jellyport:pending-operation-receipts')),
+  ).toBe(JSON.stringify(lost.map(({ receipt }) => receipt).reverse()));
+  await page.reload();
+  await page.getByText('Operations tray', { exact: true }).click();
+  const pending = page.getByRole('group', { name: 'Pending submission receipts' });
+  await expect(pending.getByRole('button')).toHaveCount(2);
+  for (const [{ id, receipt }, username] of [
+    [lost[0]!, 'crew_owner'],
+    [lost[1]!, 'lost-synthetic-account'],
+  ] as const) {
+    if (await pending.count())
+      await pending.getByRole('button', { name: `Receipt ending in ${receipt.slice(-8)}` }).click();
+    await expect(page.getByRole('textbox', { name: 'Operation submission receipt' })).toHaveValue(
+      receipt,
+    );
+    const lookup = page.waitForResponse(
+      (response) => new URL(response.url()).pathname === `/api/jobs/receipts/${receipt}`,
+    );
+    await page.getByRole('button', { name: 'Find operation' }).click();
+    expect(await (await lookup).json()).toEqual({ job_id: id });
+    await expect(details).toContainText(username);
+    await details.getByRole('button', { name: 'Close dialog' }).click();
+  }
+  expect(
+    await page.evaluate(() => sessionStorage.getItem('jellyport:pending-operation-receipts')),
+  ).toBeNull();
+  expect(mutations.filter((request) => request === `POST ${acceptPath}`)).toHaveLength(1);
+  expect(
+    admin.app.jellyport.store
+      .jobs()
+      .filter(({ kind }) => kind === 'membership')
+      .map(({ id }) => id),
+  ).toEqual([lost[0]!.id]);
+});
+
 test('subscription review provisions the trusted tier for an opted-in member and ignoring a later cancellation preserves access', async ({
   page,
   admin,

@@ -3,7 +3,7 @@ import { lstat, mkdtemp, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Store } from './store.js';
 import type { ClientFactory, MediaItem } from './media.js';
-import type { Settings } from './types.js';
+import type { MediaServerObservation, Settings } from './types.js';
 import type { MigrationScope } from './migration.js';
 import { ServiceError } from './errors.js';
 import { snapshotProcess } from './snapshot-process.js';
@@ -286,7 +286,7 @@ export class SourceSnapshots {
         : {}),
     };
   }
-  async status(observed?: { id?: string; version?: string }) {
+  async status(observation?: MediaServerObservation) {
     const records: SnapshotMetadata[] = [];
     let usable = false;
     const settings = this.store.settings();
@@ -296,13 +296,18 @@ export class SourceSnapshots {
           const result = await this.result(id);
           const record = this.metadata(result);
           records.push(record);
-          if (id === this.state.generations[0])
+          if (id === this.state.generations[0]) {
+            const observed =
+              observation && observation.observed_at >= Date.parse(result.requested_at)
+                ? observation
+                : undefined;
             usable =
               Date.parse(record.expires_at) > Date.now() &&
               Date.parse(snapshotHistoryTime(result)) <= Date.now() + 60_000 &&
               result.binding.url === sourceUrl(settings) &&
               (!observed?.id || observed.id === result.binding.server_id) &&
               (!observed?.version || observed.version === result.binding.version);
+          }
         } catch {
           /* Retained error is reported separately. */
         }

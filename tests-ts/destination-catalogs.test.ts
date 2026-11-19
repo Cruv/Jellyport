@@ -688,6 +688,23 @@ describe('saved destination catalog manager', () => {
     });
     expect(worker).not.toHaveBeenCalled();
   });
+  it('reflects removed catalog files and newer observed version incompatibility in local status', async () => {
+    const f = await fixture('backup');
+    const record = await f.complete();
+    const newerVersion = { id: serverId, version: '12.3.0', observed_at: Date.now() };
+    f.factory.mockClear();
+    expect(await f.manager.status()).toMatchObject({ usable: true });
+    expect(await f.manager.status(newerVersion)).toMatchObject({ usable: false });
+    expect(
+      await f.manager.status({
+        ...newerVersion,
+        observed_at: Date.parse(record.requested_at) - 1,
+      }),
+    ).toMatchObject({ usable: true });
+    await rm(join(f.shared, `${destinationCatalogPrefix(record.id)}.db.enc`));
+    expect(await f.manager.status()).toMatchObject({ usable: false, record: { id: record.id } });
+    expect(f.factory).not.toHaveBeenCalled();
+  });
   it.each(['missing', 'truncate', 'symlink'] as const)(
     'rejects %s encrypted output before adoption and cleans unused files',
     async (file) => {

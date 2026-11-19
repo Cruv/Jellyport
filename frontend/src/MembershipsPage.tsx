@@ -71,7 +71,7 @@ export default function MembershipsPage({
   openJob?: (id: string) => void;
   embedded?: boolean;
   refreshKey?: number;
-  initialMember?: { id: string; username: string };
+  initialMember?: { id: string; username: string; tier_id?: string };
   handoffKey?: number;
   onInitialMemberApplied?: () => void;
   active?: boolean;
@@ -297,8 +297,16 @@ export default function MembershipsPage({
     if (handoff.current === key) return;
     handoff.current = key;
     selectMember({ ...initialMember, display_name: null, nickname: null, membership_active: null });
+    if (tiers.some(({ id }) => id === initialMember.tier_id)) setTierId(initialMember.tier_id!);
     onInitialMemberApplied?.();
-  }, [initialMember?.id, initialMember?.username, handoffKey, loaded, loading]);
+  }, [
+    initialMember?.id,
+    initialMember?.username,
+    initialMember?.tier_id,
+    handoffKey,
+    loaded,
+    loading,
+  ]);
   function showReview(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (
@@ -338,14 +346,11 @@ export default function MembershipsPage({
     const controller = new AbortController();
     controllers.current.add(controller);
     try {
-      const result = await api<{ membership: Membership; job: Job | null }>(
-        '/api/memberships/workflow/accept',
-        {
-          method: 'POST',
-          body: { review_token: review.plan.review_token },
-          signal: controller.signal,
-        },
-      );
+      const result = await api<{ job: Job | null }>('/api/memberships/workflow/accept', {
+        method: 'POST',
+        body: { review_token: review.plan.review_token },
+        signal: controller.signal,
+      });
       if (!mounted.current || controller.signal.aborted) return;
       setReview(null);
       if (result.job) {

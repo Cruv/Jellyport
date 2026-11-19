@@ -146,6 +146,79 @@ afterEach(async () => {
 });
 
 describe('administrator membership HTTP endpoints', () => {
+  it('recovers the original membership job after the review has been consumed', async () => {
+    const { app, headers, servers } = await fixture();
+    const reviewed = await app.inject({
+      method: 'POST',
+      url: '/api/memberships/workflow/review',
+      headers,
+      payload: {
+        discord_user_id: owner,
+        access_mode: 'subscription',
+        tier_id: 'sloop',
+        provision_jellyfin: true,
+      },
+    });
+    expect(reviewed.statusCode, reviewed.body).toBe(200);
+    const payload = { review_token: reviewed.json().review_token };
+    const receipt = 'a1000000-1234-4abc-8123-000000000000';
+    const request = {
+      method: 'POST' as const,
+      url: '/api/memberships/workflow/accept',
+      headers,
+      payload,
+    };
+    const submit = { ...request, headers: { ...headers, 'x-jellyport-submission': receipt } };
+    const [accepted, parallel] = await Promise.all([app.inject(submit), app.inject(submit)]);
+    expect(accepted.statusCode, accepted.body).toBe(202);
+    expect(parallel.statusCode, parallel.body).toBe(202);
+    const id = accepted.json().job.id;
+    expect(parallel.json().job.id).toBe(id);
+    expect((await app.inject(request)).statusCode).toBe(400);
+
+    const lookup = `/api/jobs/receipts/${receipt}`;
+    expect((await app.inject(lookup)).statusCode).toBe(401);
+    const recovered = await app.inject({ url: lookup, headers });
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json()).toEqual({ job_id: id });
+    const replay = await app.inject(submit);
+    expect(replay.statusCode).toBe(202);
+    expect(replay.json().job.id).toBe(id);
+    const changed = await app.inject({
+      ...submit,
+      payload: { review_token: 'a2000000-1234-4abc-8123-000000000000' },
+    });
+    expect(changed.statusCode).toBe(409);
+    await app.jellyport.service.jobTasks.get(id);
+    expect(app.jellyport.store.jobs().map(({ id }) => id)).toEqual([id]);
+    const target = app.jellyport.store.link(owner, 1);
+    expect(target?.remote_id).toBeTruthy();
+    expect(
+      servers.users.jellyfin.filter((account) => account.Name === target?.username),
+    ).toHaveLength(1);
+  });
+
+  it('looks up a membership job submitted directly with a receipt', async () => {
+    const { app, headers } = await fixture();
+    const receipt = 'a3000000-1234-4abc-8123-000000000000';
+    const request = {
+      method: 'POST' as const,
+      url: '/api/memberships/provision',
+      headers: { ...headers, 'x-jellyport-submission': receipt },
+      payload: { discord_user_id: owner, tier_id: 'sloop' },
+    };
+    const accepted = await app.inject(request);
+    expect(accepted.statusCode, accepted.body).toBe(202);
+    const id = accepted.json().id;
+    expect((await app.inject({ url: `/api/jobs/receipts/${receipt}`, headers })).json()).toEqual({
+      job_id: id,
+    });
+    expect((await app.inject(request)).json().id).toBe(id);
+    await app.jellyport.service.jobTasks.get(id);
+    expect(app.jellyport.store.jobs().map(({ id }) => id)).toEqual([id]);
+    expect(app.jellyport.service.getJob(id).status).toBe('completed');
+  });
+
   it('combines exact household accounts, redacted billing evidence and confirmed access changes', async () => {
     const { app, headers } = await fixture();
     const { service, store } = app.jellyport;

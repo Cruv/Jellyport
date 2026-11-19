@@ -11,7 +11,7 @@ import {
   type MediaItem,
   type MediaAPI,
 } from './media.js';
-import type { Settings } from './types.js';
+import type { MediaServerObservation, Settings } from './types.js';
 import type { PathMapping } from './matching.js';
 import {
   BACKUP_CLEANUP_DEADLINE,
@@ -362,9 +362,13 @@ export class DestinationCatalogs {
       return false;
     }
   }
-  async status(observed?: { id?: string; version?: string }) {
+  async status(observation?: MediaServerObservation) {
     const available = await this.helper();
     const latest = this.state.generations[0];
+    const observed =
+      latest && observation && observation.observed_at >= Date.parse(latest.requested_at)
+        ? observation
+        : undefined;
     const record =
       latest && validDestinationResult(latest) ? destinationCatalogMetadata(latest) : null;
     let usable = false;

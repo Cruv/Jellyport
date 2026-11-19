@@ -8,6 +8,11 @@ export interface PathMapping {
   source: string;
   target: string;
 }
+export interface MediaServerObservation {
+  id: string;
+  version?: string;
+  observed_at: number;
+}
 export interface Settings {
   emby_url: string;
   emby_api_key: string;

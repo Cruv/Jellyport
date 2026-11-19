@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { DemoServers } from '../server/demo.js';
 import { MediaClient, type JsonObject, type MediaAPI, type MediaItem } from '../server/media.js';
 import { MediaError } from '../server/errors.js';
@@ -97,6 +98,7 @@ describe('reviewed independent Jellyfin account clones', () => {
           'user',
           'systemInfo',
           'clonePlayedItems',
+          'migrationCapabilities',
           'createUser',
           'setPassword',
           'setPolicy',
@@ -153,6 +155,44 @@ describe('reviewed independent Jellyfin account clones', () => {
   async function clone(value = input()) {
     return finish(await service.cloneAccounts(await service.reviewCloneAccounts(value)));
   }
+
+  it('leaves unrelated access changes available while clone capability discovery stalls', async () => {
+    const reviewed = await service.reviewCloneAccounts({
+      ...input(),
+      accounts: [input().accounts[0]!],
+    });
+    let entered!: () => void;
+    const capabilityStarted = new Promise<void>((resolve) => (entered = resolve));
+    let release!: () => void;
+    const capabilityRelease = new Promise<void>((resolve) => (release = resolve));
+    before = async (method) => {
+      if (method !== 'migrationCapabilities') return;
+      entered();
+      await capabilityRelease;
+    };
+    const job = await service.cloneAccounts(reviewed);
+    await capabilityStarted;
+    const access = service.setAccountAccess({
+      kind: 'jellyfin',
+      user_id: 'j-river',
+      disabled: true,
+      expected_username: 'river',
+      expected_profile_revision: '',
+    });
+    try {
+      expect(await Promise.race([access, delay(1500, null, { ref: false })])).toMatchObject({
+        disabled: true,
+      });
+      expect(service.getJob(job.id).status).toBe('running');
+      expect(writes().some((call) => call.method === 'createUser')).toBe(false);
+    } finally {
+      release();
+      await access;
+    }
+    const completed = await finish(job);
+    expect(completed.status).toBe('completed');
+    expect(completed.results[0]).toMatchObject({ created: true, applied: 2 });
+  });
 
   it('reviews without history reads or writes and never exposes the source credentials or parameters', async () => {
     const reviewed = await service.reviewCloneAccounts(input());

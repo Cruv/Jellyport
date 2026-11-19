@@ -585,6 +585,7 @@ export interface PreviewTask {
 }
 export interface SubscriptionEvent {
   id: string;
+  stripe_price_review_required?: true;
   username?: string;
   discord_user_id?: string;
   action: string;

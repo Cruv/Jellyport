@@ -1,6 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { ServiceError } from './errors.js';
+import { ServiceError, StripePriceReviewRequired } from './errors.js';
 import { DEFAULT_MEMBERSHIP_TIERS, Memberships } from './memberships.js';
+import { MediaOwnerships } from './media-ownership.js';
+import {
+  canonicalMembershipAccessTargets,
+  hasMembershipAccessAboveLimit,
+  membershipAccessTargets,
+  type MembershipAccessTarget,
+} from './membership-access-targets.js';
 import { discordAuthority } from './discord-authority.js';
 import {
   StripeClient,
@@ -16,6 +23,7 @@ import {
   stripeAuthority,
   stripeAuthorityScope,
   stripeBillingDecisions,
+  type StripeEntitlementCheck,
   type StripeEntitlementFact,
 } from './stripe-entitlements.js';
 import {
@@ -79,6 +87,7 @@ interface StripeState {
     price_id: string;
     owners: Array<{ id: string; prior_slots: number; scope: string }>;
   }>;
+  price_reduction_review_required?: boolean;
 }
 interface BillingVerification {
   owners_checked: number;
@@ -265,6 +274,7 @@ function blankState(guild: string, key = ''): StripeState {
     snapshot: null,
     links: [],
     price_tiers: [],
+    price_reduction_review_required: false,
     hints: [],
     hint_receipts: [],
     checkout_cache: [],
@@ -334,8 +344,10 @@ export class StripeIntegration {
       throw new ServiceError(
         'The saved Stripe connection could not be read. Restore a valid Jellyport backup.',
       );
+    const legacyGuard = this.state.price_reduction_review_required === undefined;
+    if (legacyGuard) this.state.price_reduction_review_required = this.state.price_tiers.length > 0;
     this.scope();
-    if (!record) this.persist();
+    if (!record || legacyGuard) this.persist();
     this.roleCleanup = new StripeRoleCleanup(
       store,
       options.roleCleanup,
@@ -478,6 +490,7 @@ export class StripeIntegration {
     owner: string,
     tier_id: string,
     limit: number,
+    affectedTargets: MembershipAccessTarget[],
     customerIds?: string[],
   ): string {
     const settings = this.store.settings();
@@ -495,14 +508,18 @@ export class StripeIntegration {
           .filter(({ discord_user_id }) => discord_user_id === owner)
           .map(({ customer_id }) => customer_id)
           .sort(),
-      this.store
-        .linksForMember(owner)
-        .filter(({ membership_slot }) => membership_slot > limit)
-        .map(({ membership_slot, username, remote_id }) => [membership_slot, username, remote_id]),
+      affectedTargets,
     ]);
   }
-  private priceApprovals(impact: StripePriceTierImpact): StripeState['price_cutovers'] {
-    const changed = new Set(impact.mappings.map(({ price_id }) => price_id));
+  private priceReviewState(
+    impact: StripePriceTierImpact,
+  ): Pick<StripeState, 'price_cutovers' | 'price_reduction_review_required'> {
+    if (
+      !this.state.price_reduction_review_required &&
+      !this.state.price_tiers.length &&
+      !this.state.links.length
+    )
+      return {};
     const records = new Map(
       impact.mappings.flatMap(({ price_id, account_limit, tier_id }) =>
         account_limit !== null && tier_id
@@ -521,6 +538,7 @@ export class StripeIntegration {
       ),
     );
     const memberships = new Memberships(this.store);
+    const ownerships = new MediaOwnerships(this.store);
     const settings = this.store.settings();
     const customers = new Map<string, string[]>();
     for (const { discord_user_id, customer_id } of this.state.links) {
@@ -531,22 +549,30 @@ export class StripeIntegration {
     for (const { discord_user_id: id, price_ids } of impact.affected) {
       const prior_slots = memberships.get(id, settings)?.account_limit ?? 1;
       const customerIds = customers.get(id)?.sort();
+      const accounts = membershipAccessTargets(
+        this.store.linksForMember(id),
+        ownerships.forOwner(id, settings),
+      );
       for (const price of price_ids) {
         const entry = records.get(price);
         if (!entry) continue;
         entry.owners.push({
           id,
           prior_slots,
-          scope: this.priceReductionScope(id, entry.tier_id, entry.account_limit, customerIds),
+          scope: this.priceReductionScope(
+            id,
+            entry.tier_id,
+            entry.account_limit,
+            accounts.filter(([slot]) => slot > entry.account_limit),
+            customerIds,
+          ),
         });
       }
     }
-    return [
-      ...(this.state.price_cutovers ?? []).filter(({ price_id }) => !changed.has(price_id)),
-      ...[...records.values()]
-        .filter(({ owners }) => owners.length)
-        .map(({ price_id, owners }) => ({ price_id, owners })),
-    ];
+    return {
+      price_cutovers: [...records.values()].map(({ price_id, owners }) => ({ price_id, owners })),
+      price_reduction_review_required: true,
+    };
   }
   async configure(
     input: StripeIntegrationConfiguration,
@@ -669,7 +695,7 @@ export class StripeIntegration {
         );
       approvePriceImpact(impact);
     }
-    const approvals = impact?.mappings.length ? this.priceApprovals(impact) : undefined;
+    const approved = impact?.mappings.length ? this.priceReviewState(impact) : undefined;
     this.entitlements.configure(
       keyChanged
         ? false
@@ -683,7 +709,7 @@ export class StripeIntegration {
       'Stripe configuration changed. A new verified billing sync is required.',
     );
     if (keyChanged) this.state = blankState(this.guild(), key);
-    if (approvals) this.state.price_cutovers = approvals;
+    if (approved) Object.assign(this.state, approved);
     this.state.sync_enabled = input.sync_enabled;
     // Existing mappings never silently cross a replacement key/account boundary.
     this.state.price_tiers = keyChanged ? [] : structuredClone(priceTiers);
@@ -1531,13 +1557,14 @@ export class StripeIntegration {
       throw new ServiceError(
         'The reviewed billing links or price mappings exceed their safe storage limits.',
       );
-    if (
-      next.price_tiers.length !== this.state.price_tiers.length &&
-      this.priceTierImpact(this.state.revision, next.price_tiers).affected.length
-    )
-      throw new ServiceError(
-        'This price affects an existing linked household. Review the affected slots in Settings → Stripe before approving the migration.',
-      );
+    if (next.price_tiers.length !== this.state.price_tiers.length) {
+      const impact = this.priceTierImpact(this.state.revision, next.price_tiers);
+      if (impact.affected.length)
+        throw new ServiceError(
+          'This price affects an existing linked household. Review the affected slots in Settings → Stripe before approving the migration.',
+        );
+      Object.assign(next, this.priceReviewState(impact));
+    }
     if (changed) next.revision = randomUUID();
     let persisted = false;
     return {
@@ -1887,7 +1914,7 @@ export class StripeIntegration {
     }
     await this.roleCleanup.reconcile(this.state.generation);
   }
-  assertEntitlement(fact: StripeEntitlementFact): void {
+  assertEntitlement(fact: StripeEntitlementFact, check?: StripeEntitlementCheck): void {
     this.scope();
     if (
       this.stopped ||
@@ -1910,29 +1937,42 @@ export class StripeIntegration {
       fact,
       stripeAuthority(this.state.links, this.state.price_tiers, this.store),
     );
-    if (fact.action === 'subscribe') {
-      const approved = this.state.price_cutovers
-        ?.find(({ price_id }) => price_id === fact.price_id)
-        ?.owners.find(({ id }) => id === fact.discord_user_id);
-      if (!approved) return;
+    if (fact.action === 'subscribe' && !check?.evidenceOnly) {
+      const cutover = this.state.price_cutovers?.find(({ price_id }) => price_id === fact.price_id);
+      // The cached review cannot prove that a later winning price is unrelated to a remap.
+      // Preserve access unless this mapping review covered the fresh reduction's exact slots.
+      if (!this.state.price_reduction_review_required && !cutover) return;
+      const approved = cutover?.owners.find(({ id }) => id === fact.discord_user_id);
       const settings = this.store.settings();
-      const current = new Memberships(this.store).get(fact.discord_user_id, settings);
+      const owner = fact.discord_user_id;
+      const current = new Memberships(this.store).get(owner, settings);
       if (current?.access_mode === 'complimentary') return;
       const limit = (settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).find(
         ({ id }) => id === fact.tier_id,
       )?.account_limit;
+      if (limit === undefined) throw new StripePriceReviewRequired();
+      const links = this.store.linksForMember(owner);
+      const ownership = new MediaOwnerships(this.store).forOwner(owner, settings);
+      const currentLimit = current?.account_limit ?? 1;
       if (
-        limit === undefined ||
-        (((current?.account_limit ?? 1) > limit ||
-          this.store
-            .linksForMember(fact.discord_user_id)
-            .some((link) => link.membership_slot > limit && !link.disabled_by_jellyport)) &&
-          ((current?.account_limit ?? 1) > approved.prior_slots ||
-            this.priceReductionScope(fact.discord_user_id, fact.tier_id, limit) !== approved.scope))
+        currentLimit <= limit &&
+        !check?.wouldDisable &&
+        !check?.plannedReduction?.hasEnabledTarget &&
+        !hasMembershipAccessAboveLimit(links, ownership, limit)
       )
-        throw new ServiceError(
-          'The household changed after the Stripe price review. Review its exact account slots before applying the tier reduction.',
-        );
+        return;
+      const affectedTargets = membershipAccessTargets(links, ownership).filter(
+        ([slot]) => slot > limit,
+      );
+      if (
+        !approved ||
+        (currentLimit !== limit && currentLimit !== approved.prior_slots) ||
+        this.priceReductionScope(owner, fact.tier_id, limit, affectedTargets) !== approved.scope ||
+        (check?.plannedReduction &&
+          JSON.stringify(canonicalMembershipAccessTargets(check.plannedReduction.targets)) !==
+            JSON.stringify(affectedTargets))
+      )
+        throw new StripePriceReviewRequired();
     }
   }
   private requireCurrentReview(revision: string): void {

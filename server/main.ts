@@ -2352,6 +2352,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   const publicSubscription = (event: Awaited<ReturnType<Service['applySubscription']>>) => {
     const {
       stripe_entitlement: _privateEvidence,
+      stripe_price_review_revision: _privateReviewRevision,
       discord_authority: _authority,
       ...summary
     } = event;

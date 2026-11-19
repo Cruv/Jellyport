@@ -321,6 +321,62 @@ describe('verified Stripe entitlement policy', () => {
     expect(policy.status(generation).automation_review_count).toBe(1);
     expect(policy.claim(fact)).toBe(false);
   });
+  it.each(['untouched before cutover', 'untouched before restart', 'uncertain write'] as const)(
+    'recovers a claimed Stripe reduction across a verified replacement and restart (%s)',
+    (scenario) => {
+      const first = prepare()[0]!;
+      expect(policy.claim(first)).toBe(true);
+      const untouched = scenario !== 'uncertain write';
+      store.saveSubscription({
+        id: first.event_id,
+        action: 'subscribe',
+        discord_user_id: owner,
+        source: 'stripe',
+        status: untouched ? 'pending' : 'processing',
+        ...(untouched ? { stripe_price_review_required: true } : {}),
+        created_at: new Date(clock).toISOString(),
+        stripe_entitlement: first,
+        tier_id: 'sloop',
+        account_limit: 1,
+      });
+      // Simulate interruption between saving the local event and finishing its receipt.
+      const restart = () => {
+        store.close();
+        store = new Store(directory);
+        policy = new StripeEntitlements(store, () => clock);
+      };
+      if (scenario === 'untouched before restart') {
+        restart();
+        expect(policy.claim(first)).toBe(true);
+        policy.finish(first, false);
+      }
+      const replacement = policy.prepare(
+        generation,
+        snapshot(),
+        links,
+        [{ price_id: 'price_member', tier_id: 'galleon' }],
+        new Map([['sub_new', paid()]]),
+      )[0]!;
+      expect(replacement.event_id).not.toBe(first.event_id);
+      policy.supersedeHeldPriceReductions(replacement);
+      expect(store.subscription(first.event_id)?.status).toBe(
+        untouched ? 'superseded' : 'processing',
+      );
+      expect(policy.status(generation).automation_review_count).toBe(untouched ? 0 : 1);
+      if (untouched) {
+        policy.finish(first, false);
+        expect(policy.status(generation).automation_review_count).toBe(0);
+      }
+
+      restart();
+      expect(store.subscription(first.event_id)?.status).toBe(untouched ? 'superseded' : 'failed');
+      const current = prepare()[0]!;
+      expect(current.event_id).toBe(first.event_id);
+      expect(current.invoice_id).toBe(first.invoice_id);
+      expect(policy.claim(current)).toBe(untouched);
+      expect(policy.claim(current)).toBe(false);
+    },
+  );
   it('accepts unchanged evidence after refresh while rejecting a changed owner or tier', () => {
     const fact = prepare()[0]!;
     clock += 1000;

@@ -92,11 +92,15 @@ import {
 } from './account-cloning.js';
 import { AccountRenames } from './account-rename.js';
 import { MediaOwnerships, type MediaOwnership } from './media-ownership.js';
-import { hasMembershipAccessAboveLimit } from './membership-access-targets.js';
+import {
+  hasMembershipAccessAboveLimit,
+  membershipAccessTargets,
+} from './membership-access-targets.js';
 import { NewSubscriberPolicy } from './new-subscriber-policy.js';
 import {
   isDeferredStripeExpiry,
   isHeldStripePriceReduction,
+  isSupersededStripePriceReduction,
   stripeDecisionKey,
   type StripeEntitlementCheck,
   type StripeEntitlementFact,
@@ -339,6 +343,7 @@ export interface SubscriptionEvent {
   stripe_expiry_deferred?: true;
   stripe_price_review_required?: true;
   stripe_price_review_accepted?: true;
+  stripe_price_review_revision?: string;
   discord_authority?: string;
   id: string;
   action: 'subscribe' | 'cancel' | 'expire';
@@ -510,6 +515,7 @@ class Mutex {
 class StoppedError extends Error {}
 class CanceledError extends StoppedError {}
 class SourcePreparationError extends ServiceError {}
+class MigrationSourceVerificationError extends ServiceError {}
 class DestinationPreparationError extends ServiceError {}
 class NewSubscriberOptInRequired extends ServiceError {}
 class SubscriptionSourceChanged extends ServiceError {}
@@ -874,7 +880,7 @@ export class Service {
       account.Id !== binding.user_id ||
       account.Name !== binding.username
     )
-      throw new ServiceError(
+      throw new MigrationSourceVerificationError(
         'The reviewed Emby server or source account changed. Prepare a new migration review.',
       );
   }
@@ -2878,7 +2884,10 @@ export class Service {
         this.assertAutomaticSubscriptionSource(automaticSource);
         this.assertDiscordAuthority(discordId, settings);
       }
-      if (stripeEntitlement) this.assertStripeEntitlement(stripeEntitlement, { plannedReduction });
+      if (stripeEntitlement) {
+        this.assertStripeEntitlement(stripeEntitlement, { plannedReduction });
+        if (plannedReduction?.hasEnabledTarget) this.assertAutomaticStripeDisable(automaticSource);
+      }
       if (!newSubscriber) return;
       this.newSubscriberPolicy.assertActive(settings, newSubscriber.revision);
       if (
@@ -3424,7 +3433,7 @@ export class Service {
   }
   private requireStripePriceReview(
     input: MembershipWorkflowInput,
-    expected?: StripeEntitlementFact,
+    expected?: SubscriptionEvent,
   ): SubscriptionEvent | undefined {
     if (!input.stripe_price_review_event_id) return;
     const event = this.store.subscription(input.stripe_price_review_event_id);
@@ -3442,7 +3451,11 @@ export class Service {
       event.tier_id !== tier.id ||
       event.stripe_entitlement.tier_id !== tier.id ||
       event.account_limit !== tier.account_limit ||
-      (expected && stripeDecisionKey(expected) !== stripeDecisionKey(event.stripe_entitlement))
+      (expected &&
+        (expected.stripe_price_review_revision !== event.stripe_price_review_revision ||
+          !expected.stripe_entitlement ||
+          stripeDecisionKey(expected.stripe_entitlement) !==
+            stripeDecisionKey(event.stripe_entitlement)))
     )
       throw new ServiceError(
         'This Stripe household review changed or was superseded. Open the current membership event to review again.',
@@ -3465,10 +3478,11 @@ export class Service {
     return this.membershipMutex.run(
       () =>
         this.mutationMutex.run(async () => {
-          const stripe = this.requireStripePriceReview(input)?.stripe_entitlement;
+          const stripeEvent = this.requireStripePriceReview(input);
+          const stripe = stripeEvent?.stripe_entitlement;
           const guard = () => {
             authorize();
-            this.requireStripePriceReview(input, stripe);
+            this.requireStripePriceReview(input, stripeEvent);
           };
           const plan = await this.prepareMembershipProvision(
             input.discord_user_id,
@@ -3494,6 +3508,7 @@ export class Service {
                   summary,
                   plan.requests,
                   stripe && stripeDecisionKey(stripe),
+                  stripeEvent?.stripe_price_review_revision,
                 ]),
               )
               .digest('hex'),
@@ -3519,7 +3534,7 @@ export class Service {
           const stripe = stripeEvent?.stripe_entitlement;
           const guard = () => {
             authorize();
-            this.requireStripePriceReview(input, stripe);
+            this.requireStripePriceReview(input, stripeEvent);
           };
           const plan = await this.prepareMembershipProvision(
             input.discord_user_id,
@@ -3541,6 +3556,7 @@ export class Service {
                 summary,
                 plan.requests,
                 stripe && stripeDecisionKey(stripe),
+                stripeEvent?.stripe_price_review_revision,
               ]),
             )
             .digest('hex');
@@ -3711,7 +3727,7 @@ export class Service {
   }
   private assertLinkedTarget(
     target: MediaUser | undefined,
-    link: Link,
+    link: Pick<Link, 'remote_id' | 'username'>,
     settings: Settings,
   ): asserts target is MediaUser {
     if (
@@ -5623,6 +5639,10 @@ export class Service {
       throw new ServiceError(
         'This account is an incomplete clone. Default account recovery cannot replace its restrictions. Inspect it in Jellyfin before continuing.',
       );
+    if (local?.status === 'uncertain' && !recoverTargetId)
+      throw new ServiceError(
+        'An earlier creation request requires inspection. Use Accounts → Recover account before retrying this username.',
+      );
     if (target?.Id === template.Id || (target && target.Id === settings.template_user_id))
       throw new ServiceError('The template account cannot be a destination account.');
     if (target?.Policy?.IsAdministrator)
@@ -5690,7 +5710,7 @@ export class Service {
           'This Jellyfin username already exists. Its password and permissions were preserved. Use migration to merge watch history.',
         );
     } else {
-      if (['uncertain', 'clone_uncertain', 'clone_incomplete'].includes(local?.status ?? ''))
+      if (['clone_uncertain', 'clone_incomplete'].includes(local?.status ?? ''))
         throw new ServiceError(
           'An earlier creation request had an uncertain outcome. Inspect Jellyfin before retrying this username.',
         );
@@ -5700,6 +5720,10 @@ export class Service {
       const confirmedTarget = migrationPin ? this.target(await jellyfin.users(), username) : null;
       if (confirmMigrationSource) await confirmMigrationSource();
       if (migrationPin) await validatePin(confirmedTarget, false);
+      if (confirmMigrationSource) {
+        await confirmMigrationSource();
+        await validatePin(confirmedTarget, false);
+      }
       guard();
       // Persist before the POST: a process exit between sending the request and receiving
       // its response must require inspection, rather than replaying account creation.
@@ -6298,9 +6322,18 @@ export class Service {
       this.save(job);
     };
     job.progress.current_user = mapping?.target_username ?? request.username;
-    const guard = () => {
+    const checkSource = () => {
       this.checkJobStopped(job);
-      this.assertConnections(settings);
+      try {
+        this.assertConnections(settings, sourcePin);
+      } catch (error) {
+        delete catalogContext.key;
+        delete catalogContext.value;
+        throw error;
+      }
+    };
+    const guard = () => {
+      checkSource();
       if (
         bindsMigrationIdentity &&
         this.mediaOwnerships.scope(this.store.settings()) !== migrationIdentityScope
@@ -6331,10 +6364,6 @@ export class Service {
           );
       }
     };
-    const checkSource = () => {
-      this.checkJobStopped(job);
-      this.assertConnections(settings);
-    };
     const discardSourceCatalog = () => {
       this.sourceCatalogs.clear();
       delete catalogContext.key;
@@ -6349,11 +6378,11 @@ export class Service {
           : await emby.systemInfo();
         check();
         if (info.Id !== sourcePin!.server_id)
-          throw new ServiceError(
+          throw new MigrationSourceVerificationError(
             'The reviewed Emby server changed. Prepare a new migration review.',
           );
         if (sourceVersion !== undefined && info.Version !== sourceVersion)
-          throw new ServiceError(
+          throw new MigrationSourceVerificationError(
             'The Emby source version changed. Prepare a new migration review.',
           );
         const user = emby.user(sourcePin!.user_id);
@@ -6378,8 +6407,13 @@ export class Service {
           signal,
         );
       } catch (error) {
+        if (error instanceof MigrationSourceVerificationError) throw error;
         this.checkJobStopped(job);
-        if (deadline?.aborted) throw new MediaError('Emby source identity verification timed out.');
+        if (deadline?.aborted)
+          throw new MigrationSourceVerificationError(
+            'Emby source identity verification timed out.',
+          );
+        if (error instanceof MediaError) throw new MigrationSourceVerificationError(error.message);
         throw error;
       }
     };
@@ -6803,8 +6837,20 @@ export class Service {
     guard();
     job.results.push(result);
     this.save(job);
+    let migrationPassword: string | null = null;
     const pinCreatedTarget = async (target: MediaUser) => {
       destinationId = target.Id;
+      let sourceFailure: MigrationSourceVerificationError | undefined;
+      if (source) {
+        try {
+          await confirmSourceAtBoundary();
+        } catch (error) {
+          if (!(error instanceof MigrationSourceVerificationError)) throw error;
+          sourceFailure = error;
+        }
+      }
+      // Finish the fresh destination check before configuration, even when the
+      // source could not be verified. Its exact target is needed for recovery.
       if (migrationPin)
         await validateLiveDestination(target.Id, Boolean(request.recover_target_id));
       if (!historyOnly && targetOwnershipServerId && !targetOwnershipPin) {
@@ -6825,10 +6871,12 @@ export class Service {
         targetOwnershipPin = { id: target.Id, identity_hash: this.ownershipHash(owner) };
       }
       guard();
+      if (source) Object.assign(result, { created: true, target_user_id: target.Id });
+      if (sourceFailure) throw sourceFailure;
     };
     try {
       // Keep source confirmation after destination preparation outside the lock.
-      // Provisioning repeats it after final roster preparation and rechecks Jellyfin before writing.
+      // Provisioning brackets the final Jellyfin identity read with source checks.
       if (source) await confirmSource();
       const { target, password, publicUrl, message } = await withMutation(async () => {
         guard();
@@ -6874,7 +6922,13 @@ export class Service {
         const message = password
           ? accountCredentialMessage(settings, username, password)
           : undefined;
+        let verifiedTarget: MediaUser | undefined;
         if (password) {
+          if (source) {
+            migrationPassword = password;
+            await confirmSourceAtBoundary();
+            verifiedTarget = await validateLiveDestination(target.Id);
+          }
           this.store.saveCredentials(job.id, username, password, publicUrl, message);
           this.store.saveAccount(username, target.Id, 'ready');
         }
@@ -6882,7 +6936,8 @@ export class Service {
         if (!historyOnly && mapping && !mapping.target_user_id)
           mapping = this.mappings.bindTarget(mapping.id, mapping.revision, target.Id, settings);
         // Recheck the stable identity and protection flags after provisioning, before personal data.
-        const liveTarget = historyOnly ? currentTarget! : await jellyfin.user(target.Id);
+        const liveTarget =
+          verifiedTarget ?? (historyOnly ? currentTarget! : await jellyfin.user(target.Id));
         if (
           liveTarget.Id !== target.Id ||
           liveTarget.Name !== username ||
@@ -7360,7 +7415,8 @@ export class Service {
           archiveSent = true;
           result.discord_delivery = 'sent';
           this.store.deleteCredentials(job.id, username);
-        } catch {
+        } catch (error) {
+          if (error instanceof MigrationSourceVerificationError) throw error;
           if (archivedMessage && !archiveSent) {
             try {
               this.store.saveBotMessage(job.id, { ...archivedMessage, status: 'uncertain' });
@@ -7408,6 +7464,24 @@ export class Service {
           ? 'partial'
           : 'completed';
     } catch (error) {
+      const sourceFailure = error instanceof MigrationSourceVerificationError ? error : null;
+      const recoveryTarget = sourceFailure && result.created ? result.target_user_id : undefined;
+      if (recoveryTarget) {
+        const local = this.store.account(username);
+        this.store.transaction(() => {
+          this.store.deleteCredentials(job.id, username);
+          if (
+            local?.remote_id === recoveryTarget &&
+            ['provisioning', 'ready'].includes(local.status)
+          )
+            this.store.saveAccount(
+              username,
+              recoveryTarget,
+              'uncertain',
+              migrationPassword ?? this.store.accountPassword(local),
+            );
+        });
+      }
       this.checkJobStopped(job);
       if (error instanceof StoppedError) throw error;
       result.status = 'failed';
@@ -7418,9 +7492,11 @@ export class Service {
           unresolved_source_history: savedMetadata?.diagnostics?.orphan_state_items ?? 0,
         };
       result.error =
-        error instanceof MediaError || error instanceof ServiceError
-          ? error.message
-          : 'This account could not be completed. Review server connectivity and run again; existing passwords are preserved.';
+        recoveryTarget && sourceFailure
+          ? `${sourceFailure.message} Inspect the created Jellyfin account in Accounts → Recover account before retrying.`
+          : error instanceof MediaError || error instanceof ServiceError
+            ? error.message
+            : 'This account could not be completed. Review server connectivity and run again; existing passwords are preserved.';
       if (error instanceof DestinationPreparationError) {
         this.save(job);
         throw error;
@@ -7442,15 +7518,21 @@ export class Service {
     if (job.cancel_requested || this.jobControllers.get(job.id)?.signal.aborted)
       throw new CanceledError('Job canceled.');
   }
-  private assertConnections(settings: Settings): void {
+  private assertConnections(settings: Settings, sourcePin?: MigrationSourceBinding): void {
     const live = this.store.settings();
+    const sourceChanged =
+      live.emby_url !== settings.emby_url || live.emby_api_key !== settings.emby_api_key;
     if (
-      ['emby_url', 'emby_api_key', 'jellyfin_url', 'jellyfin_api_key'].some(
-        (key) => live[key as keyof Settings] !== settings[key as keyof Settings],
-      )
+      sourceChanged ||
+      live.jellyfin_url !== settings.jellyfin_url ||
+      live.jellyfin_api_key !== settings.jellyfin_api_key
     ) {
       this.sourceCatalogs.clear();
       this.destinationCatalogs.clear();
+      if (sourcePin && sourceChanged)
+        throw new MigrationSourceVerificationError(
+          'The reviewed Emby connection changed. Prepare a new migration review.',
+        );
       throw new ServiceError('A media server connection changed. Review and start a new job.');
     }
   }
@@ -7553,11 +7635,13 @@ export class Service {
                       this.assertMembershipRequest(request, settings);
                     },
                     request.stripe_entitlement
-                      ? () =>
+                      ? () => {
                           this.assertStripeEntitlement(request.stripe_entitlement!, {
                             evidenceOnly: request.stripe_price_review ? true : undefined,
                             wouldDisable: true,
-                          })
+                          });
+                          this.assertAutomaticStripeDisable(request.automatic_subscription_source);
+                        }
                       : undefined,
                   );
                   job.results.push({
@@ -7723,6 +7807,12 @@ export class Service {
       );
     this.verifyStripeEntitlement(fact, check);
   }
+  private assertAutomaticStripeDisable(automaticSource: string | null | undefined): void {
+    if (automaticSource !== undefined && !this.store.settings().auto_disable)
+      throw new AutomaticDisablePaused(
+        'Automatic account disable is off. Review this household before changing account access.',
+      );
+  }
   private holdStripePriceReview(event: SubscriptionEvent, error: StripePriceReviewRequired) {
     const settings = this.store.settings();
     const tier = (settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).find(
@@ -7744,6 +7834,7 @@ export class Service {
     event: SubscriptionEvent,
     job?: Job,
     requests: JobRequest[] = [],
+    verifiedExcessAccess = false,
   ): boolean {
     const settings = this.store.settings();
     const membership = event.discord_user_id
@@ -7786,13 +7877,15 @@ export class Service {
       membership.access_mode === 'subscription' &&
       membership.tier_id === event.tier_id &&
       membership.account_limit === event.account_limit &&
-      !this.isMembershipDowngrade(
-        membership.discord_user_id,
-        membership.account_limit,
-        settings,
-        (id) =>
-          verifiedDisabled.has(id) || this.profiles.get('jellyfin', id, settings)?.family === true,
-      )
+      (verifiedExcessAccess ||
+        !this.isMembershipDowngrade(
+          membership.discord_user_id,
+          membership.account_limit,
+          settings,
+          (id) =>
+            verifiedDisabled.has(id) ||
+            this.profiles.get('jellyfin', id, settings)?.family === true,
+        ))
     ) {
       event.status = 'applied';
       event.error = null;
@@ -7810,6 +7903,71 @@ export class Service {
     delete event.stripe_price_review_required;
     this.store.saveSubscription(event);
     return event.status === 'applied';
+  }
+  private async verifyHeldStripeExcessAccess(
+    owner: string,
+    tierId: string,
+    limit: number | undefined,
+    settings: Settings,
+  ): Promise<boolean> {
+    const membership = this.memberships.get(owner, settings);
+    if (
+      !membership?.active ||
+      membership.access_mode !== 'subscription' ||
+      membership.tier_id !== tierId ||
+      limit === undefined ||
+      membership.account_limit !== limit
+    )
+      return false;
+    const links = this.store.linksForMember(owner);
+    const owners = this.mediaOwnerships.forOwner(owner, settings);
+    const targets = membershipAccessTargets(links, owners).filter(
+      ([slot, , id]) =>
+        slot > limit && this.profiles.get('jellyfin', id, settings)?.family !== true,
+    );
+    if (!targets.length) return true;
+    const targetIds = new Set(targets.map(([, , id]) => id));
+    const auth = this.store.authState();
+    if (
+      auth?.kind !== 'configured' ||
+      targets.length > 3 ||
+      new Set(targets.map(([slot]) => slot)).size !== targets.length ||
+      targetIds.size !== targets.length ||
+      owners.some(
+        (account) =>
+          account.kind === 'jellyfin' &&
+          targetIds.has(account.account_id) &&
+          account.server_id !== auth.serverId,
+      ) ||
+      links.some((link) => link.pending_disabled !== null && targetIds.has(link.remote_id))
+    )
+      return false;
+    const signal = AbortSignal.timeout(5_000);
+    try {
+      return await abortable(
+        this.withClient(
+          settings,
+          'jellyfin',
+          async (client) => {
+            if ((await client.systemInfo({ signal, retry: false })).Id !== auth.serverId)
+              return false;
+            for (const [, username, id] of targets) {
+              signal.throwIfAborted();
+              const target = await client.user(id);
+              this.assertLinkedTarget(target, { remote_id: id, username }, settings);
+              if (target.Policy?.IsDisabled !== true) return false;
+            }
+            return (await client.systemInfo({ signal, retry: false })).Id === auth.serverId;
+          },
+          signal,
+        ),
+        signal,
+      );
+    } catch (error) {
+      if (signal.aborted || error instanceof MediaError || error instanceof ServiceError)
+        return false;
+      throw error;
+    }
   }
   private assertAutomaticSubscriptionSource(source: string | null | undefined): void {
     if (this.store.settings().new_subscriber_source === 'stripe' && source !== 'stripe')
@@ -7853,19 +8011,39 @@ export class Service {
         );
     }
     const existing = this.store.subscription(String(incoming.id));
-    if (existing) {
+    const resumedReduction =
+      incoming.source === 'stripe' &&
+      incoming.stripe_entitlement &&
+      isSupersededStripePriceReduction(existing, incoming.stripe_entitlement);
+    if (existing && !resumedReduction) {
       if (incoming.source === 'stripe' && isHeldStripePriceReduction(existing)) {
         const fact = incoming.stripe_entitlement!;
         if (
           existing.discord_user_id === fact.discord_user_id &&
           existing.tier_id === fact.tier_id
         ) {
-          existing.stripe_entitlement = structuredClone(fact);
-          existing.discord_authority = discordAuthority(settings);
-          existing.account_limit = (settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).find(
+          const before = JSON.stringify(existing);
+          const context = this.membershipWorkflowContext(fact.discord_user_id);
+          const limit = (settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS).find(
             ({ id }) => id === fact.tier_id,
           )?.account_limit;
-          if (!this.recordReviewedStripePriceOutcome(existing))
+          const verified = await this.verifyHeldStripeExcessAccess(
+            fact.discord_user_id,
+            fact.tier_id,
+            limit,
+            settings,
+          );
+          const current = this.store.subscription(existing.id);
+          if (
+            before !== JSON.stringify(current) ||
+            context !== this.membershipWorkflowContext(fact.discord_user_id)
+          )
+            return current ?? existing;
+          this.assertStripeEntitlement(fact, { evidenceOnly: true });
+          existing.stripe_entitlement = structuredClone(fact);
+          existing.discord_authority = discordAuthority(settings);
+          existing.account_limit = limit;
+          if (!verified || !this.recordReviewedStripePriceOutcome(existing, undefined, [], true))
             this.store.saveSubscription(existing);
         }
         return existing;
@@ -7896,7 +8074,8 @@ export class Service {
         : {}),
       discord_authority: incoming.discord_authority ?? discordAuthority(settings),
       status: 'pending',
-      created_at: now(),
+      created_at: resumedReduction ? existing!.created_at : now(),
+      ...(resumedReduction ? { stripe_price_review_revision: randomUUID() } : {}),
     };
     if (event.source === 'stripe' && event.action === 'expire' && !settings.auto_disable) {
       event.stripe_expiry_deferred = true;
@@ -7934,9 +8113,8 @@ export class Service {
             'Waiting for a recognized MEE6 plan announcement or administrator review; no account was created.';
         }
         if (
-          event.discord_user_id &&
-          this.isMembershipDowngrade(event.discord_user_id, tier.account_limit, settings) &&
-          !settings.auto_disable
+          !settings.auto_disable &&
+          this.isSubscriptionDowngrade(event, tier.account_limit, settings)
         )
           automatic = false;
       } catch (error) {
@@ -8007,6 +8185,8 @@ export class Service {
       if (['applied', 'ignored', 'canceled', 'processing'].includes(event.status)) return event;
       if (event.status === 'superseded' || event.stripe_price_review_accepted) return event;
       if (event.stripe_price_review_required) return event;
+      const canHoldStripePriceReview =
+        event.status === 'pending' && !event.job_id && !event.report_cleared;
       const operationSettings = this.store.settings();
       let expiryMutationStarted = false;
       const assertSource = () => {
@@ -8066,7 +8246,7 @@ export class Service {
         try {
           this.assertStripeEntitlement(event.stripe_entitlement);
         } catch (error) {
-          if (error instanceof StripePriceReviewRequired && !event.job_id)
+          if (error instanceof StripePriceReviewRequired && canHoldStripePriceReview)
             return this.holdStripePriceReview(event, error);
           throw error;
         }
@@ -8170,8 +8350,8 @@ export class Service {
           if (
             automatic &&
             (!settings.auto_provision ||
-              (this.isMembershipDowngrade(memberId, tier?.account_limit, settings) &&
-                !settings.auto_disable))
+              (!settings.auto_disable &&
+                this.isSubscriptionDowngrade(event, tier.account_limit, settings)))
           )
             throw new ServiceError(
               'This tier change requires administrator review under the current automation settings.',
@@ -8462,8 +8642,20 @@ export class Service {
         if (event.status !== 'ignored') event.status = 'applied';
       } catch (error) {
         if (error instanceof SubscriptionSourceChanged) return holdForSourceReview();
-        if (error instanceof StripePriceReviewRequired && !event.job_id)
+        if (error instanceof StripePriceReviewRequired && canHoldStripePriceReview && !event.job_id)
           return this.holdStripePriceReview(event, error);
+        if (
+          error instanceof AutomaticDisablePaused &&
+          event.source === 'stripe' &&
+          event.action === 'subscribe' &&
+          !event.job_id
+        ) {
+          event.status = 'pending';
+          event.error = null;
+          event.result = error.message;
+          this.store.saveSubscription(event);
+          return event;
+        }
         if (
           error instanceof AutomaticDisablePaused &&
           !expiryMutationStarted &&
@@ -8525,6 +8717,17 @@ export class Service {
         'This subscription plan is not configured. Map its exact plan name in Settings and review the event.',
       );
     return tier;
+  }
+  private isSubscriptionDowngrade(
+    event: SubscriptionEvent,
+    limit: number,
+    settings: Settings,
+  ): boolean {
+    if (!event.discord_user_id) return false;
+    // Stripe checks live excess-slot access while preparing the account plan.
+    if (event.stripe_entitlement)
+      return (this.memberships.get(event.discord_user_id, settings)?.account_limit ?? 1) > limit;
+    return this.isMembershipDowngrade(event.discord_user_id, limit, settings);
   }
   private isMembershipDowngrade(
     memberId: string,

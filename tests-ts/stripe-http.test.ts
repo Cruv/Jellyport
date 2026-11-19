@@ -23,6 +23,8 @@ async function fixture(demo = false, live = false, paid = false) {
     accessToken: 'synthetic-admin-token',
   };
   const servers = new DemoServers();
+  // The same Stripe subscription and invoice keep their dates across snapshot reads.
+  const billingEpoch = Math.floor(Date.now() / 1000);
   const billing: { priceId: string; invoiceId: string; previousPriceId?: string } = {
     priceId: 'price_Crew',
     invoiceId: 'in_Crew',
@@ -39,8 +41,8 @@ async function fixture(demo = false, live = false, paid = false) {
         status: live && !paid ? 'canceled' : 'active',
         ...(live
           ? {
-              created: Math.floor(Date.now() / 1000) - 100_000,
-              ...(paid ? {} : { ended_at: Math.floor(Date.now() / 1000) - 100 }),
+              created: billingEpoch - 100_000,
+              ...(paid ? {} : { ended_at: billingEpoch - 100 }),
             }
           : {}),
         collection_method: 'charge_automatically',
@@ -60,8 +62,8 @@ async function fixture(demo = false, live = false, paid = false) {
               id: 'sub_Previous',
               customer_id: 'cus_Crew',
               status: 'canceled',
-              created: Math.floor(Date.now() / 1000) - 200_000,
-              ended_at: Math.floor(Date.now() / 1000) - 3_600,
+              created: billingEpoch - 200_000,
+              ended_at: billingEpoch - 3_600,
               collection_method: 'charge_automatically' as const,
               cancel_at_period_end: false,
               pause_collection: false,
@@ -98,10 +100,10 @@ async function fixture(demo = false, live = false, paid = false) {
         customer_id: 'cus_Crew',
         subscription_id: id,
         price_id: id === 'sub_Previous' ? billing.previousPriceId! : billing.priceId,
-        created: Math.floor(Date.now() / 1000) - 100_000,
-        paid_at: Math.floor(Date.now() / 1000) - 1,
-        start: Math.floor(Date.now() / 1000) - 90_000,
-        end: Math.floor(Date.now() / 1000) + (paid && id !== 'sub_Previous' ? 3600 : -3600),
+        created: billingEpoch - 100_000,
+        paid_at: billingEpoch - 1,
+        start: billingEpoch - 90_000,
+        end: billingEpoch + (paid && id !== 'sub_Previous' ? 3600 : -3600),
       }),
     }),
   });

@@ -2,10 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { ServiceError, StripePriceReviewRequired } from './errors.js';
 import { DEFAULT_MEMBERSHIP_TIERS, Memberships } from './memberships.js';
 import { MediaOwnerships } from './media-ownership.js';
-import { AccountProfiles } from './account-profiles.js';
 import {
   canonicalMembershipAccessTargets,
-  hasMembershipAccessAboveLimit,
   membershipAccessTargets,
   type MembershipAccessTarget,
 } from './membership-access-targets.js';
@@ -1957,22 +1955,17 @@ export class StripeIntegration {
         ({ id }) => id === fact.tier_id,
       )?.account_limit;
       if (limit === undefined) throw new StripePriceReviewRequired();
-      const links = this.store.linksForMember(owner);
-      const ownership = new MediaOwnerships(this.store).forOwner(owner, settings);
-      const profiles = new AccountProfiles(this.store);
       const currentLimit = current?.account_limit ?? 1;
+      // Link flags record disable attribution. An unchanged allowance requires
+      // live access evidence from the account plan or an imminent disable.
       if (
         currentLimit <= limit &&
         !check?.wouldDisable &&
-        !check?.plannedReduction?.hasEnabledTarget &&
-        !hasMembershipAccessAboveLimit(
-          links,
-          ownership,
-          limit,
-          (id) => profiles.get('jellyfin', id, settings)?.family === true,
-        )
+        !check?.plannedReduction?.hasEnabledTarget
       )
         return;
+      const links = this.store.linksForMember(owner);
+      const ownership = new MediaOwnerships(this.store).forOwner(owner, settings);
       const affectedTargets = membershipAccessTargets(links, ownership).filter(
         ([slot]) => slot > limit,
       );

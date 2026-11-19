@@ -143,6 +143,20 @@ Older reports without exact source evidence require manual account selection.
 A mapped account can recover its inspected Jellyfin setup separately from
 transferring Emby history. Use a fresh migration review for that transfer.
 
+Before creating a migration account, Jellyport alternates live Emby and Jellyfin
+identity checks and leaves Jellyfin's final server check immediately before the
+create request. Each server answers independently. Emby can change
+during the last Jellyfin check or while creation is in flight, and Jellyfin can
+change after its final response. A replacement that appears and disappears
+between observations can go undetected.
+
+Jellyport journals the create attempt before sending it. After a create response,
+it checks the Emby source and the exact Jellyfin account before applying defaults.
+It checks them again before releasing credentials. If a source check fails after
+creation, the inspected account remains in recovery and its migration credentials
+are unavailable. Earlier changes accepted by Jellyfin remain in place. Inspect the
+account in **Accounts → Recover account** and prepare a fresh review for Emby history.
+
 From 0.24.0, reports separate matching coverage from execution outcome. Coverage is
 `matched / (matched + unmatched + ambiguous)` over identifiable source items;
 multiple source editions may map to one Jellyfin item. Unidentified backup-history

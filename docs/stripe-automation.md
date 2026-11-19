@@ -28,11 +28,20 @@ Open **Memberships → Events → Review household** to see the member and tier 
 the verified Stripe event and review its account plan. A newer verified billing
 decision supersedes the hold and invalidates an earlier approval. **Start
 independent policy edit** opens the ordinary membership workflow for a deliberate
-policy change. An applied reduction preserves approved Family accounts and links
+policy change. If fresh verification returns to the same paid decision before
+any work was attempted, Jellyport evaluates the current approval and settings
+again. Completed and uncertain operations keep their original receipts.
+An applied reduction preserves approved Family accounts and links
 to the operation in Events. If an independent edit already brought a household
 into line, the next verification of the same Stripe event can clear the hold.
 If a migration price would affect an already linked household, review the price
 in Settings before approving the migration.
+
+For a renewal at the same allowance, Jellyport checks current Jellyfin access
+for the linked household. Extra slots that remain disabled can settle without a
+new price review. A re-enabled slot needs current approval before Jellyport can
+disable it again. Manual disable attribution and approved Family access are
+preserved.
 
 Stripe documents [restricted-key permissions](https://docs.stripe.com/keys/restricted-api-keys). The current API boundary uses `2025-06-30.basil`; all requests are bounded GETs with serial rate limiting, cancellation, timeouts and backoff.
 

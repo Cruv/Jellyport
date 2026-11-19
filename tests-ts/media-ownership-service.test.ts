@@ -297,10 +297,11 @@ describe('approved media ownership in existing migration workflows', () => {
   it.each([
     { server: 'Emby', phase: 'destination preparation', replaceAt: 1 },
     { server: 'Emby', phase: 'final provisioning check', replaceAt: 3 },
+    { server: 'Emby', phase: 'final Jellyfin identity check', replaceAt: 3 },
     { server: 'Jellyfin', phase: 'final Emby confirmation', replaceAt: 3 },
   ])(
     'rejects a $server replacement during $phase before any destination side effect',
-    async ({ server, replaceAt }) => {
+    async ({ server, phase, replaceAt }) => {
       const source = servers.users.emby.find((user) => user.Id === 'e-alex')!;
       source.Name = 'discord.user';
       const targets = structuredClone(servers.users.jellyfin);
@@ -328,16 +329,23 @@ describe('approved media ownership in existing migration workflows', () => {
               : original;
           };
         } else {
+          const duringJellyfinIdentity = phase === 'final Jellyfin identity check';
           const users = client.users.bind(client);
           client.users = async () => {
             const roster = await users();
-            if (historyCollected && ++destinationRosterReads === replaceAt && server === 'Emby')
+            if (
+              historyCollected &&
+              ++destinationRosterReads === replaceAt &&
+              server === 'Emby' &&
+              !duringJellyfinIdentity
+            )
               replacement = true;
             return roster;
           };
           const info = client.systemInfo.bind(client);
           client.systemInfo = async () => {
             const original = await info();
+            if (duringJellyfinIdentity && destinationRosterReads === replaceAt) replacement = true;
             return server === 'Jellyfin' && replacement
               ? { ...original, Id: 'replacement-jellyfin' }
               : original;
@@ -365,6 +373,154 @@ describe('approved media ownership in existing migration workflows', () => {
       );
     },
   );
+
+  it.each([
+    'last Jellyfin identity check',
+    'create response',
+    'configuration',
+    'history capability check',
+    'Emby URL change',
+    'Emby key rotation',
+  ] as const)('requires exact account recovery when Emby changes during the %s', async (stage) => {
+    const source = servers.users.emby.find((user) => user.Id === 'e-alex')!;
+    source.Name = 'discord.user';
+    const played = structuredClone(servers.played);
+    const history = structuredClone(servers.userData);
+    const factory = service.clientFactory;
+    const saveAccount = vi.spyOn(store, 'saveAccount');
+    const saveCredentials = vi.spyOn(store, 'saveCredentials');
+    const connectionChange =
+      stage === 'Emby URL change'
+        ? { emby_url: 'http://replacement-emby.example.test' }
+        : stage === 'Emby key rotation'
+          ? { emby_api_key: 'replacement-synthetic-emby-key' }
+          : null;
+    let replacement = false;
+    let replacementBeforeCreate = false;
+    let historyCollected = false;
+    let rosterReads = 0;
+    let finalIdentityReads = 0;
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      if (args[2] === 'emby') {
+        const state = client.migrationState!.bind(client);
+        client.migrationState = async (...params) => {
+          const items = await state(...params);
+          historyCollected = true;
+          return items;
+        };
+        const info = client.systemInfo.bind(client);
+        client.systemInfo = async () => {
+          const original = await info();
+          return replacement ? { ...original, Id: 'replacement-emby' } : original;
+        };
+      } else if (stage === 'last Jellyfin identity check' || stage === 'create response') {
+        if (stage === 'last Jellyfin identity check') {
+          const users = client.users.bind(client);
+          client.users = async () => {
+            const roster = await users();
+            if (historyCollected) rosterReads++;
+            return roster;
+          };
+          const info = client.systemInfo.bind(client);
+          client.systemInfo = async () => {
+            const current = await info();
+            if (rosterReads === 3 && ++finalIdentityReads === 2) replacement = true;
+            return current;
+          };
+        }
+        const create = client.createUser.bind(client);
+        client.createUser = async (...params) => {
+          replacementBeforeCreate = replacement;
+          const account = await create(...params);
+          if (stage === 'create response') replacement = true;
+          return account;
+        };
+      } else if (stage === 'configuration') {
+        const configure = client.setConfiguration.bind(client);
+        client.setConfiguration = async (...params) => {
+          await configure(...params);
+          replacement = true;
+        };
+      } else {
+        const capabilities = client.migrationCapabilities!.bind(client);
+        client.migrationCapabilities = async () => {
+          const current = await capabilities();
+          if (connectionChange) store.saveSettings({ ...store.settings(), ...connectionChange });
+          else replacement = true;
+          return current;
+        };
+      }
+      return client;
+    };
+
+    const result = await finish(await service.migrateUsers(['e-alex'], { 'e-alex': owner }));
+    if (connectionChange) expect(store.settings()).toMatchObject(connectionChange);
+    else expect(replacement).toBe(true);
+    if (stage === 'last Jellyfin identity check') expect(replacementBeforeCreate).toBe(true);
+    const targets = servers.users.jellyfin.filter(({ Name }) => Name === 'discord.user');
+    expect(targets).toHaveLength(1);
+    const target = targets[0]!;
+    expect(store.account('discord.user')).toMatchObject({
+      remote_id: target.Id,
+      status: 'uncertain',
+    });
+    expect(store.revealCredentials(result.id, 'synthetic-session')).toEqual([]);
+    expect(store.takeCredentials(result.id)).toEqual([]);
+    expect(bot.delivered).not.toHaveBeenCalled();
+    expect(servers.played).toEqual(played);
+    expect(servers.userData).toEqual(history);
+    if (stage !== 'history capability check' && !connectionChange) {
+      expect(store.links()).toEqual([]);
+      expect(service.mediaOwnerships.list(store.settings())).toEqual([]);
+      expect(saveCredentials).not.toHaveBeenCalled();
+      expect(saveAccount.mock.calls.some(([, , status]) => status === 'ready')).toBe(false);
+    }
+    if (stage === 'create response' || stage === 'last Jellyfin identity check') {
+      expect(new Set(mediaWrites().map(({ method }) => method))).toEqual(new Set(['createUser']));
+    }
+    expect(result.status).toBe('failed');
+    expect(result.results[0]).toMatchObject({
+      created: true,
+      target_user_id: target.Id,
+      error: expect.stringContaining('Recover account'),
+    });
+    expect(await service.recoveryInfo('discord.user')).toMatchObject({
+      eligible: true,
+      target_user_id: target.Id,
+    });
+    if (
+      stage !== 'create response' &&
+      stage !== 'last Jellyfin identity check' &&
+      !connectionChange
+    )
+      return;
+
+    service.clientFactory = factory;
+    const writesBeforeRecovery = mediaWrites().length;
+    if (!connectionChange) {
+      const retry = await finish(await service.migrateUsers(['e-alex'], { 'e-alex': owner }));
+      expect(retry.status).toBe('failed');
+      expect(retry.results[0]?.error).toContain('Recover account');
+      expect(store.takeCredentials(retry.id)).toEqual([]);
+    }
+    const recoveryRecipient = stage === 'Emby key rotation' ? owner : undefined;
+    const recovered = await finish(
+      await service.recoverAccount('discord.user', target.Id, recoveryRecipient),
+    );
+    expect(recovered.status).toBe('completed');
+    expect(store.account('discord.user')?.status).toBe('ready');
+    expect(store.takeCredentials(recovered.id)).toHaveLength(recoveryRecipient ? 0 : 1);
+    expect(bot.delivered).toHaveBeenCalledTimes(recoveryRecipient ? 1 : 0);
+    expect(servers.played).toEqual(played);
+    expect(servers.userData).toEqual(history);
+    expect(servers.users.jellyfin.filter(({ Name }) => Name === 'discord.user')).toHaveLength(1);
+    expect(
+      mediaWrites()
+        .slice(writesBeforeRecovery)
+        .some(({ method }) => method === 'createUser'),
+    ).toBe(false);
+  });
 
   it('permits an explicitly approved migration and credential delivery for a verified source username exception', async () => {
     registered('emby', 'e-alex');

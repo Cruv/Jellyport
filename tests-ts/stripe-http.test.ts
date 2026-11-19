@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createApp, type JellyportApp } from '../server/main.js';
-import { DemoServers } from '../server/demo.js';
+import { DemoClient, DemoServers } from '../server/demo.js';
+import { MediaError } from '../server/errors.js';
 import { Service } from '../server/service.js';
 import { Store } from '../server/store.js';
 import type { StripeSnapshot } from '../server/stripe-client.js';
@@ -649,6 +650,9 @@ describe('private Stripe integration HTTP boundary', () => {
     'approved Family exemption',
     'independent Family exemption',
     'already disabled outside Jellyport',
+    'outside-disabled renewal with auto-disable off',
+    'outside-disabled slot re-enabled before renewal',
+    'Jellyport-disabled slot re-enabled before renewal',
     'queued review survives restart',
     'queued review with changed event fails closed',
   ] as const)(
@@ -854,7 +858,12 @@ describe('private Stripe integration HTTP boundary', () => {
         return;
       }
       const independentFamily = scenario === 'independent Family exemption';
-      const alreadyDisabled = scenario === 'already disabled outside Jellyport';
+      const reenabledOutside = scenario === 'outside-disabled slot re-enabled before renewal';
+      const reenabled =
+        reenabledOutside || scenario === 'Jellyport-disabled slot re-enabled before renewal';
+      const autoDisableOff = scenario === 'outside-disabled renewal with auto-disable off';
+      const alreadyDisabled =
+        scenario === 'already disabled outside Jellyport' || reenabledOutside || autoDisableOff;
       if (alreadyDisabled)
         servers.users.jellyfin.find(({ Id }) => Id === 'cached-slot-2')!.Policy!.IsDisabled = true;
       const manualReview = await post(
@@ -945,18 +954,218 @@ describe('private Stripe integration HTTP boundary', () => {
       expect(store.subscription(held.id)).toMatchObject({ status: 'applied', error: null });
       expect(store.subscription(held.id)).not.toHaveProperty('stripe_price_review_required');
       expect(stripe.status().automation_review_count).toBe(0);
-      if (alreadyDisabled) {
-        expect(store.link(member, 2)?.disabled_by_jellyport).toBe(0);
-        return;
-      }
+      if (alreadyDisabled) expect(store.link(member, 2)?.disabled_by_jellyport).toBe(0);
 
+      if (reenabled)
+        servers.users.jellyfin.find(({ Id }) => Id === 'cached-slot-2')!.Policy!.IsDisabled = false;
+      if (autoDisableOff) store.saveSettings({ ...store.settings(), auto_disable: false });
+      const jobsBeforeRenewal = store.jobCount();
       billing.invoiceId = 'in_Renewal';
-      await stripe.sync();
+      const checkLive = alreadyDisabled || reenabled;
+      const renewalRoster = checkLive ? vi.spyOn(DemoClient.prototype, 'users') : undefined;
+      const renewalWrites = checkLive ? vi.spyOn(DemoClient.prototype, 'setPolicy') : undefined;
+      try {
+        await stripe.sync();
+        if (checkLive) {
+          expect(renewalRoster).toHaveBeenCalled();
+          expect(renewalWrites).not.toHaveBeenCalled();
+        }
+      } finally {
+        renewalRoster?.mockRestore();
+        renewalWrites?.mockRestore();
+      }
       const renewal = store
         .subscriptionsForMember(member, 'stripe')
         .find(({ stripe_entitlement }) => stripe_entitlement?.invoice_id === 'in_Renewal');
+      if (reenabled) {
+        expect(renewal).toMatchObject({ status: 'pending', stripe_price_review_required: true });
+        await stripe.sync();
+        expect(store.subscription(renewal!.id)).toMatchObject({
+          status: 'pending',
+          stripe_price_review_required: true,
+        });
+        expect(store.jobCount()).toBe(jobsBeforeRenewal);
+        expect(
+          servers.users.jellyfin.find(({ Id }) => Id === 'cached-slot-2')?.Policy?.IsDisabled,
+        ).toBe(false);
+        expect(store.link(member, 2)?.disabled_by_jellyport).toBe(reenabledOutside ? 0 : 1);
+        return;
+      }
       expect(renewal).toMatchObject({ status: 'applied' });
       expect(renewal).not.toHaveProperty('stripe_price_review_required');
+      if (alreadyDisabled) {
+        expect(
+          servers.users.jellyfin.find(({ Id }) => Id === 'cached-slot-2')?.Policy?.IsDisabled,
+        ).toBe(true);
+        expect(store.link(member, 2)?.disabled_by_jellyport).toBe(0);
+      }
+    },
+  );
+
+  it.each(['approved mapping', 'fresh event approval', 'uncertain write'] as const)(
+    'reopens an untouched reduction on the same paid invoice (%s)',
+    async (scenario) => {
+      const { app, store, headers, revision, servers, billing } = await fixture(false, true, true);
+      const { stripe, service } = app.jellyport;
+      const exactEventApproval = scenario === 'fresh event approval';
+      store.saveSettings({
+        ...store.settings(),
+        new_subscriber_source: 'stripe',
+        template_user_id: 'template',
+        auto_provision: !exactEventApproval,
+        auto_disable: true,
+      });
+      const post = (url: string, payload: Record<string, unknown>) =>
+        app.inject({ method: 'POST', url, headers, payload });
+      const configure = (body: Record<string, unknown>) =>
+        post('/api/stripe/config', { sync_enabled: false, expected_revision: revision(), ...body });
+      const base = { price_id: 'price_Crew', tier_id: 'galleon' };
+      const low = { price_id: 'price_Recurring', tier_id: 'sloop' };
+      const high = { ...low, tier_id: 'galleon' };
+      const setPrice = async (mapping: typeof low, affected: boolean) => {
+        const price_tiers = [base, mapping];
+        const review = await post('/api/stripe/config/price-review', {
+          expected_revision: revision(),
+          price_tiers,
+        });
+        expect(review.statusCode, review.body).toBe(200);
+        expect(
+          review
+            .json()
+            .affected.map(({ discord_user_id }: { discord_user_id: string }) => discord_user_id),
+        ).toEqual(affected ? [member] : []);
+        const accepted = await configure({
+          price_tiers,
+          ...(affected ? { price_review_token: review.json().review_token } : {}),
+        });
+        expect(accepted.statusCode, accepted.body).toBe(200);
+      };
+      expect((await configure({ api_key: 'rk_live_syntheticKeyOnly123' })).statusCode).toBe(200);
+      expect(
+        (await configure({ price_tiers: [base, { ...low, tier_id: 'brigantine' }] })).statusCode,
+      ).toBe(200);
+      await stripe.sync();
+      await stripe.linkCustomer({
+        customer_id: 'cus_Crew',
+        discord_user_id: member,
+        expected_revision: revision(),
+      });
+      const originalMembership = service.memberships.save(
+        {
+          discord_user_id: member,
+          base_username: 'synthetic-member',
+          tier_id: 'galleon',
+          account_limit: 3,
+        },
+        store.settings(),
+      );
+      const accountIds = [1, 2, 3].map((slot) => `recurring-slot-${slot}`);
+      for (const [index, id] of accountIds.entries()) {
+        servers.users.jellyfin.push({
+          Id: id,
+          Name: id,
+          Policy: { IsAdministrator: false, IsDisabled: false },
+        });
+        store.saveLink(member, id, id, false, index + 1);
+      }
+      await setPrice(low, false);
+      expect((await configure({ automation_enabled: true })).statusCode).toBe(200);
+      billing.priceId = low.price_id;
+      billing.invoiceId = 'in_Recurring';
+      await stripe.sync();
+      const first = store.heldStripePriceReviews(member)[0]!;
+      expect(first).toMatchObject({ status: 'pending', tier_id: 'sloop', account_limit: 1 });
+      const reviewPath = '/api/memberships/workflow/review';
+      const acceptPath = '/api/memberships/workflow/accept';
+      const draft = {
+        discord_user_id: member,
+        access_mode: 'subscription',
+        provision_jellyfin: false,
+        tier_id: low.tier_id,
+        expected_revision: originalMembership.revision,
+        stripe_price_review_event_id: first.id,
+      };
+      const oldReview = await post(reviewPath, draft);
+      expect(oldReview.statusCode, oldReview.body).toBe(200);
+      await setPrice(high, true);
+      await stripe.sync();
+      expect(store.subscription(first.id)).toMatchObject({ status: 'superseded' });
+      expect(store.subscriptionsForMember(member, 'stripe')).toContainEqual(
+        expect.objectContaining({
+          tier_id: 'galleon',
+          account_limit: 3,
+          stripe_entitlement: expect.objectContaining({ invoice_id: 'in_Recurring' }),
+        }),
+      );
+
+      if (exactEventApproval) {
+        billing.priceId = base.price_id;
+        billing.invoiceId = 'in_Other';
+        await stripe.sync();
+      }
+      await setPrice(low, !exactEventApproval);
+      billing.priceId = low.price_id;
+      billing.invoiceId = 'in_Recurring';
+      const jobsBefore = store.jobCount();
+      const setPolicy = DemoClient.prototype.setPolicy;
+      const writes = vi.spyOn(DemoClient.prototype, 'setPolicy').mockImplementation(async function (
+        this: DemoClient,
+        id,
+        policy,
+      ) {
+        await setPolicy.call(this, id, policy);
+        if (scenario === 'uncertain write' && id === accountIds[1] && policy.IsDisabled)
+          throw new MediaError('Synthetic connection lost after accepting the policy.');
+      });
+      try {
+        await stripe.sync();
+        if (exactEventApproval) {
+          expect(store.subscription(first.id)).toMatchObject({
+            status: 'pending',
+            stripe_price_review_required: true,
+          });
+          expect(store.jobCount()).toBe(jobsBefore);
+          expect(
+            (await post(acceptPath, { review_token: oldReview.json().review_token })).statusCode,
+          ).toBe(400);
+          const freshReview = await post(reviewPath, draft);
+          expect(freshReview.statusCode, freshReview.body).toBe(200);
+          const accepted = await post(acceptPath, {
+            review_token: freshReview.json().review_token,
+          });
+          expect(accepted.statusCode, accepted.body).toBe(202);
+          await vi.waitFor(() =>
+            expect(service.getJob(accepted.json().job.id).status).toBe('completed'),
+          );
+        }
+        const event = store.subscription(first.id)!;
+        expect(event).toMatchObject({
+          status: scenario === 'uncertain write' ? 'failed' : 'applied',
+          tier_id: 'sloop',
+          account_limit: 1,
+          job_id: expect.any(String),
+          stripe_entitlement: expect.objectContaining({ invoice_id: 'in_Recurring' }),
+        });
+        expect(service.memberships.get(member, store.settings())?.account_limit).toBe(1);
+        expect(store.jobCount()).toBe(jobsBefore + 1);
+        expect(writes.mock.calls.map(([id, policy]) => [id, policy.IsDisabled])).toEqual([
+          [accountIds[1], true],
+          [accountIds[2], true],
+        ]);
+        await stripe.sync();
+        await stripe.sync();
+        await setPrice(high, true);
+        await stripe.sync();
+        await setPrice(low, true);
+        await stripe.sync();
+        expect(store.subscription(first.id)?.job_id).toBe(event.job_id);
+        expect(store.subscription(first.id)?.status).toBe(event.status);
+        expect(store.jobCount()).toBe(jobsBefore + 1);
+        expect(writes).toHaveBeenCalledTimes(2);
+        if (scenario === 'uncertain write') expect(store.link(member, 2)?.pending_disabled).toBe(1);
+      } finally {
+        writes.mockRestore();
+      }
     },
   );
 });

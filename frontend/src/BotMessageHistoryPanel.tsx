@@ -1,16 +1,36 @@
 import { useEffect, useRef, useState } from 'react';
 import type { BotMessageHistory } from '../../server/bot-messages';
-import { date, type Api, type Notify } from './types';
+import { date, type Api, type JobResult } from './types';
 
-export default function BotMessageHistoryPanel({
-  jobId,
-  api,
-  notify,
+const deliveryLabels: Record<BotMessageHistory['status'], string> = {
+  sent: 'DM sent',
+  failed: 'DM failed',
+  uncertain: 'Check whether they got the DM',
+  pending: 'DM pending',
+};
+
+export function DiscordDeliverySummary({
+  result,
 }: {
-  jobId: string;
-  api: Api;
-  notify: Notify;
+  result: Pick<JobResult, 'discord_delivery' | 'delivery_error'>;
 }) {
+  const delivery = result.discord_delivery;
+  switch (typeof delivery === 'string' ? delivery : delivery?.status) {
+    case 'sent':
+      return <p>Discord DM sent</p>;
+    case 'failed':
+    case 'uncertain':
+      return <p>Check whether they got the Discord DM.</p>;
+    case 'pending':
+      return <p>Discord DM pending</p>;
+    default:
+      return result.delivery_error ? (
+        <div className="error-block">{result.delivery_error}</div>
+      ) : null;
+  }
+}
+
+export default function BotMessageHistoryPanel({ jobId, api }: { jobId: string; api: Api }) {
   const [messages, setMessages] = useState<Omit<BotMessageHistory, 'content'>[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -41,11 +61,9 @@ export default function BotMessageHistoryPanel({
       );
       if (!mounted.current || controller.signal.aborted) return;
       setMessages(value.messages);
-      notify('Bot message history loaded.');
     } catch {
       if (mounted.current && !controller.signal.aborted) {
-        setError('Bot messages could not be loaded. Refresh to try again.');
-        notify('Bot message history could not be loaded.', true);
+        setError('Couldn’t load Discord delivery. Try again.');
       }
     } finally {
       if (current.current === controller) current.current = null;
@@ -53,9 +71,9 @@ export default function BotMessageHistoryPanel({
     }
   }
   return (
-    <section className="form-stack" aria-label="Bot message history">
+    <section className="form-stack" aria-label="Discord delivery" aria-busy={loading}>
       <div className="button-row">
-        <h3>Bot messages</h3>
+        <h3>Discord delivery</h3>
         <button
           type="button"
           className="btn btn-small btn-quiet"
@@ -69,20 +87,12 @@ export default function BotMessageHistoryPanel({
               : 'Refresh bot messages'}
         </button>
       </div>
-      <p className="section-note">
-        Delivery records show the recipient, account and delivery outcome.
-      </p>
       {error && (
         <p className="error-block" role="alert">
           {error}
         </p>
       )}
-      {messages?.length === 0 && (
-        <p className="section-note">
-          No archived bot messages are available for this operation. Messages sent before message
-          archiving was added, expired messages, and deleted archives cannot be reconstructed.
-        </p>
-      )}
+      {messages?.length === 0 && <p className="section-note">No Discord DMs recorded.</p>}
       {messages?.map((message) => (
         <article
           className="inline-panel form-stack"
@@ -93,23 +103,9 @@ export default function BotMessageHistoryPanel({
             {message.account_username} · Slot {message.membership_slot}
           </strong>
           <p className="section-note">
-            Discord recipient:{' '}
             {message.recipient_username ? `@${message.recipient_username}` : message.recipient_id} ·{' '}
-            {message.status === 'sent'
-              ? 'Sent'
-              : message.status === 'failed'
-                ? 'Delivery failed'
-                : message.status === 'uncertain'
-                  ? 'Delivery outcome uncertain'
-                  : 'Delivery pending'}{' '}
-            · {date(message.sent_at || message.created_at)}
+            {deliveryLabels[message.status]} · {date(message.sent_at || message.created_at)}
           </p>
-          {message.status !== 'sent' && (
-            <p className="section-note">
-              Delivery was unconfirmed. Use the operation’s credential reveal if it is still
-              available.
-            </p>
-          )}
         </article>
       ))}
     </section>

@@ -21,7 +21,7 @@ import {
   SourceSnapshotNote,
 } from './components';
 import SettingsPage from './SettingsPage';
-import BotMessageHistoryPanel from './BotMessageHistoryPanel';
+import BotMessageHistoryPanel, { DiscordDeliverySummary } from './BotMessageHistoryPanel';
 import AuthScreen from './AuthScreen';
 import UserMappingsPage from './UserMappingsPage';
 import MigrationPreviewDialog from './MigrationPreviewDialog';
@@ -2225,12 +2225,12 @@ function DialogContent({
         }
         description={
           cloneJob
-            ? 'New independent accounts with copied settings and played flags. The source account is preserved.'
+            ? 'Copied settings and played status'
             : job.migration_scope === 'played_favorites'
-              ? 'Played-status and favorites migration. Review matching coverage and verified transfers.'
+              ? 'Played status and favorites'
               : job.migration_scope === 'watched_only'
-                ? 'Played-status migration. Review matching coverage and verified transfers.'
-                : 'Follow account changes and review delivery results.'
+                ? 'Played status'
+                : undefined
         }
         close={close}
         footer={
@@ -2283,15 +2283,12 @@ function DialogContent({
         </div>
         {historicalMigration && (
           <Callout icon="info" title="Historical migration">
-            This job used an earlier migration scope. Its recorded field counts describe that run;
-            new migrations merge played status and favorites only.
+            This report shows results from an earlier migration scope.
           </Callout>
         )}
         <JobProgressDetails job={job} />
         {jobOutcome(job).needsReview && (
           <Callout warning title="Review this operation before retrying.">
-            Inspect the recorded errors and verification below. A new request may repeat changes
-            that already reached the server.
             <div className="button-row mt-12">
               {job.kind === 'create' && (
                 <button
@@ -2330,43 +2327,34 @@ function DialogContent({
             </div>
           </Callout>
         )}
-        {migrationJob &&
-          job.workflow_elapsed_ms !== undefined &&
-          job.preview_timing &&
-          job.elapsed_ms !== undefined && (
-            <p className="subtle text-small">
-              Combined migration elapsed: {(job.workflow_elapsed_ms / 1000).toFixed(1)} seconds ·
-              review build: {(job.preview_timing.elapsed_ms / 1000).toFixed(1)} seconds · accepted
-              migration: {(job.elapsed_ms / 1000).toFixed(1)} seconds, including all preparation,
-              queue, writes, retries and verification. Human review wait is excluded. This is the
-              whole job duration, not an average per user.
-            </p>
-          )}
         {job.elapsed_ms !== undefined && (
           <p className="subtle text-small">
-            {migrationJob ? 'Accepted migration elapsed' : 'Operation elapsed'}:{' '}
-            {(job.elapsed_ms / 1000).toFixed(1)} seconds, including{' '}
-            {migrationJob
-              ? 'preparation, queue, writes, retries and verification.'
-              : 'preparation and queued work.'}
-            {job.queue_ms !== undefined && (
-              <> Preparation/queue: {(job.queue_ms / 1000).toFixed(1)} seconds.</>
+            {migrationJob && job.workflow_elapsed_ms !== undefined && job.preview_timing ? (
+              <>
+                Combined migration elapsed: {(job.workflow_elapsed_ms / 1000).toFixed(1)} seconds ·
+                review build: {(job.preview_timing.elapsed_ms / 1000).toFixed(1)} seconds · accepted
+                migration: {(job.elapsed_ms / 1000).toFixed(1)} seconds
+              </>
+            ) : (
+              <>
+                {migrationJob ? 'Accepted migration elapsed' : 'Operation elapsed'}:{' '}
+                {(job.elapsed_ms / 1000).toFixed(1)} seconds
+              </>
             )}
-            {migrationJob &&
-              !job.preview_timing &&
-              ' Review-build timing was not recorded for this job.'}
+            {job.queue_ms !== undefined && (
+              <> · preparation/queue: {(job.queue_ms / 1000).toFixed(1)} seconds</>
+            )}
           </p>
         )}
         {activeJob(job) && (
           <p className="subtle text-small mt-15">
-            You can cancel queued or running work. Changes already applied to media accounts are
-            kept and are not rolled back. Review the results before rerunning.
+            Cancel stops remaining work. Completed changes stay in place.
           </p>
         )}
         {job.error && <div className="error-block mt-15">{job.error}</div>}
         {!!job.credential_availability?.claimed_elsewhere && (
-          <Callout warning title="Credential reveal claimed in another session.">
-            The session that claimed the reveal can recover it until the receipt expires.
+          <Callout warning title="Credentials claimed in another session">
+            Open the reveal in that session.
           </Callout>
         )}
         {job.results?.map((result, index) => (
@@ -2380,10 +2368,7 @@ function DialogContent({
               />
             </div>
             {result.history_only && (
-              <p className="subtle text-small">
-                Watch history only · existing protected account. No password, permissions, account
-                preferences, or Discord ownership changes were requested.
-              </p>
+              <p className="subtle text-small">Watch history only · existing protected account</p>
             )}
             {result.cloned_from_username && (
               <p className="muted">Cloned from Jellyfin: {result.cloned_from_username}</p>
@@ -2420,8 +2405,7 @@ function DialogContent({
             {result.source_catalog && (
               <p className="subtle text-small">
                 Matching catalog collected {date(result.source_catalog.captured_at)} ·{' '}
-                {num(result.source_catalog.items)} items. Personal activity was read live; library
-                changes after collection require another migration.
+                {num(result.source_catalog.items)} items
               </p>
             )}
             {result.role_name && (
@@ -2508,8 +2492,7 @@ function DialogContent({
                 {num(result.data.write_metrics.failed)} failed · peak{' '}
                 {num(result.data.write_metrics.peak_in_flight)} in flight. Cumulative request time:{' '}
                 {(result.data.write_metrics.cumulative_ms / 1000).toFixed(1)} seconds; slowest
-                request: {(result.data.write_metrics.max_ms / 1000).toFixed(1)} seconds. Concurrent
-                request times overlap; use total elapsed for the migration duration.
+                request: {(result.data.write_metrics.max_ms / 1000).toFixed(1)} seconds.
               </p>
             )}
             {!!result.data?.failed_items && (
@@ -2535,7 +2518,7 @@ function DialogContent({
                       <p className="mt-8">
                         Showing {num(Math.min(result.data.failed_updates.length, 200))} of{' '}
                         {num(result.data.failed_items)} failed updates. At most 200 item details are
-                        retained per account. Review these failures before retrying the migration.
+                        retained per account.
                       </p>
                     )}
                   </>
@@ -2562,9 +2545,6 @@ function DialogContent({
                 {num(result.data.verification.missing)} missing ·{' '}
                 {num(result.data.verification.mismatched)} mismatched ·{' '}
                 {num(result.data.verification.unsupported_fields)} unsupported fields.
-                {job.migration_scope === 'played_favorites' && (
-                  <> Existing Jellyfin playback progress and other personal fields are preserved.</>
-                )}
               </p>
             )}
             {result.data?.warnings.map((warning, index) => (
@@ -2585,15 +2565,7 @@ function DialogContent({
                 {warning}
               </div>
             ))}
-            {result.discord_delivery && (
-              <p>
-                <Icon name="discord" /> Discord delivery:{' '}
-                {typeof result.discord_delivery === 'string'
-                  ? result.discord_delivery
-                  : result.discord_delivery.status || JSON.stringify(result.discord_delivery)}
-              </p>
-            )}
-            {result.delivery_error && <div className="error-block">{result.delivery_error}</div>}
+            <DiscordDeliverySummary result={result} />
             {result.error && <div className="error-block">{result.error}</div>}
             <Issues
               label="Unmatched items"
@@ -2611,15 +2583,7 @@ function DialogContent({
         {!job.results?.length && !activeJob(job) && !job.error && (
           <p className="muted text-small mt-18">This operation has no per-user results.</p>
         )}
-        <BotMessageHistoryPanel key={job.id} jobId={job.id} api={api} notify={notify} />
-        {!activeJob(job) &&
-          job.kind !== 'role_update' &&
-          !job.results?.every((result) => result.history_only) && (
-            <div className="support-note">
-              New account passwords can be revealed once. Existing account passwords are preserved.
-              If Discord delivery failed, reveal and copy the new credentials for manual delivery.
-            </div>
-          )}
+        <BotMessageHistoryPanel key={job.id} jobId={job.id} api={api} />
       </Modal>
     );
   }

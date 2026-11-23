@@ -1805,37 +1805,58 @@ describe('React account safeguards', () => {
       discord_user_id: '123456789012345678',
     });
   });
-  it('shows only Discord delivery metadata after reopening Activity details', async () => {
-    const content =
-      'Account: family_2\nPassword: SyntheticArchive42\nhttps://jellyfin.example.test';
-    responses['/api/jobs/job-1/messages'] = {
-      messages: [
-        {
-          id: 'archive-1',
-          kind: 'credentials',
-          recipient_id: '123456789012345678',
-          recipient_username: 'family.owner',
-          account_username: 'family_2',
-          membership_slot: 2,
-          content,
-          status: 'sent',
-          created_at: '2026-10-23T12:00:00.000Z',
-        },
-      ],
+  it('shows the archived Discord outcome and current credential availability in Activity', async () => {
+    const message = {
+      id: 'archive-1',
+      kind: 'credentials',
+      recipient_id: '123456789012345678',
+      recipient_username: 'family.owner',
+      account_username: 'family_2',
+      membership_slot: 2,
+      content: 'Account: family_2\nPassword: SyntheticArchive42\nhttps://jellyfin.example.test',
+      status: 'uncertain',
+      created_at: '2026-10-23T12:00:00.000Z',
     };
-    const dialog = await openJob();
+    responses['/api/jobs/job-1'] = {
+      ...job,
+      credential_availability: { available: 1, claimed_elsewhere: 0 },
+    } satisfies Job;
+    responses['/api/jobs/job-1/messages'] = { messages: [message] };
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    fireEvent.click(await screen.findByRole('button', { name: 'View operation details' }));
+    const dialog = await screen.findByRole('dialog');
     expect(requests.some((request) => request.path.endsWith('/messages'))).toBe(false);
     fireEvent.click(within(dialog).getByRole('button', { name: 'View bot messages' }));
     const article = await within(dialog).findByRole('article', { name: 'Message for family_2' });
+    expect(article.textContent).toContain('Check whether they got the DM');
     expect(article.textContent).toContain('@family.owner');
     expect(article.textContent).not.toContain('SyntheticArchive42');
-    fireEvent.click(within(dialog).getByRole('button', { name: /^Close$/ }));
+    expect(within(dialog).getByRole('button', { name: 'Refresh bot messages' })).toBeTruthy();
+    expect(within(dialog).queryByText(/New account passwords can be revealed once/)).toBeNull();
+    expect(within(dialog).queryByText(/Delivery records show the recipient/)).toBeNull();
+    expect(within(dialog).queryByText(/Delivery was unconfirmed/)).toBeNull();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Reveal new credentials' }));
+    const confirmation = await screen.findByRole('dialog', {
+      name: 'Reveal new account credentials?',
+    });
+    expect(within(confirmation).getByRole('button', { name: 'Reveal credentials' })).toBeTruthy();
+    expect(requests.some((request) => request.path === '/api/jobs/job-1/credentials')).toBe(false);
+    fireEvent.click(within(confirmation).getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByText(/SyntheticArchive42/)).toBeNull();
+
+    responses['/api/jobs/job-1'] = {
+      ...job,
+      credential_availability: { available: 0, claimed_elsewhere: 0 },
+    } satisfies Job;
+    responses['/api/jobs/job-1/messages'] = { messages: [{ ...message, status: 'sent' }] };
     fireEvent.click(screen.getByRole('button', { name: 'View operation details' }));
     const reopened = await screen.findByRole('dialog');
+    expect(within(reopened).queryByRole('button', { name: 'Reveal new credentials' })).toBeNull();
     fireEvent.click(within(reopened).getByRole('button', { name: 'View bot messages' }));
     const delivery = await within(reopened).findByRole('article', { name: 'Message for family_2' });
-    expect(delivery.textContent).toContain('Sent');
+    expect(delivery.textContent).toContain('DM sent');
     expect(delivery.textContent).not.toContain('SyntheticArchive42');
     expect(requests.filter((request) => request.path === '/api/jobs/job-1/messages')).toHaveLength(
       2,
@@ -2869,7 +2890,7 @@ describe('React account safeguards', () => {
       })),
     );
   });
-  it('shows durable combined timing for the whole accepted job and excludes human review wait', async () => {
+  it('shows combined, review, accepted, and preparation timing for the job', async () => {
     responses['/api/jobs/job-1'] = {
       ...job,
       kind: 'migrate',
@@ -2887,21 +2908,16 @@ describe('React account safeguards', () => {
     const dialog = await openJob();
     expect(
       within(dialog).getByText(
-        /Combined migration elapsed: 101.5 seconds · review build: 11.5 seconds · accepted migration: 90.0 seconds/,
+        'Combined migration elapsed: 101.5 seconds · review build: 11.5 seconds · accepted migration: 90.0 seconds · preparation/queue: 2.0 seconds',
       ),
     ).toBeTruthy();
-    expect(within(dialog).getByText(/Human review wait is excluded/)).toBeTruthy();
-    expect(within(dialog).getByText(/whole job duration, not an average per user/)).toBeTruthy();
   });
-  it('labels accepted-only timing honestly when a historical or direct job has no recorded review timing', async () => {
+  it('shows accepted timing when there is no recorded review or queue timing', async () => {
     responses['/api/jobs/job-1'] = { ...job, kind: 'migrate', elapsed_ms: 90000 };
     const dialog = await openJob();
-    expect(within(dialog).getByText(/Accepted migration elapsed: 90.0 seconds/)).toBeTruthy();
-    expect(
-      within(dialog).getByText(/Review-build timing was not recorded for this job/),
-    ).toBeTruthy();
+    expect(within(dialog).getByText('Accepted migration elapsed: 90.0 seconds')).toBeTruthy();
     expect(within(dialog).queryByText(/Combined migration elapsed/)).toBeNull();
-    expect(within(dialog).queryByText(/Preparation\/queue: 0.0/)).toBeNull();
+    expect(within(dialog).queryByText(/preparation\/queue/i)).toBeNull();
   });
   it('cancels a preview when leaving the migration page and ignores an already pending late result', async () => {
     prepareRunningPreview();
@@ -3303,11 +3319,8 @@ describe('React account safeguards', () => {
     responses['/api/jobs/job-1/cancel'] = { ...job, status: 'canceled', results: [] };
     const dialog = await openJob();
     expect(
-      within(dialog).getByText(
-        /Changes already applied to media accounts are kept and are not rolled back/,
-      ),
+      within(dialog).getByText('Cancel stops remaining work. Completed changes stay in place.'),
     ).toBeTruthy();
-    expect(within(dialog).getByText(/Review the results before rerunning/)).toBeTruthy();
     fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel job' }));
     expect(await within(dialog).findByText('Canceled')).toBeTruthy();
     expect(within(dialog).queryByRole('button', { name: 'Cancel job' })).toBeNull();
@@ -3499,10 +3512,10 @@ describe('React account safeguards', () => {
       within(dialog).getByText(/Independent played-status and favorites verification: 3 verified/),
     ).toBeTruthy();
     expect(
-      within(dialog).getByText(
+      within(dialog).queryByText(
         /Existing Jellyfin playback progress and other personal fields are preserved/,
       ),
-    ).toBeTruthy();
+    ).toBeNull();
     expect(within(dialog).queryByText(/newer Jellyfin activity preserved/)).toBeNull();
     expect(within(dialog).queryByText('Historical migration')).toBeNull();
     expect(within(dialog).queryByText(/resume positions/)).toBeNull();
@@ -3520,9 +3533,8 @@ describe('React account safeguards', () => {
     expect(within(coverage).getByText('99.6% matched')).toBeTruthy();
     expect(coverage.textContent).toContain('2,978 of 2,991 identifiable source items');
     expect(coverage.textContent).toContain(
-      '545 saved-history rows have no verified media identity',
+      '545 saved-history rows have no verified media identity and are excluded from coverage.',
     );
-    expect(coverage.textContent).toContain('not migrated or assumed obsolete');
     expect(within(dialog).getByText(/37 attempted · 37 succeeded · 0 failed/)).toBeTruthy();
     expect(
       within(dialog).getByText(/Independent played-status verification: 2,976 verified/),

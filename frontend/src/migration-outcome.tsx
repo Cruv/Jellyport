@@ -37,18 +37,13 @@ export function MigrationCoverage({ result }: { result: JobResult }) {
       {coverage && coverage.unmatched + coverage.ambiguous > 0 && (
         <p>
           {num(coverage.unmatched + coverage.ambiguous)} identifiable source items skipped:{' '}
-          {num(coverage.unmatched)} unmatched · {num(coverage.ambiguous)} ambiguous. Their Jellyfin
-          state was not changed.
+          {num(coverage.unmatched)} unmatched · {num(coverage.ambiguous)} ambiguous
         </p>
       )}
-      <p className="subtle text-small">
-        Coverage counts identifiable source items, not unique Jellyfin items or every saved-history
-        row. Multiple source items can map to the same Jellyfin item.
-      </p>
       {typeof unresolved === 'number' && Number.isSafeInteger(unresolved) && unresolved > 0 && (
         <p>
-          {num(unresolved)} saved-history rows have no verified media identity. They are excluded
-          from this percentage and were not migrated or assumed obsolete.
+          {num(unresolved)} saved-history rows have no verified media identity and are excluded from
+          coverage.
         </p>
       )}
     </section>

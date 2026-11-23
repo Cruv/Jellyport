@@ -26,13 +26,13 @@ import {
 } from './jellyfin-catalog-index.js';
 import {
   DESTINATION_CATALOG_MAX_AGE,
-  normalizedServerVersion,
   DestinationCatalogError,
   destinationCatalogErrorCode,
   type DestinationCatalogDiagnostic,
   type DestinationCatalogStage,
 } from './destination-catalog-files.js';
 import type { MediaItem } from './media.js';
+import type { DestinationCatalogRequest } from './destination-catalog-files.js';
 import type { PathMapping } from './matching.js';
 
 type Request =
@@ -42,7 +42,6 @@ type Request =
       output: string;
       capture_method?: SnapshotCaptureMethod;
       server_id?: string;
-      server_version?: string;
     }
   | {
       operation: 'read';
@@ -56,7 +55,7 @@ type Request =
       directory: string;
       output: string;
       version: string;
-      expected_backup?: { name: string; created_at: string };
+      expected_backup?: DestinationCatalogRequest['expected_backup'];
     }
   | {
       operation: 'destination_read';
@@ -111,9 +110,7 @@ async function run(request: Request): Promise<unknown> {
   if (request.operation !== 'capture') throw new Error('Unknown operation.');
   if (snapshotCaptureMethod(request.capture_method) === 'plugin_backup') {
     if (!request.server_id) throw new Error('A verified source server identity is required.');
-    return importPluginBackup(request.directory, request.output, request.server_id, {
-      serverVersion: request.server_version,
-    });
+    return importPluginBackup(request.directory, request.output, request.server_id);
   }
   if (snapshotCaptureMethod(request.capture_method) === 'file_copy')
     return captureFileCopy(request.directory, request.output);
@@ -245,7 +242,8 @@ async function captureDestination(request: Extract<Request, { operation: 'destin
     )
       throw new DestinationCatalogError('backup_invalid');
     const imported = await importJellyfinBackupCatalog(path, request.output, {
-      expectedServerVersion: request.version,
+      observedServerVersion: request.version,
+      expectedArchiveVersion: request.expected_backup?.server_version,
       expectedCreatedAt: request.expected_backup?.created_at,
       onProgress: (value) =>
         observe(
@@ -263,20 +261,9 @@ async function captureDestination(request: Extract<Request, { operation: 'destin
         ),
     });
     const created = Date.parse(imported.manifest.createdAt);
-    if (
-      normalizedServerVersion(imported.manifest.serverVersion) !==
-        normalizedServerVersion(request.version) ||
-      !normalizedServerVersion(request.version) ||
-      !Number.isFinite(created) ||
-      created > Date.now() + 60_000 ||
-      Date.now() - created > DESTINATION_CATALOG_MAX_AGE
-    )
+    if (created > Date.now() + 60_000 || Date.now() - created > DESTINATION_CATALOG_MAX_AGE)
       throw new DestinationCatalogError(
-        created > Date.now() + 60_000
-          ? 'backup_future'
-          : Date.now() - created > DESTINATION_CATALOG_MAX_AGE
-            ? 'backup_expired'
-            : 'version_mismatch',
+        created > Date.now() + 60_000 ? 'backup_future' : 'backup_expired',
       );
     observe('indexing');
     const indexed = await buildJellyfinCatalogIndex(request.output, {

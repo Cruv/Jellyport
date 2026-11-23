@@ -36,7 +36,7 @@ async function settled(path: string) {
   const date = new Date(NOW - PLUGIN_BACKUP_SETTLE_MS - 60_000);
   await utimes(path, date, date);
 }
-async function fixture(serverVersion = '4.10.1.0') {
+async function fixture(serverVersion = '4.10.1.0', pluginVersion = '1.8.7.0') {
   const directory = await mkdtemp(join(tmpdir(), 'jellyport-plugin-backup-test-'));
   directories.push(directory);
   const root = join(directory, 'backups'),
@@ -50,7 +50,7 @@ async function fixture(serverVersion = '4.10.1.0') {
     new URL('./fixtures/emby-4.10.1.0-schema.sql', import.meta.url),
     'utf8',
   );
-  if (serverVersion === '4.10.2.0')
+  if (serverVersion !== '4.10.1.0')
     schema = schema
       .replace('RunTimeTicks INTEGER', 'RunTimeTicks BIGINT')
       .replace('rating REAL', 'rating FLOAT')
@@ -89,7 +89,7 @@ async function fixture(serverVersion = '4.10.1.0') {
   }
   const manifest = {
     ServerVersion: serverVersion,
-    PluginVersion: '1.8.7.0',
+    PluginVersion: pluginVersion,
     CanRestore: true,
     IsFullBackup: true,
     DateCreated: '2026-10-15T10:00:00.1234567Z',
@@ -136,15 +136,18 @@ async function reject(
 }
 
 describe('Emby Backup & Restore completed full-backup imports', () => {
-  it.each(['4.10.1.0', '4.10.2.0'])(
-    'reads only the fixed full-backup allowlist for %s, preserves history and publishes a private sanitized projection',
-    async (serverVersion) => {
-      const value = await fixture(serverVersion),
+  it.each([
+    ['4.10.1.0', '1.8.7.0'],
+    ['4.10.2.0', '1.8.8.0'],
+    ['5.0.0.0', '2.0.0.0'],
+  ])(
+    'reads the fixed file allowlist for Emby %s and plugin %s and publishes a private history projection',
+    async (serverVersion, pluginVersion) => {
+      const value = await fixture(serverVersion, pluginVersion),
         before = await hash(join(value.data, 'library.db'));
       const copied: string[] = [];
       const result = await importPluginBackup(value.root, value.output, SERVER, {
         now: NOW,
-        serverVersion,
         copied: async (name) => {
           copied.push(name);
           const temporary = (await readdir(value.work)).find((name) =>
@@ -166,7 +169,8 @@ describe('Emby Backup & Restore completed full-backup imports', () => {
         orphan_identity_version: 1,
         identities: { [GUID]: 1 },
         backup_created_at: '2026-10-15T10:00:00.123Z',
-        plugin_version: '1.8.7.0',
+        backup_server_version: serverVersion,
+        plugin_version: pluginVersion,
       });
       expect(result.backup_fingerprint).toMatch(/^[a-f0-9]{64}$/);
       expect(result.bytes).toBe((await lstat(value.output)).size);
@@ -194,15 +198,15 @@ describe('Emby Backup & Restore completed full-backup imports', () => {
       }
       const second = await importPluginBackup(value.root, join(value.work, 'second.db'), SERVER, {
         now: NOW,
-        serverVersion,
       });
       expect(second.backup_fingerprint).toBe(result.backup_fingerprint);
     },
   );
 
   it.each([
-    { ServerVersion: '4.10.2.0' },
-    { PluginVersion: '1.8.8.0' },
+    { ServerVersion: undefined },
+    { PluginVersion: '' },
+    { PluginVersion: '1.8.8.0\n' },
     { CanRestore: false },
     { IsFullBackup: false },
     { Users: [] },
@@ -378,21 +382,20 @@ describe('Emby Backup & Restore completed full-backup imports', () => {
   });
 });
 
-it.each([
-  ['4.10.1.0', '4.10.2.0'],
-  ['4.10.2.0', '4.10.1.0'],
-  ['4.10.2.0', '4.10.3.0'],
-])(
-  'rejects backup %s when the exact source request is %s before copying',
-  async (backupVersion, serverVersion) => {
-    const value = await fixture(backupVersion);
-    const copied: string[] = [];
-    await reject(value, {
-      serverVersion,
-      copied: (name) => {
-        copied.push(name);
-      },
-    });
-    expect(copied).toEqual([]);
+it.each(['library.db', 'users.db'])(
+  'rejects a fresh %s using an unsupported schema',
+  async (name) => {
+    const value = await fixture('4.10.2.0', '1.8.8.0');
+    const path = join(value.data, name);
+    const table = name === 'library.db' ? 'UserDatas' : 'LocalUsersv2';
+    const database = new DatabaseSync(path);
+    try {
+      database.exec(`ALTER TABLE ${table} RENAME TO NewLayout;`);
+      expect(database.prepare('PRAGMA integrity_check').get()?.integrity_check).toBe('ok');
+    } finally {
+      database.close();
+    }
+    await settled(path);
+    await reject(value);
   },
 );

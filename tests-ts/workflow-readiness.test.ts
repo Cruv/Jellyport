@@ -97,7 +97,7 @@ describe('workflow requirements before account tasks', () => {
     f.store.saveSettings({ ...f.store.settings(), template_user_id: '' });
     expect((await f.readiness.snapshot()).actions.create_account.ready).toBe(false);
   });
-  it('checks catalog version against the live Jellyfin metadata and routes mismatch to imports', async () => {
+  it('checks the catalog against live Jellyfin identity and routes a mismatch to imports', async () => {
     const f = fixture((client, kind) => {
       if (kind === 'jellyfin')
         client.systemInfo = async () => ({ Id: 'current-jf', Version: '12.3.0' });
@@ -105,9 +105,9 @@ describe('workflow requirements before account tasks', () => {
     const check = vi
       .spyOn(f.service.destinationSnapshots, 'queuedSelection')
       .mockImplementation((_settings, info) => {
-        if (info?.Version === '12.3.0')
+        if (info?.Id === 'current-jf')
           throw new ServiceError(
-            'The current Jellyfin version differs from the saved matching catalog.',
+            'The saved matching catalog belongs to a different Jellyfin connection.',
           );
       });
     const result = await f.readiness.snapshot();
@@ -115,7 +115,7 @@ describe('workflow requirements before account tasks', () => {
     for (const action of [result.actions.migrate, result.actions.migrate_saved])
       expect(action.blockers).toContainEqual({
         code: 'matching_catalog',
-        message: 'The current Jellyfin version differs from the saved matching catalog.',
+        message: 'The saved matching catalog belongs to a different Jellyfin connection.',
         route: { page: 'settings', tab: 'history', subtab: 'jellyfin' },
       });
     expect(result.actions.create_account.ready).toBe(true);

@@ -9,6 +9,7 @@ import { MediaError, ServiceError } from '../server/errors.js';
 import type { JellyfinBackupManifest, JellyfinBackupTask } from '../server/jellyfin-backup-api.js';
 import type { MediaAPI } from '../server/media.js';
 import {
+  DESTINATION_ARCHIVE_SCHEMA,
   destinationCatalogPrefix,
   normalizedServerVersion,
   type DestinationCatalogRequest,
@@ -166,8 +167,11 @@ async function fixture() {
       keys: 1,
       backup_created_at: request.expected_backup?.created_at ?? old.created_at,
       backup_fingerprint: createHash('sha256').update(request.id).digest('hex'),
-      server_version: normalizedServerVersion(request.binding.version),
+      server_version: normalizedServerVersion(
+        request.expected_backup?.server_version ?? request.binding.version,
+      ),
       backup_engine_version: '0.2.0',
+      archive_schema: DESTINATION_ARCHIVE_SCHEMA,
       projection_format: 2,
     };
     await writeEnvelope(
@@ -236,7 +240,11 @@ describe('scheduled native Jellyfin backup creation', () => {
     const [request] = await f.requests();
     expect(request).toMatchObject({
       binding: { version: '12.4.0' },
-      expected_backup: { name: fresh.name, created_at: fresh.created_at },
+      expected_backup: {
+        name: fresh.name,
+        created_at: fresh.created_at,
+        server_version: fresh.server_version,
+      },
     });
     await f.finish(request!);
     expect(await f.manager.status()).toMatchObject({
@@ -270,7 +278,11 @@ describe('scheduled native Jellyfin backup creation', () => {
     await f.tick();
     const [request] = await f.requests();
     expect(request).toMatchObject({
-      expected_backup: { name: fresh.name, created_at: fresh.created_at },
+      expected_backup: {
+        name: fresh.name,
+        created_at: fresh.created_at,
+        server_version: fresh.server_version,
+      },
       binding: { server_id: serverId },
     });
     expect(request!.expected_backup?.name).not.toBe(f.old.name);
@@ -295,6 +307,7 @@ describe('scheduled native Jellyfin backup creation', () => {
     expect((await f.requests())[0]!.expected_backup).toEqual({
       name: f.old.name,
       created_at: f.old.created_at,
+      server_version: f.old.server_version,
     });
     expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
     expect(f.client.jellyfinBackups).toHaveBeenCalledOnce();
@@ -345,6 +358,7 @@ describe('scheduled native Jellyfin backup creation', () => {
       expect((await f.requests())[0]!.expected_backup).toEqual({
         name: fresh.name,
         created_at: fresh.created_at,
+        server_version: fresh.server_version,
       });
       expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
     },
@@ -361,6 +375,7 @@ describe('scheduled native Jellyfin backup creation', () => {
     expect((await f.requests())[0]!.expected_backup).toEqual({
       name: fresh.name,
       created_at: fresh.created_at,
+      server_version: fresh.server_version,
     });
     expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
     expect(f.imports.busy).toBe(true);
@@ -422,6 +437,7 @@ describe('scheduled native Jellyfin backup creation', () => {
 
   it('pins the latest completed API manifest by original time rather than local filename order', async () => {
     const f = await fixture();
+    f.client.systemInfo.mockResolvedValue({ Id: serverId, Version: '12.5.0' });
     const newest = { ...manifest(initialTime - 1000), name: 'jellyfin-backup-20261018003000.zip' };
     const older = { ...manifest(initialTime - 60_000), name: 'jellyfin-backup-20261018014500.zip' };
     f.client.jellyfinBackups.mockResolvedValue([older, newest]);
@@ -430,6 +446,12 @@ describe('scheduled native Jellyfin backup creation', () => {
     expect((await f.requests())[0]!.expected_backup).toEqual({
       name: newest.name,
       created_at: newest.created_at,
+      server_version: newest.server_version,
+    });
+    await f.finish((await f.requests())[0]!);
+    expect(await f.manager.status()).toMatchObject({
+      usable: true,
+      record: { server_version: newest.server_version, observed_server_version: '12.5.0' },
     });
     expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
   });
@@ -442,6 +464,21 @@ describe('scheduled native Jellyfin backup creation', () => {
     expect(await f.requests()).toEqual([]);
     expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])(
+    'refuses a same-URL server replacement during backup listing (native create=%s)',
+    async (createBackup) => {
+      const f = await fixture();
+      f.client.jellyfinBackups.mockImplementationOnce(async () => {
+        f.client.systemInfo.mockResolvedValue({ Id: 'f'.repeat(32), Version: '12.2.0.0' });
+        return [f.old];
+      });
+      await f.heartbeat();
+      await expect(f.manager.refresh(createBackup)).rejects.toThrow('identity or version changed');
+      expect(await f.requests()).toEqual([]);
+      expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
+    },
+  );
 
   async function failedHandoff(f: Awaited<ReturnType<typeof fixture>>) {
     await f.enable();
@@ -529,7 +566,7 @@ describe('scheduled native Jellyfin backup creation', () => {
     expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
   });
 
-  it('rejects an unsupported future server version before native backup work and retains the last valid catalog', async () => {
+  it('uses native backup preflight on newer versions and waits for schema-validated import', async () => {
     const f = await fixture();
     const good = await f.seedGood();
     f.client.jellyfinBackups.mockClear();
@@ -537,15 +574,25 @@ describe('scheduled native Jellyfin backup creation', () => {
     await f.enable();
     await f.due();
     expect(await f.manager.status()).toMatchObject({
-      last_outcome: 'failed',
-      last_error: expect.stringContaining('unsupported'),
+      last_outcome: 'running',
       record: { id: good.id },
     });
-    expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
-    expect(f.client.jellyfinBackupTasks).not.toHaveBeenCalled();
-    expect(f.client.jellyfinBackups).not.toHaveBeenCalled();
-    expect(await f.requests()).toEqual([]);
-    expect(f.imports.busy).toBe(false);
+    expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
+    expect(f.client.jellyfinBackupTasks).toHaveBeenCalledOnce();
+    expect(f.client.jellyfinBackups).toHaveBeenCalledOnce();
+    const fresh = { ...manifest(), server_version: '13.0.0.0' };
+    f.creation.resolve(fresh);
+    await vi.waitFor(async () => {
+      expect((await f.manager.status()).backup_creation?.phase).toBe('waiting');
+    });
+    await f.tick();
+    const request = (await f.requests())[0]!;
+    expect(request.expected_backup?.server_version).toBe(fresh.server_version);
+    await f.finish(request);
+    expect(await f.manager.status()).toMatchObject({
+      last_outcome: 'succeeded',
+      record: { id: request.id, server_version: '13.0.0.0', observed_server_version: '13.0.0' },
+    });
   });
 
   it.each(['old', 'unavailable'] as const)(
@@ -764,6 +811,7 @@ describe('scheduled native Jellyfin backup creation', () => {
     expect((await f.requests())[0]!.expected_backup).toEqual({
       name: fresh.name,
       created_at: fresh.created_at,
+      server_version: fresh.server_version,
     });
     expect(f.client.createJellyfinBackup).toHaveBeenCalledOnce();
   });
@@ -1081,6 +1129,7 @@ describe('owned Jellyfin backup retention', () => {
           .mockRejectedValue(new MediaError('Synthetic backup listing unavailable.'));
       else
         f.client.systemInfo
+          .mockResolvedValueOnce({ Id: serverId, Version: '12.2.0.0' })
           .mockResolvedValueOnce({ Id: serverId, Version: '12.2.0.0' })
           .mockResolvedValue({ Id: 'b'.repeat(32), Version: '12.2.0.0' });
       const good = await f.seedGood();

@@ -25,8 +25,11 @@ import {
   snapshotHistoryTime,
   snapshotIdentitiesMatch,
   snapshotOrphanIdentityVersion,
+  snapshotRequestVersionMatches,
+  snapshotVersionLabel,
   writeEnvelope,
   SNAPSHOT_VERSION,
+  SNAPSHOT_PROJECTION_SCHEMA,
   supportedSnapshotVersion,
   MAX_SNAPSHOT_BYTES,
   SNAPSHOT_MAX_AGE,
@@ -169,40 +172,49 @@ export class SourceSnapshots {
   private async helperStatus(): Promise<{
     capture_method: SnapshotCaptureMethod;
     versions: string[];
+    plugin_backup_schema?: typeof SNAPSHOT_PROJECTION_SCHEMA;
   } | null> {
     if (!this.key || this.options.demo) return null;
     try {
       const status = await readEnvelope<{
         version: number;
-        emby_version: string;
+        emby_version?: unknown;
         emby_versions?: unknown;
         updated_at: string;
         capture_method?: unknown;
+        plugin_backup_schema?: unknown;
       }>(join(this.directory, 'helper.status'), this.key);
-      if (!(
-        status.version === 1 &&
-        supportedSnapshotVersion(status.emby_version) &&
-        Math.abs(Date.now() - Date.parse(status.updated_at)) < 20_000
-      ))
+      if (!(status.version === 1 && Math.abs(Date.now() - Date.parse(status.updated_at)) < 20_000))
         return null;
       const capture_method = snapshotCaptureMethod(status.capture_method);
-      const versions = status.emby_versions ?? [status.emby_version];
+      const plugin_backup_schema = status.plugin_backup_schema;
       if (
-        !Array.isArray(versions) ||
-        !versions.length ||
-        versions.length > 2 ||
-        versions.some((version) => !supportedSnapshotVersion(version)) ||
-        new Set(versions).size !== versions.length ||
-        !versions.includes(status.emby_version) ||
-        (capture_method !== 'plugin_backup' &&
-          (versions.length !== 1 || versions[0] !== SNAPSHOT_VERSION))
+        plugin_backup_schema !== undefined &&
+        (capture_method !== 'plugin_backup' || plugin_backup_schema !== SNAPSHOT_PROJECTION_SCHEMA)
       )
         return null;
+      let versions: string[] = [];
+      if (plugin_backup_schema === undefined) {
+        const legacy = status.emby_versions ?? [status.emby_version];
+        if (
+          !supportedSnapshotVersion(status.emby_version) ||
+          !Array.isArray(legacy) ||
+          !legacy.length ||
+          legacy.length > 2 ||
+          legacy.some((version) => !supportedSnapshotVersion(version)) ||
+          new Set(legacy).size !== legacy.length ||
+          !legacy.includes(status.emby_version) ||
+          (capture_method !== 'plugin_backup' &&
+            (legacy.length !== 1 || legacy[0] !== SNAPSHOT_VERSION))
+        )
+          return null;
+        versions = legacy;
+      }
       if (this.state.last_capture_method !== capture_method) {
         this.state.last_capture_method = capture_method;
         this.save();
       }
-      return { capture_method, versions };
+      return { capture_method, versions, plugin_backup_schema };
     } catch {
       return null;
     }
@@ -219,10 +231,8 @@ export class SourceSnapshots {
       if (
         !value.ok ||
         value.id !== id ||
-        !supportedSnapshotVersion(value.binding.version) ||
-        value.schema !== 'emby-4.10.1.0' ||
-        (snapshotCaptureMethod(value.capture_method) !== 'plugin_backup' &&
-          value.binding.version !== SNAPSHOT_VERSION) ||
+        !snapshotRequestVersionMatches(value) ||
+        value.schema !== SNAPSHOT_PROJECTION_SCHEMA ||
         !snapshotIdentitiesMatch(
           value.identities,
           value.user_ids,
@@ -253,11 +263,15 @@ export class SourceSnapshots {
     userId = '',
     username = 'All Emby users',
   ): SnapshotMetadata {
+    const method = snapshotCaptureMethod(value.capture_method);
     return {
       id: value.id,
       source_server_url: value.binding.url,
       source_server_id: value.binding.server_id,
-      source_server_version: value.binding.version,
+      source_server_version:
+        method === 'plugin_backup'
+          ? (value.backup_server_version ?? value.binding.version)
+          : value.binding.version,
       source_user_id: userId,
       source_username: username,
       // Capture requests never trim UserDatas by migration scope. Existing
@@ -272,12 +286,12 @@ export class SourceSnapshots {
       playlist_entries: 0,
       bytes: value.bytes!,
       avatar: false,
-      source_type: snapshotCaptureMethod(value.capture_method),
+      source_type: method,
       schema: value.schema!,
       ...(value.orphan_identity_version === undefined
         ? {}
         : { orphan_identity_version: value.orphan_identity_version }),
-      ...(snapshotCaptureMethod(value.capture_method) === 'plugin_backup'
+      ...(method === 'plugin_backup'
         ? {
             backup_created_at: value.backup_created_at,
             backup_fingerprint: value.backup_fingerprint,
@@ -305,8 +319,7 @@ export class SourceSnapshots {
               Date.parse(record.expires_at) > Date.now() &&
               Date.parse(snapshotHistoryTime(result)) <= Date.now() + 60_000 &&
               result.binding.url === sourceUrl(settings) &&
-              (!observed?.id || observed.id === result.binding.server_id) &&
-              (!observed?.version || observed.version === result.binding.version);
+              (!observed?.id || observed.id === result.binding.server_id);
           }
         } catch {
           /* Retained error is reported separately. */
@@ -412,11 +425,11 @@ export class SourceSnapshots {
       let userIds: string[];
       try {
         const info = await client.systemInfo();
-        if (!supportedSnapshotVersion(info.Version) || typeof info.Id !== 'string' || !info.Id)
+        if (!snapshotVersionLabel(info.Version) || typeof info.Id !== 'string' || !info.Id)
           throw new ServiceError(
-            'Database snapshots currently support verified Emby 4.10.1.0 and 4.10.2.0 only.',
+            'Emby did not return a verifiable server identity and version. Check the Emby connection.',
           );
-        if (!helper.versions.includes(info.Version))
+        if (!helper.plugin_backup_schema && !helper.versions.includes(info.Version))
           throw new ServiceError(
             'The snapshot helper does not support the configured Emby version. Update both Jellyport containers; live captures also require the matching helper version setting.',
           );
@@ -448,6 +461,9 @@ export class SourceSnapshots {
         binding,
         user_ids: userIds,
         capture_method: helper.capture_method,
+        ...(helper.plugin_backup_schema
+          ? { plugin_backup_schema: helper.plugin_backup_schema }
+          : {}),
       };
       this.state.active = request;
       this.state.last_attempt_at = request.requested_at;
@@ -500,7 +516,8 @@ export class SourceSnapshots {
         ) {
           if (
             snapshotCaptureMethod(result.capture_method) !==
-            snapshotCaptureMethod(active.capture_method)
+              snapshotCaptureMethod(active.capture_method) ||
+            result.plugin_backup_schema !== active.plugin_backup_schema
           )
             throw new Error('The capture method changed during the request.');
           if (result.ok) {
@@ -599,7 +616,6 @@ export class SourceSnapshots {
       if (
         previous.binding.url !== value.binding.url ||
         previous.binding.server_id !== value.binding.server_id ||
-        previous.binding.version !== value.binding.version ||
         snapshotCaptureMethod(previous.capture_method) !== 'plugin_backup'
       )
         continue;
@@ -608,7 +624,9 @@ export class SourceSnapshots {
       if (previous.backup_fingerprint === value.backup_fingerprint) {
         if (
           previous.backup_created_at !== value.backup_created_at ||
-          previous.plugin_version !== value.plugin_version
+          previous.plugin_version !== value.plugin_version ||
+          (previous.backup_server_version ?? previous.binding.version) !==
+            (value.backup_server_version ?? value.binding.version)
         )
           throw new Error('The plugin backup identity changed.');
         if ((previous.orphan_identity_version ?? 0) >= (value.orphan_identity_version ?? 0))
@@ -626,7 +644,6 @@ export class SourceSnapshots {
     settings: Settings,
     serverId: string,
     id?: string,
-    liveVersion: string = SNAPSHOT_VERSION,
   ): Promise<{ id: string; metadata: SnapshotMetadata; result: CaptureResult }> {
     if (this.clearing || this.stopping)
       throw new ServiceError(
@@ -639,10 +656,6 @@ export class SourceSnapshots {
     if (result.binding.url !== sourceUrl(settings) || result.binding.server_id !== serverId)
       throw new ServiceError(
         'The saved database belongs to a different Emby connection. Capture the configured server again.',
-      );
-    if (!supportedSnapshotVersion(liveVersion) || result.binding.version !== liveVersion)
-      throw new ServiceError(
-        'The saved database Emby version does not match the running server. Import a fresh backup before migrating.',
       );
     if (
       Date.now() - Date.parse(snapshotHistoryTime(result)) > MAX_AGE ||

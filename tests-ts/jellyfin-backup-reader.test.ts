@@ -177,6 +177,8 @@ describe('Jellyfin backup catalog reader', () => {
     ['12.2.0.0', '12.2.0.0'],
     ['12.4.0', '12.4.0.0'],
     ['12.4.0.0', '12.4.0.0'],
+    ['12.5.1', '12.5.1.0'],
+    ['13.0.0.0', '13.0.0.0'],
   ])(
     'imports the verified %s backup format with its own matching live version',
     async (version, normalized) => {
@@ -195,7 +197,7 @@ describe('Jellyfin backup catalog reader', () => {
         { ...manifest, ServerVersion: version, DateCreated: new Date(now - 60_000).toISOString() },
       );
       const result = await importJellyfinBackupCatalog(source.archive, source.output, {
-        expectedServerVersion: version.slice(0, 6),
+        observedServerVersion: version.slice(0, 6),
         now,
       });
       expect(result.manifest.serverVersion).toBe(normalized);
@@ -643,18 +645,31 @@ describe('Jellyfin backup catalog reader', () => {
   });
 
   it.each([
-    { ...manifest, ServerVersion: '12.3.0.0' },
-    { ...manifest, ServerVersion: '12.4.1.0' },
-    { ...manifest, ServerVersion: '13.0.0.0' },
+    { ...manifest, ServerVersion: 'future-release' },
     { ...manifest, BackupEngineVersion: '0.3.0' },
     { ...manifest, DateCreated: 'not-a-date' },
     { ...manifest, Options: { Database: false } },
   ])('rejects unverified manifest formats', async (value) => {
     const source = await fixture([item(1)], [], [], value);
     await expect(importJellyfinBackupCatalog(source.archive, source.output)).rejects.toMatchObject({
-      error_code:
-        value.ServerVersion !== manifest.ServerVersion ? 'version_unsupported' : 'backup_invalid',
+      error_code: 'backup_invalid',
     });
+  });
+
+  it('rejects a newer release whose catalog fields changed shape', async () => {
+    const source = await fixture(
+      [item(1, undefined, { Path: { NewPath: '/synthetic/movie' } })],
+      [],
+      [],
+      {
+        ...manifest,
+        ServerVersion: '13.0.0.0',
+      },
+    );
+    await expect(importJellyfinBackupCatalog(source.archive, source.output)).rejects.toMatchObject({
+      error_code: 'backup_invalid',
+    });
+    await expect(stat(source.output)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it('never uses a newer supported backup with an older linked server', async () => {
@@ -668,7 +683,7 @@ describe('Jellyfin backup catalog reader', () => {
     await writeFile(source.archive, zip(source.entries));
     await expect(
       importJellyfinBackupCatalog(source.archive, source.output, {
-        expectedServerVersion: '12.2.0',
+        observedServerVersion: '12.2.0',
         now,
       }),
     ).rejects.toMatchObject({ error_code: 'version_mismatch' });
@@ -693,7 +708,7 @@ describe('Jellyfin backup catalog reader', () => {
       const progress: JellyfinBackupProgress[] = [];
       await expect(
         importJellyfinBackupCatalog(source.archive, source.output, {
-          expectedServerVersion: version,
+          observedServerVersion: version,
           now,
           onProgress: (value) => progress.push(value),
         }),
@@ -708,7 +723,7 @@ describe('Jellyfin backup catalog reader', () => {
     const created = new Date(now - 48 * 60 * 60_000).toISOString();
     const source = await fixture([item(1)], [], [], { ...manifest, DateCreated: created });
     const result = await importJellyfinBackupCatalog(source.archive, source.output, {
-      expectedServerVersion: '12.2.0',
+      observedServerVersion: '12.2.0',
       now,
     });
     expect(result.manifest.createdAt).toBe(created);

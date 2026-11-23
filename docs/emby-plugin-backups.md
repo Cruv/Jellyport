@@ -1,18 +1,18 @@
-# Emby Backup & Restore history imports — 0.14.0
+# Emby Backup & Restore history imports
 
-Jellyport imports saved history from the **full-backup layout** produced by Emby
-Server **4.10.1.0** and **4.10.2.0** with Backup & Restore **1.8.7.0**. Emby
-4.10.2.0 requires Jellyport **0.33.1 or later on both the web app and helper**;
-4.10.1.0 imports remain compatible with existing projections. Other versions and
-dated database-only folders are rejected until their format and source binding
-are verified.
+Jellyport imports saved history from **completed full backups** whose manifest,
+library and user database schemas it can validate. It records the Emby Server and
+Backup & Restore versions from the backup and accepts later version labels when
+the required layout still matches. A fresh backup from an earlier release of the
+same verified server remains usable after an upgrade. Dated database-only
+folders and incompatible schemas are rejected.
 
-The 4.10.2.0 compatibility check inspected a completed plugin backup's schema:
-consumed library/user columns and the unique history key match the previously
-verified upgraded 4.10.1.0 layout. Synthetic imports exercise both versions through
-the real network-isolated helper. This does not reclassify older isolated API or
-performance trials as 4.10.2.0 tests. Raw file-copy and SQLite Online Backup modes
-remain limited to 4.10.1.0.
+Synthetic imports exercise Emby 4.10.1.0 / Backup & Restore 1.8.7.0 and Emby
+4.10.2.0 / Backup & Restore 1.8.8.0 through the network-isolated helper. The latter
+fixture is imported against the same running server with a newer version.
+Raw file-copy and SQLite Online Backup **capture** modes still require 4.10.1.0
+because they operate on an actively written SQLite database. Existing validated
+captures can be reused after an upgrade while their source identity and age checks pass.
 
 ## Configure Emby and the helper
 
@@ -27,11 +27,10 @@ remain limited to 4.10.1.0.
    **backup root** read-only at `/emby-backups`; it must contain
    `embyserver-backup-full/backupinfo.json` and that folder's `data/library.db`,
    `data/users.db` and `data/device.txt`. A laptop's mounted-share path is not the
-   Docker host's path. Do not substitute a live database mount. The existing
-   `JELLYPORT_EMBY_VERSION=4.10.1.0` helper setting can remain for plugin mode:
-   the updated helper explicitly advertises both supported backup versions, and
-   each request still requires the backup's version to exactly match the running
-   Emby server. An older helper cannot satisfy a 4.10.2.0 request.
+   Docker host's path. Do not substitute a live database mount. Update the app
+   and helper together to use schema-based imports. Omit `JELLYPORT_EMBY_VERSION`
+   in plugin mode. The helper ignores an existing value in this mode. Older
+   helpers and requests still use their original version constraints.
 3. Keep `/work` helper-only and private. Share only the separate `/snapshots`
    exchange with Jellyport, and preserve the existing Jellyport `/data` mount.
    The helper needs no network and opens only copied private SQLite databases.
@@ -49,13 +48,14 @@ remain limited to 4.10.1.0.
 
 ## Validation and freshness
 
-The importer reads a fixed allowlist only. It checks the known manifest version,
-`CanRestore`, full-backup flag, exact requested server version, original date,
-embedded server ID and exact user identity set. A backup from a different
-supported server version is still rejected; a server upgrade requires a fresh
-completed backup. Files must be regular, settled and unchanged before/open/after
-the copy; manifest and identity bytes are rechecked. Symlinks, database sidecars,
-changes, unsupported schemas and corruption fail without replacing saved history.
+The importer reads a fixed allowlist of files. It checks the manifest structure,
+`CanRestore`, full-backup flag, original date, embedded server ID and exact user
+identity set. The embedded server ID must match the live server ID returned by
+the configured Emby connection. A matching version or URL alone cannot prove
+the server identity. Files must be regular, settled and unchanged at each stage
+of copying. The helper rereads manifest and identity bytes after copying.
+Symlinks, database sidecars, changes, unsupported schemas and corruption fail
+without replacing saved history.
 SQLite integrity checks, schema validation and projection run on private copies.
 Copied-byte fingerprints identify unchanged generations. Authentication databases,
 configuration, artwork and raw user account records are never published.

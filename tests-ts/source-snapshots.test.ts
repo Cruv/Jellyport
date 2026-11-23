@@ -14,6 +14,7 @@ import {
   recoverSnapshotHelper,
   snapshotKey,
   writeEnvelope,
+  SNAPSHOT_PROJECTION_SCHEMA,
   SNAPSHOT_VERSION,
   type CaptureRequest,
   type CaptureResult,
@@ -74,6 +75,7 @@ async function fixture(demo = false, imports?: ImportCoordinator) {
     version = SNAPSHOT_VERSION,
     captureMethod?: unknown,
     versions?: unknown,
+    pluginBackupSchema?: unknown,
   ) {
     await writeEnvelope(
       join(shared, 'helper.status'),
@@ -83,6 +85,7 @@ async function fixture(demo = false, imports?: ImportCoordinator) {
         ...(versions === undefined ? {} : { emby_versions: versions }),
         updated_at: updatedAt,
         ...(captureMethod === undefined ? {} : { capture_method: captureMethod }),
+        ...(pluginBackupSchema === undefined ? {} : { plugin_backup_schema: pluginBackupSchema }),
       },
       key!,
     );
@@ -776,7 +779,7 @@ it('fails closed for stale helpers, unsupported server versions and unsupported 
   expect(f.factory).not.toHaveBeenCalled();
   await f.heartbeat();
   f.client.systemInfo.mockResolvedValueOnce({ Id: 'fixture-emby-server', Version: '4.10.3.0' });
-  await expect(f.manager.refresh()).rejects.toThrow('4.10.1.0 and 4.10.2.0 only');
+  await expect(f.manager.refresh()).rejects.toThrow('helper does not support');
   f.client.users.mockResolvedValueOnce([{ Id: 'not-a-public-guid', Name: 'fixture' }]);
   await expect(f.manager.refresh()).rejects.toThrow('unsupported user identities');
   expect(f.client.close).toHaveBeenCalledTimes(2);
@@ -1474,13 +1477,7 @@ it('imports verified 4.10.2 plugin backups only through a capable helper and pre
     plugin_version: '1.8.7.0',
   });
   await f.restart();
-  const selected = await f.manager.select(
-    userId,
-    f.settings,
-    'fixture-emby-server',
-    result.id,
-    '4.10.2.0',
-  );
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server', result.id);
   expect(selected.metadata.source_server_version).toBe('4.10.2.0');
   expect(selected.metadata.schema).toBe('emby-4.10.1.0');
 });
@@ -1501,12 +1498,79 @@ it.each([
   },
 );
 
-it('refuses a supported backup from a different live server version without changing its saved generation', async () => {
+it('imports by schema and reuses the exact same server backup across Emby upgrades and restarts', async () => {
+  const f = await fixture();
+  const serverId = 'fixture-emby-server';
+  const backup = {
+    backup_created_at: new Date(Date.now() - 60 * 60_000).toISOString(),
+    backup_fingerprint: 'a'.repeat(64),
+    backup_server_version: '4.10.2.0',
+    plugin_version: '1.8.8.0',
+  };
+  async function importAtVersion(version: string, overrides: Partial<CaptureResult> = {}) {
+    f.client.systemInfo.mockResolvedValueOnce({ Id: serverId, Version: version });
+    await f.manager.refresh();
+    const request = await f.pendingRequest();
+    expect(request).toMatchObject({
+      binding: { version },
+      plugin_backup_schema: SNAPSHOT_PROJECTION_SCHEMA,
+    });
+    return f.finish(request, { ...backup, ...overrides });
+  }
+  await f.heartbeat(
+    new Date().toISOString(),
+    '5.0.0.0',
+    'plugin_backup',
+    undefined,
+    SNAPSHOT_PROJECTION_SCHEMA,
+  );
+  const capture = await importAtVersion('4.10.3.0');
+  await f.restart();
+  const observation = { id: serverId, version: '5.0.0.0', observed_at: Date.now() };
+  expect(await f.manager.status(observation)).toMatchObject({
+    usable: true,
+    records: [{ id: capture.id, source_server_version: '4.10.2.0', plugin_version: '1.8.8.0' }],
+  });
+  expect((await f.manager.select(userId, f.settings, serverId, capture.id)).id).toBe(capture.id);
+  const newerAttempt = await importAtVersion('5.0.0.0');
+  expect((await f.manager.status(observation)).records.map(({ id }) => id)).toEqual([capture.id]);
+  await expect(stat(join(f.shared, `${newerAttempt.id}.db.enc`))).rejects.toMatchObject({
+    code: 'ENOENT',
+  });
+  await importAtVersion('5.0.0.0', { backup_server_version: undefined });
+  expect(await f.manager.status(observation)).toMatchObject({
+    snapshots: 1,
+    records: [{ id: capture.id }],
+    last_outcome: 'failed',
+  });
+  expect((await f.manager.status({ ...observation, id: 'replacement' })).usable).toBe(false);
+  await expect(f.manager.select(userId, f.settings, 'replacement', capture.id)).rejects.toThrow(
+    'different Emby connection',
+  );
+});
+
+it.each([
+  ['plugin_backup', 'future-schema'],
+  ['file_copy', SNAPSHOT_PROJECTION_SCHEMA],
+])('refuses an incompatible plugin schema advertisement (%s, %s)', async (method, schema) => {
+  const f = await fixture();
+  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, method, undefined, schema);
+  await expect(f.manager.refresh()).rejects.toThrow('helper is unavailable');
+  expect(f.factory).not.toHaveBeenCalled();
+});
+
+it('reuses projected raw history after an upgrade while keeping new live captures pinned', async () => {
   const f = await fixture();
   const result = await f.complete();
-  await expect(
-    f.manager.select(userId, f.settings, 'fixture-emby-server', result.id, '4.10.2.0'),
-  ).rejects.toThrow('version does not match');
+  expect(
+    await f.manager.status({
+      id: 'fixture-emby-server',
+      version: '4.10.2.0',
+      observed_at: Date.now(),
+    }),
+  ).toMatchObject({ usable: true });
+  f.client.systemInfo.mockResolvedValueOnce({ Id: 'fixture-emby-server', Version: '4.10.2.0' });
+  await expect(f.manager.refresh()).rejects.toThrow('helper does not support');
   expect((await f.manager.select(userId, f.settings, 'fixture-emby-server', result.id)).id).toBe(
     result.id,
   );

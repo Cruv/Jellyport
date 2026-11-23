@@ -677,24 +677,32 @@ describe('saved destination catalog manager', () => {
     expect(f.manager.queuedSelection(f.settings, { Id: serverId, Version: '12.2.0.0' })).toBe(
       record.id,
     );
-    expect(() =>
-      f.manager.queuedSelection(f.settings, { Id: serverId, Version: '12.3.0' }),
-    ).toThrow(/version differs.*Import a backup/);
+    expect(f.manager.queuedSelection(f.settings, { Id: serverId, Version: '12.3.0' })).toBe(
+      record.id,
+    );
     expect(() =>
       f.manager.queuedSelection(f.settings, { Id: 'f'.repeat(32), Version: '12.2.0' }),
-    ).toThrow(/server or version differs/);
-    expect(await f.manager.metadata(record.id, f.settings, serverId, '12.2.0')).toMatchObject({
+    ).toThrow(/server identity.*Import a backup/);
+    expect(await f.manager.metadata(record.id, f.settings, serverId, '12.3.0')).toMatchObject({
       id: record.id,
+      server_version: '12.2.0.0',
+      observed_server_version: '12.2.0',
     });
+    await expect(
+      f.manager.metadata(record.id, f.settings, 'f'.repeat(32), '12.3.0'),
+    ).rejects.toThrow('pinned Jellyfin catalog');
     expect(worker).not.toHaveBeenCalled();
   });
-  it('reflects removed catalog files and newer observed version incompatibility in local status', async () => {
+  it('retains a usable catalog after an upgrade and flags replaced servers or missing files', async () => {
     const f = await fixture('backup');
     const record = await f.complete();
     const newerVersion = { id: serverId, version: '12.3.0', observed_at: Date.now() };
     f.factory.mockClear();
     expect(await f.manager.status()).toMatchObject({ usable: true });
-    expect(await f.manager.status(newerVersion)).toMatchObject({ usable: false });
+    expect(await f.manager.status(newerVersion)).toMatchObject({ usable: true });
+    expect(await f.manager.status({ ...newerVersion, id: 'f'.repeat(32) })).toMatchObject({
+      usable: false,
+    });
     expect(
       await f.manager.status({
         ...newerVersion,

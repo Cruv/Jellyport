@@ -311,7 +311,7 @@ it('emits one bounded JSON event per early version failure without duplicating f
     source_rows: 0,
   });
   expect((await f.result()).error).toContain(
-    'After a Jellyfin upgrade, create a fresh database backup',
+    'does not match the completed archive selected from Jellyfin',
   );
 });
 it('publishes authenticated aggregate progress and retains a specific safe early failure without a completed catalog', async () => {

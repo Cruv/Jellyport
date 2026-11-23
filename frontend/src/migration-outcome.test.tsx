@@ -418,10 +418,8 @@ describe('migration coverage presentation', () => {
       '13 identifiable source items skipped: 1 unmatched · 12 ambiguous',
     );
     expect(coverage.textContent).toContain(
-      '545 saved-history rows have no verified media identity',
+      '545 saved-history rows have no verified media identity and are excluded from coverage.',
     );
-    expect(coverage.textContent).toContain('not migrated or assumed obsolete');
-    expect(coverage.textContent).toContain('not unique Jellyfin items or every saved-history row');
   });
 
   it('renders empty or unavailable coverage honestly', () => {
@@ -432,6 +430,9 @@ describe('migration coverage presentation', () => {
     expect(screen.queryByText(/100.0%/)).toBeNull();
     view.rerender(<MigrationCoverage result={{ status: 'partial' }} />);
     expect(screen.getByText('Matching coverage unavailable')).toBeTruthy();
+    expect(screen.getByRole('region', { name: 'Matching coverage' }).textContent).toBe(
+      'Matching coverage unavailable',
+    );
     expect(screen.queryByText(/545/)).toBeNull();
     view.rerender(
       <MigrationCoverage result={{ status: 'running', matched: 0, unmatched: 0, ambiguous: 0 }} />,

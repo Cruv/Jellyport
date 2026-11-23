@@ -316,9 +316,9 @@ test('verified high matching coverage succeeds while failed writes stay in revie
   await expect(coverage).toContainText(
     '20 identifiable source items skipped: 15 unmatched · 5 ambiguous',
   );
-  await expect(coverage).toContainText('not unique Jellyfin items or every saved-history row');
-  await expect(coverage).toContainText('120 saved-history rows have no verified media identity');
-  await expect(coverage).toContainText('excluded from this percentage');
+  await expect(coverage).toContainText(
+    '120 saved-history rows have no verified media identity and are excluded from coverage.',
+  );
   await coverage.scrollIntoViewIfNeeded();
   await expectContainedLayout(page);
   await page.screenshot({ path: info.outputPath('matching-success-coverage.png'), fullPage: true });

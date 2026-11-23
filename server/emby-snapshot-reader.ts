@@ -8,9 +8,8 @@ import { ServiceError } from './errors.js';
 // Verified against a clean official emby/embyserver:4.10.1.0 instance, with media
 // scanned and state written through its API. Completed 4.10.2.0 backups retain the
 // same consumed schema, including upgraded declarations and the unique history key.
-// Plugin imports validate this schema independently of the version labels in the
-// manifest. Keep the projection identifier stable for existing saved captures.
-export const EMBY_SNAPSHOT_VERSION = '4.10.1.0';
+// Validate the consumed schema independently of release labels. Keep the
+// projection identifier stable for existing saved captures.
 export interface EmbySnapshotLibraryInfo {
   adapter: 'emby-4.10.1.0';
   item_count: number;

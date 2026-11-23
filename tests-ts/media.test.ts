@@ -9,6 +9,82 @@ import { MediaError } from '../server/errors.js';
 
 const json = (data: unknown, status = 200) =>
   new Response(JSON.stringify(data), { status, headers: { 'Content-Type': 'application/json' } });
+
+function jellyfinWriteContract() {
+  const schema = (name: string) => ({ $ref: `#/components/schemas/${name}` });
+  const parameters = (id: string) => [
+    { name: 'userId', in: 'query', schema: { type: 'string', format: 'uuid' } },
+    { name: id, in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+  ];
+  const body = (name: string) => ({ content: { 'application/json': { schema: schema(name) } } });
+  return {
+    paths: {
+      '/UserItems/{itemId}/UserData': {
+        get: {
+          operationId: 'GetItemUserData',
+          parameters: parameters('itemId'),
+          responses: { '200': body('UserItemDataDto') },
+        },
+        post: {
+          operationId: 'UpdateItemUserData',
+          parameters: parameters('itemId'),
+          requestBody: {
+            content: {
+              'application/json': {
+                schema: { allOf: [schema('UpdateUserItemDataDto')], description: 'Update DTO' },
+              },
+            },
+            required: true,
+          },
+        },
+      },
+      '/Playlists': {
+        post: { operationId: 'CreatePlaylist', requestBody: body('CreatePlaylistDto') },
+      },
+      '/Playlists/{playlistId}/Items': {
+        post: {
+          operationId: 'AddItemToPlaylist',
+          parameters: [
+            ...parameters('playlistId'),
+            { name: 'ids', in: 'query', schema: { type: 'array', format: undefined } },
+          ],
+        },
+      },
+    },
+    components: {
+      schemas: {
+        UserItemDataDto: {
+          type: 'object',
+          properties: { Played: { type: 'boolean' }, IsFavorite: { type: 'boolean' } },
+        },
+        UpdateUserItemDataDto: {
+          type: 'object',
+          properties: {
+            Played: { type: 'boolean', nullable: true },
+            IsFavorite: { type: 'boolean', nullable: true },
+            Likes: { type: 'boolean', nullable: true },
+            PlaybackPositionTicks: { type: 'integer', nullable: true },
+            PlayCount: { type: 'integer', nullable: true },
+            LastPlayedDate: { type: 'string', nullable: true },
+            Rating: { type: 'number', nullable: true },
+          },
+        },
+        CreatePlaylistDto: {
+          type: 'object',
+          required: ['Name'],
+          properties: {
+            Name: { type: 'string' },
+            UserId: { type: 'string', format: 'uuid' },
+            Ids: { type: 'array' },
+            Users: { type: 'array' },
+            IsPublic: { type: 'boolean' },
+          },
+        },
+      },
+    },
+  };
+}
+
 describe('media API boundary', () => {
   it('retains bounded review context without retaining unrelated private DTO fields', () => {
     expect(
@@ -627,29 +703,101 @@ describe('media API boundary', () => {
     await client.close();
   });
 
-  it.each([
-    ['10.8.13', false, false],
-    ['10.9.0', true, false],
-    ['10.11.10', true, false],
-    ['12.0', true, true],
-    ['12.2.0', true, true],
-    ['12.2.0-rc.1', false, false],
-    ['unknown', false, false],
-    [undefined, false, false],
-  ])(
-    'checks writable capabilities for Jellyfin version %s',
-    async (version, supported, duplicates) => {
-      const transport = vi.fn(async () => json({ Version: version }));
-      const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
-      const capabilities = await client.migrationCapabilities();
-      expect(capabilities.userData).toBe(supported);
-      expect(capabilities.privatePlaylists).toBe(supported);
-      expect(capabilities.playlistDuplicates).toBe(duplicates);
-      await client.migrationCapabilities();
+  it.each([undefined, '10.8.13', 'rolling-2026-11-22-preview'])(
+    'coalesces read-only migration contract checks with release metadata %s',
+    async (version) => {
+      const transport = vi.fn<FetchTransport>(async (address, init) => {
+        expect(address).toBe('http://jellyfin.test/base/api-docs/openapi.json');
+        expect(init.method).toBe('GET');
+        expect(init.redirect).toBe('manual');
+        return json({ ...jellyfinWriteContract(), ...(version ? { info: { version } } : {}) });
+      });
+      const client = new MediaClient('http://jellyfin.test/base', 'secret', 'jellyfin', {
+        transport,
+      });
+      const capabilities = {
+        userData: true,
+        privatePlaylists: true,
+        appendPlaylistItems: true,
+      };
+      expect(
+        await Promise.all([client.migrationCapabilities(), client.migrationCapabilities()]),
+      ).toEqual([capabilities, capabilities]);
+      expect(await client.migrationCapabilities()).toEqual(capabilities);
       expect(transport).toHaveBeenCalledOnce();
       await client.close();
     },
   );
+
+  it('does not probe an Emby server for Jellyfin write capabilities', async () => {
+    const transport = vi.fn<FetchTransport>();
+    const client = new MediaClient('http://emby.test', 'key', 'emby', { transport });
+    expect(await client.migrationCapabilities()).toMatchObject({
+      userData: false,
+      privatePlaylists: false,
+    });
+    expect(transport).not.toHaveBeenCalled();
+    await client.close();
+  });
+
+  it.each([
+    'replacement DTO',
+    'non-null default',
+    'wrong user selector',
+    'missing readback schema',
+  ])('refuses the UserData mutation with a %s contract', async (mismatch) => {
+    const contract = jellyfinWriteContract();
+    const itemData = contract.paths['/UserItems/{itemId}/UserData'];
+    if (mismatch === 'replacement DTO')
+      itemData.post.requestBody.content['application/json'].schema.allOf[0]!.$ref =
+        '#/components/schemas/UserItemDataDto';
+    if (mismatch === 'non-null default')
+      Object.assign(contract.components.schemas.UpdateUserItemDataDto.properties.PlayCount, {
+        default: 0,
+      });
+    if (mismatch === 'wrong user selector') itemData.post.parameters[0]!.name = 'ownerId';
+    if (mismatch === 'missing readback schema')
+      Reflect.deleteProperty(contract.components.schemas, 'UserItemDataDto');
+    const transport = vi.fn<FetchTransport>(async (address, init) => {
+      expect(new URL(address).pathname).toBe('/api-docs/openapi.json');
+      expect(init.method).toBe('GET');
+      return json(contract);
+    });
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
+    await expect(client.updateUserData('alice', 'movie', { Played: true })).rejects.toThrow(
+      'verified partial user-data contract',
+    );
+    expect((await client.migrationCapabilities()).privatePlaylists).toBe(true);
+    expect(transport).toHaveBeenCalledOnce();
+    await client.close();
+  });
+
+  it('bounds a stalled contract read, allows a later read, and does not retry uncertain writes', async () => {
+    const canceled = vi.fn();
+    const requests: string[] = [];
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', {
+      timeoutMs: 25,
+      transport: async (address, init) => {
+        requests.push(`${init.method} ${new URL(address).pathname}`);
+        if (requests.length === 1) return new Response(new ReadableStream({ cancel: canceled }));
+        if (init.method === 'GET') return json(jellyfinWriteContract());
+        return new Response('private-upstream-data', { status: 503 });
+      },
+    });
+    await expect(client.updateUserData('alice', 'movie', { Played: true })).rejects.toThrow(
+      'timed out',
+    );
+    expect(canceled).toHaveBeenCalledOnce();
+    await expect(client.updateUserData('alice', 'movie', { Played: true })).rejects.toThrow(
+      'HTTP 503',
+    );
+    expect(requests).toEqual([
+      'GET /api-docs/openapi.json',
+      'GET /api-docs/openapi.json',
+      'POST /UserItems/movie/UserData',
+    ]);
+    await client.close();
+  });
 
   it('whitelists detailed user-data reads and partial writes without carrying item identifiers', async () => {
     const writes: unknown[] = [];
@@ -679,7 +827,7 @@ describe('media API boundary', () => {
     const client = new MediaClient('http://jellyfin.test/base', 'private-key', 'jellyfin', {
       transport: async (address, init) => {
         const url = new URL(address);
-        if (url.pathname.endsWith('/System/Info')) return json({ Version: '12.2' });
+        if (url.pathname === '/base/api-docs/openapi.json') return json(jellyfinWriteContract());
         expect(url.pathname).toBe('/base/UserItems/target-item/UserData');
         expect(url.searchParams.get('userId')).toBe('target-user');
         expect(address).not.toContain('private-key');
@@ -780,7 +928,7 @@ describe('media API boundary', () => {
     const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
       transport: async (address, init) => {
         const url = new URL(address);
-        if (url.pathname === '/System/Info') return json({ Version: '12.2' });
+        if (url.pathname === '/api-docs/openapi.json') return json(jellyfinWriteContract());
         expect(address).not.toContain('private-key');
         seen.push({
           url,
@@ -798,7 +946,7 @@ describe('media API boundary', () => {
       Type: 'Playlist',
       MediaType: 'Audio',
     });
-    await client.addPlaylistItems('new-playlist', 'target-user', ['song-b', 'song-a', 'song-b']);
+    await client.addPlaylistItems('new-playlist', 'target-user', ['song-b', 'song-a']);
     expect(seen[0]!.body).toEqual({
       Name: 'An imported mix',
       UserId: 'target-user',
@@ -809,7 +957,10 @@ describe('media API boundary', () => {
     });
     expect(seen[1]!.url.pathname).toBe('/Playlists/new-playlist/Items');
     expect(seen[1]!.url.searchParams.get('userId')).toBe('target-user');
-    expect(seen[1]!.url.searchParams.get('ids')).toBe('song-b,song-a,song-b');
+    expect(seen[1]!.url.searchParams.get('ids')).toBe('song-b,song-a');
+    await expect(
+      client.addPlaylistItems('new-playlist', 'target-user', ['song-b', 'song-a', 'song-b']),
+    ).rejects.toThrow('does not confirm support for duplicate playlist entries');
     await expect(
       client.addPlaylistItems('new-playlist', 'target-user', ['one,other']),
     ).rejects.toThrow('valid playlist item identifiers');
@@ -820,28 +971,63 @@ describe('media API boundary', () => {
     await client.close();
   });
 
-  it.each(['10.8.13', 'unknown'])(
-    'refuses potentially public playlist creation on version %s',
-    async (version) => {
-      const transport = vi.fn(async () => json({ Version: version }));
-      const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
-      await expect(client.createPlaylist('alice', 'Private')).rejects.toThrow('10.9 or newer');
-      await expect(client.updateUserData('alice', 'movie', { Played: true })).rejects.toThrow(
-        '10.9 or newer',
-      );
-      await expect(client.addPlaylistItems('playlist', 'alice', ['one'])).rejects.toThrow(
-        '10.9 or newer',
-      );
-      expect(transport).toHaveBeenCalledOnce();
-      await client.close();
-    },
-  );
+  it('refuses potentially public playlist creation when its privacy field is absent', async () => {
+    const contract = jellyfinWriteContract();
+    Reflect.deleteProperty(contract.components.schemas.CreatePlaylistDto.properties, 'IsPublic');
+    const transport = vi.fn<FetchTransport>(async (address, init) => {
+      expect(new URL(address).pathname).toBe('/api-docs/openapi.json');
+      expect(init.method).toBe('GET');
+      return json(contract);
+    });
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
+    await expect(client.createPlaylist('alice', 'Private')).rejects.toThrow(
+      'verified private playlist creation contract',
+    );
+    await expect(client.addPlaylistItems('playlist', 'alice', ['one'])).rejects.toThrow(
+      'verified playlist append contract',
+    );
+    expect((await client.migrationCapabilities()).userData).toBe(true);
+    expect(transport).toHaveBeenCalledOnce();
+    await client.close();
+  });
+
+  it('fails closed when a legacy server exposes only older mutation routes', async () => {
+    const transport = vi.fn<FetchTransport>(async (address, init) => {
+      expect(new URL(address).pathname).toBe('/api-docs/openapi.json');
+      expect(init.method).toBe('GET');
+      return json({
+        info: { version: '99.0.0' },
+        paths: { '/Users/{userId}/PlayedItems/{itemId}': { post: {} } },
+      });
+    });
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
+    await expect(client.updateUserData('alice', 'movie', { Played: true })).rejects.toThrow(
+      'verified partial user-data contract',
+    );
+    await expect(client.userData('alice', 'movie')).rejects.toThrow(
+      'verified partial user-data contract',
+    );
+    expect(transport).toHaveBeenCalledOnce();
+    await client.close();
+  });
+
+  it('reports inaccessible contract discovery before attempting any mutation', async () => {
+    const transport = vi.fn<FetchTransport>(async () => new Response(null, { status: 404 }));
+    const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', { transport });
+    await expect(client.updateUserData('alice', 'movie', { IsFavorite: true })).rejects.toThrow(
+      'migration API contract could not be read at /api-docs/openapi.json. Jellyfin rejected the request (HTTP 404)',
+    );
+    expect(transport).toHaveBeenCalledOnce();
+    expect(transport.mock.calls[0]![1].method).toBe('GET');
+    await client.close();
+  });
 
   it('creates the full private playlist atomically with a bounded ordered ID list', async () => {
     const bodies: Record<string, unknown>[] = [];
     const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {
       transport: async (address, init) => {
-        if (new URL(address).pathname === '/System/Info') return json({ Version: '12.2' });
+        if (new URL(address).pathname === '/api-docs/openapi.json')
+          return json(jellyfinWriteContract());
         expect(new URL(address).pathname).toBe('/Playlists');
         bodies.push(JSON.parse(String(init.body)));
         return json({ Id: 'target-list' });
@@ -890,7 +1076,7 @@ describe('media API boundary', () => {
     const client = new MediaClient('http://jellyfin.test', 'key', 'jellyfin', {
       transport: async (address, init) => {
         const url = new URL(address);
-        if (init.method === 'GET') return json({ Version: '12.2' });
+        if (init.method === 'GET') return json(jellyfinWriteContract());
         posts.push(url.pathname);
         return new Response('private-upstream-data', { status: 503 });
       },

@@ -99,8 +99,7 @@ describe('workflow requirements before account tasks', () => {
   });
   it('checks the catalog against live Jellyfin identity and routes a mismatch to imports', async () => {
     const f = fixture((client, kind) => {
-      if (kind === 'jellyfin')
-        client.systemInfo = async () => ({ Id: 'current-jf', Version: '12.3.0' });
+      if (kind === 'jellyfin') client.systemInfo = async () => ({ Id: 'current-jf' });
     });
     const check = vi
       .spyOn(f.service.destinationSnapshots, 'queuedSelection')
@@ -111,7 +110,7 @@ describe('workflow requirements before account tasks', () => {
           );
       });
     const result = await f.readiness.snapshot();
-    expect(check).toHaveBeenCalledWith(f.store.settings(), { Id: 'current-jf', Version: '12.3.0' });
+    expect(check).toHaveBeenCalledWith(f.store.settings(), { Id: 'current-jf' });
     for (const action of [result.actions.migrate, result.actions.migrate_saved])
       expect(action.blockers).toContainEqual({
         code: 'matching_catalog',

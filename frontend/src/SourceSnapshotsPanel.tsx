@@ -270,8 +270,8 @@ export default function SourceSnapshotsPanel({
                       <td data-label="Source">
                         <strong>{record.source_username || 'All Emby users'}</strong>
                         <small>
-                          Emby {record.source_server_version}
-                          {record.schema ? ` · ${record.schema}` : ''}
+                          Emby
+                          {record.source_server_version ? ` ${record.source_server_version}` : ''}
                         </small>
                         <small>Source {record.source_server_id}</small>
                       </td>

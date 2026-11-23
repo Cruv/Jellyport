@@ -214,7 +214,7 @@ try {
   let phase = 'opening',
     phaseStarted = started;
   const result = await importJellyfinBackupCatalog(archive, output, {
-    observedServerVersion: VERSION,
+    requireFreshBackup: true,
     expectedCreatedAt: CREATED_AT,
     now: Date.parse(CREATED_AT) + 1000,
     onProgress: (progress) => {

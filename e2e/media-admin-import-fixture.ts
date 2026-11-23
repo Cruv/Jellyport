@@ -24,9 +24,9 @@ const destinationServer = 'ffeeddccbbaa99887766554433221111';
 const templateUser = '2233445566778899aabbccddeeff0011';
 const username = 'synthetic_member';
 const embyBackupVersion = '4.10.2.0';
-const embyLiveVersion = '4.10.3.0';
 const jellyfinBackupVersion = '12.2.0.0';
-const jellyfinLiveVersion = '12.5.0.0';
+const jellyfinNativeBackupVersion = '12.5.0.0';
+const backupEngineVersion = '1.7.0';
 type Kind = 'emby' | 'jellyfin';
 type BackupState = 'valid' | 'missing' | 'missing_file' | 'incomplete' | 'expired';
 
@@ -79,7 +79,7 @@ function jellyfinArchive(createdAt: string, serverVersion: string): Buffer {
       name: 'manifest.json',
       text: JSON.stringify({
         ServerVersion: serverVersion,
-        BackupEngineVersion: '0.2.0',
+        BackupEngineVersion: backupEngineVersion,
         DateCreated: createdAt,
         DatabaseTables: ['DbSet`1'],
         Options: { Database: true, Metadata: false, Subtitles: false, Trickplay: false },
@@ -267,7 +267,7 @@ export const test = base.extend<{ imports: ImportFixture }>({
             name,
             created_at: createdAt,
             server_version: jellyfinBackupVersion,
-            backup_engine_version: '0.2.0',
+            backup_engine_version: backupEngineVersion,
             database: true,
             metadata: false,
             subtitles: false,
@@ -341,7 +341,6 @@ export const test = base.extend<{ imports: ImportFixture }>({
             const media = servers.factory(url, key, kind);
             media.systemInfo = async () => ({
               Id: kind === 'emby' ? sourceServer : destinationServer,
-              Version: kind === 'emby' ? embyLiveVersion : jellyfinLiveVersion,
             });
             media.catalogItems = async () => {
               throw new Error('Live catalog scans are prohibited in this saved-backup fixture.');
@@ -572,13 +571,13 @@ for(const object of [dns,dns.promises]) for(const name of Object.keys(object)) i
           const name = `jellyfin-backup-${stamp}.zip`;
           await writeFile(
             join(destinationBackups, name),
-            jellyfinArchive(createdAt, jellyfinLiveVersion),
+            jellyfinArchive(createdAt, jellyfinNativeBackupVersion),
           );
           const manifest: JellyfinBackupManifest = {
             name,
             created_at: createdAt,
-            server_version: jellyfinLiveVersion,
-            backup_engine_version: '0.2.0',
+            server_version: jellyfinNativeBackupVersion,
+            backup_engine_version: backupEngineVersion,
             database: true,
             metadata: false,
             subtitles: false,

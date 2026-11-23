@@ -1,15 +1,19 @@
 import { MediaError } from './errors.js';
+import { snapshotVersionProvenance } from './snapshot-files.js';
 
-/** Safe identity and options only; the native server's filesystem path is private. */
-export interface JellyfinBackupManifest {
-  name: string;
-  created_at: string;
-  server_version: string;
-  backup_engine_version: string;
+export interface JellyfinBackupOptions {
   database: true;
   metadata: boolean;
   trickplay: boolean;
   subtitles: boolean;
+}
+
+/** Safe identity and options only; the native server's filesystem path is private. */
+export interface JellyfinBackupManifest extends JellyfinBackupOptions {
+  name: string;
+  created_at: string;
+  server_version?: string;
+  backup_engine_version?: string;
 }
 
 export interface JellyfinBackupTask {
@@ -20,11 +24,50 @@ export interface JellyfinBackupTask {
 const MAX_ENTRIES = 10_000;
 const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
-const version = (value: unknown): value is string =>
-  typeof value === 'string' &&
-  !/[\r\n]/.test(value) &&
-  /^\d{1,5}\.\d{1,5}(?:\.\d{1,5}){0,2}$/.test(value);
 const invalid = () => new MediaError('Jellyfin returned invalid backup information.');
+
+export function jellyfinBackupOptions(value: unknown): JellyfinBackupOptions | undefined {
+  if (
+    !object(value) ||
+    value.Database !== true ||
+    typeof value.Metadata !== 'boolean' ||
+    typeof value.Trickplay !== 'boolean' ||
+    typeof value.Subtitles !== 'boolean'
+  )
+    return;
+  return {
+    database: true,
+    metadata: value.Metadata,
+    trickplay: value.Trickplay,
+    subtitles: value.Subtitles,
+  };
+}
+
+export function validJellyfinBackupOptions(value: unknown): value is JellyfinBackupOptions {
+  return (
+    object(value) &&
+    value.database === true &&
+    typeof value.metadata === 'boolean' &&
+    typeof value.trickplay === 'boolean' &&
+    typeof value.subtitles === 'boolean'
+  );
+}
+
+export function sameJellyfinBackupOptions(
+  a: JellyfinBackupOptions,
+  b: JellyfinBackupOptions,
+): boolean {
+  return (
+    a.database === b.database &&
+    a.metadata === b.metadata &&
+    a.trickplay === b.trickplay &&
+    a.subtitles === b.subtitles
+  );
+}
+
+export function sameJellyfinBackup(a: JellyfinBackupManifest, b: JellyfinBackupManifest): boolean {
+  return a.name === b.name && a.created_at === b.created_at && sameJellyfinBackupOptions(a, b);
+}
 
 function validDateParts(year: number, month: number, day: number): boolean {
   if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1) return false;
@@ -76,27 +119,20 @@ export function parseJellyfinBackupManifest(value: unknown): JellyfinBackupManif
     !object(value) ||
     typeof value.Path !== 'string' ||
     value.Path.length > 4096 ||
-    /[\u0000-\u001f\u007f]/.test(value.Path) ||
-    !version(value.ServerVersion) ||
-    !version(value.BackupEngineVersion) ||
-    !object(value.Options) ||
-    value.Options.Database !== true ||
-    typeof value.Options.Metadata !== 'boolean' ||
-    typeof value.Options.Trickplay !== 'boolean' ||
-    typeof value.Options.Subtitles !== 'boolean'
+    /[\u0000-\u001f\u007f]/.test(value.Path)
   )
     throw invalid();
   const name = value.Path.split(/[\\/]/).at(-1);
-  if (!validJellyfinBackupName(name)) throw invalid();
+  const options = jellyfinBackupOptions(value.Options);
+  if (!validJellyfinBackupName(name) || !options) throw invalid();
+  const serverVersion = snapshotVersionProvenance(value.ServerVersion);
+  const engineVersion = snapshotVersionProvenance(value.BackupEngineVersion);
   return {
     name,
     created_at: createdAt(value.DateCreated),
-    server_version: value.ServerVersion,
-    backup_engine_version: value.BackupEngineVersion,
-    database: true,
-    metadata: value.Options.Metadata,
-    trickplay: value.Options.Trickplay,
-    subtitles: value.Options.Subtitles,
+    ...(serverVersion ? { server_version: serverVersion } : {}),
+    ...(engineVersion ? { backup_engine_version: engineVersion } : {}),
+    ...options,
   };
 }
 

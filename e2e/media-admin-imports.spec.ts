@@ -97,7 +97,7 @@ async function importBoth(page: Page, imports: ImportFixture) {
   expect(destination).toMatchObject({
     backup_created_at: imports.backupAt,
     server_version: '12.2.0.0',
-    observed_server_version: '12.5.0.0',
+    backup_engine_version: '1.7.0',
   });
   expect(source.expires_at).toBe(
     new Date(Date.parse(imports.backupAt) + 48 * 60 * 60_000).toISOString(),

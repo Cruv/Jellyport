@@ -10,7 +10,6 @@ import {
   snapshotKey,
   readEnvelope,
   writeEnvelope,
-  SNAPSHOT_VERSION,
   type CaptureRequest,
 } from '../server/snapshot-files.js';
 import {
@@ -49,7 +48,7 @@ async function fixture(restored = false) {
     binding: {
       url: 'http://emby:8096',
       server_id: 'synthetic-emby-server',
-      version: SNAPSHOT_VERSION,
+      version: '4.10.1.0',
     },
     user_ids: ['a'.repeat(32)],
     capture_method: 'plugin_backup',
@@ -109,7 +108,7 @@ async function fixture(restored = false) {
     join(shared, 'helper.status'),
     {
       version: 1,
-      emby_version: SNAPSHOT_VERSION,
+      emby_version: '4.10.1.0',
       capture_method: 'plugin_backup',
       jellyfin_catalog_enabled: true,
       updated_at: now,
@@ -118,7 +117,7 @@ async function fixture(restored = false) {
   );
   const sourceInfo = vi.fn(async () => ({
     Id: 'synthetic-emby-server',
-    Version: SNAPSHOT_VERSION,
+    Version: '4.10.1.0',
   }));
   const destinationInfo = vi.fn(async () => ({ Id: 'b'.repeat(32), Version: '12.2.0' }));
   const service = new Service(store, {
@@ -157,7 +156,7 @@ it('shares helper ownership between real Service managers throughout binding loo
   await enteredLookup;
   await expect(f.service.destinationSnapshots.refresh()).rejects.toThrow('already running');
   expect(f.destinationInfo).not.toHaveBeenCalled();
-  release({ Id: 'synthetic-emby-server', Version: SNAPSHOT_VERSION });
+  release({ Id: 'synthetic-emby-server', Version: '4.10.1.0' });
   await pending;
   await expect(f.service.destinationSnapshots.refresh()).rejects.toThrow('already running');
   const name = (await readdir(f.shared)).find((name) => name.endsWith('.request'))!;

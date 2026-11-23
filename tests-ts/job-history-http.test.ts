@@ -516,14 +516,14 @@ it('refreshes inbox status from local evidence and newer server observations wit
   ).toBe(401);
 
   let present = true;
-  let version = '12.2.0';
+  let serverId = 'synthetic-jellyfin';
   const reads = { systemInfo: 0, users: 0 };
   service.clientFactory = (...args) => {
     const client = clientFactory(...args);
     const users = client.users.bind(client);
     client.systemInfo = async () => {
       reads.systemInfo++;
-      return { Id: 'synthetic-jellyfin', Version: version };
+      return { Id: serverId };
     };
     client.users = async () => {
       reads.users++;
@@ -538,7 +538,7 @@ it('refreshes inbox status from local evidence and newer server observations wit
       ...destination,
       configured: true,
       available: true,
-      usable: present && observed?.version === '12.2.0',
+      usable: present && observed?.id === 'synthetic-jellyfin',
     }));
   const inspect = async (attention: boolean) => {
     const result = await app.inject({ url: pathname, headers });
@@ -561,7 +561,7 @@ it('refreshes inbox status from local evidence and newer server observations wit
   expect(reads).toEqual({ systemInfo: 1, users: 1 });
 
   present = true;
-  version = '12.3.0';
+  serverId = 'replacement-jellyfin';
   expect(
     (
       await app.inject({
@@ -575,8 +575,8 @@ it('refreshes inbox status from local evidence and newer server observations wit
   clientFactory.mockClear();
   await inspect(true);
   expect(clientFactory).not.toHaveBeenCalled();
-  expect(reads).toEqual({ systemInfo: 2, users: 2 });
-  expect(status).toHaveBeenLastCalledWith(expect.objectContaining({ version: '12.3.0' }));
+  expect(reads).toEqual({ systemInfo: 2, users: 1 });
+  expect(status).toHaveBeenLastCalledWith(expect.objectContaining({ id: 'replacement-jellyfin' }));
 });
 
 it('observes retained catalog providers at most once per five minutes without delaying inbox replies', async () => {
@@ -593,7 +593,7 @@ it('observes retained catalog providers at most once per five minutes without de
   const stalled = new Promise<void>((resolve) => {
     release = resolve;
   });
-  let upgraded = false;
+  let replaced = false;
   const reads = {
     emby: { systemInfo: 0, users: 0 },
     jellyfin: { systemInfo: 0, users: 0 },
@@ -604,11 +604,11 @@ it('observes retained catalog providers at most once per five minutes without de
     const users = client.users.bind(client);
     client.systemInfo = async (options) => {
       reads[kind].systemInfo++;
-      if (upgraded) {
+      if (replaced) {
         expect(options).toMatchObject({ retry: false, signal: expect.any(AbortSignal) });
         await stalled;
       }
-      return { Id: `synthetic-${kind}`, Version: upgraded ? '12.3.0' : '12.2.0' };
+      return { Id: `${replaced ? 'replacement' : 'synthetic'}-${kind}` };
     };
     client.users = async () => {
       reads[kind].users++;
@@ -626,12 +626,12 @@ it('observes retained catalog providers at most once per five minutes without de
   vi.spyOn(service.sourceSnapshots, 'status').mockImplementation(async (observed) => ({
     ...source,
     ...saved,
-    usable: observed?.version === '12.2.0',
+    usable: observed?.id === 'synthetic-emby',
   }));
   vi.spyOn(service.destinationSnapshots, 'status').mockImplementation(async (observed) => ({
     ...target,
     ...saved,
-    usable: observed?.version === '12.2.0',
+    usable: observed?.id === 'synthetic-jellyfin',
   }));
   const inbox = () => app.inject({ url: '/api/overview/inbox', headers });
   const catalogStates = (response: Awaited<ReturnType<typeof inbox>>) =>
@@ -649,7 +649,7 @@ it('observes retained catalog providers at most once per five minutes without de
     jellyfin: { systemInfo: 1, users: 1 },
   });
   time++;
-  upgraded = true;
+  replaced = true;
   try {
     // Both replies must finish while the upstream checks are still stalled.
     expect(catalogStates(await inbox())).toEqual([false, false]);

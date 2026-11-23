@@ -54,7 +54,6 @@ type Request =
       operation: 'destination_capture';
       directory: string;
       output: string;
-      version: string;
       expected_backup?: DestinationCatalogRequest['expected_backup'];
     }
   | {
@@ -242,9 +241,9 @@ async function captureDestination(request: Extract<Request, { operation: 'destin
     )
       throw new DestinationCatalogError('backup_invalid');
     const imported = await importJellyfinBackupCatalog(path, request.output, {
-      observedServerVersion: request.version,
-      expectedArchiveVersion: request.expected_backup?.server_version,
+      requireFreshBackup: true,
       expectedCreatedAt: request.expected_backup?.created_at,
+      expectedOptions: request.expected_backup?.options,
       onProgress: (value) =>
         observe(
           value.phase === 'items'

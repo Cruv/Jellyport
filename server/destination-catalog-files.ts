@@ -1,12 +1,14 @@
-import type { SnapshotBinding } from './snapshot-files.js';
-import { snapshotId } from './snapshot-files.js';
+import { snapshotId, snapshotVersionProvenance, type SnapshotBinding } from './snapshot-files.js';
 import { ServiceError } from './errors.js';
-import { validJellyfinBackupName } from './jellyfin-backup-api.js';
+import {
+  sameJellyfinBackupOptions,
+  validJellyfinBackupName,
+  validJellyfinBackupOptions,
+  type JellyfinBackupOptions,
+} from './jellyfin-backup-api.js';
 
-// Retained for legacy results and the separate backup deletion workflow.
-export const DESTINATION_BACKUP_SERVER_VERSIONS = ['12.2.0.0', '12.4.0.0'] as const;
+// Historical identifier of the validated projection contract, not an engine release gate.
 export const DESTINATION_ARCHIVE_SCHEMA = 'jellyfin-native-json-0.2.0';
-export const DESTINATION_BACKUP_ENGINE = '0.2.0';
 export const DESTINATION_CATALOG_MAX_AGE = 48 * 60 * 60_000;
 // Offline ZIP/index preparation is separate from the user migration performance target.
 export const DESTINATION_CATALOG_DEADLINE = 30 * 60_000;
@@ -149,7 +151,7 @@ export interface DestinationCatalogRequest {
   requested_at: string;
   binding: SnapshotBinding;
   /** A completed native backup selected by the web process; no credentials or raw paths. */
-  expected_backup?: { name: string; created_at: string; server_version?: string };
+  expected_backup?: { name: string; created_at: string; options?: JellyfinBackupOptions };
 }
 export interface DestinationCatalogResult extends DestinationCatalogRequest {
   ok: boolean;
@@ -184,9 +186,9 @@ export interface DestinationCatalogMetadata {
   items: number;
   keys: number;
   bytes: number;
-  server_version: string;
+  server_version?: string;
   observed_server_version?: string;
-  backup_engine_version: string;
+  backup_engine_version?: string;
   backup_created_at: string;
   imported_at: string;
   import_elapsed_ms: number;
@@ -197,14 +199,31 @@ export const destinationCatalogPrefix = (id: string) => {
   if (!snapshotId.test(id)) throw new Error('Invalid destination catalog generation.');
   return `jellyfin-${id}`;
 };
-export const normalizedServerVersion = (version: string) =>
-  /^\d{1,5}\.\d{1,5}(?:\.\d{1,5}){0,2}$/.test(version)
-    ? version.split('.').map(Number).concat([0, 0]).slice(0, 4).join('.')
-    : '';
-export const supportedDestinationBackupVersion = (version: string): boolean =>
-  DESTINATION_BACKUP_SERVER_VERSIONS.some(
-    (supported) => supported === normalizedServerVersion(version),
+export function sameDestinationBinding(
+  a: Pick<SnapshotBinding, 'url' | 'server_id'>,
+  b: Pick<SnapshotBinding, 'url' | 'server_id'>,
+): boolean {
+  try {
+    return (
+      new URL(a.url).toString() === new URL(b.url).toString() &&
+      a.server_id.toLowerCase() === b.server_id.toLowerCase()
+    );
+  } catch {
+    return false;
+  }
+}
+export function sameDestinationSelection(
+  a: DestinationCatalogRequest['expected_backup'],
+  b: DestinationCatalogRequest['expected_backup'],
+): boolean {
+  return (
+    a?.name === b?.name &&
+    a?.created_at === b?.created_at &&
+    (a?.options && b?.options
+      ? sameJellyfinBackupOptions(a.options, b.options)
+      : a?.options === b?.options)
   );
+}
 function validUrl(value: unknown): boolean {
   if (typeof value !== 'string' || value.length > 4096) return false;
   try {
@@ -226,27 +245,12 @@ export function validDestinationRequest(value: DestinationCatalogRequest): boole
     validUrl(value.binding?.url) &&
     typeof value.binding.server_id === 'string' &&
     /^[a-fA-F0-9]{32}$/.test(value.binding.server_id) &&
-    typeof value.binding.version === 'string' &&
-    normalizedServerVersion(value.binding.version) &&
     (value.expected_backup === undefined ||
       (validJellyfinBackupName(value.expected_backup?.name) &&
         typeof value.expected_backup.created_at === 'string' &&
         Number.isFinite(Date.parse(value.expected_backup.created_at)) &&
-        (value.expected_backup.server_version === undefined ||
-          (typeof value.expected_backup.server_version === 'string' &&
-            normalizedServerVersion(value.expected_backup.server_version)))))
-  );
-}
-function validArchiveBinding(value: DestinationCatalogResult): boolean {
-  if (typeof value.server_version !== 'string') return false;
-  const archive = normalizedServerVersion(value.server_version);
-  const observed = normalizedServerVersion(value.binding.version);
-  const selected = normalizedServerVersion(value.expected_backup?.server_version ?? '');
-  if (!archive || (selected && selected !== archive)) return false;
-  if (value.archive_schema === undefined)
-    return archive === observed && supportedDestinationBackupVersion(archive);
-  return (
-    value.archive_schema === DESTINATION_ARCHIVE_SCHEMA && (archive === observed || !!selected)
+        (value.expected_backup.options === undefined ||
+          validJellyfinBackupOptions(value.expected_backup.options))))
   );
 }
 export function validDestinationResult(value: DestinationCatalogResult): boolean {
@@ -274,8 +278,7 @@ export function validDestinationResult(value: DestinationCatalogResult): boolean
     Number.isFinite(Date.parse(value.finished_at)) &&
     Date.parse(value.finished_at) >= Date.parse(value.started_at) &&
     Date.parse(value.backup_created_at) <= Date.parse(value.finished_at) + 60_000 &&
-    validArchiveBinding(value) &&
-    value.backup_engine_version === DESTINATION_BACKUP_ENGINE &&
+    (value.archive_schema === undefined || value.archive_schema === DESTINATION_ARCHIVE_SCHEMA) &&
     typeof value.backup_fingerprint === 'string' &&
     /^[a-f0-9]{64}$/.test(value.backup_fingerprint)
   );
@@ -284,14 +287,17 @@ export function destinationCatalogMetadata(
   value: DestinationCatalogResult,
 ): DestinationCatalogMetadata {
   if (!validDestinationResult(value)) throw new Error('Unsupported destination catalog.');
+  const archiveVersion = snapshotVersionProvenance(value.server_version);
+  const observedVersion = snapshotVersionProvenance(value.binding.version);
+  const engineVersion = snapshotVersionProvenance(value.backup_engine_version);
   return {
     id: value.id,
     items: value.items!,
     keys: value.keys!,
     bytes: value.bytes!,
-    server_version: value.server_version!,
-    observed_server_version: value.binding.version,
-    backup_engine_version: value.backup_engine_version!,
+    ...(archiveVersion ? { server_version: archiveVersion } : {}),
+    ...(observedVersion ? { observed_server_version: observedVersion } : {}),
+    ...(engineVersion ? { backup_engine_version: engineVersion } : {}),
     backup_created_at: value.backup_created_at!,
     imported_at: value.finished_at,
     import_elapsed_ms: Math.max(0, Date.parse(value.finished_at) - Date.parse(value.requested_at)),

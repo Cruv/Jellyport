@@ -15,7 +15,6 @@ import {
   snapshotKey,
   writeEnvelope,
   SNAPSHOT_PROJECTION_SCHEMA,
-  SNAPSHOT_VERSION,
   type CaptureRequest,
   type CaptureResult,
 } from '../server/snapshot-files.js';
@@ -26,6 +25,7 @@ vi.mock('../server/snapshot-process.js', () => ({ snapshotProcess: vi.fn() }));
 
 const userId = '0123456789ab4cde81230123456789ab';
 const otherUserId = '123456789abc4def8123123456789abc';
+const FIXTURE_EMBY_VERSION = '4.10.1.0';
 const resources: Array<{ manager: SourceSnapshots; store: Store; directory: string }> = [];
 const worker = vi.mocked(snapshotProcess);
 
@@ -58,7 +58,10 @@ async function fixture(demo = false, imports?: ImportCoordinator) {
   };
   store.saveSettings(settings);
   const client = {
-    systemInfo: vi.fn(async () => ({ Id: 'fixture-emby-server', Version: SNAPSHOT_VERSION })),
+    systemInfo: vi.fn<() => Promise<{ Id: string; Version?: unknown }>>(async () => ({
+      Id: 'fixture-emby-server',
+      Version: FIXTURE_EMBY_VERSION,
+    })),
     users: vi.fn(async () => [{ Id: userId, Name: 'fixture-user' }]),
     close: vi.fn(async () => {}),
   };
@@ -72,7 +75,7 @@ async function fixture(demo = false, imports?: ImportCoordinator) {
   const key = demo ? undefined : await snapshotKey(shared);
   async function heartbeat(
     updatedAt = new Date().toISOString(),
-    version = SNAPSHOT_VERSION,
+    version = FIXTURE_EMBY_VERSION,
     captureMethod?: unknown,
     versions?: unknown,
     pluginBackupSchema?: unknown,
@@ -160,7 +163,7 @@ async function pluginCapture(
   f: Awaited<ReturnType<typeof fixture>>,
   overrides: Partial<CaptureResult> = {},
 ) {
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  await f.heartbeat(new Date().toISOString(), FIXTURE_EMBY_VERSION, 'plugin_backup');
   await f.manager.refresh();
   return f.finish(await f.pendingRequest(), {
     backup_created_at: new Date(Date.now() - 60 * 60_000).toISOString(),
@@ -233,8 +236,6 @@ it('imports plugin provenance with original history age and permits accounts cre
 });
 
 it.each([
-  { plugin_version: undefined },
-  { plugin_version: '1.8.8.0' },
   { backup_fingerprint: undefined },
   { backup_fingerprint: '../private-backup' },
   { backup_created_at: undefined },
@@ -636,7 +637,7 @@ it('requests an encrypted capture bound to verified source identity and its publ
     binding: {
       url: 'http://emby:8096',
       server_id: 'fixture-emby-server',
-      version: SNAPSHOT_VERSION,
+      version: FIXTURE_EMBY_VERSION,
     },
     user_ids: [userId],
   });
@@ -671,7 +672,7 @@ it('collects stale unfinished ciphertext while preserving recent work and the la
 
 it('pins a file-copy helper method and preserves its provenance across restart and helper changes', async () => {
   const f = await fixture();
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  await f.heartbeat(new Date().toISOString(), FIXTURE_EMBY_VERSION, 'file_copy');
   expect(await f.manager.status()).toMatchObject({ available: true, capture_method: 'file_copy' });
   await f.manager.refresh();
   const request = await f.pendingRequest();
@@ -681,12 +682,12 @@ it('pins a file-copy helper method and preserves its provenance across restart a
     (await f.manager.select(userId, f.settings, 'fixture-emby-server')).metadata.source_type,
   ).toBe('file_copy');
   await f.restart();
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'sqlite_online_backup');
+  await f.heartbeat(new Date().toISOString(), FIXTURE_EMBY_VERSION, 'sqlite_online_backup');
   expect(await f.manager.status()).toMatchObject({
     capture_method: 'sqlite_online_backup',
     records: [{ id: capture.id, source_type: 'file_copy' }],
   });
-  await f.heartbeat(new Date(Date.now() - 30_000).toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  await f.heartbeat(new Date(Date.now() - 30_000).toISOString(), FIXTURE_EMBY_VERSION, 'file_copy');
   expect(await f.manager.status()).toMatchObject({
     available: false,
     capture_method: 'sqlite_online_backup',
@@ -697,14 +698,18 @@ it('pins a file-copy helper method and preserves its provenance across restart a
 
 it('remembers an authenticated plugin source without any imported generation through helper failure and restart', async () => {
   const f = await fixture();
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  await f.heartbeat(new Date().toISOString(), FIXTURE_EMBY_VERSION, 'plugin_backup');
   expect(await f.manager.status()).toMatchObject({
     available: true,
     history_source_known: true,
     capture_method: 'plugin_backup',
     snapshots: 0,
   });
-  await f.heartbeat(new Date(Date.now() - 30_000).toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  await f.heartbeat(
+    new Date(Date.now() - 30_000).toISOString(),
+    FIXTURE_EMBY_VERSION,
+    'plugin_backup',
+  );
   expect(await f.manager.status()).toMatchObject({
     available: false,
     history_source_known: true,
@@ -731,9 +736,13 @@ it('marks an unobserved configured source as unknown instead of authorizing a de
     history_source_known: false,
     snapshots: 0,
   });
-  await f.heartbeat(new Date(Date.now() - 30_000).toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  await f.heartbeat(
+    new Date(Date.now() - 30_000).toISOString(),
+    FIXTURE_EMBY_VERSION,
+    'plugin_backup',
+  );
   expect((await f.manager.status()).history_source_known).toBe(false);
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
+  await f.heartbeat(new Date().toISOString(), FIXTURE_EMBY_VERSION, 'plugin_backup');
   expect(await f.manager.status()).toMatchObject({
     available: true,
     history_source_known: true,
@@ -744,7 +753,7 @@ it('marks an unobserved configured source as unknown instead of authorizing a de
 it('rejects an authenticated result that silently changes file-copy capture to online backup', async () => {
   const f = await fixture();
   const good = await f.complete();
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  await f.heartbeat(new Date().toISOString(), FIXTURE_EMBY_VERSION, 'file_copy');
   await f.manager.refresh();
   const request = await f.pendingRequest();
   await f.finish(request, { capture_method: 'sqlite_online_backup' });
@@ -757,7 +766,7 @@ it('rejects an authenticated result that silently changes file-copy capture to o
 
 it('rejects unknown helper capture methods before making any Emby API request', async () => {
   const f = await fixture();
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'unrecognized-capture-method');
+  await f.heartbeat(new Date().toISOString(), FIXTURE_EMBY_VERSION, 'unrecognized-capture-method');
   await expect(f.manager.refresh()).rejects.toThrow('helper is unavailable');
   expect(f.factory).not.toHaveBeenCalled();
 });
@@ -772,14 +781,14 @@ it('reads legacy capture manifests without a method as SQLite online backups', a
   ).toBe('sqlite_online_backup');
 });
 
-it('fails closed for stale helpers, unsupported server versions and unsupported public user IDs', async () => {
+it('fails closed for stale helpers, missing server identities and unsupported public user IDs', async () => {
   const f = await fixture();
   await f.heartbeat(new Date(Date.now() - 30_000).toISOString());
   await expect(f.manager.refresh()).rejects.toThrow('helper is unavailable');
   expect(f.factory).not.toHaveBeenCalled();
   await f.heartbeat();
-  f.client.systemInfo.mockResolvedValueOnce({ Id: 'fixture-emby-server', Version: '4.10.3.0' });
-  await expect(f.manager.refresh()).rejects.toThrow('helper does not support');
+  f.client.systemInfo.mockResolvedValueOnce({ Id: '', Version: '4.10.3.0' });
+  await expect(f.manager.refresh()).rejects.toThrow('server identity');
   f.client.users.mockResolvedValueOnce([{ Id: 'not-a-public-guid', Name: 'fixture' }]);
   await expect(f.manager.refresh()).rejects.toThrow('unsupported user identities');
   expect(f.client.close).toHaveBeenCalledTimes(2);
@@ -812,7 +821,7 @@ it('selects only captures for the configured server, user and age without fallin
   expect(selected.metadata).toMatchObject({
     source_type: 'sqlite_online_backup',
     schema: 'emby-4.10.1.0',
-    source_server_version: SNAPSHOT_VERSION,
+    source_server_version: FIXTURE_EMBY_VERSION,
     source_user_id: userId,
     scope: 'complete',
   });
@@ -1271,7 +1280,7 @@ it('restores the named-zone schedule and last daily attempt across a manager res
 it('uses the file-copy method for daily scheduled captures without repeating the daily attempt', async () => {
   vi.setSystemTime(new Date('2026-10-09T03:30:00Z'));
   const f = await fixture();
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'file_copy');
+  await f.heartbeat(new Date().toISOString(), FIXTURE_EMBY_VERSION, 'file_copy');
   const config = (await f.manager.status()).config;
   await f.manager.configure({ ...config, enabled: true, expected_revision: config.revision });
   await f.tick();
@@ -1365,7 +1374,7 @@ it('owns the shared helper throughout asynchronous identity lookup and releases 
   expect((await f.manager.status()).running).toBe(true);
   expect(imports.acquire('jellyfin:synthetic-other-import')).toBe(false);
   await expect(f.manager.refresh()).rejects.toThrow('already running');
-  release({ Id: 'fixture-emby-server', Version: SNAPSHOT_VERSION });
+  release({ Id: 'fixture-emby-server', Version: FIXTURE_EMBY_VERSION });
   await request;
   expect(imports.busy).toBe(true);
   await f.finish(await f.pendingRequest());
@@ -1457,16 +1466,12 @@ it('skips a nonexistent spring-forward wall-clock time in the actual scheduler',
   expect((await f.manager.status()).next_run_at).toBe('2026-03-09T06:30:00.000Z');
 });
 
-it('imports verified 4.10.2 plugin backups only through a capable helper and preserves the source version across restarts', async () => {
+it('accepts legacy helper envelopes without checking their advertised Emby versions', async () => {
   const f = await fixture();
   f.client.systemInfo.mockResolvedValue({ Id: 'fixture-emby-server', Version: '4.10.2.0' });
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'plugin_backup');
-  await expect(f.manager.refresh()).rejects.toThrow('helper does not support');
-  expect((await readdir(f.shared)).filter((name) => name.endsWith('.request'))).toEqual([]);
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, 'plugin_backup', [
-    '4.10.1.0',
-    '4.10.2.0',
-  ]);
+  await f.heartbeat(new Date().toISOString(), FIXTURE_EMBY_VERSION, 'plugin_backup', {
+    malformed: true,
+  });
   await f.manager.refresh();
   const request = await f.pendingRequest();
   expect(request.binding.version).toBe('4.10.2.0');
@@ -1481,22 +1486,6 @@ it('imports verified 4.10.2 plugin backups only through a capable helper and pre
   expect(selected.metadata.source_server_version).toBe('4.10.2.0');
   expect(selected.metadata.schema).toBe('emby-4.10.1.0');
 });
-
-it.each([
-  ['plugin_backup', ['4.10.1.0', '4.10.3.0']],
-  ['plugin_backup', ['4.10.2.0']],
-  ['plugin_backup', ['4.10.1.0', '4.10.1.0']],
-  ['file_copy', ['4.10.1.0', '4.10.2.0']],
-  ['sqlite_online_backup', ['4.10.1.0', '4.10.2.0']],
-] as const)(
-  'refuses malformed or unverified helper version capabilities for %s: %j',
-  async (method, versions) => {
-    const f = await fixture();
-    await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, method, versions);
-    await expect(f.manager.refresh()).rejects.toThrow('helper is unavailable');
-    expect(f.factory).not.toHaveBeenCalled();
-  },
-);
 
 it('imports by schema and reuses the exact same server backup across Emby upgrades and restarts', async () => {
   const f = await fixture();
@@ -1537,7 +1526,7 @@ it('imports by schema and reuses the exact same server backup across Emby upgrad
   await expect(stat(join(f.shared, `${newerAttempt.id}.db.enc`))).rejects.toMatchObject({
     code: 'ENOENT',
   });
-  await importAtVersion('5.0.0.0', { backup_server_version: undefined });
+  await importAtVersion('5.0.0.0', { schema: 'unsupported-projection' });
   expect(await f.manager.status(observation)).toMatchObject({
     snapshots: 1,
     records: [{ id: capture.id }],
@@ -1554,25 +1543,51 @@ it.each([
   ['file_copy', SNAPSHOT_PROJECTION_SCHEMA],
 ])('refuses an incompatible plugin schema advertisement (%s, %s)', async (method, schema) => {
   const f = await fixture();
-  await f.heartbeat(new Date().toISOString(), SNAPSHOT_VERSION, method, undefined, schema);
+  await f.heartbeat(new Date().toISOString(), FIXTURE_EMBY_VERSION, method, undefined, schema);
   await expect(f.manager.refresh()).rejects.toThrow('helper is unavailable');
   expect(f.factory).not.toHaveBeenCalled();
 });
 
-it('reuses projected raw history after an upgrade while keeping new live captures pinned', async () => {
+it('retains plugin history with absent or malformed release provenance across a restart', async () => {
   const f = await fixture();
-  const result = await f.complete();
-  expect(
-    await f.manager.status({
-      id: 'fixture-emby-server',
-      version: '4.10.2.0',
-      observed_at: Date.now(),
-    }),
-  ).toMatchObject({ usable: true });
-  f.client.systemInfo.mockResolvedValueOnce({ Id: 'fixture-emby-server', Version: '4.10.2.0' });
-  await expect(f.manager.refresh()).rejects.toThrow('helper does not support');
-  expect((await f.manager.select(userId, f.settings, 'fixture-emby-server', result.id)).id).toBe(
-    result.id,
-  );
-  expect((await f.manager.status()).snapshots).toBe(1);
+  f.client.systemInfo.mockResolvedValueOnce({ Id: 'fixture-emby-server' });
+  const capture = await pluginCapture(f, {
+    backup_server_version: null,
+    plugin_version: '../invalid-plugin-label',
+  });
+  await f.restart();
+  const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server', capture.id);
+  expect(selected.metadata).not.toHaveProperty('source_server_version');
+  expect(selected.metadata).not.toHaveProperty('plugin_version');
+  expect(selected.metadata.backup_created_at).toBe(capture.backup_created_at);
 });
+
+it.each([undefined, '4.10.2.0', { private: 'fixture' }, '../private-fixture', '4.10.2.0\n'])(
+  'allows new live captures with optional release provenance (%j)',
+  async (version) => {
+    const f = await fixture();
+    const result = await f.complete();
+    expect(
+      await f.manager.status({
+        id: 'fixture-emby-server',
+        observed_at: Date.now(),
+      }),
+    ).toMatchObject({ usable: true });
+    f.client.systemInfo.mockResolvedValueOnce({ Id: 'fixture-emby-server', Version: version });
+    const request = await f.request();
+    const provenance = version === '4.10.2.0' ? version : undefined;
+    expect(request.binding.version).toBe(provenance);
+    // The release in a stored result has no role in matching it to its request.
+    const observedVersion =
+      version === undefined ? undefined : provenance ? '5.0.0.0' : '../private-fixture';
+    const captured = await f.finish(request, {
+      binding: { ...request.binding, version: observedVersion },
+    });
+    const selected = await f.manager.select(userId, f.settings, 'fixture-emby-server', captured.id);
+    expect(selected.metadata.source_server_version).toBe(provenance ? observedVersion : undefined);
+    expect((await f.manager.status()).records.map((record) => record.id)).toEqual([
+      captured.id,
+      result.id,
+    ]);
+  },
+);

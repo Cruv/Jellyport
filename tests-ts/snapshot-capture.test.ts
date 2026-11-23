@@ -342,18 +342,20 @@ it('reports conditional failure retention for an interrupted first capture witho
   expect((await readdir(path)).filter((name) => /\.(working|pending)$/.test(name))).toEqual([]);
 });
 
-it('preserves an authenticated completed capture result and removes only its interrupted markers', async () => {
+it('preserves an authenticated completed capture regardless of release provenance and clears interrupted markers', async () => {
   const path = await directory();
   const key = randomBytes(32);
-  for (const [ok, orphan_identity_version] of [
-    [true, undefined],
-    [true, 1],
-    [false, undefined],
+  for (const [ok, orphan_identity_version, resultVersion] of [
+    [true, undefined, undefined],
+    [true, 1, '5.0.0.0'],
+    [true, 1, '../malformed-release'],
+    [false, undefined, undefined],
   ] as const) {
     const request = recoveryRequest();
     const now = new Date().toISOString();
     const result: CaptureResult = {
       ...request,
+      binding: { ...request.binding, version: resultVersion },
       ok,
       started_at: now,
       finished_at: now,

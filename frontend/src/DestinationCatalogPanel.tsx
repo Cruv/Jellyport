@@ -326,10 +326,17 @@ export default function DestinationCatalogPanel({
                       {record.keys.toLocaleString()} matching keys ·{' '}
                       {(record.bytes / 1024 ** 2).toFixed(1)} MiB
                     </small>
-                    <small>
-                      Jellyfin {record.server_version} · Backup format{' '}
-                      {record.backup_engine_version}
-                    </small>
+                    {(record.server_version || record.backup_engine_version) && (
+                      <small>
+                        {[
+                          record.server_version && `Jellyfin ${record.server_version}`,
+                          record.backup_engine_version &&
+                            `Backup engine ${record.backup_engine_version}`,
+                        ]
+                          .filter(Boolean)
+                          .join(' · ')}
+                      </small>
+                    )}
                   </td>
                   <td data-label="Availability">
                     <strong>{expired ? 'Expired' : usable ? 'Available' : 'Unavailable'}</strong>

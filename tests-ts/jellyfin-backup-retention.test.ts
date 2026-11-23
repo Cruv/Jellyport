@@ -36,7 +36,7 @@ afterEach(async () => {
   for (const path of roots.splice(0)) await rm(path, { recursive: true, force: true });
 });
 /** Independent minimal archive writer; all contents are synthetic. */
-function archive(date: string) {
+function archive(date: string, overrides: Record<string, unknown> = {}) {
   const entries = {
     'manifest.json': JSON.stringify({
       ServerVersion: '12.2.0.0',
@@ -44,6 +44,7 @@ function archive(date: string) {
       DateCreated: date,
       DatabaseTables: ['Synthetic'],
       Options: { Database: true, Metadata: false, Trickplay: false, Subtitles: false },
+      ...overrides,
     }),
     'Database/BaseItems.json': '[]',
     'Database/BaseItemProviders.json': '[]',
@@ -194,7 +195,7 @@ it('rejects stale and unauthenticated requests without touching archives', async
   await f.run();
   expect(await readFile(f.source)).toEqual(f.bytes);
 });
-it('rejects arbitrary paths, mismatched versions, excessive batches and duplicates', async () => {
+it('rejects arbitrary paths, excessive batches and duplicates', async () => {
   const f = await fixture();
   expect(validBackupCleanupRequest(f.request)).toBe(true);
   for (const name of [
@@ -212,12 +213,6 @@ it('rejects arbitrary paths, mismatched versions, excessive batches and duplicat
       }),
     ).toBe(false);
   }
-  expect(
-    validBackupCleanupRequest({
-      ...f.request,
-      binding: { ...f.request.binding, version: '99.0.0' },
-    }),
-  ).toBe(false);
   expect(
     validBackupCleanupRequest({
       ...f.request,
@@ -345,16 +340,35 @@ it('caps a fresh cleanup execution at fifteen minutes', async () => {
   expect((await f.result()).ok).toBe(true);
 });
 
-it('rejects malformed backup-version types in authenticated metadata without throwing', async () => {
+it('deletes only the exact owned archive regardless of missing or malformed release labels', async () => {
   const f = await fixture();
-  const malformed = {
-    ...f.request,
-    backups: [
-      {
-        ...f.request.backups[0]!,
-        manifest: { ...f.request.backups[0]!.manifest, server_version: 12.2 },
-      },
-    ],
-  };
-  expect(validBackupCleanupRequest(malformed as unknown as BackupCleanupRequest)).toBe(false);
+  const entry = f.request.backups[0]!;
+  const bytes = archive(entry.manifest.created_at, {
+    ServerVersion: undefined,
+    BackupEngineVersion: { label: 'next' },
+  });
+  f.request.binding.version = 'new live release';
+  delete entry.manifest.server_version;
+  entry.manifest.backup_engine_version = 'other engine';
+  entry.fingerprint = createHash('sha256').update(bytes).digest('hex');
+  await writeFile(f.source, bytes);
+  await writeEnvelope(join(f.exchange, `${f.prefix}.request`), f.request, f.key);
+  expect(validBackupCleanupRequest(f.request)).toBe(true);
+  await f.run();
+  expect(await f.result()).toMatchObject({ ok: true, removed: [entry.manifest.name] });
+  await expect(readFile(f.source)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+it('preserves an exact-fingerprint archive when its manifest options disagree', async () => {
+  const f = await fixture();
+  const entry = f.request.backups[0]!;
+  const bytes = archive(entry.manifest.created_at, {
+    Options: { Database: true, Metadata: true, Trickplay: false, Subtitles: false },
+  });
+  entry.fingerprint = createHash('sha256').update(bytes).digest('hex');
+  await writeFile(f.source, bytes);
+  await writeEnvelope(join(f.exchange, `${f.prefix}.request`), f.request, f.key);
+  await f.run();
+  expect(await f.result()).toMatchObject({ ok: false, removed: [] });
+  expect(await readFile(f.source)).toEqual(bytes);
 });

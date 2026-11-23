@@ -60,10 +60,11 @@ The web app uses its saved administrator API key to request Jellyfin's native
 backup API with database enabled and metadata, subtitles and trickplay disabled.
 Jellyfin also includes configuration and supporting files in this native archive.
 The helper receives the completed archive's safe filename, original timestamp and
-archive version. The API key stays in the web app. The helper's backup mount stays
-read-only unless the separate cleanup feature below is enabled. Manual **Import latest Jellyfin backup** remains
-import-only. With a compatible helper, imports select a completed backup from the
-native Jellyfin API by its original creation timestamp and pin that exact archive.
+backup options. The API key stays in the web app. The helper's backup mount stays
+read-only unless the separate cleanup feature below is enabled. Manual **Import
+latest Jellyfin backup** remains import-only. With a compatible helper, imports
+select a completed backup from the native Jellyfin API by its original creation
+timestamp and pin that exact archive.
 A newer ZIP still being written in the mounted folder cannot displace a completed
 archive. Filename ordering does not establish freshness. Older helper adapters
 without exact-selection support retain their legacy directory-selection behavior;
@@ -94,7 +95,7 @@ Jellyfin supplies neither a backup job ID nor a cancellation/idempotency API.
 Jellyport saves its intent before the POST and never automatically repeats that
 POST after a timeout, network error or application restart. It reconciles through
 read-only completed-backup observations. A unique new archive matching the bound
-server/version and request time can continue the import; an ambiguous result or
+server identity, database-only options and request time can continue the import. An ambiguous result or
 unconfirmed completion retains the last good catalog and blocks new imports.
 Late completion can still be recovered without another creation request.
 If a completed backup cannot initially be handed to the helper, Jellyport can
@@ -153,8 +154,9 @@ since import, an active/uncertain operation or an unverifiable identity is
 protected rather than guessed. Each pass handles at most sixteen archives, with
 sequential fingerprint checks and a fifteen-minute execution watchdog. Fingerprint
 reads use storage bandwidth, although cleanup never scans the live catalog.
-Deletion retains its separate exact-version safeguards for the inspected Jellyfin
-12.2.0.0 and 12.4.0.0 releases, even when catalog import can read a newer archive.
+Deletion requires a positive creation receipt from the linked Jellyfin server.
+The original filename, creation time, options and exact imported fingerprint must
+still match. A same-server upgrade preserves this evidence.
 Protected files and bounded cleanup batches can temporarily exceed the configured
 count. Keep any separate policy you already use for manual Jellyfin or Emby backups.
 
@@ -211,22 +213,20 @@ it is separate from the latest attempt's duration. Missing progress from an olde
 helper is shown without inventing counts or a completion percentage. Diagnostics
 contain no private paths, item identities, credentials or playback details.
 
-The adapter validates the native JSON schema used by **backup engine 0.2.0**.
-Jellyfin 12.2 and 12.4 use this schema, and another release can import when its
-manifest, neutral table entries, fields and relationships pass the same checks.
+The adapter validates the native JSON manifest, neutral table entries, fields and
+relationships. Jellyfin and backup engine release labels are optional metadata.
 The backup service, manifest, base-item and provider entities, and database table
 declarations were compared between 12.2 and 12.4 on 2026-11-04 and were unchanged.
 See the upstream [backup service](https://github.com/jellyfin/jellyfin/blob/v12.4/Jellyfin.Server.Implementations/FullSystemBackup/BackupService.cs),
 [base-item model](https://github.com/jellyfin/jellyfin/blob/v12.4/src/Jellyfin.Database/Jellyfin.Database.Implementations/Entities/BaseItemEntity.cs)
 and [provider model](https://github.com/jellyfin/jellyfin/blob/v12.4/src/Jellyfin.Database/Jellyfin.Database.Implementations/Entities/BaseItemProvider.cs).
 
-A previous-version archive can be imported after upgrading Jellyfin when the
-same linked server lists that exact completed archive and it passes schema and
-freshness checks. Without a linked API selection, the helper uses the newest
-canonical filename in the trusted mount and requires its version to match the
-live version observed at admission. An invalid selected archive stops the attempt.
-Jellyport records the archive version separately from the live version observed at
-import. Reuse and reimport keep the archive's original age.
+A current backup from the same server can be imported after a Jellyfin upgrade
+if it passes the same schema and freshness checks. Without a linked API selection,
+the helper uses the newest canonical filename in the trusted mount. An invalid
+selected archive stops the attempt. When available, Jellyport records the archive
+version and the live version observed at import separately. Reuse and reimport
+keep the archive's original age.
 
 After upgrading to 0.16.3, import the matching backup once again, even if the archive
 has not changed. Projection v2 adds neutral physical-root/library associations used
@@ -272,13 +272,12 @@ neutral library/root associations; it is encrypted in the shared directory and t
 private application storage. Protect exchange, work and application directories.
 
 This archive manifest lacks a server ID. The administrator's trusted backup-folder
-mount supplies provenance; the requested import is bound to the linked server's
-fresh API ID and URL, and cross-version imports also require the linked server's
-completed archive selection. The same server can keep using a current, validated
+mount supplies provenance. The requested import is bound to the linked server's
+fresh API ID and URL. The same server can keep using a current, validated
 catalog after a Jellyfin update. Before use, every candidate is checked through the
 actual user's API access and matching identity. Archive metadata cannot authorize
-an account, grant library access or bypass fresh state checks. Reusing an archive
-from another server is unsupported even if versions match.
+an account, grant library access or bypass fresh state checks. Mount the backups
+from the linked server.
 
 Backup creation and later library changes are not one atomic operation with live
 migration. New items are absent until another backup, and metadata edits can make

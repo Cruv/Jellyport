@@ -511,7 +511,7 @@ async function fixture(mode?: string, imports?: ImportCoordinator, keepTimer = f
   };
   store.saveSettings(settings);
   const client = {
-    systemInfo: vi.fn(async () => ({ Id: serverId, Version: '12.2.0' })),
+    systemInfo: vi.fn<MediaAPI['systemInfo']>(async () => ({ Id: serverId, Version: '12.2.0' })),
     close: vi.fn(async () => {}),
   };
   const factory = vi.fn(() => client as unknown as MediaAPI);
@@ -627,7 +627,7 @@ async function read(
   source: MediaItem[] = [item],
   signal?: AbortSignal,
 ) {
-  return f.manager.candidates(id, f.settings, serverId, '12.2.0.0', source, [], signal);
+  return f.manager.candidates(id, f.settings, serverId, source, [], signal);
 }
 
 describe('saved destination catalog manager', () => {
@@ -674,23 +674,18 @@ describe('saved destination catalog manager', () => {
       record: { id: record.id, backup_created_at: record.backup_created_at },
     });
     expect(f.manager.queuedSelection(f.settings)).toBe(record.id);
-    expect(f.manager.queuedSelection(f.settings, { Id: serverId, Version: '12.2.0.0' })).toBe(
-      record.id,
+    expect(f.manager.queuedSelection(f.settings, { Id: serverId })).toBe(record.id);
+    expect(() => f.manager.queuedSelection(f.settings, { Id: 'f'.repeat(32) })).toThrow(
+      /server identity.*Import a backup/,
     );
-    expect(f.manager.queuedSelection(f.settings, { Id: serverId, Version: '12.3.0' })).toBe(
-      record.id,
-    );
-    expect(() =>
-      f.manager.queuedSelection(f.settings, { Id: 'f'.repeat(32), Version: '12.2.0' }),
-    ).toThrow(/server identity.*Import a backup/);
-    expect(await f.manager.metadata(record.id, f.settings, serverId, '12.3.0')).toMatchObject({
+    expect(await f.manager.metadata(record.id, f.settings, serverId)).toMatchObject({
       id: record.id,
       server_version: '12.2.0.0',
       observed_server_version: '12.2.0',
     });
-    await expect(
-      f.manager.metadata(record.id, f.settings, 'f'.repeat(32), '12.3.0'),
-    ).rejects.toThrow('pinned Jellyfin catalog');
+    await expect(f.manager.metadata(record.id, f.settings, 'f'.repeat(32))).rejects.toThrow(
+      'pinned Jellyfin catalog',
+    );
     expect(worker).not.toHaveBeenCalled();
   });
   it('retains a usable catalog after an upgrade and flags replaced servers or missing files', async () => {
@@ -712,6 +707,25 @@ describe('saved destination catalog manager', () => {
     await rm(join(f.shared, `${destinationCatalogPrefix(record.id)}.db.enc`));
     expect(await f.manager.status()).toMatchObject({ usable: false, record: { id: record.id } });
     expect(f.factory).not.toHaveBeenCalled();
+  });
+  it('adopts and reads a legacy-shaped catalog without any release metadata', async () => {
+    const f = await fixture('backup');
+    f.client.systemInfo.mockResolvedValue({ Id: serverId });
+    const request = await f.request();
+    expect(request.binding).not.toHaveProperty('version');
+    const record = await f.finish(request, {
+      server_version: undefined,
+      backup_engine_version: undefined,
+    });
+    await f.restart();
+    const observation = { id: serverId, version: 'invalid\nlabel', observed_at: Date.now() };
+    const status = await f.manager.status(observation);
+    expect(status).toMatchObject({ usable: true, record: { id: record.id } });
+    expect(status.record).not.toHaveProperty('server_version');
+    expect(status.record).not.toHaveProperty('backup_engine_version');
+    expect(status.record).not.toHaveProperty('observed_server_version');
+    expect(f.manager.queuedSelection(f.settings, { Id: serverId })).toBe(record.id);
+    expect(await read(f, record.id)).toEqual([item]);
   });
   it.each(['missing', 'truncate', 'symlink'] as const)(
     'rejects %s encrypted output before adoption and cleans unused files',
@@ -751,7 +765,7 @@ describe('saved destination catalog manager', () => {
       backup_created_at: legacy.backup_created_at,
     });
     expect((await f.manager.status()).record?.id).toBe(upgraded.id);
-    expect(await f.manager.metadata(upgraded.id, f.settings, serverId, '12.2.0')).toMatchObject({
+    expect(await f.manager.metadata(upgraded.id, f.settings, serverId)).toMatchObject({
       projection_format: 2,
       backup_created_at: legacy.backup_created_at,
     });
@@ -848,14 +862,14 @@ describe('saved destination catalog manager', () => {
     const job = f.pin(first.id);
     await f.complete();
     await f.complete();
-    expect(await f.manager.metadata(first.id, f.settings, serverId, '12.2.0')).toMatchObject({
+    expect(await f.manager.metadata(first.id, f.settings, serverId)).toMatchObject({
       id: first.id,
     });
     await expect(f.manager.clear()).rejects.toThrow('using this catalog');
     job.status = 'completed';
     f.store.saveJob(job);
     await f.tick();
-    await expect(f.manager.metadata(first.id, f.settings, serverId, '12.2.0')).rejects.toThrow(
+    await expect(f.manager.metadata(first.id, f.settings, serverId)).rejects.toThrow(
       'expired, changed or incompatible',
     );
   });

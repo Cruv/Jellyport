@@ -23,9 +23,9 @@ export class MigrationCatalogCache {
     } = {},
   ) {}
 
-  static key(url: string, apiKey: string, serverId: string, version: string): string {
+  static key(url: string, apiKey: string, serverId: string): string {
     return createHash('sha256')
-      .update(JSON.stringify([new URL(url).toString(), apiKey, serverId, version]))
+      .update(JSON.stringify([new URL(url).toString(), apiKey, serverId]))
       .digest('hex');
   }
 

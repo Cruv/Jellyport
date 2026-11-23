@@ -347,41 +347,151 @@ syncBuiltinESMExports();
   10_000,
 );
 
-it.each(['file_copy', 'sqlite_online_backup'])(
-  'refuses unverified 4.10.2 raw %s helper startup',
+it.each(['file_copy', 'sqlite_online_backup'] as const)(
+  'captures %s with no mounted release file while enforcing identity and schema',
   async (method) => {
-    const directory = await mkdtemp(join(tmpdir(), 'jellyport-raw-version-refusal-'));
+    const directory = await mkdtemp(join(tmpdir(), 'jellyport-raw-schema-helper-'));
     directories.push(directory);
-    let stderr = '';
-    const child = fork(
-      fileURLToPath(new URL('../server/snapshot-helper.ts', import.meta.url)),
-      [],
-      {
-        execArgv: ['--import', 'tsx'],
-        stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
-        env: {
-          ...process.env,
-          JELLYPORT_SNAPSHOT_DIR: join(directory, 'exchange'),
-          JELLYPORT_SNAPSHOT_WORK_DIR: join(directory, 'work'),
-          JELLYPORT_SNAPSHOT_METHOD: method,
-          JELLYPORT_EMBY_DATA_DIR: join(directory, 'source-must-not-be-opened'),
-          JELLYPORT_EMBY_VERSION: '4.10.2.0',
-        },
-      },
+    const source = join(directory, 'source'),
+      exchange = join(directory, 'exchange'),
+      work = join(directory, 'work');
+    await mkdir(source);
+    const identity = join(source, 'device.txt');
+    await writeFile(identity, SERVER);
+    const schema = await readFile(
+      new URL('./fixtures/emby-4.10.1.0-schema.sql', import.meta.url),
+      'utf8',
     );
-    child.stderr?.on('data', (bytes: Buffer) => {
-      stderr = (stderr + bytes.toString()).slice(-4096);
-    });
-    const helper = {
-      child,
-      closed: new Promise<number | null>((resolve, reject) => {
-        child.once('close', resolve);
-        child.once('error', reject);
-      }),
-    };
-    helpers.push(helper);
-    expect(await helper.closed).toBe(1);
-    expect(stderr).toContain('selected Emby source mount and supported version');
-    expect(await readdir(directory)).toEqual([]);
+    const library = new DatabaseSync(join(source, 'library.db'));
+    const users = new DatabaseSync(join(source, 'users.db'));
+    try {
+      library.exec('PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;');
+      library.exec(schema.slice(0, schema.indexOf('CREATE TABLE LocalUsersv2')));
+      library.exec(`
+        INSERT INTO UserDataKeys2(Id,UserDataKey) VALUES (1,'fixture-movie');
+        INSERT INTO MediaItems(Id,type,Name,Path,ProviderIds,UserDataKeyId)
+          VALUES (1,5,'Synthetic Movie','/media/synthetic.mkv','Tmdb=987654321',1);
+        INSERT INTO UserDatas(UserDataKeyId,userId,played,playCount,isFavorite,
+          HideFromResume,playbackPositionTicks,LastPlayedDateInt,RatingLastModified,PlaystateLastModified)
+          VALUES (1,1,1,2,1,0,0,1791374400,0,0);
+      `);
+      users.exec('CREATE TABLE LocalUsersv2 (Id INTEGER PRIMARY KEY,guid BLOB NOT NULL) STRICT;');
+      users
+        .prepare('INSERT INTO LocalUsersv2 VALUES (1,?)')
+        .run(Buffer.from('33221100554477668899aabbccddeeff', 'hex'));
+      await verifyRawHelper();
+    } finally {
+      users.close();
+      library.close();
+    }
+
+    async function verifyRawHelper() {
+      const key = await snapshotKey(exchange, true);
+      const versions = [undefined, '5.0.0.0'];
+      const pending = await Promise.all(versions.map(submit));
+      const guard = join(directory, 'identity-swap.mjs');
+      const marker = join(directory, 'swap-device-id');
+      // The real fork checks device.txt, then this preloaded worker hook simulates it changing
+      // during capture. A successful worker still cannot publish after that change.
+      await writeFile(
+        guard,
+        `
+import { existsSync, writeFileSync } from 'node:fs';
+if (process.argv[1]?.endsWith('/snapshot-worker.ts') && existsSync(${JSON.stringify(marker)}))
+  writeFileSync(${JSON.stringify(identity)}, ${JSON.stringify(NEW_USER)});
+`,
+      );
+      let stderr = '';
+      const child = fork(
+        fileURLToPath(new URL('../server/snapshot-helper.ts', import.meta.url)),
+        [],
+        {
+          execArgv: ['--import', 'tsx'],
+          stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+          env: {
+            ...process.env,
+            NODE_OPTIONS: `--import=${pathToFileURL(guard).href}`,
+            JELLYPORT_SNAPSHOT_DIR: exchange,
+            JELLYPORT_SNAPSHOT_WORK_DIR: work,
+            JELLYPORT_SNAPSHOT_METHOD: method,
+            JELLYPORT_EMBY_DATA_DIR: source,
+            JELLYPORT_EMBY_VERSION: undefined,
+          },
+        },
+      );
+      child.stderr?.on('data', (bytes: Buffer) => {
+        stderr = (stderr + bytes.toString()).slice(-4096);
+      });
+      const helper = {
+        child,
+        closed: new Promise<number | null>((resolve, reject) => {
+          child.once('close', resolve);
+          child.once('error', reject);
+        }),
+      };
+      helpers.push(helper);
+      const status = await waitFor(() =>
+        readEnvelope<{ capture_method: string }>(join(exchange, 'helper.status'), key),
+      );
+      expect(status.capture_method).toBe(method);
+      expect(status).not.toHaveProperty('emby_version');
+      for (const [index, id] of pending.entries()) {
+        const result = await captured(id);
+        expect(result, stderr).toMatchObject({
+          ok: true,
+          schema: SNAPSHOT_PROJECTION_SCHEMA,
+          identities: { [GUID]: 1 },
+        });
+        expect(result.binding.version).toBe(versions[index]);
+      }
+      const capturesBefore = (await readdir(exchange)).filter((name) => name.endsWith('.db.enc'));
+      expect(capturesBefore).toHaveLength(2);
+      const hashes = await Promise.all(capturesBefore.map((name) => hash(join(exchange, name))));
+
+      await writeFile(identity, NEW_USER);
+      expect((await capture()).ok).toBe(false);
+      await writeFile(identity, SERVER);
+      await writeFile(marker, 'swap');
+      expect((await capture()).ok).toBe(false);
+      expect(await readFile(identity, 'utf8')).toBe(NEW_USER);
+      await rm(marker);
+      await writeFile(identity, SERVER);
+      library.exec('ALTER TABLE UserDatas RENAME TO UnsupportedHistory;');
+      expect(library.prepare('PRAGMA integrity_check').get()?.integrity_check).toBe('ok');
+      expect((await capture()).ok).toBe(false);
+
+      expect((await readdir(exchange)).filter((name) => name.endsWith('.db.enc'))).toEqual(
+        capturesBefore,
+      );
+      expect(await Promise.all(capturesBefore.map((name) => hash(join(exchange, name))))).toEqual(
+        hashes,
+      );
+      await expect(stat(join(source, 'lastversion.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+      expect(await stopHelper(helper), stderr).toBe(0);
+      expect(await readdir(work)).toEqual([]);
+
+      async function submit(version?: string) {
+        const request: CaptureRequest = {
+          id: randomUUID(),
+          requested_at: new Date().toISOString(),
+          capture_method: method,
+          binding: {
+            url: 'http://emby.invalid',
+            server_id: SERVER,
+            ...(version === undefined ? {} : { version }),
+          },
+          user_ids: [GUID],
+        };
+        await writeEnvelope(join(exchange, `${request.id}.request`), request, key);
+        return request.id;
+      }
+      async function captured(id: string) {
+        return waitFor(() => readEnvelope<CaptureResult>(join(exchange, `${id}.result`), key));
+      }
+      async function capture() {
+        return captured(await submit());
+      }
+    }
   },
+  15_000,
 );

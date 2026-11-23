@@ -80,7 +80,6 @@ export class WorkflowReadiness {
         configured,
         available: false,
         id: '',
-        version: undefined,
         users: [] as MediaUser[],
       };
       if (!configured) return unavailable;
@@ -108,7 +107,6 @@ export class WorkflowReadiness {
             if (users.length > 10_000) throw new Error('limit');
             return {
               id: info.Id,
-              version: typeof info.Version === 'string' ? info.Version : undefined,
               users,
             };
           })(),
@@ -216,7 +214,7 @@ export class WorkflowReadiness {
     try {
       this.service.destinationSnapshots.queuedSelection(
         settings,
-        jellyfin.available ? { Id: jellyfin.id, Version: jellyfin.version } : undefined,
+        jellyfin.available ? { Id: jellyfin.id } : undefined,
       );
     } catch (error) {
       matching.push({

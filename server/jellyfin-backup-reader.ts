@@ -19,12 +19,15 @@ import { projectCatalogItem, type MediaItem } from './media.js';
 import { jellyfinAsciiPathKey } from './jellyfin-library-membership.js';
 import {
   DestinationCatalogError,
-  DESTINATION_BACKUP_ENGINE,
   DESTINATION_CATALOG_MAX_AGE,
   destinationCatalogErrorCode,
-  normalizedServerVersion,
-  supportedDestinationBackupVersion,
 } from './destination-catalog-files.js';
+import {
+  jellyfinBackupOptions,
+  sameJellyfinBackupOptions,
+  type JellyfinBackupOptions,
+} from './jellyfin-backup-api.js';
+import { snapshotVersionProvenance } from './snapshot-files.js';
 
 export const JELLYFIN_BACKUP_PROJECTION_FORMAT = 'jellyfin-backup-catalog-v2';
 const MAX_ARCHIVE_BYTES = 8 * 1024 ** 3;
@@ -78,9 +81,10 @@ const itemFields = new Set([
 ]);
 const providerFields = new Set(['ItemId', 'ProviderId', 'ProviderValue']);
 export interface JellyfinBackupManifest {
-  serverVersion: string;
-  backupEngineVersion: string;
+  serverVersion?: string;
+  backupEngineVersion?: string;
   createdAt: string;
+  options: JellyfinBackupOptions;
 }
 export interface JellyfinBackupStats {
   sourceRows: number;
@@ -95,11 +99,9 @@ export interface JellyfinBackupProgress extends JellyfinBackupStats {
 export interface JellyfinBackupReadOptions {
   signal?: AbortSignal;
   onProgress?: (progress: JellyfinBackupProgress) => void;
-  /** Current server observation. Without a selected API manifest, require equal versions. */
-  observedServerVersion?: string;
-  /** Archive version reported for the exact completed backup by the linked server. */
-  expectedArchiveVersion?: string;
+  requireFreshBackup?: boolean;
   expectedCreatedAt?: string;
+  expectedOptions?: JellyfinBackupOptions;
   /** Deterministic private clock for synthetic tests, never accepted over IPC. */
   now?: number;
 }
@@ -158,13 +160,10 @@ function unchanged(first: BigIntStats, second: BigIntStats): boolean {
 }
 function readManifest(bytes: Buffer): JellyfinBackupManifest {
   const value: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+  const options = isObject(value) ? jellyfinBackupOptions(value.Options) : undefined;
   if (
     !isObject(value) ||
-    typeof value.ServerVersion !== 'string' ||
-    !normalizedServerVersion(value.ServerVersion) ||
-    value.BackupEngineVersion !== DESTINATION_BACKUP_ENGINE ||
-    !isObject(value.Options) ||
-    value.Options.Database !== true ||
+    !options ||
     !Array.isArray(value.DatabaseTables) ||
     value.DatabaseTables.length < 1 ||
     value.DatabaseTables.length > 128 ||
@@ -184,10 +183,13 @@ function readManifest(bytes: Buffer): JellyfinBackupManifest {
     new Date(wallTime).toISOString().slice(0, 19) !== value.DateCreated.slice(0, 19)
   )
     throw invalid();
+  const serverVersion = snapshotVersionProvenance(value.ServerVersion);
+  const backupEngineVersion = snapshotVersionProvenance(value.BackupEngineVersion);
   return {
-    serverVersion: normalizedServerVersion(value.ServerVersion),
-    backupEngineVersion: DESTINATION_BACKUP_ENGINE,
+    ...(serverVersion ? { serverVersion } : {}),
+    ...(backupEngineVersion ? { backupEngineVersion } : {}),
     createdAt: new Date(date).toISOString(),
+    options,
   };
 }
 
@@ -493,12 +495,7 @@ export async function inspectJellyfinBackupManifest(fd: number, signal?: AbortSi
       }),
       { signal },
     );
-    const manifest = readManifest(Buffer.concat(buffers));
-    // Manifest-only inspection feeds destructive retention and cannot establish
-    // compatibility of a new version by validating the complete catalog schema.
-    if (!supportedDestinationBackupVersion(manifest.serverVersion))
-      throw new DestinationCatalogError('version_unsupported');
-    return manifest;
+    return readManifest(Buffer.concat(buffers));
   } finally {
     zip.close();
   }
@@ -580,19 +577,13 @@ export async function importJellyfinBackupCatalog(
     )
       throw new DestinationCatalogError('backup_changed');
     if (
-      options.observedServerVersion !== undefined ||
-      options.expectedArchiveVersion !== undefined
-    ) {
+      options.expectedOptions &&
+      !sameJellyfinBackupOptions(manifest.options, options.expectedOptions)
+    )
+      throw new DestinationCatalogError('backup_changed');
+    if (options.requireFreshBackup) {
       const now = options.now ?? Date.now();
       const created = Date.parse(manifest.createdAt);
-      if (
-        !normalizedServerVersion(options.observedServerVersion ?? '') ||
-        (options.expectedArchiveVersion !== undefined && options.expectedCreatedAt === undefined) ||
-        normalizedServerVersion(
-          options.expectedArchiveVersion ?? options.observedServerVersion!,
-        ) !== manifest.serverVersion
-      )
-        throw new DestinationCatalogError('version_mismatch');
       if (created > now + 60_000) throw new DestinationCatalogError('backup_future');
       if (now - created > DESTINATION_CATALOG_MAX_AGE)
         throw new DestinationCatalogError('backup_expired');

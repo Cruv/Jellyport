@@ -4,7 +4,6 @@ import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  EMBY_SNAPSHOT_VERSION,
   inspectLibrary,
   projectLibrary,
   readSnapshotHistory,
@@ -219,10 +218,9 @@ describe('verified Emby 4.10.1.0 offline history reader', () => {
     );
   });
 
-  it('inspects the version-specific schema and returns only counts', () => {
+  it('validates the consumed schema and returns only counts', () => {
     const f = fixture();
     f.database.close();
-    expect(EMBY_SNAPSHOT_VERSION).toBe('4.10.1.0');
     expect(inspectLibrary(f.path)).toEqual({
       adapter: 'emby-4.10.1.0',
       item_count: 4,

@@ -18,7 +18,6 @@ import {
   BACKUP_CLEANUP_MAX_FILES,
   BACKUP_CLEANUP_ERROR,
   backupCleanupPrefix,
-  sameBackupBinding,
   validBackupCleanupResult,
   type OwnedJellyfinBackup,
   type BackupRetentionConfig,
@@ -27,7 +26,11 @@ import {
 } from './jellyfin-backup-retention.js';
 import { MediaError, ServiceError } from './errors.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
-import { validJellyfinBackupName, type JellyfinBackupManifest } from './jellyfin-backup-api.js';
+import {
+  sameJellyfinBackup,
+  validJellyfinBackupName,
+  type JellyfinBackupManifest,
+} from './jellyfin-backup-api.js';
 import {
   dailyImportSchedule,
   ImportCoordinator,
@@ -36,22 +39,26 @@ import {
   type ImportOutcome,
 } from './daily-import-schedule.js';
 import { snapshotProcess } from './snapshot-process.js';
-import { decryptDatabase, readEnvelope, snapshotKey, writeEnvelope } from './snapshot-files.js';
+import {
+  decryptDatabase,
+  readEnvelope,
+  snapshotKey,
+  snapshotVersionProvenance,
+  writeEnvelope,
+} from './snapshot-files.js';
 import {
   DESTINATION_CATALOG_MAX_AGE,
   DESTINATION_CATALOG_RECOVERY_DEADLINE,
   DESTINATION_CATALOG_REQUEST_MAX_AGE,
-  DESTINATION_BACKUP_ENGINE,
   destinationCatalogMetadata,
   destinationCatalogPrefix,
-  normalizedServerVersion,
-  supportedDestinationBackupVersion,
+  sameDestinationBinding,
+  sameDestinationSelection,
   validDestinationResult,
   validDestinationDiagnostic,
   validDestinationProgress,
   validDestinationErrorCode,
   destinationCatalogFailureMessage,
-  DestinationCatalogError,
   type DestinationCatalogDiagnostic,
   type DestinationCatalogErrorCode,
   type DestinationCatalogProgress,
@@ -143,38 +150,15 @@ async function cancelable<T>(promise: Promise<T>, signal: AbortSignal): Promise<
     if (signal.aborted) abort();
   });
 }
-function sameServerIdentity(
-  first: Pick<DestinationCatalogRequest['binding'], 'url' | 'server_id'>,
-  second: Pick<DestinationCatalogRequest['binding'], 'url' | 'server_id'>,
-): boolean {
-  try {
-    return (
-      new URL(first.url).toString() === new URL(second.url).toString() &&
-      first.server_id.toLowerCase() === second.server_id.toLowerCase()
-    );
-  } catch {
-    return false;
-  }
-}
-function sameBinding(
-  first: DestinationCatalogRequest['binding'],
-  second: DestinationCatalogRequest['binding'],
-): boolean {
-  return (
-    sameServerIdentity(first, second) &&
-    normalizedServerVersion(first.version) === normalizedServerVersion(second.version)
-  );
-}
-function sameSelectedBackup(
-  first: DestinationCatalogRequest['expected_backup'],
-  second: DestinationCatalogRequest['expected_backup'],
-): boolean {
-  return (
-    first?.name === second?.name &&
-    first?.created_at === second?.created_at &&
-    normalizedServerVersion(first?.server_version ?? '') ===
-      normalizedServerVersion(second?.server_version ?? '')
-  );
+function selectedBackup({
+  name,
+  created_at,
+  database,
+  metadata,
+  trickplay,
+  subtitles,
+}: JellyfinBackupManifest) {
+  return { name, created_at, options: { database, metadata, trickplay, subtitles } };
 }
 function current(value: DestinationCatalogResult): boolean {
   return (
@@ -401,7 +385,6 @@ export class DestinationCatalogs {
         new URL(latest.binding.url).toString() ===
           new URL(this.store.settings().jellyfin_url).toString() &&
         (!observed?.id || latest.binding.server_id.toLowerCase() === observed.id.toLowerCase()) &&
-        (!observed?.version || !!normalizedServerVersion(observed.version)) &&
         (await this.completeFile(latest));
     } catch {
       /* An expired/missing record remains visible, but cannot be selected. */
@@ -531,16 +514,15 @@ export class DestinationCatalogs {
       this.cleanupStarting ||
       this.state.backup_creation ||
       this.state.active ||
-      this.state.backup_cleanup!.pending ||
-      !supportedDestinationBackupVersion(binding.version)
+      this.state.backup_cleanup!.pending
     )
       return;
     const owned = this.state
-      .owned_backups!.filter((entry) => sameBackupBinding(entry.binding, binding))
+      .owned_backups!.filter((entry) => sameDestinationBinding(entry.binding, binding))
       .sort((a, b) => Date.parse(b.manifest.created_at) - Date.parse(a.manifest.created_at));
     const protectedDates = new Set(
       this.state.generations
-        .filter((entry) => sameServerIdentity(entry.binding, binding))
+        .filter((entry) => sameDestinationBinding(entry.binding, binding))
         .map((entry) => entry.backup_created_at),
     );
     if (owned.length <= retention.keep) return;
@@ -563,23 +545,25 @@ export class DestinationCatalogs {
       this.backupReadClients.add(client);
       let present: JellyfinBackupManifest[];
       try {
-        const info = await client.systemInfo();
+        const matches = await this.matchesLiveBinding(client, binding);
         if (
           this.stopping ||
           this.state.active ||
           this.state.backup_creation ||
           connectionHash(settings) !== connectionHash(this.store.settings()) ||
-          !sameBackupBinding(binding, {
+          !sameDestinationBinding(binding, {
             url: settings.jellyfin_url,
-            server_id: String(info.Id),
-            version: String(info.Version),
-          })
+            server_id: binding.server_id,
+          }) ||
+          !matches
         )
           throw new Error('Cleanup server changed.');
         if (!client.jellyfinBackups) throw new Error('Backup listing unavailable.');
         // This bounded native manifest listing is positive presence evidence, not
         // a catalog scan. An unavailable listing never prunes ownership records.
         present = await client.jellyfinBackups();
+        if (!(await this.matchesLiveBinding(client, binding)))
+          throw new Error('Cleanup server changed.');
       } finally {
         this.backupReadClients.delete(client);
         await client.close();
@@ -594,21 +578,12 @@ export class DestinationCatalogs {
         throw new Error('Cleanup settings changed.');
       const byName = new Map(present.map((entry) => [entry.name, entry]));
       this.state.owned_backups = this.state.owned_backups!.filter(
-        (entry) => !sameBackupBinding(entry.binding, binding) || byName.has(entry.manifest.name),
+        (entry) =>
+          !sameDestinationBinding(entry.binding, binding) || byName.has(entry.manifest.name),
       );
       const unchanged = owned.filter((entry) => {
         const current = byName.get(entry.manifest.name);
-        return (
-          !!current &&
-          current.created_at === entry.manifest.created_at &&
-          normalizedServerVersion(current.server_version) ===
-            normalizedServerVersion(entry.manifest.server_version) &&
-          current.backup_engine_version === entry.manifest.backup_engine_version &&
-          current.database === entry.manifest.database &&
-          current.metadata === entry.manifest.metadata &&
-          current.trickplay === entry.manifest.trickplay &&
-          current.subtitles === entry.manifest.subtitles
-        );
+        return !!current && sameJellyfinBackup(current, entry.manifest);
       });
       const candidates = unchanged
         .slice(retention.keep)
@@ -662,7 +637,7 @@ export class DestinationCatalogs {
     if (result && validBackupCleanupResult(result, request)) {
       this.state.owned_backups = this.state.owned_backups!.filter(
         (entry) =>
-          !sameBackupBinding(entry.binding, request.binding) ||
+          !sameDestinationBinding(entry.binding, request.binding) ||
           !result!.removed.includes(entry.manifest.name),
       );
       cleanup.last_run_at = result.finished_at;
@@ -684,10 +659,7 @@ export class DestinationCatalogs {
     await rm(join(this.directory, `${backupCleanupPrefix(request.id)}.request`), { force: true });
   }
   /** Queue pinning is synchronous; execution authenticates the file and live identity again. */
-  queuedSelection(
-    settings: Settings,
-    server?: { Id?: unknown; Version?: unknown },
-  ): string | undefined {
+  queuedSelection(settings: Settings, server?: { Id?: unknown }): string | undefined {
     if (this.stopping || this.clearing)
       throw new ServiceError('Saved Jellyfin catalogs are unavailable.');
     if (!this.state.configured) return;
@@ -706,9 +678,7 @@ export class DestinationCatalogs {
     if (
       server &&
       (typeof server.Id !== 'string' ||
-        typeof server.Version !== 'string' ||
-        !normalizedServerVersion(server.Version) ||
-        !sameServerIdentity(latest!.binding, {
+        !sameDestinationBinding(latest!.binding, {
           url: settings.jellyfin_url,
           server_id: server.Id,
         }))
@@ -723,11 +693,7 @@ export class DestinationCatalogs {
     binding: DestinationCatalogRequest['binding'],
   ): Promise<boolean> {
     const info = await client.systemInfo();
-    return (
-      typeof info.Id === 'string' &&
-      typeof info.Version === 'string' &&
-      sameBinding(binding, { ...binding, server_id: info.Id, version: info.Version })
-    );
+    return typeof info.Id === 'string' && info.Id.toLowerCase() === binding.server_id.toLowerCase();
   }
   async refresh(createBackup = false, scheduledDate?: string) {
     const revision = this.revision;
@@ -787,13 +753,9 @@ export class DestinationCatalogs {
       let request: DestinationCatalogRequest;
       try {
         const info = await client.systemInfo();
-        if (
-          typeof info.Id !== 'string' ||
-          !/^[a-f0-9]{32}$/i.test(info.Id) ||
-          typeof info.Version !== 'string' ||
-          !normalizedServerVersion(info.Version)
-        )
+        if (typeof info.Id !== 'string' || !/^[a-f0-9]{32}$/i.test(info.Id))
           throw new ServiceError('The linked Jellyfin server identity could not be verified.');
+        const version = snapshotVersionProvenance(info.Version);
         request = {
           purpose: 'jellyfin_catalog',
           id,
@@ -801,7 +763,7 @@ export class DestinationCatalogs {
           binding: {
             url: new URL(settings.jellyfin_url).toString(),
             server_id: info.Id,
-            version: info.Version,
+            ...(version ? { version } : {}),
           },
         };
         const auth = this.store.authState();
@@ -816,7 +778,7 @@ export class DestinationCatalogs {
         const verifyBackupServer = async () => {
           if (!(await this.matchesLiveBinding(client, request.binding)))
             throw new ServiceError(
-              'The linked Jellyfin identity or version changed while listing backups. Refresh the connection before importing.',
+              'The linked Jellyfin identity changed while listing backups. Refresh the connection before importing.',
             );
         };
         if (createBackup) {
@@ -888,13 +850,7 @@ export class DestinationCatalogs {
             throw new ServiceError(
               'No completed Jellyfin backup was found. Create a database backup or enable scheduled backup creation.',
             );
-          if (latest.backup_engine_version !== DESTINATION_BACKUP_ENGINE)
-            throw new DestinationCatalogError('backup_invalid');
-          request.expected_backup = {
-            name: latest.name,
-            created_at: latest.created_at,
-            server_version: latest.server_version,
-          };
+          request.expected_backup = selectedBackup(latest);
         }
       } finally {
         this.backupReadClients.delete(client);
@@ -959,9 +915,6 @@ export class DestinationCatalogs {
       Number.isFinite(created) &&
       created >= Date.parse(backup.started_at) - 60_000 &&
       created <= Date.now() + 60_000 &&
-      normalizedServerVersion(value.server_version) ===
-        normalizedServerVersion(backup.binding.version) &&
-      value.backup_engine_version === DESTINATION_BACKUP_ENGINE &&
       value.database === true &&
       value.metadata === false &&
       value.trickplay === false &&
@@ -976,12 +929,18 @@ export class DestinationCatalogs {
         this.uncertainBackup(backup);
         return;
       }
+      const matches = await this.matchesLiveBinding(client, backup.binding).catch(() => false);
+      if (this.stopping || this.state.backup_creation?.id !== backup.id) return;
+      if (!matches || connectionHash(this.store.settings()) !== backup.connection) {
+        this.uncertainBackup(backup);
+        return;
+      }
       backup.completed = completed;
       if (
         !this.state.owned_backups!.some(
           (entry) =>
             entry.manifest.name === completed.name &&
-            sameBackupBinding(entry.binding, backup.binding),
+            sameDestinationBinding(entry.binding, backup.binding),
         )
       ) {
         this.state.owned_backups!.push({
@@ -1039,14 +998,7 @@ export class DestinationCatalogs {
     );
     this.backupReadClients.add(client);
     try {
-      const info = await client.systemInfo();
-      if (
-        !sameBinding(backup.binding, {
-          url: settings.jellyfin_url,
-          server_id: String(info.Id),
-          version: String(info.Version),
-        })
-      ) {
+      if (!(await this.matchesLiveBinding(client, backup.binding))) {
         this.uncertainBackup(backup);
         return 'blocked';
       }
@@ -1095,11 +1047,7 @@ export class DestinationCatalogs {
         id: backup.id,
         requested_at: new Date().toISOString(),
         binding: backup.binding,
-        expected_backup: {
-          name: value.name,
-          created_at: value.created_at,
-          server_version: value.server_version,
-        },
+        expected_backup: selectedBackup(value),
       };
       // Persist the transition before publishing. Restarts resume checking this
       // request, not the native mutation. Offline import has its own worker watchdog.
@@ -1160,14 +1108,7 @@ export class DestinationCatalogs {
       );
       this.backupReadClients.add(client);
       try {
-        const info = await client.systemInfo();
-        if (
-          !sameBinding(request.binding, {
-            url: settings.jellyfin_url,
-            server_id: String(info.Id),
-            version: String(info.Version),
-          })
-        )
+        if (!(await this.matchesLiveBinding(client, request.binding)))
           throw new ServiceError('The Jellyfin import server identity changed.');
       } finally {
         this.backupReadClients.delete(client);
@@ -1234,7 +1175,6 @@ export class DestinationCatalogs {
     id: string,
     settings: Settings,
     serverId: string,
-    version: string,
   ): Promise<DestinationCatalogResult> {
     if (!this.key || this.stopping || this.clearing)
       throw new ServiceError('The saved Jellyfin catalog is unavailable.');
@@ -1257,12 +1197,12 @@ export class DestinationCatalogs {
         value.keys !== stored.keys ||
         value.projection_format !== stored.projection_format ||
         value.archive_schema !== stored.archive_schema ||
-        normalizedServerVersion(value.server_version!) !==
-          normalizedServerVersion(stored.server_version!) ||
-        !sameSelectedBackup(value.expected_backup, stored.expected_backup) ||
-        !sameBinding(value.binding, stored.binding) ||
-        !normalizedServerVersion(version) ||
-        !sameServerIdentity(value.binding, { url: settings.jellyfin_url, server_id: serverId }) ||
+        !sameDestinationSelection(value.expected_backup, stored.expected_backup) ||
+        !sameDestinationBinding(value.binding, stored.binding) ||
+        !sameDestinationBinding(value.binding, {
+          url: settings.jellyfin_url,
+          server_id: serverId,
+        }) ||
         !(await this.completeFile(value)) ||
         this.clearing ||
         this.stopping
@@ -1279,20 +1219,18 @@ export class DestinationCatalogs {
     id: string,
     settings: Settings,
     serverId: string,
-    version: string,
   ): Promise<DestinationCatalogMetadata> {
-    return destinationCatalogMetadata(await this.validated(id, settings, serverId, version));
+    return destinationCatalogMetadata(await this.validated(id, settings, serverId));
   }
   async candidates(
     id: string,
     settings: Settings,
     serverId: string,
-    version: string,
     source: MediaItem[],
     mappings: PathMapping[],
     signal?: AbortSignal,
   ): Promise<MediaItem[]> {
-    await this.validated(id, settings, serverId, version);
+    await this.validated(id, settings, serverId);
     const combined = AbortSignal.any([this.reads.signal, ...(signal ? [signal] : [])]);
     check(combined);
     if (this.clearing || this.pendingCleanup.size) throw new ServiceError(CLEANUP_ERROR);
@@ -1372,7 +1310,8 @@ export class DestinationCatalogs {
         validDestinationProgress(progress) &&
         progress.id === active.id &&
         progress.requested_at === active.requested_at &&
-        sameBinding(progress.binding, active.binding) &&
+        sameDestinationBinding(progress.binding, active.binding) &&
+        sameDestinationSelection(progress.expected_backup, active.expected_backup) &&
         this.acceptDiagnostic(progress.diagnostic, active)
       )
         this.save();
@@ -1433,7 +1372,7 @@ export class DestinationCatalogs {
           value &&
           value.id === active.id &&
           value.requested_at === active.requested_at &&
-          sameBinding(value.binding, active.binding)
+          sameDestinationBinding(value.binding, active.binding)
         ) {
           let adopted = false;
           this.acceptDiagnostic(value.diagnostic, active);
@@ -1458,7 +1397,7 @@ export class DestinationCatalogs {
                   : 'backup_invalid';
             this.state.last_error = destinationCatalogFailureMessage(this.state.last_error_code);
           } else if (
-            !sameSelectedBackup(value.expected_backup, active.expected_backup) ||
+            !sameDestinationSelection(value.expected_backup, active.expected_backup) ||
             (active.expected_backup &&
               Date.parse(value.backup_created_at!) !==
                 Date.parse(active.expected_backup.created_at))
@@ -1468,7 +1407,7 @@ export class DestinationCatalogs {
               'The imported catalog does not match the newly completed Jellyfin backup. Check the helper mount and import that backup again. The previous catalog is preserved.';
           } else {
             const previous = this.state.generations.find((record) =>
-              sameServerIdentity(record.binding, value!.binding),
+              sameDestinationBinding(record.binding, value!.binding),
             );
             if (
               previous &&
@@ -1505,7 +1444,8 @@ export class DestinationCatalogs {
               (entry) =>
                 entry.attempt_id === active.id &&
                 entry.manifest.name === active.expected_backup!.name &&
-                sameBackupBinding(entry.binding, active.binding),
+                sameDestinationBinding(entry.binding, active.binding) &&
+                sameDestinationSelection(selectedBackup(entry.manifest), active.expected_backup),
             );
             if (owned) owned.fingerprint = value.backup_fingerprint;
           }

@@ -206,7 +206,7 @@ export class DemoClient implements MediaAPI {
     );
   }
   async migrationCapabilities() {
-    return { userData: true, privatePlaylists: true, playlistDuplicates: true, version: '12.2.0' };
+    return { userData: true, privatePlaylists: true, playlistDuplicates: true };
   }
   async userData(userId: string, itemId: string): Promise<MediaUserDataPatch> {
     return (await this.items(userId)).find((item) => item.Id === itemId)?.UserData ?? {};

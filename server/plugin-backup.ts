@@ -4,7 +4,11 @@ import { lstat, mkdtemp, open, realpath, rm, type FileHandle } from 'node:fs/pro
 import { dirname, join, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { inspectLibrary, projectLibrary, readUserIdentities } from './emby-snapshot-reader.js';
-import { MAX_SNAPSHOT_BYTES, SNAPSHOT_MAX_AGE, snapshotVersionLabel } from './snapshot-files.js';
+import {
+  MAX_SNAPSHOT_BYTES,
+  SNAPSHOT_MAX_AGE,
+  snapshotVersionProvenance,
+} from './snapshot-files.js';
 import type { FileCopyCaptureResult } from './snapshot-copy.js';
 
 export const PLUGIN_BACKUP_SETTLE_MS = 5 * 60_000;
@@ -27,8 +31,8 @@ interface OpenSource {
 export interface PluginBackupCaptureResult extends FileCopyCaptureResult {
   backup_created_at: string;
   backup_fingerprint: string;
-  backup_server_version: string;
-  plugin_version: string;
+  backup_server_version: string | null;
+  plugin_version?: string;
 }
 export interface PluginBackupCaptureOptions {
   /** Deterministic clock for isolated tests; callers do not supply this over IPC. */
@@ -82,8 +86,6 @@ function backupManifest(buffer: Buffer, now: number) {
     !value ||
     typeof value !== 'object' ||
     Array.isArray(value) ||
-    !snapshotVersionLabel(value.ServerVersion) ||
-    !snapshotVersionLabel(value.PluginVersion) ||
     value.CanRestore !== true ||
     value.IsFullBackup !== true ||
     typeof value.DateCreated !== 'string' ||
@@ -118,8 +120,8 @@ function backupManifest(buffer: Buffer, now: number) {
   }
   return {
     created: new Date(date).toISOString(),
-    server_version: value.ServerVersion,
-    plugin_version: value.PluginVersion,
+    server_version: snapshotVersionProvenance(value.ServerVersion),
+    plugin_version: snapshotVersionProvenance(value.PluginVersion),
     users,
   };
 }
@@ -310,7 +312,7 @@ export async function importPluginBackup(
         : { orphan_identity_version: inspected.orphan_identity_version }),
       backup_created_at: manifest.created,
       backup_fingerprint: fingerprint.digest('hex'),
-      backup_server_version: manifest.server_version,
+      backup_server_version: manifest.server_version ?? null,
       plugin_version: manifest.plugin_version,
     };
   } catch {

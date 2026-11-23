@@ -7,18 +7,9 @@ import { join } from 'node:path';
 export const snapshotId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 // The projection identifier describes the reader contract, independent of the source release.
 export const SNAPSHOT_PROJECTION_SCHEMA = 'emby-4.10.1.0';
-export const SNAPSHOT_VERSION = '4.10.1.0';
-// Legacy helper protocol fields. Current plugin imports negotiate the projection schema.
-export const SNAPSHOT_VERSIONS = ['4.10.1.0', '4.10.2.0'] as const;
-export function supportedSnapshotVersion(
-  value: unknown,
-): value is (typeof SNAPSHOT_VERSIONS)[number] {
-  return SNAPSHOT_VERSIONS.some((version) => version === value);
-}
 export const MAX_SNAPSHOT_BYTES = 8 * 1024 ** 3;
 export const CAPTURE_DEADLINE = 5 * 60_000;
 export const SNAPSHOT_MAX_AGE = 48 * 60 * 60_000;
-export const SNAPSHOT_PLUGIN_VERSION = '1.8.7.0';
 export type SnapshotCaptureMethod = 'sqlite_online_backup' | 'file_copy' | 'plugin_backup';
 export function snapshotCaptureMethod(value: unknown): SnapshotCaptureMethod {
   if (value === undefined || value === 'sqlite_online_backup') return 'sqlite_online_backup';
@@ -26,15 +17,13 @@ export function snapshotCaptureMethod(value: unknown): SnapshotCaptureMethod {
   if (value === 'plugin_backup') return 'plugin_backup';
   throw new Error('Unsupported snapshot capture method.');
 }
-/** Version strings on completed backups are provenance, not a compatibility test. */
-export function snapshotVersionLabel(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    value.length > 0 &&
-    value.length <= 128 &&
+/** Sanitize optional provenance independently of the capture and projection contracts. */
+export function snapshotVersionProvenance(value: unknown): string | undefined {
+  return typeof value === 'string' &&
     value.trim() === value &&
-    !/[\x00-\x1f\x7f]/.test(value)
-  );
+    /^[a-z0-9][a-z0-9._+-]{0,127}$/i.test(value)
+    ? value
+    : undefined;
 }
 const aad = Buffer.from('Jellyport SQLite snapshot v1');
 
@@ -172,7 +161,7 @@ export async function decryptDatabase(
 export interface SnapshotBinding {
   url: string;
   server_id: string;
-  version: string;
+  version?: string;
 }
 export interface CaptureRequest {
   id: string;
@@ -182,17 +171,12 @@ export interface CaptureRequest {
   capture_method?: SnapshotCaptureMethod;
   plugin_backup_schema?: typeof SNAPSHOT_PROJECTION_SCHEMA;
 }
-export function snapshotRequestVersionMatches(value: CaptureRequest): boolean {
+function snapshotRequestSchemaMatches(value: CaptureRequest): boolean {
   const method = snapshotCaptureMethod(value.capture_method);
-  if (value.plugin_backup_schema !== undefined)
-    return (
-      method === 'plugin_backup' &&
-      value.plugin_backup_schema === SNAPSHOT_PROJECTION_SCHEMA &&
-      snapshotVersionLabel(value.binding?.version)
-    );
-  return method === 'plugin_backup'
-    ? supportedSnapshotVersion(value.binding?.version)
-    : value.binding?.version === SNAPSHOT_VERSION;
+  return (
+    value.plugin_backup_schema === undefined ||
+    (method === 'plugin_backup' && value.plugin_backup_schema === SNAPSHOT_PROJECTION_SCHEMA)
+  );
 }
 export interface CaptureResult extends CaptureRequest {
   ok: boolean;
@@ -206,8 +190,8 @@ export interface CaptureResult extends CaptureRequest {
   identities?: Record<string, number>;
   backup_created_at?: string;
   backup_fingerprint?: string;
-  /** Legacy results used the same version in the manifest and verified live binding. */
-  backup_server_version?: string;
+  /** `null` records absent backup provenance. Legacy results fall back to the live binding. */
+  backup_server_version?: string | null;
   plugin_version?: string;
   error?: string;
 }
@@ -222,12 +206,6 @@ export function snapshotOrphanIdentityVersion(value: unknown): 1 | undefined {
 export function snapshotHistoryTime(value: CaptureResult): string {
   if (snapshotCaptureMethod(value.capture_method) !== 'plugin_backup') return value.finished_at;
   if (
-    (value.plugin_backup_schema === SNAPSHOT_PROJECTION_SCHEMA
-      ? !snapshotVersionLabel(value.backup_server_version) ||
-        !snapshotVersionLabel(value.plugin_version)
-      : value.plugin_version !== SNAPSHOT_PLUGIN_VERSION ||
-        (value.backup_server_version !== undefined &&
-          value.backup_server_version !== value.binding.version)) ||
     typeof value.backup_fingerprint !== 'string' ||
     !/^[a-f0-9]{64}$/.test(value.backup_fingerprint) ||
     typeof value.backup_created_at !== 'string' ||
@@ -270,7 +248,7 @@ export function snapshotIdentitiesMatch(
     : !userIds?.some((user) => !Object.hasOwn(identities, user));
 }
 
-function recoveredRequest(value: CaptureRequest, id: string): CaptureRequest {
+export function validatedSnapshotRequest(value: CaptureRequest, id: string): CaptureRequest {
   if (
     !value ||
     value.id !== id ||
@@ -280,20 +258,21 @@ function recoveredRequest(value: CaptureRequest, id: string): CaptureRequest {
     !value.binding.url ||
     typeof value.binding.server_id !== 'string' ||
     !value.binding.server_id ||
-    !snapshotRequestVersionMatches(value) ||
+    !snapshotRequestSchemaMatches(value) ||
     (value.user_ids !== undefined &&
       (!Array.isArray(value.user_ids) ||
         value.user_ids.length > 1000 ||
         value.user_ids.some((user) => typeof user !== 'string' || !/^[a-f0-9]{32}$/.test(user))))
   )
-    throw new Error('Invalid interrupted capture request.');
+    throw new Error('Invalid capture request.');
+  const version = snapshotVersionProvenance(value.binding.version);
   return {
     id,
     requested_at: value.requested_at,
     binding: {
       url: value.binding.url,
       server_id: value.binding.server_id,
-      version: value.binding.version,
+      ...(version === undefined ? {} : { version }),
     },
     ...(value.capture_method === undefined
       ? {}
@@ -312,12 +291,11 @@ async function completedCapture(
 ): Promise<boolean> {
   try {
     const value = await readEnvelope<CaptureResult>(join(directory, `${request.id}.result`), key);
-    recoveredRequest(value, request.id);
+    validatedSnapshotRequest(value, request.id);
     if (
       value.requested_at !== request.requested_at ||
       value.binding.url !== request.binding.url ||
       value.binding.server_id !== request.binding.server_id ||
-      value.binding.version !== request.binding.version ||
       value.plugin_backup_schema !== request.plugin_backup_schema ||
       snapshotCaptureMethod(value.capture_method) !==
         snapshotCaptureMethod(request.capture_method) ||
@@ -376,7 +354,7 @@ export async function recoverSnapshotHelper(directory: string, key: Buffer): Pro
     }
     let request: CaptureRequest;
     try {
-      request = recoveredRequest(await readEnvelope<CaptureRequest>(path, key), match[1]!);
+      request = validatedSnapshotRequest(await readEnvelope<CaptureRequest>(path, key), match[1]!);
     } catch {
       await rm(path, { force: true });
       continue;

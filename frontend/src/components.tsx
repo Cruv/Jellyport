@@ -783,6 +783,9 @@ export function JobProgressDetails({ job }: { job: Job }) {
 }
 export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetadata }) {
   const fileCopy = snapshot.source_type === 'file_copy';
+  const versionLabel = snapshot.source_server_version
+    ? ` · Emby ${snapshot.source_server_version}`
+    : '';
   const recovered = snapshot.diagnostics?.recovered_orphan_state_items ?? 0;
   const recoveryNote = recovered
     ? ` ${num(recovered)} orphan history ${recovered === 1 ? 'record was' : 'records were'} reattached to verified Emby media. Duplicate played flags were merged before Jellyfin matching.`
@@ -790,7 +793,7 @@ export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetad
   if (snapshot.source_type === 'plugin_backup')
     return (
       <p className="subtle text-small">
-        Saved Emby plugin backup · Emby {snapshot.source_server_version} ·{' '}
+        Saved Emby plugin backup{versionLabel} ·{' '}
         {snapshot.scope === 'watched_only' ? 'played-status capture' : 'complete database capture'}{' '}
         · backed up{' '}
         {snapshot.backup_created_at
@@ -803,7 +806,8 @@ export function SourceSnapshotNote({ snapshot }: { snapshot: SourceSnapshotMetad
     );
   return (
     <p className="subtle text-small">
-      Saved Emby snapshot{fileCopy ? ' · File copy' : ''} · Emby {snapshot.source_server_version} ·{' '}
+      Saved Emby snapshot{fileCopy ? ' · File copy' : ''}
+      {versionLabel} ·{' '}
       {snapshot.scope === 'watched_only' ? 'played-status capture' : 'complete database capture'} ·
       captured {new Date(snapshot.finished_at).toLocaleString()}. {fileCopy ? 'Copy' : 'Read'}{' '}
       window: {new Date(snapshot.started_at).toLocaleString()} –{' '}

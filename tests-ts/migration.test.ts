@@ -103,7 +103,6 @@ function playlistFixture(count = 2, duplicates = false) {
       userData: true,
       privatePlaylists: true,
       playlistDuplicates: true,
-      version: '12.2',
     }),
     playlists: async () => [],
     playlistItems,
@@ -605,7 +604,7 @@ describe('private playlist migration and durable retries', () => {
     });
   });
 
-  it('reports old-server duplicate losses while keeping first occurrences and order', async () => {
+  it('keeps first occurrences and order when the adapter explicitly disallows repeats', async () => {
     const database = store(),
       fixture = playlistFixture(2, true),
       details = migrationDetails();
@@ -613,13 +612,43 @@ describe('private playlist migration and durable retries', () => {
       userData: true,
       privatePlaylists: true,
       playlistDuplicates: false,
-      version: '10.11.10',
     });
     await migrate(database, fixture, details);
     expect(fixture.current().map((item) => item.Id)).toEqual(['target-1', 'target-0']);
     expect(details.playlist_duplicates_skipped).toBe(1);
-    expect(details.warnings.join(' ')).toMatch(/duplicate/);
+    expect(details.warnings.join(' ')).toContain('Duplicate playlist entries were skipped.');
   });
+
+  it.each([
+    { ids: ['target-1', 'target-0', 'target-1'], status: 'complete', added: 3, skipped: 0 },
+    { ids: ['target-1', 'target-0'], status: 'complete', added: 2, skipped: 1 },
+    { ids: ['target-0', 'target-1'], status: 'ready', added: 0, skipped: 0 },
+  ])(
+    'verifies server behavior for requested repeats with readback $ids',
+    async ({ ids, status, added, skipped }) => {
+      const database = store();
+      const fixture = playlistFixture(2, true);
+      const details = migrationDetails();
+      fixture.api.migrationCapabilities = async () => ({ userData: true, privatePlaylists: true });
+      fixture.playlistItems.mockResolvedValueOnce(ids.map((Id) => ({ Id, Type: 'Audio' })));
+      await migrate(database, fixture, details);
+      expect(fixture.createPlaylist).toHaveBeenCalledExactlyOnceWith(
+        'target-user',
+        expect.any(String),
+        'Audio',
+        ['target-1', 'target-0', 'target-1'],
+      );
+      expect(fixture.addPlaylistItems).not.toHaveBeenCalled();
+      expect(database.playlistImport(playlistKey())).toMatchObject({
+        targetId: 'target-list',
+        status,
+      });
+      expect(details).toMatchObject({
+        playlist_items_added: added,
+        playlist_duplicates_skipped: skipped,
+      });
+    },
+  );
 
   it('reuses an unchanged completed import without any additional playlist writes', async () => {
     const database = store(),

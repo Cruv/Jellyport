@@ -68,6 +68,7 @@ import { AccountProfiles, type AccountProfileInput } from './account-profiles.js
 import { AdminAlerts } from './admin-alerts.js';
 import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { SourceSnapshots, type SnapshotMetadata } from './source-snapshots.js';
+import { snapshotVersionProvenance } from './snapshot-files.js';
 import { ImportCoordinator } from './daily-import-schedule.js';
 import { DestinationCatalogs } from './destination-catalogs.js';
 import type { DestinationCatalogMetadata } from './destination-catalog-files.js';
@@ -918,7 +919,6 @@ export class Service {
       connection,
       observed: {
         id: info.Id,
-        version: typeof info.Version === 'string' ? info.Version : undefined,
         observed_at: Date.now(),
       },
     };
@@ -1018,7 +1018,7 @@ export class Service {
           Object.assign(result, {
             connected: true,
             name: info.ServerName ?? kind,
-            version: info.Version ?? '',
+            version: snapshotVersionProvenance(info.Version) ?? '',
           });
         } catch (error) {
           if (!(error instanceof MediaError || error instanceof ServiceError)) throw error;
@@ -6121,13 +6121,12 @@ export class Service {
       guard();
       const info = await jellyfin.systemInfo();
       guard();
-      if (typeof info.Id !== 'string' || !info.Id || typeof info.Version !== 'string')
+      if (typeof info.Id !== 'string' || !info.Id)
         throw new ServiceError('The Jellyfin destination identity could not be verified.');
       const key = MigrationCatalogCache.key(
         settings.jellyfin_url,
         settings.jellyfin_api_key,
         info.Id,
-        info.Version,
       );
       if (context.key && context.key !== key)
         throw new ServiceError(
@@ -6141,13 +6140,11 @@ export class Service {
           job.destination_catalog_id,
           settings,
           info.Id,
-          info.Version,
         );
         candidates = await this.destinationSnapshots.candidates(
           job.destination_catalog_id,
           settings,
           info.Id,
-          info.Version,
           eligible,
           settings.path_mappings,
           this.jobControllers.get(job.id)?.signal,
@@ -6357,7 +6354,6 @@ export class Service {
       delete catalogContext.key;
       delete catalogContext.value;
     };
-    let sourceVersion: string | undefined;
     const readPinnedSource = async (emby: MediaAPI, check = checkSource, signal?: AbortSignal) => {
       try {
         check();
@@ -6369,15 +6365,11 @@ export class Service {
           throw new MigrationSourceVerificationError(
             'The reviewed Emby server changed. Prepare a new migration review.',
           );
-        if (sourceVersion !== undefined && info.Version !== sourceVersion)
-          throw new MigrationSourceVerificationError(
-            'The Emby source version changed. Prepare a new migration review.',
-          );
         const user = emby.user(sourcePin!.user_id);
         const account = signal ? await abortable(user, signal) : await user;
         check();
         this.assertMigrationSource(sourcePin!, info.Id, account);
-        return { info, account };
+        return account;
       } catch (error) {
         discardSourceCatalog();
         throw error;
@@ -6432,8 +6424,7 @@ export class Service {
           settings,
           'emby',
           async (emby) => {
-            const { info, account: sourceUser } = await readPinnedSource(emby);
-            sourceVersion = typeof info.Version === 'string' ? info.Version : undefined;
+            const sourceUser = await readPinnedSource(emby);
             sourceOwnershipServerId = sourcePin!.server_id;
             registeredSource.value = this.sourceOwnership(
               request,
@@ -6445,13 +6436,10 @@ export class Service {
                 throw new ServiceError(
                   'This source client cannot perform bounded history reads. Use a saved snapshot or update the source integration.',
                 );
-              if (typeof info.Version !== 'string')
-                throw new ServiceError('The Emby source version could not be verified.');
               const key = MigrationCatalogCache.key(
                 settings.emby_url,
                 settings.emby_api_key,
                 sourceOwnershipServerId,
-                info.Version,
               );
               if (catalogContext.key && catalogContext.key !== key) {
                 discardSourceCatalog();
@@ -7565,13 +7553,12 @@ export class Service {
               );
             if (job.destination_catalog_id) {
               const info = await jellyfin.systemInfo();
-              if (typeof info.Id !== 'string' || typeof info.Version !== 'string')
+              if (typeof info.Id !== 'string' || !info.Id)
                 throw new ServiceError('The Jellyfin identity could not be verified.');
               await this.destinationSnapshots.metadata(
                 job.destination_catalog_id,
                 settings,
                 info.Id,
-                info.Version,
               );
             }
           }

@@ -204,9 +204,23 @@ describe('Emby Backup & Restore completed full-backup imports', () => {
   );
 
   it.each([
-    { ServerVersion: undefined },
-    { PluginVersion: '' },
-    { PluginVersion: '1.8.8.0\n' },
+    { ServerVersion: undefined, PluginVersion: undefined },
+    { ServerVersion: { malformed: true }, PluginVersion: '1.8.8.0\nprivate' },
+  ])(
+    'imports supported schemas when release provenance is missing or malformed (%j)',
+    async (patch) => {
+      const value = await fixture();
+      await changeManifest(value, patch);
+      const result = await importPluginBackup(value.root, value.output, SERVER, { now: NOW });
+      expect(result.backup_server_version).toBeNull();
+      expect(result.plugin_version).toBeUndefined();
+      expect(readSnapshotItems(value.output, GUID, result.identities)[0]?.UserData?.Played).toBe(
+        true,
+      );
+    },
+  );
+
+  it.each([
     { CanRestore: false },
     { IsFullBackup: false },
     { Users: [] },

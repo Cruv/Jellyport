@@ -10,7 +10,6 @@ export interface PathMapping {
 }
 export interface MediaServerObservation {
   id: string;
-  version?: string;
   observed_at: number;
 }
 export interface Settings {

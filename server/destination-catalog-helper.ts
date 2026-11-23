@@ -16,6 +16,8 @@ import {
   destinationCatalogFailureMessage,
   validDestinationDiagnostic,
   validDestinationProgress,
+  sameDestinationBinding,
+  sameDestinationSelection,
   type DestinationCatalogDiagnostic,
   type DestinationCatalogProgress,
   type DestinationCatalogStage,
@@ -138,15 +140,14 @@ export async function processDestinationCatalogRequest(
       keys: number;
       backup_created_at: string;
       backup_fingerprint: string;
-      server_version: string;
-      backup_engine_version: string;
+      server_version?: string;
+      backup_engine_version?: string;
       diagnostic?: DestinationCatalogDiagnostic;
     }>(
       {
         operation: 'destination_capture',
         directory: backups,
         output,
-        version: request.binding.version,
         expected_backup: request.expected_backup,
       },
       signal,
@@ -268,7 +269,9 @@ export async function recoverDestinationCatalogHelper(
         completed =
           validDestinationResult(result) &&
           result.id === id &&
-          JSON.stringify(result.binding) === JSON.stringify(request.binding) &&
+          result.requested_at === request.requested_at &&
+          sameDestinationBinding(result.binding, request.binding) &&
+          sameDestinationSelection(result.expected_backup, request.expected_backup) &&
           stat.isFile() &&
           !stat.isSymbolicLink() &&
           stat.size === result.bytes! + 28;
@@ -283,7 +286,8 @@ export async function recoverDestinationCatalogHelper(
             validDestinationProgress(progress) &&
             progress.id === request.id &&
             progress.requested_at === request.requested_at &&
-            JSON.stringify(progress.binding) === JSON.stringify(request.binding)
+            sameDestinationBinding(progress.binding, request.binding) &&
+            sameDestinationSelection(progress.expected_backup, request.expected_backup)
           )
             diagnostic = { ...progress.diagnostic, updated_at: finished_at };
         } catch {

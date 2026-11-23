@@ -478,7 +478,7 @@ describe('saved Jellyfin catalog service integration and independent readback', 
       entered = resolve;
     });
     fixture.savedCandidates.mockImplementation(
-      async (_id, _settings, _serverId, _version, _source, _mappings, signal) => {
+      async (_id, _settings, _serverId, _source, _mappings, signal) => {
         entered();
         return new Promise((_resolve, reject) => {
           signal!.addEventListener(

@@ -372,8 +372,8 @@ export async function migrateItemState(
     migrationWarning(
       details,
       scope === 'played_favorites'
-        ? 'Jellyfin partial user-data support could not be verified. Played and favorite flags were not changed.'
-        : 'Jellyfin partial user-data support could not be verified. Watched flags were not changed.',
+        ? 'Jellyfin’s partial user-data API could not be verified. Check access to /api-docs/openapi.json before retrying. Played and favorite flags were not changed.'
+        : 'Jellyfin’s partial user-data API could not be verified. Check access to /api-docs/openapi.json before retrying. Watched flags were not changed.',
     );
   }
   let applied = 0;
@@ -443,8 +443,8 @@ export async function migrateItemState(
       if (!supported)
         throw new ServiceError(
           scope === 'played_favorites'
-            ? 'Played and favorite updates require Jellyfin’s partial user-data API. Legacy endpoints were not used because they can change unrelated personal data.'
-            : 'Watched-flag updates require Jellyfin’s partial user-data API. Legacy watched endpoints were not used because they can change resume positions, dates and counts.',
+            ? 'Played and favorite updates require Jellyfin’s partial user-data API. Check its API description at /api-docs/openapi.json. Legacy endpoints can change unrelated personal data.'
+            : 'Watched-flag updates require Jellyfin’s partial user-data API. Check its API description at /api-docs/openapi.json. Legacy watched endpoints can change resume positions, dates and counts.',
         );
       if (attemptedTargets.has(target.Id))
         throw new ServiceError(
@@ -576,20 +576,22 @@ export async function migratePlaylists(
   preparedMatcher?: PreparedMatcher,
 ): Promise<void> {
   if (!source.length) return;
-  let capabilities = { privatePlaylists: false, playlistDuplicates: false };
+  let capabilities: Pick<MigrationCapabilities, 'privatePlaylists' | 'playlistDuplicates'> = {
+    privatePlaylists: false,
+  };
   try {
     if (jellyfin.migrationCapabilities) capabilities = await jellyfin.migrationCapabilities();
   } catch {
     migrationWarning(
       details,
-      'Jellyfin private playlist support could not be verified. Playlists were skipped.',
+      'Jellyfin private playlist support could not be verified. Check access to /api-docs/openapi.json before retrying. Playlists were skipped.',
     );
     return;
   }
   if (!capabilities.privatePlaylists || !jellyfin.playlistItems || !jellyfin.createPlaylist) {
     migrationWarning(
       details,
-      'Private playlist migration requires Jellyfin 10.9 or newer and a compatible client. No public playlist was created.',
+      'Jellyfin does not expose a verified private playlist creation contract. Playlists were skipped.',
     );
     return;
   }
@@ -603,13 +605,11 @@ export async function migratePlaylists(
     try {
       const plan = matchPlaylist(entry.items);
       const mapped = new Map(plan.matches.map((match) => [match.source.Id, match.target.Id]));
-      let ids = entry.items.flatMap((item) => (mapped.has(item.Id) ? [mapped.get(item.Id)!] : []));
+      const ids = entry.items.flatMap((item) =>
+        mapped.has(item.Id) ? [mapped.get(item.Id)!] : [],
+      );
       details.playlist_items_skipped += entry.items.length - ids.length;
-      if (!capabilities.playlistDuplicates) {
-        const unique = [...new Set(ids)];
-        details.playlist_duplicates_skipped += ids.length - unique.length;
-        ids = unique;
-      }
+      const requested = capabilities.playlistDuplicates === false ? [...new Set(ids)] : ids;
       const key = createHash('sha256')
         .update(
           JSON.stringify([
@@ -664,7 +664,7 @@ export async function migratePlaylists(
                 : undefined));
         // Privacy and membership are set in one request. Never append to a saved copy:
         // its owner may have made it public/shared since the preceding migration.
-        const created = await jellyfin.createPlaylist(userId, record.name, mediaType, ids);
+        const created = await jellyfin.createPlaylist(userId, record.name, mediaType, requested);
         record = { ...record, targetId: created.Id, status: 'ready' };
         store.savePlaylistImport(key, record);
         details.playlists_created++;
@@ -677,10 +677,11 @@ export async function migratePlaylists(
       const observed = current.map((item) => item.Id);
       const hash = (values: string[]) =>
         createHash('sha256').update(JSON.stringify(values)).digest('hex');
+      const observedHash = hash(observed);
       if (
         record.status === 'complete' &&
         record.content_hash &&
-        record.content_hash !== hash(observed)
+        record.content_hash !== observedHash
       ) {
         migrationWarning(
           details,
@@ -688,17 +689,25 @@ export async function migratePlaylists(
         );
         continue;
       }
-      if (hash(observed) !== hash(ids)) {
+      // The contract can accept ordered repeats without promising to retain them.
+      // Verify either all occurrences or exactly the first occurrences in source order.
+      const matchesRequested = observedHash === hash(requested);
+      const matchesDeduplicated =
+        !matchesRequested &&
+        capabilities.playlistDuplicates === undefined &&
+        observedHash === hash([...new Set(ids)]);
+      if (!matchesRequested && !matchesDeduplicated) {
         migrationWarning(
           details,
           'An imported playlist differs from its source or was not confirmed complete. Review it in Jellyfin. No entries were appended because the copy may now be shared.',
         );
         continue;
       }
+      details.playlist_duplicates_skipped += ids.length - observed.length;
       if (createdHere) details.playlist_items_added += observed.length;
       else details.playlists_existing++;
       record.status = 'complete';
-      record.content_hash = hash(observed);
+      record.content_hash = observedHash;
       store.savePlaylistImport(key, record);
       saved();
       if (hasPersonalState(entry.playlist)) {
@@ -739,6 +748,6 @@ export async function migratePlaylists(
   if (details.playlist_duplicates_skipped)
     migrationWarning(
       details,
-      'This Jellyfin version removes duplicate playlist entries. First occurrences and their order were preserved.',
+      'Duplicate playlist entries were skipped. Readback confirmed the first occurrences in their original order.',
     );
 }

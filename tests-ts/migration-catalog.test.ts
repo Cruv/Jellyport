@@ -30,25 +30,17 @@ describe('bounded reusable migration catalog', () => {
     expect(hit.mock.calls).toEqual([[0], [1]]);
   });
 
-  it('scopes keys to normalized URL, API credentials, server identity and version without revealing them', () => {
-    const key = MigrationCatalogCache.key(
-      'http://emby',
-      'private-api-key',
-      'server-one',
-      '4.10.1.0',
-    );
+  it('scopes keys to normalized URL, API credentials and server identity without revealing them', () => {
+    const key = MigrationCatalogCache.key('http://emby', 'private-api-key', 'server-one');
     expect(key).toMatch(/^[a-f0-9]{64}$/);
     expect(key).not.toContain('private-api-key');
-    expect(
-      MigrationCatalogCache.key('http://emby:80/', 'private-api-key', 'server-one', '4.10.1.0'),
-    ).toBe(key);
-    for (const args of [
-      ['http://other-source', 'private-api-key', 'server-one', '4.10.1.0'],
-      ['http://emby', 'different-api-key', 'server-one', '4.10.1.0'],
-      ['http://emby', 'private-api-key', 'server-two', '4.10.1.0'],
-      ['http://emby', 'private-api-key', 'server-one', '4.10.2.0'],
+    expect(MigrationCatalogCache.key('http://emby:80/', 'private-api-key', 'server-one')).toBe(key);
+    for (const [url, apiKey, serverId] of [
+      ['http://other-source', 'private-api-key', 'server-one'],
+      ['http://emby', 'different-api-key', 'server-one'],
+      ['http://emby', 'private-api-key', 'server-two'],
     ] as const)
-      expect(MigrationCatalogCache.key(args[0], args[1], args[2], args[3])).not.toBe(key);
+      expect(MigrationCatalogCache.key(url, apiKey, serverId)).not.toBe(key);
   });
 
   it.each([false, true])(

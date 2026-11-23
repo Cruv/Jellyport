@@ -28,8 +28,9 @@ export interface MediaUserDataPatch extends JsonObject {
 export interface MigrationCapabilities {
   userData: boolean;
   privatePlaylists: boolean;
-  playlistDuplicates: boolean;
-  version?: string;
+  /** Undefined when the API contract does not establish how repeats are stored. */
+  playlistDuplicates?: boolean;
+  appendPlaylistItems?: boolean;
 }
 export interface MediaItem extends JsonObject {
   Id: string;
@@ -154,6 +155,13 @@ export interface MediaClientOptions {
 
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 1024 * 1024;
+const MIGRATION_CONTRACT_TIMEOUT_MS = 5_000;
+const USER_DATA_CONTRACT_ERROR =
+  'Jellyfin does not expose a verified partial user-data contract at /api-docs/openapi.json.';
+const PRIVATE_PLAYLIST_CONTRACT_ERROR =
+  'Jellyfin does not expose a verified private playlist creation contract at /api-docs/openapi.json.';
+const MIGRATION_CONTRACT_READ_ERROR =
+  'Jellyfin’s migration API contract could not be read at /api-docs/openapi.json.';
 export const MAX_CATALOG_ITEMS = 200_000;
 export const MAX_CATALOG_BYTES = 64 * 1024 * 1024;
 export const MAX_MIGRATION_STATE_ITEMS = 100_000;
@@ -286,13 +294,156 @@ function personalState(item: MediaItem): boolean {
   );
 }
 
-function versionAtLeast(version: string | undefined, major: number, minor = 0): boolean {
-  // Unknown and prerelease versions fail closed for privacy-sensitive writes.
-  const match = version?.match(/^(\d+)\.(\d+)(?:\.(\d+))?(?:\.\d+)?$/);
+function contractObject(value: unknown, ...path: string[]): JsonObject | undefined {
+  for (const key of path) {
+    if (!isObject(value) || !Object.hasOwn(value, key)) return undefined;
+    value = value[key];
+  }
+  return isObject(value) ? value : undefined;
+}
+
+function referencesContractSchema(value: JsonObject | undefined, name: string): boolean {
+  if (!value) return false;
+  // The generated contract uses a direct reference or decorates it with a description.
+  const reference = Array.isArray(value.allOf) && value.allOf.length === 1 ? value.allOf[0] : value;
   return (
-    !!match &&
-    (Number(match[1]) > major || (Number(match[1]) === major && Number(match[2]) >= minor))
+    isObject(reference) &&
+    Object.keys(reference).every((key) => key === '$ref' || key === 'description') &&
+    reference.$ref === `#/components/schemas/${name}` &&
+    (reference === value ||
+      Object.keys(value).every((key) => key === 'allOf' || key === 'description'))
   );
+}
+
+const itemUserParameters = [
+  { name: 'itemId', in: 'path', type: 'string', format: 'uuid' },
+  { name: 'userId', in: 'query', type: 'string', format: 'uuid' },
+] as const;
+
+function declaresContractParameters(
+  operation: JsonObject,
+  expected: ReadonlyArray<{ name: string; in: string; type: string; format?: string }>,
+): boolean {
+  const parameters = operation.parameters;
+  if (!Array.isArray(parameters) || !parameters.every(isObject)) return false;
+  return (
+    expected.every((definition) => {
+      const matches = parameters.filter(
+        (parameter) => parameter.name === definition.name && parameter.in === definition.in,
+      );
+      if (matches.length !== 1) return false;
+      const parameter = matches[0]!;
+      const schema = contractObject(parameter, 'schema');
+      return (
+        parameter.deprecated !== true &&
+        (definition.in !== 'path' || parameter.required === true) &&
+        schema?.type === definition.type &&
+        (!definition.format || schema.format === definition.format)
+      );
+    }) &&
+    parameters.every(
+      (parameter) =>
+        parameter.required !== true ||
+        expected.some(
+          (definition) => parameter.name === definition.name && parameter.in === definition.in,
+        ),
+    )
+  );
+}
+
+function nullableContractField(value: unknown, type?: string): boolean {
+  if (!isObject(value) || (value.default !== undefined && value.default !== null)) return false;
+  if (value.nullable === true)
+    return typeof value.type === 'string' && (!type || value.type === type);
+  return (
+    Array.isArray(value.type) &&
+    value.type.length === 2 &&
+    value.type.includes('null') &&
+    value.type.some(
+      (entry) => typeof entry === 'string' && entry !== 'null' && (!type || entry === type),
+    )
+  );
+}
+
+function writableContractType(value: unknown, type: string): boolean {
+  return isObject(value) && value.type === type && value.readOnly !== true;
+}
+
+function jellyfinWriteCapabilities(document: JsonObject): MigrationCapabilities {
+  const paths = contractObject(document, 'paths');
+  const schemas = contractObject(document, 'components', 'schemas');
+  const itemPath = '/UserItems/{itemId}/UserData';
+  const read = contractObject(paths, itemPath, 'get');
+  const readFields = contractObject(schemas, 'UserItemDataDto', 'properties');
+  const update = contractObject(paths, itemPath, 'post');
+  const updateSchema = contractObject(schemas, 'UpdateUserItemDataDto');
+  const updateFields = contractObject(updateSchema, 'properties');
+  // Jellyfin's distinct update DTO leaves omitted fields null and only assigns supplied fields.
+  // A read DTO, replacement operation, or DTO with non-null defaults cannot prove that contract.
+  const userData =
+    read?.operationId === 'GetItemUserData' &&
+    read.deprecated !== true &&
+    declaresContractParameters(read, itemUserParameters) &&
+    referencesContractSchema(
+      contractObject(read, 'responses', '200', 'content', 'application/json', 'schema'),
+      'UserItemDataDto',
+    ) &&
+    contractObject(readFields, 'Played')?.type === 'boolean' &&
+    contractObject(readFields, 'IsFavorite')?.type === 'boolean' &&
+    update?.operationId === 'UpdateItemUserData' &&
+    update.deprecated !== true &&
+    declaresContractParameters(update, itemUserParameters) &&
+    referencesContractSchema(
+      contractObject(update, 'requestBody', 'content', 'application/json', 'schema'),
+      'UpdateUserItemDataDto',
+    ) &&
+    updateSchema?.type === 'object' &&
+    (updateSchema.required === undefined ||
+      (Array.isArray(updateSchema.required) && updateSchema.required.length === 0)) &&
+    !!updateFields &&
+    nullableContractField(updateFields.Played, 'boolean') &&
+    nullableContractField(updateFields.IsFavorite, 'boolean') &&
+    contractObject(updateFields, 'Played')?.readOnly !== true &&
+    contractObject(updateFields, 'IsFavorite')?.readOnly !== true &&
+    Object.values(updateFields).every((field) => nullableContractField(field));
+
+  const createPlaylist = contractObject(paths, '/Playlists', 'post');
+  const playlistSchema = contractObject(schemas, 'CreatePlaylistDto');
+  const playlistFields = contractObject(playlistSchema, 'properties');
+  const required = playlistSchema?.required;
+  const isPublic = contractObject(playlistFields, 'IsPublic');
+  const owner = contractObject(playlistFields, 'UserId');
+  const privatePlaylists =
+    createPlaylist?.operationId === 'CreatePlaylist' &&
+    createPlaylist.deprecated !== true &&
+    referencesContractSchema(
+      contractObject(createPlaylist, 'requestBody', 'content', 'application/json', 'schema'),
+      'CreatePlaylistDto',
+    ) &&
+    playlistSchema?.type === 'object' &&
+    (required === undefined ||
+      (Array.isArray(required) &&
+        required.every((key) => ['Name', 'Ids', 'Users', 'UserId', 'IsPublic'].includes(key)))) &&
+    writableContractType(isPublic, 'boolean') &&
+    (!Array.isArray(isPublic?.enum) || isPublic.enum.includes(false)) &&
+    writableContractType(playlistFields?.Name, 'string') &&
+    writableContractType(owner, 'string') &&
+    owner?.format === 'uuid' &&
+    writableContractType(playlistFields?.Ids, 'array') &&
+    writableContractType(playlistFields?.Users, 'array');
+  const append = contractObject(paths, '/Playlists/{playlistId}/Items', 'post');
+  const appendPlaylistItems =
+    privatePlaylists &&
+    append?.operationId === 'AddItemToPlaylist' &&
+    append.deprecated !== true &&
+    declaresContractParameters(append, [
+      { name: 'playlistId', in: 'path', type: 'string', format: 'uuid' },
+      { name: 'ids', in: 'query', type: 'array' },
+      { name: 'userId', in: 'query', type: 'string', format: 'uuid' },
+    ]);
+
+  // The request schema accepts a list, but does not promise to retain duplicate occurrences.
+  return { userData, privatePlaylists, appendPlaylistItems };
 }
 
 /** RFC Retry-After values only; retain a bounded duration, never the raw header. */
@@ -1670,16 +1821,31 @@ export class MediaClient implements MediaAPI {
 
   async migrationCapabilities(): Promise<MigrationCapabilities> {
     if (!this.capabilities) {
-      this.capabilities = this.systemInfo().then((info) => {
-        const version = typeof info.Version === 'string' ? info.Version : undefined;
-        const supported = this.kind === 'jellyfin' && versionAtLeast(version, 10, 9);
-        return {
-          userData: supported,
-          privatePlaylists: supported,
-          playlistDuplicates: supported && versionAtLeast(version, 12),
-          ...(version ? { version } : {}),
-        };
-      });
+      this.capabilities =
+        this.kind === 'jellyfin'
+          ? this.request('GET', 'api-docs/openapi.json', undefined, undefined, true, undefined, {
+              retry: false,
+              timeoutMs: MIGRATION_CONTRACT_TIMEOUT_MS,
+            }).then(
+              (document) => {
+                if (!isObject(document)) throw new MediaError(MIGRATION_CONTRACT_READ_ERROR);
+                return jellyfinWriteCapabilities(document);
+              },
+              (error: unknown) => {
+                if (error instanceof MediaError)
+                  throw new MediaError(
+                    `${MIGRATION_CONTRACT_READ_ERROR} ${error.message}`,
+                    error.statusCode,
+                    error.retryAfterMs,
+                  );
+                throw new MediaError(MIGRATION_CONTRACT_READ_ERROR);
+              },
+            )
+          : Promise.resolve({
+              userData: false,
+              privatePlaylists: false,
+              playlistDuplicates: false,
+            });
       // A temporary read failure must not permanently disable retries for this client.
       void this.capabilities.catch(() => {
         this.capabilities = undefined;
@@ -1693,14 +1859,14 @@ export class MediaClient implements MediaAPI {
     this.id(userId);
     const id = this.id(itemId);
     if (!(await this.migrationCapabilities()).userData)
-      throw new MediaError('Detailed user-data migration requires Jellyfin 10.9 or newer.');
+      throw new MediaError(USER_DATA_CONTRACT_ERROR);
     await this.request('POST', `UserItems/${id}/UserData`, { userId }, body, false);
   }
 
   async userData(userId: string, itemId: string): Promise<MediaUserDataPatch> {
     this.id(userId);
     if (!(await this.migrationCapabilities()).userData)
-      throw new MediaError('Detailed user-data migration requires Jellyfin 10.9 or newer.');
+      throw new MediaError(USER_DATA_CONTRACT_ERROR);
     return writableUserData(
       await this.request('GET', `UserItems/${this.id(itemId)}/UserData`, { userId }),
     );
@@ -1799,8 +1965,8 @@ export class MediaClient implements MediaAPI {
     };
     if (Buffer.byteLength(JSON.stringify(body), 'utf8') > 4 * 1024 * 1024)
       throw new MediaError('The private playlist creation request exceeds the supported size.');
-    if (!(await this.migrationCapabilities()).privatePlaylists)
-      throw new MediaError('Private playlist migration requires Jellyfin 10.9 or newer.');
+    const capabilities = await this.migrationCapabilities();
+    if (!capabilities.privatePlaylists) throw new MediaError(PRIVATE_PLAYLIST_CONTRACT_ERROR);
     const result = this.object(await this.request('POST', 'Playlists', undefined, body));
     if (typeof result.Id !== 'string' || !result.Id)
       throw new MediaError(
@@ -1827,8 +1993,13 @@ export class MediaClient implements MediaAPI {
       )
     )
       throw new MediaError('Add between 1 and 100 valid playlist item identifiers at a time.');
-    if (!(await this.migrationCapabilities()).privatePlaylists)
-      throw new MediaError('Private playlist migration requires Jellyfin 10.9 or newer.');
+    const capabilities = await this.migrationCapabilities();
+    if (!capabilities.appendPlaylistItems)
+      throw new MediaError(
+        'Jellyfin does not expose a verified playlist append contract at /api-docs/openapi.json.',
+      );
+    if (!capabilities.playlistDuplicates && new Set(ids).size !== ids.length)
+      throw new MediaError('Jellyfin does not confirm support for duplicate playlist entries.');
     await this.request(
       'POST',
       `Playlists/${id}/Items`,

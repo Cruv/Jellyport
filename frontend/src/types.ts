@@ -210,8 +210,8 @@ export interface DestinationCatalogMetadata {
   items: number;
   keys: number;
   bytes: number;
-  server_version: string;
-  backup_engine_version: string;
+  server_version?: string;
+  backup_engine_version?: string;
   backup_created_at: string;
   imported_at: string;
   import_elapsed_ms: number;
@@ -339,7 +339,7 @@ export interface SourceSnapshotMetadata {
   id: string;
   source_server_url: string;
   source_server_id: string;
-  source_server_version: string;
+  source_server_version?: string;
   source_user_id: string;
   source_username: string;
   scope: SnapshotCaptureScope;

@@ -9,10 +9,7 @@ import {
 } from './destination-catalog-helper.js';
 import {
   CAPTURE_DEADLINE,
-  SNAPSHOT_PLUGIN_VERSION,
   SNAPSHOT_PROJECTION_SCHEMA,
-  SNAPSHOT_VERSION,
-  SNAPSHOT_VERSIONS,
   encryptDatabase,
   readEnvelope,
   recoverSnapshotHelper,
@@ -22,7 +19,7 @@ import {
   snapshotCaptureMethod,
   snapshotIdentitiesMatch,
   snapshotOrphanIdentityVersion,
-  snapshotRequestVersionMatches,
+  validatedSnapshotRequest,
   writeEnvelope,
   type CaptureRequest,
   type CaptureResult,
@@ -34,24 +31,16 @@ const workDirectory = process.env.JELLYPORT_SNAPSHOT_WORK_DIR;
 const jellyfinBackups = process.env.JELLYPORT_JELLYFIN_BACKUP_DIR;
 const jellyfinBackupCleanup = process.env.JELLYPORT_JELLYFIN_BACKUP_CLEANUP === 'true';
 const captureMethod = snapshotCaptureMethod(process.env.JELLYPORT_SNAPSHOT_METHOD);
-const configuredVersion = process.env.JELLYPORT_EMBY_VERSION;
 const source =
   captureMethod === 'plugin_backup'
     ? process.env.JELLYPORT_EMBY_BACKUP_DIR
     : process.env.JELLYPORT_EMBY_DATA_DIR;
-if (
-  !directory ||
-  !source ||
-  !workDirectory ||
-  (captureMethod !== 'plugin_backup' && configuredVersion !== SNAPSHOT_VERSION)
-)
+if (!directory || !source || !workDirectory)
   throw new Error(
-    'Configure snapshot exchange, private work directory, the selected Emby source mount and supported version.',
+    'Configure the snapshot exchange, private work directory and selected Emby source mount.',
   );
 const embyCaptureCapability = {
   capture_method: captureMethod,
-  emby_version: SNAPSHOT_VERSION,
-  emby_versions: captureMethod === 'plugin_backup' ? SNAPSHOT_VERSIONS : [SNAPSHOT_VERSION],
   ...(captureMethod === 'plugin_backup'
     ? { plugin_backup_schema: SNAPSHOT_PROJECTION_SCHEMA }
     : {}),
@@ -62,19 +51,14 @@ await mkdir(workDirectory, { recursive: true, mode: 0o700 });
 process.env.SQLITE_TMPDIR = workDirectory;
 if (directory === workDirectory)
   throw new Error('The helper work directory must be separate from the snapshot exchange.');
-async function sourceIdentity(serverId: string, version: string): Promise<void> {
-  for (const [name, expected] of [
-    ['lastversion.txt', version],
-    ['device.txt', serverId],
-  ]) {
-    const path = join(source!, name!);
-    await regular(path);
-    if (
-      (await lstat(path)).size > 128 ||
-      (await readFile(path, 'utf8')).replace(/^\uFEFF/, '').trim() !== expected
-    )
-      throw new Error('The mounted Emby identity or version does not match.');
-  }
+async function sourceIdentity(serverId: string): Promise<void> {
+  const path = join(source!, 'device.txt');
+  await regular(path);
+  if (
+    (await lstat(path)).size > 128 ||
+    (await readFile(path, 'utf8')).replace(/^\uFEFF/, '').trim() !== serverId
+  )
+    throw new Error('The mounted Emby server identity does not match.');
 }
 const heartbeat = setInterval(() => {
   void snapshotKey(directory)
@@ -156,13 +140,8 @@ while (!stopping) {
         path = join(directory, name);
       let request: CaptureRequest;
       try {
-        request = await readEnvelope<CaptureRequest>(path, key);
-        if (
-          request.id !== id ||
-          !snapshotRequestVersionMatches(request) ||
-          !Number.isFinite(Date.parse(request.requested_at)) ||
-          Math.abs(Date.now() - Date.parse(request.requested_at)) > CAPTURE_DEADLINE
-        )
+        request = validatedSnapshotRequest(await readEnvelope<CaptureRequest>(path, key), id);
+        if (Math.abs(Date.now() - Date.parse(request.requested_at)) > CAPTURE_DEADLINE)
           throw new Error('Invalid capture request.');
         await rename(path, join(directory, `${id}.working`));
       } catch {
@@ -175,8 +154,7 @@ while (!stopping) {
       try {
         if (snapshotCaptureMethod(request.capture_method) !== captureMethod)
           throw new Error('The helper capture method changed. Request a new capture.');
-        if (captureMethod !== 'plugin_backup')
-          await sourceIdentity(request.binding.server_id, request.binding.version);
+        if (captureMethod !== 'plugin_backup') await sourceIdentity(request.binding.server_id);
         temporary = await mkdtemp(join(workDirectory, `capture-${id}-`));
         const output = join(temporary, 'library.db');
         const value = await snapshotProcess<
@@ -196,17 +174,9 @@ while (!stopping) {
           controller.signal,
         );
         snapshotOrphanIdentityVersion(value.orphan_identity_version);
-        if (
-          captureMethod === 'plugin_backup' &&
-          request.plugin_backup_schema === undefined &&
-          (value.backup_server_version !== request.binding.version ||
-            value.plugin_version !== SNAPSHOT_PLUGIN_VERSION)
-        )
-          throw new Error('Update Jellyport to import backups by schema.');
         if (!snapshotIdentitiesMatch(value.identities, request.user_ids, captureMethod))
           throw new Error('The mounted database does not contain the requested users.');
-        if (captureMethod !== 'plugin_backup')
-          await sourceIdentity(request.binding.server_id, request.binding.version);
+        if (captureMethod !== 'plugin_backup') await sourceIdentity(request.binding.server_id);
         await encryptDatabase(
           output,
           join(directory, `${id}.db.enc.pending`),
@@ -232,7 +202,7 @@ while (!stopping) {
           error:
             captureMethod === 'plugin_backup'
               ? 'Emby backup import failed. Check that the full backup is complete, mounted read-only, and uses a supported layout. Any previously saved capture is preserved.'
-              : 'Database capture failed. Check the helper mount, version, permissions and WAL files. Any previously saved capture is preserved.',
+              : 'Database capture failed. Check the Emby server identity, helper mount, database layout, permissions and WAL files. Any previously saved capture is preserved.',
         };
         await rm(join(directory, `${id}.db.enc`), { force: true });
       } finally {

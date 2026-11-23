@@ -20,7 +20,7 @@ function deferred() {
 describe('playback-conscious migration orchestration', () => {
   let directory: string, store: Store, servers: DemoServers, service: Service;
   let events: MediaWorkloadEvent[];
-  let sourceVersion: string;
+  let sourceVersion: string | undefined;
   const releases: Array<() => void> = [];
   beforeEach(() => {
     directory = mkdtempSync(join(tmpdir(), 'jellyport-workload-service-'));
@@ -266,6 +266,26 @@ describe('playback-conscious migration orchestration', () => {
       error: expect.stringContaining('reviewed Emby server changed'),
     });
     expect(servers.userData['j-river']).toEqual(before);
+  });
+
+  it('migrates live history when version labels disappear on the same servers', async () => {
+    const factory = service.clientFactory;
+    service.clientFactory = (...args) => {
+      const client = factory(...args);
+      if (args[2] === 'emby') {
+        const read = client.migrationState!.bind(client);
+        client.migrationState = async (...params) => {
+          const history = await read(...params);
+          sourceVersion = undefined;
+          return history;
+        };
+      } else client.systemInfo = async () => ({ Id: 'demo-jellyfin' });
+      return client;
+    };
+
+    const job = await finish(await service.migrateUsers(['e-river']));
+    expect(job.status).toBe('completed');
+    expect(servers.played['j-river']).toEqual(new Set(['1', '2']));
   });
 
   it('does not use an account that appeared after the reviewed absence was queued', async () => {

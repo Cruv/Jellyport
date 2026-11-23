@@ -1,18 +1,18 @@
 # Emby Backup & Restore history imports
 
 Jellyport imports saved history from **completed full backups** whose manifest,
-library and user database schemas it can validate. It records the Emby Server and
-Backup & Restore versions from the backup and accepts later version labels when
-the required layout still matches. A fresh backup from an earlier release of the
-same verified server remains usable after an upgrade. Dated database-only
-folders and incompatible schemas are rejected.
+library and user database schemas it can validate. The displayed Emby Server and
+Backup & Restore versions are optional information from the backup. A fresh
+backup from the same verified server remains usable after an upgrade. Dated
+database-only folders and incompatible schemas are rejected.
 
 Synthetic imports exercise Emby 4.10.1.0 / Backup & Restore 1.8.7.0 and Emby
 4.10.2.0 / Backup & Restore 1.8.8.0 through the network-isolated helper. The latter
-fixture is imported against the same running server with a newer version.
-Raw file-copy and SQLite Online Backup **capture** modes still require 4.10.1.0
-because they operate on an actively written SQLite database. Existing validated
-captures can be reused after an upgrade while their source identity and age checks pass.
+fixture is imported against the same running server with a newer version. The
+same importer accepts a valid backup without release labels. Raw file-copy and
+SQLite Online Backup capture validate the mounted Emby server ID, SQLite state,
+database layout and account identities. Existing validated captures can be reused
+after an upgrade while their source identity and age checks pass.
 
 ## Configure Emby and the helper
 
@@ -28,9 +28,8 @@ captures can be reused after an upgrade while their source identity and age chec
    `embyserver-backup-full/backupinfo.json` and that folder's `data/library.db`,
    `data/users.db` and `data/device.txt`. A laptop's mounted-share path is not the
    Docker host's path. Do not substitute a live database mount. Update the app
-   and helper together to use schema-based imports. Omit `JELLYPORT_EMBY_VERSION`
-   in plugin mode. The helper ignores an existing value in this mode. Older
-   helpers and requests still use their original version constraints.
+   and helper together so both use the current import checks. The helper needs
+   no `JELLYPORT_EMBY_VERSION` setting.
 3. Keep `/work` helper-only and private. Share only the separate `/snapshots`
    exchange with Jellyport, and preserve the existing Jellyport `/data` mount.
    The helper needs no network and opens only copied private SQLite databases.

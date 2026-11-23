@@ -3,8 +3,13 @@ import { constants, type BigIntStats } from 'node:fs';
 import { lstat, mkdir, open, rename, link, unlink, rm, rmdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { inspectJellyfinBackupManifest } from './jellyfin-backup-reader.js';
-import { validJellyfinBackupName, type JellyfinBackupManifest } from './jellyfin-backup-api.js';
-import { normalizedServerVersion, validDestinationRequest } from './destination-catalog-files.js';
+import {
+  sameJellyfinBackup,
+  sameJellyfinBackupOptions,
+  validJellyfinBackupName,
+  type JellyfinBackupManifest,
+} from './jellyfin-backup-api.js';
+import { sameDestinationBinding, validDestinationRequest } from './destination-catalog-files.js';
 import { readEnvelope, writeEnvelope, snapshotId, type SnapshotBinding } from './snapshot-files.js';
 
 export const BACKUP_CLEANUP_DEADLINE = 15 * 60_000;
@@ -39,26 +44,12 @@ export const backupCleanupPrefix = (id: string) => {
   if (!snapshotId.test(id)) throw new Error('Invalid backup cleanup request.');
   return `jellyfin-cleanup-${id}`;
 };
-export function sameBackupBinding(a: SnapshotBinding, b: SnapshotBinding): boolean {
-  try {
-    return (
-      new URL(a.url).toString() === new URL(b.url).toString() &&
-      a.server_id.toLowerCase() === b.server_id.toLowerCase() &&
-      normalizedServerVersion(a.version) === normalizedServerVersion(b.version)
-    );
-  } catch {
-    return false;
-  }
-}
-function validManifest(value: JellyfinBackupManifest, binding: SnapshotBinding): boolean {
+function validManifest(value: JellyfinBackupManifest): boolean {
   return (
     !!value &&
     validJellyfinBackupName(value.name) &&
     typeof value.created_at === 'string' &&
     Number.isFinite(Date.parse(value.created_at)) &&
-    typeof value.server_version === 'string' &&
-    normalizedServerVersion(value.server_version) === normalizedServerVersion(binding.version) &&
-    value.backup_engine_version === '0.2.0' &&
     value.database === true &&
     value.metadata === false &&
     value.trickplay === false &&
@@ -77,7 +68,7 @@ export function validBackupCleanupRequest(value: BackupCleanupRequest): boolean 
     value.backups.every(
       (item) =>
         item &&
-        validManifest(item.manifest, value.binding) &&
+        validManifest(item.manifest) &&
         typeof item.fingerprint === 'string' &&
         /^[a-f0-9]{64}$/.test(item.fingerprint),
     )
@@ -91,8 +82,13 @@ export function validBackupCleanupResult(
     validBackupCleanupRequest(value) &&
     value.id === request.id &&
     value.requested_at === request.requested_at &&
-    sameBackupBinding(value.binding, request.binding) &&
-    JSON.stringify(value.backups) === JSON.stringify(request.backups) &&
+    sameDestinationBinding(value.binding, request.binding) &&
+    value.backups.length === request.backups.length &&
+    value.backups.every(
+      (entry, index) =>
+        entry.fingerprint === request.backups[index]!.fingerprint &&
+        sameJellyfinBackup(entry.manifest, request.backups[index]!.manifest),
+    ) &&
     typeof value.ok === 'boolean' &&
     typeof value.finished_at === 'string' &&
     Number.isFinite(Date.parse(value.finished_at)) &&
@@ -155,9 +151,7 @@ async function removeOwnedBackup(
     const manifest = await inspectJellyfinBackupManifest(file.fd, signal);
     if (
       manifest.createdAt !== new Date(candidate.manifest.created_at).toISOString() ||
-      normalizedServerVersion(manifest.serverVersion) !==
-        normalizedServerVersion(candidate.manifest.server_version) ||
-      manifest.backupEngineVersion !== candidate.manifest.backup_engine_version
+      !sameJellyfinBackupOptions(manifest.options, candidate.manifest)
     )
       throw new Error('Changed cleanup manifest.');
     signal.throwIfAborted();

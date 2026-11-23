@@ -87,6 +87,21 @@ describe('native Jellyfin backup API', () => {
     ).toEqual({ ...projected, metadata: true, trickplay: true, subtitles: true });
   });
 
+  it.each([
+    [undefined, undefined],
+    [99, 'malformed\nlabel'],
+  ])(
+    'keeps completed archive evidence when release labels are missing or unusable (%j, %j)',
+    async (server, engine) => {
+      const body = { ...nativeManifest(), ServerVersion: server, BackupEngineVersion: engine };
+      const { server_version: _server, backup_engine_version: _engine, ...selected } = projected;
+      expect(parseJellyfinBackups([body])).toEqual([selected]);
+      await expect(client(async () => json(body)).createJellyfinBackup()).resolves.toEqual(
+        selected,
+      );
+    },
+  );
+
   it('creates exactly one database-only backup with fixed supported options', async () => {
     const transport = vi.fn(async (address: string, init: RequestInit) => {
       expect(address).toBe('https://jellyfin.test/base/Backup/Create');
@@ -218,9 +233,6 @@ describe('strict native backup observation validation', () => {
     { ...nativeManifest(), Path: '/private/jellyfin-backup-20260230021530.zip' },
     { ...nativeManifest(), Path: '/private/jellyfin-backup-20261018241530.zip' },
     { ...nativeManifest(), Path: `${'a'.repeat(4096)}/${projected.name}` },
-    { ...nativeManifest(), ServerVersion: 'private-invalid-version' },
-    { ...nativeManifest(), ServerVersion: '12.2.0.0\n' },
-    { ...nativeManifest(), BackupEngineVersion: {} },
     { ...nativeManifest(), Options: null },
     { ...nativeManifest(), Options: { ...nativeManifest().Options, Database: false } },
     { ...nativeManifest(), Options: { ...nativeManifest().Options, Metadata: 'false' } },

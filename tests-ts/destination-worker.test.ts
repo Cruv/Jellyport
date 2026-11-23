@@ -85,12 +85,13 @@ function zip(entries: Record<string, unknown>): Buffer {
 function archive(
   created = new Date(Date.now() - 60_000).toISOString(),
   count = 1,
-  version = '12.2.0.0',
+  version: string | null = '12.2.0.0',
+  engine: string | null = '0.2.0',
 ) {
   return zip({
     'manifest.json': {
-      ServerVersion: version,
-      BackupEngineVersion: '0.2.0',
+      ...(version === null ? {} : { ServerVersion: version }),
+      ...(engine === null ? {} : { BackupEngineVersion: engine }),
       DateCreated: created,
       DatabaseTables: ['DbSet`1'],
       Options: { Database: true, Metadata: false, Subtitles: false, Trickplay: false },
@@ -122,12 +123,11 @@ interface Capture {
   keys: number;
   backup_created_at: string;
   backup_fingerprint: string;
-  server_version: string;
-  backup_engine_version: string;
+  server_version?: string;
+  backup_engine_version?: string;
 }
 const capture = (
   value: Awaited<ReturnType<typeof fixture>>,
-  version = '12.2.0',
   options: SnapshotProcessOptions = {},
 ) =>
   snapshotProcess<Capture>(
@@ -135,7 +135,6 @@ const capture = (
       operation: 'destination_capture',
       directory: value.backups,
       output: value.output,
-      version,
     },
     undefined,
     undefined,
@@ -154,14 +153,12 @@ async function waitFor<T>(read: () => Promise<T>): Promise<T> {
 }
 
 describe('isolated destination catalog worker and helper', () => {
-  it('imports a current 12.4 backup through the isolated worker with exact live-version binding', async () => {
-    const value = await fixture(archive(undefined, 2, '12.4.0.0'));
-    const result = await capture(value, '12.4.0');
-    expect(result).toMatchObject({
-      items: 2,
-      server_version: '12.4.0.0',
-      backup_engine_version: '0.2.0',
-    });
+  it('imports an archive without release labels from the configured folder', async () => {
+    const value = await fixture(archive(undefined, 2, null, null));
+    const result = await capture(value);
+    expect(result.items).toBe(2);
+    expect(result).not.toHaveProperty('server_version');
+    expect(result).not.toHaveProperty('backup_engine_version');
     expect(result.backup_fingerprint).toBe(createHash('sha256').update(value.bytes).digest('hex'));
   });
 
@@ -176,18 +173,17 @@ describe('isolated destination catalog worker and helper', () => {
       operation: 'destination_capture',
       directory: value.backups,
       output: value.output,
-      version: '12.5.0',
       expected_backup: {
         name: 'jellyfin-backup-20260102030000.zip',
         created_at,
-        server_version: '12.2.0.0',
+        options: { database: true, metadata: false, trickplay: false, subtitles: false },
       },
     });
     expect(result.server_version).toBe('12.2.0.0');
     expect(Date.parse(result.backup_created_at)).toBe(Date.parse(created_at));
     expect(result.backup_fingerprint).toBe(createHash('sha256').update(value.bytes).digest('hex'));
   });
-  it('rejects an archive whose version disagrees with the linked server selection', async () => {
+  it('rejects an archive whose options disagree with the linked server selection', async () => {
     const created_at = new Date(Date.now() - 1000).toISOString();
     const value = await fixture(archive(created_at));
     await expect(
@@ -195,14 +191,13 @@ describe('isolated destination catalog worker and helper', () => {
         operation: 'destination_capture',
         directory: value.backups,
         output: value.output,
-        version: '12.5.0',
         expected_backup: {
           name: 'jellyfin-backup-20260102030000.zip',
           created_at,
-          server_version: '12.4.0.0',
+          options: { database: true, metadata: false, trickplay: false, subtitles: true },
         },
       }),
-    ).rejects.toMatchObject({ error_code: 'version_mismatch' });
+    ).rejects.toMatchObject({ error_code: 'backup_changed' });
     await expect(stat(value.output)).rejects.toMatchObject({ code: 'ENOENT' });
   });
   it('never falls back to an old archive when a requested native backup is absent or changed', async () => {
@@ -220,7 +215,6 @@ describe('isolated destination catalog worker and helper', () => {
           operation: 'destination_capture',
           directory: value.backups,
           output: value.output,
-          version: '12.2.0',
           expected_backup,
         }),
       ).rejects.toThrow(/backup|changed|found/i);
@@ -232,7 +226,7 @@ describe('isolated destination catalog worker and helper', () => {
     const bytes = archive();
     await writeFile(join(value.backups, 'jellyfin-backup-20260102040000.zip'), bytes);
     const progress: DestinationCatalogDiagnostic[] = [];
-    const result = await capture(value, '12.2.0', {
+    const result = await capture(value, {
       onProgress: (entry) => {
         expect(validDestinationDiagnostic(entry)).toBe(true);
         progress.push(entry as DestinationCatalogDiagnostic);
@@ -282,28 +276,16 @@ describe('isolated destination catalog worker and helper', () => {
     [
       'an expired original backup',
       new Date(Date.now() - 49 * 60 * 60_000).toISOString(),
-      '12.2.0',
       'backup_expired',
     ],
-    [
-      'a future original backup',
-      new Date(Date.now() + 120_000).toISOString(),
-      '12.2.0',
-      'backup_future',
-    ],
-    [
-      'a different archive version without a selection from the linked server',
-      new Date(Date.now() - 60_000).toISOString(),
-      '12.3.0',
-      'version_mismatch',
-    ],
+    ['a future original backup', new Date(Date.now() + 120_000).toISOString(), 'backup_future'],
   ])(
     'rejects %s with an early safe diagnostic before table processing',
-    async (_name, created, version, code) => {
+    async (_name, created, code) => {
       const value = await fixture(archive(created));
       const progress: unknown[] = [];
       await expect(
-        capture(value, version, { onProgress: (entry) => progress.push(entry) }),
+        capture(value, { onProgress: (entry) => progress.push(entry) }),
       ).rejects.toMatchObject({
         error_code: code,
         diagnostic: {

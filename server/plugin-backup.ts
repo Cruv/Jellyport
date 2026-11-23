@@ -4,16 +4,9 @@ import { lstat, mkdtemp, open, realpath, rm, type FileHandle } from 'node:fs/pro
 import { dirname, join, resolve, sep } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { inspectLibrary, projectLibrary, readUserIdentities } from './emby-snapshot-reader.js';
-import {
-  MAX_SNAPSHOT_BYTES,
-  SNAPSHOT_VERSION,
-  supportedSnapshotVersion,
-  SNAPSHOT_PLUGIN_VERSION,
-  SNAPSHOT_MAX_AGE,
-} from './snapshot-files.js';
+import { MAX_SNAPSHOT_BYTES, SNAPSHOT_MAX_AGE, snapshotVersionLabel } from './snapshot-files.js';
 import type { FileCopyCaptureResult } from './snapshot-copy.js';
 
-export const EMBY_BACKUP_PLUGIN_VERSION = SNAPSHOT_PLUGIN_VERSION;
 export const PLUGIN_BACKUP_SETTLE_MS = 5 * 60_000;
 export const PLUGIN_BACKUP_MAX_AGE_MS = SNAPSHOT_MAX_AGE;
 const MAX_METADATA_BYTES = 1024 * 1024;
@@ -34,13 +27,12 @@ interface OpenSource {
 export interface PluginBackupCaptureResult extends FileCopyCaptureResult {
   backup_created_at: string;
   backup_fingerprint: string;
-  plugin_version: typeof EMBY_BACKUP_PLUGIN_VERSION;
+  backup_server_version: string;
+  plugin_version: string;
 }
 export interface PluginBackupCaptureOptions {
   /** Deterministic clock for isolated tests; callers do not supply this over IPC. */
   now?: number;
-  /** Exact source version verified by the app, not a compatible-version substitute. */
-  serverVersion?: string;
   /** A caller can lower, never raise, the combined source/output byte ceiling. */
   maxBytes?: number;
   /** Race observation point for isolated synthetic tests, never a source path. */
@@ -84,18 +76,14 @@ async function exactRead(handle: FileHandle, length: number): Promise<Buffer> {
   }
   return buffer;
 }
-function backupManifest(
-  buffer: Buffer,
-  now: number,
-  serverVersion: string,
-): { created: string; users: Set<string> } {
+function backupManifest(buffer: Buffer, now: number) {
   const value = JSON.parse(buffer.toString('utf8')) as Record<string, unknown>;
   if (
     !value ||
     typeof value !== 'object' ||
     Array.isArray(value) ||
-    value.ServerVersion !== serverVersion ||
-    value.PluginVersion !== EMBY_BACKUP_PLUGIN_VERSION ||
+    !snapshotVersionLabel(value.ServerVersion) ||
+    !snapshotVersionLabel(value.PluginVersion) ||
     value.CanRestore !== true ||
     value.IsFullBackup !== true ||
     typeof value.DateCreated !== 'string' ||
@@ -128,7 +116,12 @@ function backupManifest(
       throw failed();
     users.add(user.Id.toLowerCase());
   }
-  return { created: new Date(date).toISOString(), users };
+  return {
+    created: new Date(date).toISOString(),
+    server_version: value.ServerVersion,
+    plugin_version: value.PluginVersion,
+    users,
+  };
 }
 function checkPrivateDatabase(path: string): void {
   const database = new DatabaseSync(path, { allowExtension: false, timeout: 250 });
@@ -166,10 +159,8 @@ export async function importPluginBackup(
   let ownsOutput = false;
   try {
     const now = options.now ?? Date.now(),
-      maxBytes = options.maxBytes ?? MAX_SNAPSHOT_BYTES,
-      serverVersion = options.serverVersion ?? SNAPSHOT_VERSION;
+      maxBytes = options.maxBytes ?? MAX_SNAPSHOT_BYTES;
     if (
-      !supportedSnapshotVersion(serverVersion) ||
       !Number.isFinite(now) ||
       !Number.isSafeInteger(maxBytes) ||
       maxBytes < 1 ||
@@ -220,7 +211,7 @@ export async function importPluginBackup(
       if (!sameFile(initial, await handle.stat({ bigint: true }))) throw failed();
       if (!name.endsWith('.db')) source.metadata = await exactRead(handle, Number(initial.size));
     }
-    const manifest = backupManifest(sources[0]!.metadata!, now, serverVersion);
+    const manifest = backupManifest(sources[0]!.metadata!, now);
     if (
       sources[1]!
         .metadata!.toString('utf8')
@@ -319,7 +310,8 @@ export async function importPluginBackup(
         : { orphan_identity_version: inspected.orphan_identity_version }),
       backup_created_at: manifest.created,
       backup_fingerprint: fingerprint.digest('hex'),
-      plugin_version: EMBY_BACKUP_PLUGIN_VERSION,
+      backup_server_version: manifest.server_version,
+      plugin_version: manifest.plugin_version,
     };
   } catch {
     if (ownsOutput) await rm(output, { force: true }).catch(() => {});

@@ -343,10 +343,11 @@ describe('playback-conscious migration orchestration', () => {
     expect(update).not.toHaveBeenCalled();
   });
 
-  it('passes exact 4.10.2 source version through saved preview, admission and execution', async () => {
+  it('keeps the reviewed source and saved capture pinned across an Emby update', async () => {
     sourceVersion = '4.10.2.0';
     const saved = snapshots();
     const preview = await service.preview(['e-river'], { use_snapshots: true });
+    sourceVersion = '4.11.0.0';
     const job = await service.migrateUsers(
       ['e-river'],
       {},
@@ -356,8 +357,15 @@ describe('playback-conscious migration orchestration', () => {
     );
     const result = await finish(job);
     expect(result.status).not.toBe('failed');
-    expect(saved.select).toHaveBeenCalledTimes(3);
-    for (const call of saved.select.mock.calls) expect(call[4]).toBe('4.10.2.0');
+    const pinned = preview.source_snapshot_ids?.['e-river'];
+    expect(pinned).toBeDefined();
+    expect(
+      saved.select.mock.calls.map(([id, , serverId, generation]) => [id, serverId, generation]),
+    ).toEqual([
+      ['e-river', 'fixture-source', undefined],
+      ['e-river', 'fixture-source', pinned],
+      ['e-river', 'fixture-source', pinned],
+    ]);
     expect(saved.items).toHaveBeenCalledOnce();
   });
 

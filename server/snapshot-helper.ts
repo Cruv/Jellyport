@@ -9,9 +9,10 @@ import {
 } from './destination-catalog-helper.js';
 import {
   CAPTURE_DEADLINE,
+  SNAPSHOT_PLUGIN_VERSION,
+  SNAPSHOT_PROJECTION_SCHEMA,
   SNAPSHOT_VERSION,
   SNAPSHOT_VERSIONS,
-  supportedSnapshotVersion,
   encryptDatabase,
   readEnvelope,
   recoverSnapshotHelper,
@@ -21,10 +22,12 @@ import {
   snapshotCaptureMethod,
   snapshotIdentitiesMatch,
   snapshotOrphanIdentityVersion,
+  snapshotRequestVersionMatches,
   writeEnvelope,
   type CaptureRequest,
   type CaptureResult,
 } from './snapshot-files.js';
+import type { PluginBackupCaptureResult } from './plugin-backup.js';
 
 const directory = process.env.JELLYPORT_SNAPSHOT_DIR;
 const workDirectory = process.env.JELLYPORT_SNAPSHOT_WORK_DIR;
@@ -40,14 +43,19 @@ if (
   !directory ||
   !source ||
   !workDirectory ||
-  !supportedSnapshotVersion(configuredVersion) ||
   (captureMethod !== 'plugin_backup' && configuredVersion !== SNAPSHOT_VERSION)
 )
   throw new Error(
     'Configure snapshot exchange, private work directory, the selected Emby source mount and supported version.',
   );
-const supportedVersions: readonly string[] =
-  captureMethod === 'plugin_backup' ? SNAPSHOT_VERSIONS : [configuredVersion];
+const embyCaptureCapability = {
+  capture_method: captureMethod,
+  emby_version: SNAPSHOT_VERSION,
+  emby_versions: captureMethod === 'plugin_backup' ? SNAPSHOT_VERSIONS : [SNAPSHOT_VERSION],
+  ...(captureMethod === 'plugin_backup'
+    ? { plugin_backup_schema: SNAPSHOT_PROJECTION_SCHEMA }
+    : {}),
+};
 process.umask(0o077);
 await mkdir(directory, { recursive: true, mode: 0o700 });
 await mkdir(workDirectory, { recursive: true, mode: 0o700 });
@@ -75,9 +83,7 @@ const heartbeat = setInterval(() => {
         join(directory, 'helper.status'),
         {
           version: 1,
-          emby_version: configuredVersion,
-          emby_versions: supportedVersions,
-          capture_method: captureMethod,
+          ...embyCaptureCapability,
           jellyfin_catalog_enabled: !!jellyfinBackups,
           jellyfin_backup_selection_enabled: !!jellyfinBackups,
           jellyfin_backup_cleanup_enabled: !!jellyfinBackups && jellyfinBackupCleanup,
@@ -113,9 +119,7 @@ while (!stopping) {
       join(directory, 'helper.status'),
       {
         version: 1,
-        emby_version: configuredVersion,
-        emby_versions: supportedVersions,
-        capture_method: captureMethod,
+        ...embyCaptureCapability,
         jellyfin_catalog_enabled: !!jellyfinBackups,
         jellyfin_backup_selection_enabled: !!jellyfinBackups,
         jellyfin_backup_cleanup_enabled: !!jellyfinBackups && jellyfinBackupCleanup,
@@ -155,7 +159,7 @@ while (!stopping) {
         request = await readEnvelope<CaptureRequest>(path, key);
         if (
           request.id !== id ||
-          !supportedVersions.includes(request.binding?.version) ||
+          !snapshotRequestVersionMatches(request) ||
           !Number.isFinite(Date.parse(request.requested_at)) ||
           Math.abs(Date.now() - Date.parse(request.requested_at)) > CAPTURE_DEADLINE
         )
@@ -175,23 +179,30 @@ while (!stopping) {
           await sourceIdentity(request.binding.server_id, request.binding.version);
         temporary = await mkdtemp(join(workDirectory, `capture-${id}-`));
         const output = join(temporary, 'library.db');
-        const value = await snapshotProcess<{
-          identities: Record<string, number>;
-          schema: string;
-          bytes: number;
-          orphan_identity_version?: 1;
-        }>(
+        const value = await snapshotProcess<
+          Partial<PluginBackupCaptureResult> & {
+            identities: Record<string, number>;
+            schema: string;
+            bytes: number;
+          }
+        >(
           {
             operation: 'capture',
             directory: source,
             output,
             capture_method: captureMethod,
             server_id: request.binding.server_id,
-            server_version: request.binding.version,
           },
           controller.signal,
         );
         snapshotOrphanIdentityVersion(value.orphan_identity_version);
+        if (
+          captureMethod === 'plugin_backup' &&
+          request.plugin_backup_schema === undefined &&
+          (value.backup_server_version !== request.binding.version ||
+            value.plugin_version !== SNAPSHOT_PLUGIN_VERSION)
+        )
+          throw new Error('Update Jellyport to import backups by schema.');
         if (!snapshotIdentitiesMatch(value.identities, request.user_ids, captureMethod))
           throw new Error('The mounted database does not contain the requested users.');
         if (captureMethod !== 'plugin_backup')
@@ -220,7 +231,7 @@ while (!stopping) {
           finished_at: new Date().toISOString(),
           error:
             captureMethod === 'plugin_backup'
-              ? 'Emby backup import failed. Check the completed backup, mounted backup folder, version and permissions. Any previously saved capture is preserved.'
+              ? 'Emby backup import failed. Check that the full backup is complete, mounted read-only, and uses a supported layout. Any previously saved capture is preserved.'
               : 'Database capture failed. Check the helper mount, version, permissions and WAL files. Any previously saved capture is preserved.',
         };
         await rm(join(directory, `${id}.db.enc`), { force: true });

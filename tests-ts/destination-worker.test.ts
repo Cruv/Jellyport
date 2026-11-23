@@ -176,11 +176,34 @@ describe('isolated destination catalog worker and helper', () => {
       operation: 'destination_capture',
       directory: value.backups,
       output: value.output,
-      version: '12.2.0',
-      expected_backup: { name: 'jellyfin-backup-20260102030000.zip', created_at },
+      version: '12.5.0',
+      expected_backup: {
+        name: 'jellyfin-backup-20260102030000.zip',
+        created_at,
+        server_version: '12.2.0.0',
+      },
     });
+    expect(result.server_version).toBe('12.2.0.0');
     expect(Date.parse(result.backup_created_at)).toBe(Date.parse(created_at));
     expect(result.backup_fingerprint).toBe(createHash('sha256').update(value.bytes).digest('hex'));
+  });
+  it('rejects an archive whose version disagrees with the linked server selection', async () => {
+    const created_at = new Date(Date.now() - 1000).toISOString();
+    const value = await fixture(archive(created_at));
+    await expect(
+      snapshotProcess<Capture>({
+        operation: 'destination_capture',
+        directory: value.backups,
+        output: value.output,
+        version: '12.5.0',
+        expected_backup: {
+          name: 'jellyfin-backup-20260102030000.zip',
+          created_at,
+          server_version: '12.4.0.0',
+        },
+      }),
+    ).rejects.toMatchObject({ error_code: 'version_mismatch' });
+    await expect(stat(value.output)).rejects.toMatchObject({ code: 'ENOENT' });
   });
   it('never falls back to an old archive when a requested native backup is absent or changed', async () => {
     for (const expected_backup of [
@@ -269,7 +292,7 @@ describe('isolated destination catalog worker and helper', () => {
       'backup_future',
     ],
     [
-      'an incompatible linked version',
+      'a different archive version without a selection from the linked server',
       new Date(Date.now() - 60_000).toISOString(),
       '12.3.0',
       'version_mismatch',

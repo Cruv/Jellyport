@@ -23,6 +23,10 @@ const sourceServer = 'ffeeddccbbaa99887766554433221100';
 const destinationServer = 'ffeeddccbbaa99887766554433221111';
 const templateUser = '2233445566778899aabbccddeeff0011';
 const username = 'synthetic_member';
+const embyBackupVersion = '4.10.2.0';
+const embyLiveVersion = '4.10.3.0';
+const jellyfinBackupVersion = '12.2.0.0';
+const jellyfinLiveVersion = '12.5.0.0';
 type Kind = 'emby' | 'jellyfin';
 type BackupState = 'valid' | 'missing' | 'missing_file' | 'incomplete' | 'expired';
 
@@ -69,12 +73,12 @@ function archive(entries: Array<{ name: string; text: string }>): Buffer {
   return Buffer.concat([...local, directory, end]);
 }
 
-function jellyfinArchive(createdAt: string): Buffer {
+function jellyfinArchive(createdAt: string, serverVersion: string): Buffer {
   return archive([
     {
       name: 'manifest.json',
       text: JSON.stringify({
-        ServerVersion: '12.2.0.0',
+        ServerVersion: serverVersion,
         BackupEngineVersion: '0.2.0',
         DateCreated: createdAt,
         DatabaseTables: ['DbSet`1'],
@@ -210,8 +214,8 @@ export const test = base.extend<{ imports: ImportFixture }>({
           await writeFile(
             join(full, 'backupinfo.json'),
             JSON.stringify({
-              ServerVersion: '4.10.1.0',
-              PluginVersion: '1.8.7.0',
+              ServerVersion: embyBackupVersion,
+              PluginVersion: '1.8.8.0',
               CanRestore: state !== 'incomplete',
               IsFullBackup: true,
               DateCreated:
@@ -256,13 +260,13 @@ export const test = base.extend<{ imports: ImportFixture }>({
           path,
           state === 'incomplete'
             ? Buffer.from('synthetic-truncated-zip')
-            : jellyfinArchive(createdAt),
+            : jellyfinArchive(createdAt, jellyfinBackupVersion),
         );
         if (state !== 'incomplete')
           nativeManifests.set(name, {
             name,
             created_at: createdAt,
-            server_version: '12.2.0.0',
+            server_version: jellyfinBackupVersion,
             backup_engine_version: '0.2.0',
             database: true,
             metadata: false,
@@ -337,7 +341,7 @@ export const test = base.extend<{ imports: ImportFixture }>({
             const media = servers.factory(url, key, kind);
             media.systemInfo = async () => ({
               Id: kind === 'emby' ? sourceServer : destinationServer,
-              Version: kind === 'emby' ? '4.10.1.0' : '12.2.0.0',
+              Version: kind === 'emby' ? embyLiveVersion : jellyfinLiveVersion,
             });
             media.catalogItems = async () => {
               throw new Error('Live catalog scans are prohibited in this saved-backup fixture.');
@@ -463,7 +467,6 @@ for(const object of [dns,dns.promises]) for(const name of Object.keys(object)) i
           JELLYPORT_SNAPSHOT_METHOD: 'plugin_backup',
           JELLYPORT_EMBY_BACKUP_DIR: sourceBackups,
           JELLYPORT_JELLYFIN_BACKUP_DIR: destinationBackups,
-          JELLYPORT_EMBY_VERSION: '4.10.1.0',
         },
       });
       helperClosed = new Promise<void>((done, reject) => {
@@ -567,11 +570,14 @@ for(const object of [dns,dns.promises]) for(const name of Object.keys(object)) i
           const createdAt = new Date().toISOString();
           const stamp = createdAt.slice(0, 19).replaceAll(/[-:T]/g, '');
           const name = `jellyfin-backup-${stamp}.zip`;
-          await writeFile(join(destinationBackups, name), jellyfinArchive(createdAt));
+          await writeFile(
+            join(destinationBackups, name),
+            jellyfinArchive(createdAt, jellyfinLiveVersion),
+          );
           const manifest: JellyfinBackupManifest = {
             name,
             created_at: createdAt,
-            server_version: '12.2.0.0',
+            server_version: jellyfinLiveVersion,
             backup_engine_version: '0.2.0',
             database: true,
             metadata: false,

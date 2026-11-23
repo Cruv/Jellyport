@@ -20,6 +20,7 @@ import { DatabaseSync } from 'node:sqlite';
 import {
   decryptDatabase,
   readEnvelope,
+  SNAPSHOT_PROJECTION_SCHEMA,
   snapshotKey,
   writeEnvelope,
   type CaptureRequest,
@@ -69,9 +70,12 @@ async function hash(path: string): Promise<string> {
     .digest('hex');
 }
 
-it.each(['4.10.1.0', '4.10.2.0'])(
-  'captures a synthetic %s plugin backup with conditional failure retention through the real helper without network access',
-  async (serverVersion) => {
+it.each([
+  ['4.10.1.0', '1.8.7.0', '4.10.1.0'],
+  ['4.10.2.0', '1.8.8.0', '4.10.3.0'],
+])(
+  'imports synthetic Emby %s / plugin %s through the real network-isolated helper for running Emby %s',
+  async (serverVersion, pluginVersion, liveVersion) => {
     const directory = await mkdtemp(join(tmpdir(), 'jellyport-plugin-helper-test-'));
     directories.push(directory);
     const backups = join(directory, 'backups'),
@@ -120,7 +124,7 @@ it.each(['4.10.1.0', '4.10.2.0'])(
       join(full, 'backupinfo.json'),
       JSON.stringify({
         ServerVersion: serverVersion,
-        PluginVersion: '1.8.7.0',
+        PluginVersion: pluginVersion,
         CanRestore: true,
         IsFullBackup: true,
         DateCreated: created,
@@ -175,15 +179,18 @@ syncBuiltinESMExports();
     const request: CaptureRequest = {
       id: randomUUID(),
       requested_at: new Date().toISOString(),
-      binding: { url: 'http://emby.invalid', server_id: SERVER, version: serverVersion },
+      binding: { url: 'http://emby.invalid', server_id: SERVER, version: liveVersion },
       // A completed backup may legitimately predate a newly created live user.
       user_ids: [GUID, NEW_USER],
       capture_method: 'plugin_backup',
+      plugin_backup_schema: SNAPSHOT_PROJECTION_SCHEMA,
     };
     const wrongMethod: CaptureRequest = {
       ...request,
       id: randomUUID(),
+      binding: { ...request.binding, version: '4.10.1.0' },
       capture_method: 'file_copy',
+      plugin_backup_schema: undefined,
     };
     const firstFailure = { ...request, id: randomUUID() };
     const withheld = join(directory, 'withheld-backup');
@@ -208,7 +215,7 @@ syncBuiltinESMExports();
           JELLYPORT_SNAPSHOT_METHOD: 'plugin_backup',
           JELLYPORT_EMBY_BACKUP_DIR: backups,
           JELLYPORT_EMBY_DATA_DIR: join(directory, 'live-source-does-not-exist'),
-          JELLYPORT_EMBY_VERSION: '4.10.1.0',
+          JELLYPORT_EMBY_VERSION: undefined,
         },
       },
     );
@@ -225,13 +232,13 @@ syncBuiltinESMExports();
     };
     helpers.push(helper);
     const status = await waitFor(() =>
-      readEnvelope<{ capture_method: string; emby_versions: string[] }>(
+      readEnvelope<{ capture_method: string; plugin_backup_schema: string }>(
         join(exchange, 'helper.status'),
         key,
       ),
     );
     expect(status.capture_method).toBe('plugin_backup');
-    expect(status.emby_versions).toEqual(['4.10.1.0', '4.10.2.0']);
+    expect(status.plugin_backup_schema).toBe(SNAPSHOT_PROJECTION_SCHEMA);
     const firstRejected = await waitFor(() =>
       readEnvelope<CaptureResult>(join(exchange, `${firstFailure.id}.result`), key),
     );
@@ -239,7 +246,7 @@ syncBuiltinESMExports();
       id: firstFailure.id,
       ok: false,
       error:
-        'Emby backup import failed. Check the completed backup, mounted backup folder, version and permissions. Any previously saved capture is preserved.',
+        'Emby backup import failed. Check that the full backup is complete, mounted read-only, and uses a supported layout. Any previously saved capture is preserved.',
     });
     expect((await readdir(exchange)).filter((name) => name.endsWith('.db.enc'))).toEqual([]);
     await rename(withheld, full);
@@ -253,7 +260,9 @@ syncBuiltinESMExports();
       capture_method: 'plugin_backup',
       identities: { [GUID]: 1 },
       backup_created_at: created,
-      plugin_version: '1.8.7.0',
+      plugin_backup_schema: SNAPSHOT_PROJECTION_SCHEMA,
+      backup_server_version: serverVersion,
+      plugin_version: pluginVersion,
       schema: 'emby-4.10.1.0',
       item_count: 3,
       orphan_identity_version: 1,

@@ -89,8 +89,16 @@ async function importBoth(page: Page, imports: ImportFixture) {
   ).toContainText(originalDate);
   const source = (await imports.sourceStatus()).records[0]!;
   const destination = (await imports.destinationStatus()).record!;
-  expect(source.backup_created_at).toBe(imports.backupAt);
-  expect(destination.backup_created_at).toBe(imports.backupAt);
+  expect(source).toMatchObject({
+    backup_created_at: imports.backupAt,
+    source_server_version: '4.10.2.0',
+    plugin_version: '1.8.8.0',
+  });
+  expect(destination).toMatchObject({
+    backup_created_at: imports.backupAt,
+    server_version: '12.2.0.0',
+    observed_server_version: '12.5.0.0',
+  });
   expect(source.expires_at).toBe(
     new Date(Date.parse(imports.backupAt) + 48 * 60 * 60_000).toISOString(),
   );

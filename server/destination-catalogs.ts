@@ -26,6 +26,7 @@ import {
   type BackupCleanupResult,
 } from './jellyfin-backup-retention.js';
 import { MediaError, ServiceError } from './errors.js';
+import { normalizeJellyfinUrl } from './jellyfin-auth.js';
 import { validJellyfinBackupName, type JellyfinBackupManifest } from './jellyfin-backup-api.js';
 import {
   dailyImportSchedule,
@@ -40,6 +41,7 @@ import {
   DESTINATION_CATALOG_MAX_AGE,
   DESTINATION_CATALOG_RECOVERY_DEADLINE,
   DESTINATION_CATALOG_REQUEST_MAX_AGE,
+  DESTINATION_BACKUP_ENGINE,
   destinationCatalogMetadata,
   destinationCatalogPrefix,
   normalizedServerVersion,
@@ -49,6 +51,7 @@ import {
   validDestinationProgress,
   validDestinationErrorCode,
   destinationCatalogFailureMessage,
+  DestinationCatalogError,
   type DestinationCatalogDiagnostic,
   type DestinationCatalogErrorCode,
   type DestinationCatalogProgress,
@@ -140,19 +143,38 @@ async function cancelable<T>(promise: Promise<T>, signal: AbortSignal): Promise<
     if (signal.aborted) abort();
   });
 }
-function sameBinding(
-  first: DestinationCatalogRequest['binding'],
-  second: DestinationCatalogRequest['binding'],
+function sameServerIdentity(
+  first: Pick<DestinationCatalogRequest['binding'], 'url' | 'server_id'>,
+  second: Pick<DestinationCatalogRequest['binding'], 'url' | 'server_id'>,
 ): boolean {
   try {
     return (
       new URL(first.url).toString() === new URL(second.url).toString() &&
-      first.server_id.toLowerCase() === second.server_id.toLowerCase() &&
-      normalizedServerVersion(first.version) === normalizedServerVersion(second.version)
+      first.server_id.toLowerCase() === second.server_id.toLowerCase()
     );
   } catch {
     return false;
   }
+}
+function sameBinding(
+  first: DestinationCatalogRequest['binding'],
+  second: DestinationCatalogRequest['binding'],
+): boolean {
+  return (
+    sameServerIdentity(first, second) &&
+    normalizedServerVersion(first.version) === normalizedServerVersion(second.version)
+  );
+}
+function sameSelectedBackup(
+  first: DestinationCatalogRequest['expected_backup'],
+  second: DestinationCatalogRequest['expected_backup'],
+): boolean {
+  return (
+    first?.name === second?.name &&
+    first?.created_at === second?.created_at &&
+    normalizedServerVersion(first?.server_version ?? '') ===
+      normalizedServerVersion(second?.server_version ?? '')
+  );
 }
 function current(value: DestinationCatalogResult): boolean {
   return (
@@ -378,10 +400,8 @@ export class DestinationCatalogs {
         current(latest) &&
         new URL(latest.binding.url).toString() ===
           new URL(this.store.settings().jellyfin_url).toString() &&
-        (!observed?.id || latest.binding.server_id === observed.id) &&
-        (!observed?.version ||
-          normalizedServerVersion(latest.binding.version) ===
-            normalizedServerVersion(observed.version)) &&
+        (!observed?.id || latest.binding.server_id.toLowerCase() === observed.id.toLowerCase()) &&
+        (!observed?.version || !!normalizedServerVersion(observed.version)) &&
         (await this.completeFile(latest));
     } catch {
       /* An expired/missing record remains visible, but cannot be selected. */
@@ -511,7 +531,8 @@ export class DestinationCatalogs {
       this.cleanupStarting ||
       this.state.backup_creation ||
       this.state.active ||
-      this.state.backup_cleanup!.pending
+      this.state.backup_cleanup!.pending ||
+      !supportedDestinationBackupVersion(binding.version)
     )
       return;
     const owned = this.state
@@ -519,7 +540,7 @@ export class DestinationCatalogs {
       .sort((a, b) => Date.parse(b.manifest.created_at) - Date.parse(a.manifest.created_at));
     const protectedDates = new Set(
       this.state.generations
-        .filter((entry) => sameBinding(entry.binding, binding))
+        .filter((entry) => sameServerIdentity(entry.binding, binding))
         .map((entry) => entry.backup_created_at),
     );
     if (owned.length <= retention.keep) return;
@@ -686,16 +707,27 @@ export class DestinationCatalogs {
       server &&
       (typeof server.Id !== 'string' ||
         typeof server.Version !== 'string' ||
-        !sameBinding(latest!.binding, {
+        !normalizedServerVersion(server.Version) ||
+        !sameServerIdentity(latest!.binding, {
           url: settings.jellyfin_url,
           server_id: server.Id,
-          version: server.Version,
         }))
     )
       throw new ServiceError(
-        'The current Jellyfin server or version differs from the saved matching catalog. Import a backup from the connected Jellyfin server before migrating.',
+        'The current Jellyfin server identity could not be matched to the saved catalog. Import a backup from the connected Jellyfin server before migrating.',
       );
     return latest.id;
+  }
+  private async matchesLiveBinding(
+    client: MediaAPI,
+    binding: DestinationCatalogRequest['binding'],
+  ): Promise<boolean> {
+    const info = await client.systemInfo();
+    return (
+      typeof info.Id === 'string' &&
+      typeof info.Version === 'string' &&
+      sameBinding(binding, { ...binding, server_id: info.Id, version: info.Version })
+    );
   }
   async refresh(createBackup = false, scheduledDate?: string) {
     const revision = this.revision;
@@ -772,11 +804,22 @@ export class DestinationCatalogs {
             version: info.Version,
           },
         };
-        if (createBackup) {
-          if (!supportedDestinationBackupVersion(info.Version))
+        const auth = this.store.authState();
+        if (
+          auth?.kind === 'configured' &&
+          (request.binding.server_id.toLowerCase() !== auth.serverId.toLowerCase() ||
+            normalizeJellyfinUrl(request.binding.url) !== normalizeJellyfinUrl(auth.serverUrl))
+        )
+          throw new ServiceError(
+            'The linked Jellyfin server identity changed. Restore its connection before importing.',
+          );
+        const verifyBackupServer = async () => {
+          if (!(await this.matchesLiveBinding(client, request.binding)))
             throw new ServiceError(
-              'The linked Jellyfin version is unsupported by the backup importer. No backup was requested; update Jellyport when support for that server version is available.',
+              'The linked Jellyfin identity or version changed while listing backups. Refresh the connection before importing.',
             );
+        };
+        if (createBackup) {
           if (!this.backupSelectionSupported)
             throw new ServiceError(
               'Update both Jellyport and its snapshot helper before enabling automatic Jellyfin backup creation.',
@@ -797,6 +840,7 @@ export class DestinationCatalogs {
                 : 'Jellyfin is scanning its library. No backup was requested; retry after the scan finishes.',
             );
           const baseline = await client.jellyfinBackups();
+          await verifyBackupServer();
           if (
             this.stopping ||
             this.clearing ||
@@ -836,6 +880,7 @@ export class DestinationCatalogs {
           // The native API lists completed archives. A filename on disk may still
           // be an unfinished ZIP, and its local-time name is not a UTC ordering.
           const completed = await client.jellyfinBackups();
+          await verifyBackupServer();
           const latest = [...completed].sort(
             (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at),
           )[0];
@@ -843,7 +888,13 @@ export class DestinationCatalogs {
             throw new ServiceError(
               'No completed Jellyfin backup was found. Create a database backup or enable scheduled backup creation.',
             );
-          request.expected_backup = { name: latest.name, created_at: latest.created_at };
+          if (latest.backup_engine_version !== DESTINATION_BACKUP_ENGINE)
+            throw new DestinationCatalogError('backup_invalid');
+          request.expected_backup = {
+            name: latest.name,
+            created_at: latest.created_at,
+            server_version: latest.server_version,
+          };
         }
       } finally {
         this.backupReadClients.delete(client);
@@ -910,7 +961,7 @@ export class DestinationCatalogs {
       created <= Date.now() + 60_000 &&
       normalizedServerVersion(value.server_version) ===
         normalizedServerVersion(backup.binding.version) &&
-      value.backup_engine_version === '0.2.0' &&
+      value.backup_engine_version === DESTINATION_BACKUP_ENGINE &&
       value.database === true &&
       value.metadata === false &&
       value.trickplay === false &&
@@ -1006,6 +1057,10 @@ export class DestinationCatalogs {
       const candidates = backup.completed
         ? [backup.completed]
         : (await client.jellyfinBackups()).filter((entry) => this.matchesBackup(backup, entry));
+      if (!backup.completed && !(await this.matchesLiveBinding(client, backup.binding))) {
+        this.uncertainBackup(backup);
+        return 'blocked';
+      }
       if (
         this.stopping ||
         this.state.backup_creation?.id !== backup.id ||
@@ -1040,7 +1095,11 @@ export class DestinationCatalogs {
         id: backup.id,
         requested_at: new Date().toISOString(),
         binding: backup.binding,
-        expected_backup: { name: value.name, created_at: value.created_at },
+        expected_backup: {
+          name: value.name,
+          created_at: value.created_at,
+          server_version: value.server_version,
+        },
       };
       // Persist the transition before publishing. Restarts resume checking this
       // request, not the native mutation. Offline import has its own worker watchdog.
@@ -1197,8 +1256,13 @@ export class DestinationCatalogs {
         value.items !== stored.items ||
         value.keys !== stored.keys ||
         value.projection_format !== stored.projection_format ||
+        value.archive_schema !== stored.archive_schema ||
+        normalizedServerVersion(value.server_version!) !==
+          normalizedServerVersion(stored.server_version!) ||
+        !sameSelectedBackup(value.expected_backup, stored.expected_backup) ||
         !sameBinding(value.binding, stored.binding) ||
-        !sameBinding(value.binding, { url: settings.jellyfin_url, server_id: serverId, version }) ||
+        !normalizedServerVersion(version) ||
+        !sameServerIdentity(value.binding, { url: settings.jellyfin_url, server_id: serverId }) ||
         !(await this.completeFile(value)) ||
         this.clearing ||
         this.stopping
@@ -1394,15 +1458,17 @@ export class DestinationCatalogs {
                   : 'backup_invalid';
             this.state.last_error = destinationCatalogFailureMessage(this.state.last_error_code);
           } else if (
-            active.expected_backup &&
-            Date.parse(value.backup_created_at!) !== Date.parse(active.expected_backup.created_at)
+            !sameSelectedBackup(value.expected_backup, active.expected_backup) ||
+            (active.expected_backup &&
+              Date.parse(value.backup_created_at!) !==
+                Date.parse(active.expected_backup.created_at))
           ) {
             this.state.last_error_code = 'backup_changed';
             this.state.last_error =
               'The imported catalog does not match the newly completed Jellyfin backup. Check the helper mount and import that backup again. The previous catalog is preserved.';
           } else {
             const previous = this.state.generations.find((record) =>
-              sameBinding(record.binding, value!.binding),
+              sameServerIdentity(record.binding, value!.binding),
             );
             if (
               previous &&

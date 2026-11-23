@@ -12,6 +12,7 @@ import {
   recoverSnapshotHelper,
   seal,
   snapshotKey,
+  SNAPSHOT_PROJECTION_SCHEMA,
   unseal,
   writeEnvelope,
   type CaptureRequest,
@@ -601,19 +602,28 @@ it.each(['sqlite_online_backup', 'file_copy'] as const)(
   verifyCaptureWhileWriting,
 );
 
-it('recovers interrupted 4.10.2 plugin requests without rewriting their exact source version', async () => {
-  const path = await directory();
-  const key = randomBytes(32);
-  const request = {
-    ...recoveryRequest(),
-    capture_method: 'plugin_backup' as const,
-    binding: { ...recoveryRequest().binding, version: '4.10.2.0' },
-  };
-  await writeEnvelope(join(path, `${request.id}.working`), request, key);
-  await recoverSnapshotHelper(path, key);
-  expect(await readEnvelope<CaptureResult>(join(path, `${request.id}.result`), key)).toMatchObject({
-    id: request.id,
-    binding: request.binding,
-    ok: false,
-  });
-});
+it.each([
+  ['4.10.2.0', undefined],
+  ['5.0.0.0', SNAPSHOT_PROJECTION_SCHEMA],
+] as const)(
+  'recovers interrupted Emby %s plugin requests with the original binding',
+  async (version, schema) => {
+    const path = await directory();
+    const key = randomBytes(32);
+    const original = recoveryRequest();
+    const request: CaptureRequest = {
+      ...original,
+      capture_method: 'plugin_backup',
+      binding: { ...original.binding, version },
+      ...(schema === undefined ? {} : { plugin_backup_schema: schema }),
+    };
+    await writeEnvelope(join(path, `${request.id}.working`), request, key);
+    await recoverSnapshotHelper(path, key);
+    expect(
+      await readEnvelope<CaptureResult>(join(path, `${request.id}.result`), key),
+    ).toMatchObject({
+      ...request,
+      ok: false,
+    });
+  },
+);

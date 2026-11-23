@@ -7,6 +7,7 @@ import {
   DESTINATION_CATALOG_DEADLINE,
   DESTINATION_CATALOG_REQUEST_MAX_AGE,
   DESTINATION_CATALOG_FORMAT,
+  DESTINATION_ARCHIVE_SCHEMA,
   destinationCatalogPrefix,
   validDestinationRequest,
   validDestinationResult,
@@ -178,6 +179,7 @@ export async function processDestinationCatalogRequest(
       started_at,
       finished_at: new Date().toISOString(),
       projection_format: DESTINATION_CATALOG_FORMAT,
+      archive_schema: DESTINATION_ARCHIVE_SCHEMA,
       diagnostic,
     };
     if (!validDestinationResult(result)) throw new DestinationCatalogError('backup_invalid');

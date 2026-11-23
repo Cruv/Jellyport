@@ -530,8 +530,8 @@ describe('bounded destination import diagnostics', () => {
     expect(screen.queryByText(/No recent progress update/)).toBeNull();
   });
   it.each([
-    ['version_mismatch', 'Backup server version does not match'],
-    ['version_unsupported', 'Backup server version is unsupported'],
+    ['version_mismatch', 'Backup does not match the selected Jellyfin archive'],
+    ['version_unsupported', 'Backup rejected by an older helper'],
   ] as const)('distinguishes %s without hiding the actionable failure', (code, label) => {
     renderStatus({
       status: {

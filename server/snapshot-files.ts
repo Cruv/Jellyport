@@ -5,8 +5,10 @@ import { pipeline } from 'node:stream/promises';
 import { join } from 'node:path';
 
 export const snapshotId = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
-// The projection schema keeps its original identifier; source versions remain exact bindings.
+// The projection identifier describes the reader contract, independent of the source release.
+export const SNAPSHOT_PROJECTION_SCHEMA = 'emby-4.10.1.0';
 export const SNAPSHOT_VERSION = '4.10.1.0';
+// Legacy helper protocol fields. Current plugin imports negotiate the projection schema.
 export const SNAPSHOT_VERSIONS = ['4.10.1.0', '4.10.2.0'] as const;
 export function supportedSnapshotVersion(
   value: unknown,
@@ -23,6 +25,16 @@ export function snapshotCaptureMethod(value: unknown): SnapshotCaptureMethod {
   if (value === 'file_copy') return 'file_copy';
   if (value === 'plugin_backup') return 'plugin_backup';
   throw new Error('Unsupported snapshot capture method.');
+}
+/** Version strings on completed backups are provenance, not a compatibility test. */
+export function snapshotVersionLabel(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= 128 &&
+    value.trim() === value &&
+    !/[\x00-\x1f\x7f]/.test(value)
+  );
 }
 const aad = Buffer.from('Jellyport SQLite snapshot v1');
 
@@ -168,6 +180,19 @@ export interface CaptureRequest {
   binding: SnapshotBinding;
   user_ids?: string[];
   capture_method?: SnapshotCaptureMethod;
+  plugin_backup_schema?: typeof SNAPSHOT_PROJECTION_SCHEMA;
+}
+export function snapshotRequestVersionMatches(value: CaptureRequest): boolean {
+  const method = snapshotCaptureMethod(value.capture_method);
+  if (value.plugin_backup_schema !== undefined)
+    return (
+      method === 'plugin_backup' &&
+      value.plugin_backup_schema === SNAPSHOT_PROJECTION_SCHEMA &&
+      snapshotVersionLabel(value.binding?.version)
+    );
+  return method === 'plugin_backup'
+    ? supportedSnapshotVersion(value.binding?.version)
+    : value.binding?.version === SNAPSHOT_VERSION;
 }
 export interface CaptureResult extends CaptureRequest {
   ok: boolean;
@@ -181,6 +206,8 @@ export interface CaptureResult extends CaptureRequest {
   identities?: Record<string, number>;
   backup_created_at?: string;
   backup_fingerprint?: string;
+  /** Legacy results used the same version in the manifest and verified live binding. */
+  backup_server_version?: string;
   plugin_version?: string;
   error?: string;
 }
@@ -195,7 +222,12 @@ export function snapshotOrphanIdentityVersion(value: unknown): 1 | undefined {
 export function snapshotHistoryTime(value: CaptureResult): string {
   if (snapshotCaptureMethod(value.capture_method) !== 'plugin_backup') return value.finished_at;
   if (
-    value.plugin_version !== SNAPSHOT_PLUGIN_VERSION ||
+    (value.plugin_backup_schema === SNAPSHOT_PROJECTION_SCHEMA
+      ? !snapshotVersionLabel(value.backup_server_version) ||
+        !snapshotVersionLabel(value.plugin_version)
+      : value.plugin_version !== SNAPSHOT_PLUGIN_VERSION ||
+        (value.backup_server_version !== undefined &&
+          value.backup_server_version !== value.binding.version)) ||
     typeof value.backup_fingerprint !== 'string' ||
     !/^[a-f0-9]{64}$/.test(value.backup_fingerprint) ||
     typeof value.backup_created_at !== 'string' ||
@@ -248,9 +280,7 @@ function recoveredRequest(value: CaptureRequest, id: string): CaptureRequest {
     !value.binding.url ||
     typeof value.binding.server_id !== 'string' ||
     !value.binding.server_id ||
-    !supportedSnapshotVersion(value.binding.version) ||
-    (snapshotCaptureMethod(value.capture_method) !== 'plugin_backup' &&
-      value.binding.version !== SNAPSHOT_VERSION) ||
+    !snapshotRequestVersionMatches(value) ||
     (value.user_ids !== undefined &&
       (!Array.isArray(value.user_ids) ||
         value.user_ids.length > 1000 ||
@@ -268,6 +298,9 @@ function recoveredRequest(value: CaptureRequest, id: string): CaptureRequest {
     ...(value.capture_method === undefined
       ? {}
       : { capture_method: snapshotCaptureMethod(value.capture_method) }),
+    ...(value.plugin_backup_schema === undefined
+      ? {}
+      : { plugin_backup_schema: value.plugin_backup_schema }),
     ...(value.user_ids === undefined ? {} : { user_ids: value.user_ids }),
   };
 }
@@ -285,6 +318,7 @@ async function completedCapture(
       value.binding.url !== request.binding.url ||
       value.binding.server_id !== request.binding.server_id ||
       value.binding.version !== request.binding.version ||
+      value.plugin_backup_schema !== request.plugin_backup_schema ||
       snapshotCaptureMethod(value.capture_method) !==
         snapshotCaptureMethod(request.capture_method) ||
       typeof value.ok !== 'boolean' ||
@@ -296,7 +330,7 @@ async function completedCapture(
     if (!value.ok) return typeof value.error === 'string';
     snapshotOrphanIdentityVersion(value.orphan_identity_version);
     if (
-      value.schema !== 'emby-4.10.1.0' ||
+      value.schema !== SNAPSHOT_PROJECTION_SCHEMA ||
       !Number.isSafeInteger(value.bytes) ||
       value.bytes! < 1 ||
       value.bytes! > MAX_SNAPSHOT_BYTES ||

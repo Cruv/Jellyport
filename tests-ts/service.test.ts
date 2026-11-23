@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DemoServers } from '../server/demo.js';
+import { DiscordDeliveryError } from '../server/bot-messages.js';
 import { MediaError, ServiceError } from '../server/errors.js';
 import {
   Service,
@@ -1379,6 +1380,10 @@ describe('account migration and subscription safety', () => {
     };
     const job = await finish(await service.createAccount('alex', '123456789'));
     expect(job.status).toBe('completed');
+    expect(job.results[0]?.discord_delivery).toBe('sent');
+    expect(job.results[0]?.delivery_issue).toBeUndefined();
+    expect(store.botMessages(job.id)[0]).toMatchObject({ status: 'sent', content: '' });
+    expect(store.botMessages(job.id)[0]?.delivery_issue).toBeUndefined();
     const args = delivery.mock.calls[0] as unknown as [
       string,
       string,
@@ -1393,16 +1398,66 @@ describe('account migration and subscription safety', () => {
   });
   it('retains one-time credentials after failed Discord delivery without exposing library exceptions', async () => {
     const bot = new FakeBot();
-    bot.sendCredentials = async () => {
-      throw new Error('library-secret-error');
-    };
+    const delivery = vi
+      .spyOn(bot, 'sendCredentials')
+      .mockRejectedValueOnce(new Error('library-secret-error'));
     service.bot = bot;
     const job = await finish(await service.createAccount('alex', '123456789'));
     expect(job.status).toBe('partial');
-    expect(job.results[0]?.discord_delivery).toBe('failed');
+    expect(job.results[0]).toMatchObject({
+      discord_delivery: 'failed',
+      delivery_issue: 'send_error',
+    });
+    expect(store.botMessages(job.id)[0]).toMatchObject({
+      status: 'uncertain',
+      delivery_issue: 'send_error',
+      content: '',
+    });
     expect(JSON.stringify(job)).not.toContain('library-secret-error');
     expect(store.takeCredentials(job.id)).toHaveLength(1);
+    expect(delivery).toHaveBeenCalledOnce();
   });
+
+  it.each([
+    { issue: 'rejected', status: 'failed' },
+    { issue: 'timeout', status: 'uncertain' },
+    { issue: 'interrupted', status: 'uncertain' },
+    { issue: 'unavailable', status: 'failed' },
+  ] as const)(
+    'records a $issue event without losing credentials or repeating Discord delivery',
+    async ({ issue, status }) => {
+      const bot = new FakeBot();
+      const delivery = vi
+        .spyOn(bot, 'sendCredentials')
+        .mockRejectedValueOnce(new DiscordDeliveryError(issue, 'synthetic-private-provider-error'));
+      service.bot = bot;
+      const job = await finish(await service.createAccount('alex', '123456789'));
+      expect(job.status).toBe('partial');
+      expect(job.results[0]).toMatchObject({ discord_delivery: 'failed', delivery_issue: issue });
+      const messages = store.botMessages(job.id);
+      expect(messages).toHaveLength(1);
+      expect(messages[0]).toMatchObject({ status, delivery_issue: issue, content: '' });
+      expect(JSON.stringify({ messages, job })).not.toContain('synthetic-private-provider-error');
+      expect(store.takeCredentials(job.id)).toHaveLength(1);
+      expect(delivery).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('keeps a local failure before submission out of Discord outcome history', async () => {
+    const bot = new FakeBot();
+    const delivery = vi.spyOn(bot, 'sendCredentials');
+    service.bot = bot;
+    vi.spyOn(store, 'saveBotMessage').mockImplementationOnce(() => {
+      throw new Error('synthetic archive failure');
+    });
+    const job = await finish(await service.createAccount('alex', '123456789'));
+    expect(job.results[0]).toMatchObject({ discord_delivery: 'failed' });
+    expect(job.results[0]?.delivery_issue).toBeUndefined();
+    expect(store.botMessages(job.id)).toEqual([]);
+    expect(store.takeCredentials(job.id)).toHaveLength(1);
+    expect(delivery).not.toHaveBeenCalled();
+  });
+
   it('checks recipient membership again immediately before sending credentials', async () => {
     const bot = new FakeBot();
     let validations = 0;
@@ -1411,7 +1466,11 @@ describe('account migration and subscription safety', () => {
     };
     service.bot = bot;
     const job = await finish(await service.createAccount('alex', '123456789'));
-    expect(job.results[0]?.discord_delivery).toBe('failed');
+    expect(job.results[0]).toMatchObject({
+      discord_delivery: 'failed',
+      delivery_issue: 'unavailable',
+    });
+    expect(store.botMessages(job.id)).toEqual([]);
     expect(bot.delivered).toEqual([]);
     expect(store.takeCredentials(job.id)).toHaveLength(1);
   });

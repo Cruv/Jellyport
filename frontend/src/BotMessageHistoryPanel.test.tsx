@@ -54,33 +54,50 @@ describe('administrator bot message history', () => {
     expect(localStorage.length).toBe(0);
   });
   it.each([
-    ['uncertain', 'Check whether they got the DM'],
-    ['failed', 'DM failed'],
-    ['pending', 'DM pending'],
-  ] as const)('shows one useful status for a %s attempt', async (status, label) => {
-    render(
-      <BotMessageHistoryPanel
-        jobId="job_1"
-        api={vi.fn(async () => ({ messages: [{ ...message, status }] })) as Api}
-      />,
-    );
-    fireEvent.click(screen.getByRole('button', { name: 'View bot messages' }));
-    const row = await screen.findByRole('article', { name: 'Message for household.owner_2' });
-    expect(row.querySelector('p')?.textContent).toContain(label);
-    expect(row.querySelectorAll('p')).toHaveLength(1);
-    expect(screen.queryByText(/EXAMPLE-password-42/)).toBeNull();
-  });
-  it('asks for confirmation of receipt without promising credentials are still available', () => {
+    ['sent', undefined, 'DM sent'],
+    ['failed', 'rejected', 'Discord rejected the DM'],
+    ['uncertain', 'timeout', 'Discord DM timed out'],
+    ['uncertain', 'interrupted', 'Discord send interrupted'],
+    ['failed', undefined, 'DM error'],
+    ['pending', undefined, 'DM pending'],
+  ] as const)(
+    'shows the send result or recorded issue for a %s attempt (%s)',
+    async (status, issue, label) => {
+      render(
+        <BotMessageHistoryPanel
+          jobId="job_1"
+          api={
+            vi.fn(async () => ({
+              messages: [{ ...message, status, delivery_issue: issue }],
+            })) as Api
+          }
+        />,
+      );
+      fireEvent.click(screen.getByRole('button', { name: 'View bot messages' }));
+      const row = await screen.findByRole('article', { name: 'Message for household.owner_2' });
+      expect(row.querySelector('p')?.textContent).toContain(label);
+      expect(row.querySelectorAll('p')).toHaveLength(1);
+      expect(screen.queryByText(/EXAMPLE-password-42/)).toBeNull();
+    },
+  );
+  it('shows the stored timeout and omits the old credential availability promise', () => {
     render(
       <DiscordDeliverySummary
         result={{
           discord_delivery: { status: 'failed' },
+          delivery_issue: 'timeout',
           delivery_error: 'Credentials remain available for one-time reveal for 24 hours.',
         }}
       />,
     );
-    expect(screen.getByText('Check whether they got the Discord DM.')).toBeTruthy();
+    expect(screen.getByText('Discord DM timed out')).toBeTruthy();
     expect(screen.queryByText(/24 hours/)).toBeNull();
+  });
+  it('stays quiet for old uncertainty without a recorded error', () => {
+    const { container } = render(
+      <DiscordDeliverySummary result={{ discord_delivery: 'uncertain' }} />,
+    );
+    expect(container.textContent).toBe('');
   });
   it('aborts a pending private read on close and ignores a late response', async () => {
     let reply!: (value: { messages: BotMessageHistory[] }) => void;

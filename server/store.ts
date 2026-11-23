@@ -12,7 +12,7 @@ import { finishJob } from './job-recovery.js';
 import { jobOutcome } from './job-outcome.js';
 import { legacyJobSummaryInput } from './job-summary-upgrade.js';
 import { NewSubscriberPolicy } from './new-subscriber-policy.js';
-import type { BotMessageHistory } from './bot-messages.js';
+import type { BotMessageHistory, DiscordDeliveryIssue } from './bot-messages.js';
 import { discordAuthority } from './discord-authority.js';
 import type { MediaKind } from './media.js';
 import type {
@@ -210,7 +210,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS bot_message_history (id TEXT PRIMARY KEY, job_id TEXT NOT NULL, created_ms REAL NOT NULL, status TEXT NOT NULL, encrypted BLOB NOT NULL);
       CREATE INDEX IF NOT EXISTS bot_message_history_job ON bot_message_history(job_id,created_ms);
       CREATE INDEX IF NOT EXISTS bot_message_history_age ON bot_message_history(created_ms);
-      CREATE INDEX IF NOT EXISTS bot_uncertain_delivery ON bot_message_history(created_ms,job_id) WHERE status='uncertain';
+      CREATE INDEX IF NOT EXISTS bot_delivery_issues ON bot_message_history(created_ms,job_id)
+        WHERE status IN ('failed','uncertain');
+      DROP INDEX IF EXISTS bot_uncertain_delivery;
       CREATE TRIGGER IF NOT EXISTS bot_message_history_delete AFTER DELETE ON jobs BEGIN DELETE FROM bot_message_history WHERE job_id=OLD.id; END;
       CREATE TABLE IF NOT EXISTS links (discord_user_id TEXT NOT NULL, membership_slot INTEGER NOT NULL DEFAULT 1 CHECK(membership_slot BETWEEN 1 AND 3), username TEXT NOT NULL, remote_id TEXT NOT NULL UNIQUE, disabled_by_jellyport INTEGER NOT NULL DEFAULT 0, pending_disabled INTEGER, PRIMARY KEY(discord_user_id,membership_slot));
       CREATE TABLE IF NOT EXISTS subscriptions (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
@@ -409,7 +411,11 @@ export class Store {
       const value = this.decrypt<BotMessageHistory>(row.encrypted as Uint8Array);
       this.db
         .prepare('UPDATE bot_message_history SET status=?,encrypted=? WHERE id=?')
-        .run('uncertain', this.encrypt({ ...value, status: 'uncertain' }), row.id);
+        .run(
+          'uncertain',
+          this.encrypt({ ...value, status: 'uncertain', delivery_issue: 'interrupted' }),
+          row.id,
+        );
     }
   }
   encrypt(value: unknown): Buffer {
@@ -864,15 +870,27 @@ export class Store {
       .get(owner, owner, jobId, Date.now() / 1000);
     return credentialCounts(row?.own, row?.other);
   }
-  uncertainDeliveries(limit: number): string[] {
+  credentialDeliveryIssues(
+    limit: number,
+  ): { id: string; failed: boolean; issue?: DiscordDeliveryIssue }[] {
     return this.db
       .prepare(
-        `SELECT job_id FROM bot_message_history
-      WHERE status='uncertain' AND created_ms>?
-      GROUP BY job_id ORDER BY MAX(created_ms) DESC LIMIT ?`,
+        `SELECT job_id,status,encrypted,MAX(created_ms) AS latest FROM bot_message_history
+      WHERE status IN ('failed','uncertain') AND created_ms>?
+      GROUP BY job_id ORDER BY latest DESC,job_id LIMIT ?`,
       )
       .all(this.botMessageCutoff(), limit)
-      .map(({ job_id }) => String(job_id));
+      .map(({ job_id, status, encrypted }) => {
+        const row = { id: String(job_id), failed: status === 'failed' };
+        try {
+          return {
+            ...row,
+            issue: this.decrypt<BotMessageHistory>(encrypted as Uint8Array).delivery_issue,
+          };
+        } catch {
+          return row;
+        }
+      });
   }
   jobSummaries({
     status = 'all',

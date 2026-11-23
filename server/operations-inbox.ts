@@ -1,3 +1,4 @@
+import { discordDeliveryIssueLabel } from './bot-messages.js';
 import type { DestinationCatalogs } from './destination-catalogs.js';
 import type { SourceSnapshots } from './source-snapshots.js';
 import type { StripeIntegration } from './stripe-integration.js';
@@ -142,7 +143,7 @@ export async function operationsInbox(
   for (const row of store.jobsAwaitingCredentials(6, sessionId))
     items.push({
       id: `credentials:${row.id}`,
-      title: row.available ? 'Credentials await delivery' : 'Credential reveal claimed',
+      title: row.available ? 'Credentials available' : 'Credential reveal claimed',
       detail: [
         row.available ? `${row.available} available to reveal in this session.` : '',
         row.claimed_elsewhere ? `${row.claimed_elsewhere} claimed in another session.` : '',
@@ -152,14 +153,15 @@ export async function operationsInbox(
       attention: true,
       job_id: row.id,
     });
-  for (const id of store.uncertainDeliveries(6))
+  for (const { id, issue, failed } of store.credentialDeliveryIssues(6)) {
+    const error = discordDeliveryIssueLabel(issue) ?? (failed ? 'Discord send error' : undefined);
     items.push({
       id: `delivery:${id}`,
-      title: 'Check credential delivery',
-      detail: 'Discord did not confirm delivery.',
-      attention: true,
+      title: error ?? 'Discord delivery record',
+      attention: !!error,
       job_id: id,
     });
+  }
   if (
     store.db
       .prepare(

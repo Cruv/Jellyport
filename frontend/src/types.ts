@@ -254,6 +254,7 @@ export interface JobResult {
   unmatched_items?: ItemIssue[];
   ambiguous_items?: ItemIssue[];
   discord_delivery?: string | { status?: string };
+  delivery_issue?: import('../../server/bot-messages').DiscordDeliveryIssue;
   delivery_error?: string;
   error?: string;
 }

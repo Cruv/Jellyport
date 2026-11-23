@@ -3,10 +3,12 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
   Client,
+  DiscordAPIError,
   Events,
   GatewayIntentBits,
   MessageFlags,
   PermissionFlagsBits,
+  RESTJSONErrorCodes,
   SlashCommandBuilder,
   type ChatInputCommandInteraction,
   type ClientOptions,
@@ -28,6 +30,7 @@ import {
   renderCredentialMessage,
 } from './credential-message.js';
 import { discordCredentialContent } from './credentials.js';
+import { ServiceError } from './errors.js';
 import { parseMee6Identity } from './mee6-identity.js';
 import { DISCORD_DISCOVERY_PAGE_SIZE, discordAuthority } from './discord-authority.js';
 import {
@@ -36,6 +39,7 @@ import {
 } from './subscription-messages.js';
 import type { IdentityRoster } from './identity-review-types.js';
 import {
+  DiscordDeliveryError,
   renderConfiguredBotMessage,
   type BotMessageReceipt,
   type BotMessageTemplateId,
@@ -369,6 +373,35 @@ export function botCommand(settings: Settings = {}) {
 }
 
 class Stopped extends Error {}
+class TimedOut extends Error {}
+const discordTimeoutCodes = [
+  'ETIMEDOUT',
+  'UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT',
+  'UND_ERR_BODY_TIMEOUT',
+];
+
+function credentialSendError(error: unknown): DiscordDeliveryError {
+  if (error instanceof Stopped) return new DiscordDeliveryError('interrupted');
+  if (
+    error instanceof DiscordAPIError &&
+    (error.code === RESTJSONErrorCodes.CannotSendMessagesToThisUser ||
+      error.code === RESTJSONErrorCodes.CannotSendMessagesToThisUserDueToHavingNoMutualGuilds)
+  )
+    return new DiscordDeliveryError('rejected');
+  if (
+    error instanceof TimedOut ||
+    (error instanceof Error &&
+      (error.name === 'TimeoutError' ||
+        error.name === 'AbortError' ||
+        discordTimeoutCodes.includes((error as NodeJS.ErrnoException).code ?? '') ||
+        discordTimeoutCodes.includes(
+          (error.cause as NodeJS.ErrnoException | undefined)?.code ?? '',
+        )))
+  )
+    return new DiscordDeliveryError('timeout');
+  return new DiscordDeliveryError('send_error');
+}
 
 /** Abort our wait without leaving a continuation that can queue work after shutdown. */
 async function bounded<T>(
@@ -378,7 +411,7 @@ async function bounded<T>(
 ): Promise<T> {
   if (signal?.aborted) throw new Stopped();
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => finish(false, new Error('Timed out')), milliseconds);
+    const timer = setTimeout(() => finish(false, new TimedOut('Timed out')), milliseconds);
     const aborted = () => finish(false, new Stopped());
     function finish(success: boolean, value: unknown) {
       clearTimeout(timer);
@@ -1315,29 +1348,43 @@ export class BotManager {
     requireMembership = true,
     message?: string,
   ): Promise<BotMessageReceipt> {
-    const member = await this.fetchMember(userId);
-    if (
-      !recipientEligible(member.guild.id, this.settings.discord_guild_id, {
-        bot: member.user.bot,
-        roleIds: member.roles.cache.keys(),
-        memberRoleId: requireMembership ? this.settings.discord_member_role_id : undefined,
-      })
-    )
-      throw new BotError(
-        'The recipient must be a human server member with the configured membership role.',
-      );
-    const content =
-      message === undefined
-        ? credentialMessage(
-            username,
-            password,
-            serverUrl || String(this.settings.jellyfin_public_url ?? ''),
-            this.settings.credential_message_template ?? DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
-          )
-        : discordCredentialContent(message);
-    this.checkActive();
+    let member: GuildMember;
+    let content: string;
     try {
-      const delivered = await this.wait(
+      member = await this.fetchMember(userId);
+      const recipientId = snowflake(userId);
+      if (
+        member.partial ||
+        member.id !== recipientId ||
+        member.user.id !== recipientId ||
+        !recipientEligible(member.guild.id, this.settings.discord_guild_id, {
+          bot: member.user.bot,
+          roleIds: member.roles.cache.keys(),
+          memberRoleId: requireMembership ? this.settings.discord_member_role_id : undefined,
+        })
+      )
+        throw new BotError(
+          'The recipient must be the selected human server member with the configured membership role.',
+        );
+      content =
+        message === undefined
+          ? credentialMessage(
+              username,
+              password,
+              serverUrl || String(this.settings.jellyfin_public_url ?? ''),
+              this.settings.credential_message_template ?? DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
+            )
+          : discordCredentialContent(message);
+      this.checkActive();
+    } catch (error) {
+      throw new DiscordDeliveryError(
+        'unavailable',
+        error instanceof BotError || error instanceof ServiceError ? error.message : undefined,
+      );
+    }
+    let delivered: Message;
+    try {
+      delivered = await this.wait(
         member.send({
           content,
           allowedMentions: { parse: [], repliedUser: false },
@@ -1345,21 +1392,18 @@ export class BotManager {
         }),
         20_000,
       );
-      return {
-        content,
-        ...(snowflake(delivered.id) ? { message_id: delivered.id } : {}),
-        ...(snowflake(delivered.channelId) ? { channel_id: delivered.channelId } : {}),
-        sent_at:
-          delivered.createdAt instanceof Date && Number.isFinite(delivered.createdAt.getTime())
-            ? delivered.createdAt.toISOString()
-            : new Date().toISOString(),
-      };
     } catch (error) {
-      if (error instanceof Stopped) throw error;
-      throw new BotError(
-        'Discord could not deliver the message. Ask the user to allow direct messages, then retry delivery.',
-      );
+      throw credentialSendError(error);
     }
+    return {
+      content,
+      ...(snowflake(delivered.id) ? { message_id: delivered.id } : {}),
+      ...(snowflake(delivered.channelId) ? { channel_id: delivered.channelId } : {}),
+      sent_at:
+        delivered.createdAt instanceof Date && Number.isFinite(delivered.createdAt.getTime())
+          ? delivered.createdAt.toISOString()
+          : new Date().toISOString(),
+    };
   }
 
   async deliver(

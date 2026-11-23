@@ -2,10 +2,12 @@ import { EventEmitter } from 'node:events';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   Collection,
+  DiscordAPIError,
   Events,
   GatewayIntentBits,
   MessageFlags,
   PermissionFlagsBits,
+  RESTJSONErrorCodes,
   type ChatInputCommandInteraction,
   type Client,
   type ClientOptions,
@@ -1509,27 +1511,14 @@ describe('Private credential delivery and membership', () => {
     expect(admin.send).not.toHaveBeenCalled();
   });
 
-  it('uses fixed delivery errors and rejects offline delivery', async () => {
+  it('reports a safe send error and distinguishes an offline bot before any send', async () => {
     const { manager, recipient, client } = await fixture();
     recipient.send.mockRejectedValue(new Error('private-password secret-token'));
-    await expect(
-      manager.sendCredentials(
-        '22',
-        'jlogan35',
-        'private-password',
-        'https://jellyfin.example.test',
-      ),
-    ).rejects.toThrow('could not deliver');
-    try {
-      await manager.sendCredentials(
-        '22',
-        'jlogan35',
-        'private-password',
-        'https://jellyfin.example.test',
-      );
-    } catch (error) {
-      expect(String(error)).not.toMatch(/private-password|secret-token/);
-    }
+    const failure = await manager
+      .sendCredentials('22', 'jlogan35', 'private-password', 'https://jellyfin.example.test')
+      .catch((error: unknown) => error);
+    expect(failure).toMatchObject({ issue: 'send_error', message: 'Discord send error' });
+    expect(String(failure)).not.toMatch(/private-password|secret-token/);
     client.ready = false;
     await expect(
       manager.sendCredentials(
@@ -1538,7 +1527,113 @@ describe('Private credential delivery and membership', () => {
         'private-password',
         'https://jellyfin.example.test',
       ),
-    ).rejects.toThrow('offline');
+    ).rejects.toMatchObject({ issue: 'unavailable', message: expect.stringContaining('offline') });
+    expect(recipient.send).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    RESTJSONErrorCodes.CannotSendMessagesToThisUser,
+    RESTJSONErrorCodes.CannotSendMessagesToThisUserDueToHavingNoMutualGuilds,
+  ])('identifies Discord refusal %s without retaining its body', async (code) => {
+    const { manager, recipient } = await fixture();
+    const refusal = new DiscordAPIError(
+      { message: 'private-provider-token', code },
+      code,
+      403,
+      'POST',
+      'https://discord.example.test/channels/example/messages',
+      { body: { content: 'private-password' } },
+    );
+    recipient.send.mockRejectedValueOnce(refusal);
+    const failure = await manager
+      .sendCredentials('22', 'jlogan35', 'private-password', 'https://jellyfin.example.test')
+      .catch((error: unknown) => error);
+    expect(failure).toMatchObject({ issue: 'rejected', message: 'Discord rejected the DM' });
+    expect(failure).not.toHaveProperty('requestBody');
+    expect(failure).not.toHaveProperty('cause');
+    expect(String(failure)).not.toContain('private-provider-token');
+    expect(recipient.send).toHaveBeenCalledOnce();
+  });
+
+  it('times out a credential DM without treating a late acknowledgement as delivery', async () => {
+    const { manager, recipient } = await fixture();
+    let resolveSend!: (receipt: object) => void;
+    recipient.send.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveSend = resolve;
+        }),
+    );
+    vi.useFakeTimers();
+    const send = manager.sendCredentials(
+      '22',
+      'jlogan35',
+      'private-password',
+      'https://jellyfin.example.test',
+    );
+    const timedOut = expect(send).rejects.toMatchObject({ issue: 'timeout' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    await timedOut;
+    resolveSend({ id: '200001' });
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(send).rejects.toMatchObject({ issue: 'timeout' });
+    expect(recipient.send).toHaveBeenCalledOnce();
+  });
+
+  it('identifies a transport timeout separately from a generic send error', async () => {
+    const { manager, recipient } = await fixture();
+    const cause = Object.assign(new Error('private transport details'), {
+      code: 'UND_ERR_CONNECT_TIMEOUT',
+    });
+    recipient.send.mockRejectedValueOnce(new TypeError('request failed', { cause }));
+    await expect(
+      manager.sendCredentials(
+        '22',
+        'jlogan35',
+        'private-password',
+        'https://jellyfin.example.test',
+      ),
+    ).rejects.toMatchObject({ issue: 'timeout', message: 'Discord DM timed out' });
+    expect(recipient.send).toHaveBeenCalledOnce();
+  });
+
+  it('reports an interrupted wait when the bot stops after starting a credential DM', async () => {
+    const { manager, recipient } = await fixture();
+    let start!: () => void;
+    const started = new Promise<void>((resolve) => {
+      start = resolve;
+    });
+    recipient.send.mockImplementationOnce(() => {
+      start();
+      return new Promise(() => {});
+    });
+    const send = manager.sendCredentials(
+      '22',
+      'jlogan35',
+      'private-password',
+      'https://jellyfin.example.test',
+    );
+    const interrupted = expect(send).rejects.toMatchObject({ issue: 'interrupted' });
+    await started;
+    await manager.stop();
+    await interrupted;
+    expect(recipient.send).toHaveBeenCalledOnce();
+  });
+
+  it('refuses a different Discord member returned on the last recipient read', async () => {
+    const { manager, guild, recipient } = await fixture();
+    const different = member('33', 'different');
+    guild.members.fetch.mockResolvedValue(different);
+    await expect(
+      manager.sendCredentials(
+        '22',
+        'jlogan35',
+        'private-password',
+        'https://jellyfin.example.test',
+      ),
+    ).rejects.toMatchObject({ issue: 'unavailable' });
+    expect(different.send).not.toHaveBeenCalled();
+    expect(recipient.send).not.toHaveBeenCalled();
   });
 
   it('distinguishes missing memberships from unknown status on API failure', async () => {

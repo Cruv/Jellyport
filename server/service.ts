@@ -5,7 +5,13 @@ import {
   validatePasswordOptions,
   validateCredentialMessageOptions,
 } from './credentials.js';
-import type { BotMessageHistory, BotMessageReceipt } from './bot-messages.js';
+import {
+  DiscordDeliveryError,
+  discordDeliveryIssueLabel,
+  type BotMessageHistory,
+  type BotMessageReceipt,
+  type DiscordDeliveryIssue,
+} from './bot-messages.js';
 import { finishJob } from './job-recovery.js';
 import { MediaError, ServiceError, StripePriceReviewRequired } from './errors.js';
 import {
@@ -274,6 +280,7 @@ export interface JobResult extends Partial<JobStats> {
   source_user_id?: string;
   target_user_id?: string;
   discord_delivery?: string;
+  delivery_issue?: DiscordDeliveryIssue;
   delivery_error?: string;
   error?: string;
   source_username?: string;
@@ -7342,40 +7349,56 @@ export class Service {
       let archivedMessage: BotMessageHistory | undefined;
       let archiveSent = false;
       let deliveryAcknowledged = false;
+      let deliveryIssue: DiscordDeliveryIssue | undefined;
       if (recipient && password)
         try {
           phase('delivering_credentials');
-          await this.validateRecipients([recipient]);
-          const identity = await this.recipientIdentity(recipient);
+          const slot = request.membership_slot ?? mapping?.membership_slot ?? 1;
+          let identity: Awaited<ReturnType<BotAdapter['recipientIdentity']>>;
+          try {
+            await this.validateRecipients([recipient]);
+            identity = await this.recipientIdentity(recipient);
+          } catch (error) {
+            deliveryIssue = 'unavailable';
+            throw error;
+          }
           if (
             (identity.id && identity.id !== recipient) ||
-            this.store.link(recipient, request.membership_slot ?? mapping?.membership_slot ?? 1)
-              ?.remote_id !== target.Id
-          )
-            throw new ServiceError(
-              'The Discord recipient identity changed. Credentials were preserved for administrator review.',
-            );
+            this.store.link(recipient, slot)?.remote_id !== target.Id
+          ) {
+            deliveryIssue = 'unavailable';
+            throw new ServiceError('The Discord recipient identity changed.');
+          }
           guard();
-          archivedMessage = {
+          const bot = this.requireBot();
+          const requiresMembership = this.recipientRequiresMembershipRole(recipient);
+          const pending: BotMessageHistory = {
             id: randomUUID(),
             kind: 'credentials',
             recipient_id: recipient,
             recipient_username: identity.username,
             account_username: username,
-            membership_slot: request.membership_slot ?? mapping?.membership_slot ?? 1,
+            membership_slot: slot,
             content: '',
             status: 'pending',
             created_at: now(),
           };
-          this.store.saveBotMessage(job.id, archivedMessage);
-          const receipt = await this.requireBot().sendCredentials(
-            recipient,
-            username,
-            password,
-            publicUrl,
-            this.recipientRequiresMembershipRole(recipient),
-            message,
-          );
+          this.store.saveBotMessage(job.id, pending);
+          archivedMessage = pending;
+          let receipt: BotMessageReceipt | void;
+          try {
+            receipt = await bot.sendCredentials(
+              recipient,
+              username,
+              password,
+              publicUrl,
+              requiresMembership,
+              message,
+            );
+          } catch (error) {
+            deliveryIssue = error instanceof DiscordDeliveryError ? error.issue : 'send_error';
+            throw error;
+          }
           deliveryAcknowledged = true;
           result.discord_delivery = 'sent';
           this.store.saveBotMessage(job.id, {
@@ -7386,21 +7409,29 @@ export class Service {
             sent_at: receipt?.sent_at ?? now(),
           });
           archiveSent = true;
-          result.discord_delivery = 'sent';
           this.store.deleteCredentials(job.id, username);
         } catch (error) {
           if (error instanceof MigrationSourceVerificationError) throw error;
           if (archivedMessage && !archiveSent) {
             try {
-              this.store.saveBotMessage(job.id, { ...archivedMessage, status: 'uncertain' });
+              this.store.saveBotMessage(job.id, {
+                ...archivedMessage,
+                status:
+                  deliveryIssue === 'rejected' || deliveryIssue === 'unavailable'
+                    ? 'failed'
+                    : 'uncertain',
+                ...(deliveryIssue ? { delivery_issue: deliveryIssue } : {}),
+              });
             } catch {
               /* The durable pending attempt remains uncertain; never resend automatically. */
             }
           }
           result.discord_delivery = deliveryAcknowledged ? 'sent' : 'failed';
+          if (deliveryIssue) result.delivery_issue = deliveryIssue;
           result.delivery_error = deliveryAcknowledged
-            ? 'Discord confirmed delivery, but local message archival or temporary credential cleanup could not finish. Any retained recovery credentials remain available until expiration.'
-            : 'Discord delivery was not confirmed. Credentials remain available for one-time reveal for 24 hours.';
+            ? 'Discord confirmed delivery. Jellyport could not finish saving the message or clearing the saved credentials.'
+            : (discordDeliveryIssueLabel(deliveryIssue) ??
+              'Jellyport could not prepare the Discord DM');
         }
       else if (recipient) result.discord_delivery = 'skipped_existing_account';
       if (source && result.data) {

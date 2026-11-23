@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import App from './App';
 import { jobOutcome } from './migration-outcome';
 import { StrictMode } from 'react';
+import { date } from './types';
 import type {
   Job,
   MigrationDetails,
@@ -1805,7 +1806,7 @@ describe('React account safeguards', () => {
       discord_user_id: '123456789012345678',
     });
   });
-  it('shows the archived Discord outcome and current credential availability in Activity', async () => {
+  it('shows confirmed Discord delivery and recorded errors in Activity', async () => {
     const message = {
       id: 'archive-1',
       kind: 'credentials',
@@ -1820,8 +1821,30 @@ describe('React account safeguards', () => {
     responses['/api/jobs/job-1'] = {
       ...job,
       credential_availability: { available: 1, claimed_elsewhere: 0 },
+      results: [
+        { username: 'family_2', status: 'created', created: true, discord_delivery: 'uncertain' },
+        {
+          username: 'family_3',
+          status: 'created',
+          created: true,
+          discord_delivery: 'failed',
+          delivery_issue: 'rejected',
+        },
+      ],
     } satisfies Job;
-    responses['/api/jobs/job-1/messages'] = { messages: [message] };
+    responses['/api/jobs/job-1/messages'] = {
+      messages: [
+        message,
+        {
+          ...message,
+          id: 'archive-2',
+          account_username: 'family_3',
+          membership_slot: 3,
+          status: 'failed',
+          delivery_issue: 'rejected',
+        },
+      ],
+    };
     render(<App />);
     fireEvent.click(await screen.findByRole('button', { name: 'Activity' }));
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
@@ -1830,9 +1853,16 @@ describe('React account safeguards', () => {
     expect(requests.some((request) => request.path.endsWith('/messages'))).toBe(false);
     fireEvent.click(within(dialog).getByRole('button', { name: 'View bot messages' }));
     const article = await within(dialog).findByRole('article', { name: 'Message for family_2' });
-    expect(article.textContent).toContain('Check whether they got the DM');
     expect(article.textContent).toContain('@family.owner');
+    expect(article.textContent).toContain(date(message.created_at));
+    expect(article.textContent).not.toMatch(/Check whether|DM sent|DM failed|uncertain/i);
     expect(article.textContent).not.toContain('SyntheticArchive42');
+    expect(within(dialog).queryByText(/Check whether they got/i)).toBeNull();
+    const account = within(dialog).getByRole('heading', { name: /^family_3$/ });
+    expect(within(account.closest('section')!).getByText('Discord rejected the DM')).toBeTruthy();
+    const rejection = within(dialog).getByRole('article', { name: 'Message for family_3' });
+    expect(rejection.textContent).toContain('Discord rejected the DM');
+    expect(rejection.textContent).not.toContain('SyntheticArchive42');
     expect(within(dialog).getByRole('button', { name: 'Refresh bot messages' })).toBeTruthy();
     expect(within(dialog).queryByText(/New account passwords can be revealed once/)).toBeNull();
     expect(within(dialog).queryByText(/Delivery records show the recipient/)).toBeNull();
@@ -1849,11 +1879,15 @@ describe('React account safeguards', () => {
     responses['/api/jobs/job-1'] = {
       ...job,
       credential_availability: { available: 0, claimed_elsewhere: 0 },
+      results: [
+        { username: 'family_2', status: 'created', created: true, discord_delivery: 'sent' },
+      ],
     } satisfies Job;
     responses['/api/jobs/job-1/messages'] = { messages: [{ ...message, status: 'sent' }] };
     fireEvent.click(screen.getByRole('button', { name: 'View operation details' }));
     const reopened = await screen.findByRole('dialog');
     expect(within(reopened).queryByRole('button', { name: 'Reveal new credentials' })).toBeNull();
+    expect(within(reopened).getByText(/DM sent/i)).toBeTruthy();
     fireEvent.click(within(reopened).getByRole('button', { name: 'View bot messages' }));
     const delivery = await within(reopened).findByRole('article', { name: 'Message for family_2' });
     expect(delivery.textContent).toContain('DM sent');

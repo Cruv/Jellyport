@@ -1,33 +1,23 @@
 import { useEffect, useRef, useState } from 'react';
-import type { BotMessageHistory } from '../../server/bot-messages';
+import { discordDeliveryIssueLabel, type BotMessageHistory } from '../../server/bot-messages';
 import { date, type Api, type JobResult } from './types';
 
-const deliveryLabels: Record<BotMessageHistory['status'], string> = {
-  sent: 'DM sent',
-  failed: 'DM failed',
-  uncertain: 'Check whether they got the DM',
-  pending: 'DM pending',
-};
+function deliveryLabel(status?: string, issue?: BotMessageHistory['delivery_issue']) {
+  if (status === 'sent') return 'DM sent';
+  if (status === 'pending') return 'DM pending';
+  return discordDeliveryIssueLabel(issue) ?? (status === 'failed' ? 'DM error' : undefined);
+}
 
 export function DiscordDeliverySummary({
   result,
 }: {
-  result: Pick<JobResult, 'discord_delivery' | 'delivery_error'>;
+  result: Pick<JobResult, 'discord_delivery' | 'delivery_issue' | 'delivery_error'>;
 }) {
   const delivery = result.discord_delivery;
-  switch (typeof delivery === 'string' ? delivery : delivery?.status) {
-    case 'sent':
-      return <p>Discord DM sent</p>;
-    case 'failed':
-    case 'uncertain':
-      return <p>Check whether they got the Discord DM.</p>;
-    case 'pending':
-      return <p>Discord DM pending</p>;
-    default:
-      return result.delivery_error ? (
-        <div className="error-block">{result.delivery_error}</div>
-      ) : null;
-  }
+  const status = typeof delivery === 'string' ? delivery : delivery?.status;
+  const label = deliveryLabel(status, result.delivery_issue);
+  if (label) return <p>{label}</p>;
+  return result.delivery_error ? <p>Discord send error</p> : null;
 }
 
 export default function BotMessageHistoryPanel({ jobId, api }: { jobId: string; api: Api }) {
@@ -93,21 +83,24 @@ export default function BotMessageHistoryPanel({ jobId, api }: { jobId: string; 
         </p>
       )}
       {messages?.length === 0 && <p className="section-note">No Discord DMs recorded.</p>}
-      {messages?.map((message) => (
-        <article
-          className="inline-panel form-stack"
-          key={message.id}
-          aria-label={`Message for ${message.account_username}`}
-        >
-          <strong>
-            {message.account_username} · Slot {message.membership_slot}
-          </strong>
-          <p className="section-note">
-            {message.recipient_username ? `@${message.recipient_username}` : message.recipient_id} ·{' '}
-            {deliveryLabels[message.status]} · {date(message.sent_at || message.created_at)}
-          </p>
-        </article>
-      ))}
+      {messages?.map((message) => {
+        const label = deliveryLabel(message.status, message.delivery_issue);
+        return (
+          <article
+            className="inline-panel form-stack"
+            key={message.id}
+            aria-label={`Message for ${message.account_username}`}
+          >
+            <strong>
+              {message.account_username} · Slot {message.membership_slot}
+            </strong>
+            <p className="section-note">
+              {message.recipient_username ? `@${message.recipient_username}` : message.recipient_id}
+              {label && ` · ${label}`} · {date(message.sent_at || message.created_at)}
+            </p>
+          </article>
+        );
+      })}
     </section>
   );
 }

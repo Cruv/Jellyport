@@ -442,6 +442,19 @@ it('reports missing imports, retained delivery uncertainty, and session-scoped r
     content: 'PRIVATE-DISCORD-DELIVERY',
     created_at: '2020-01-01T00:00:00Z',
   });
+  const refused = historicalJob('rejected-synthetic-delivery');
+  store.saveJob(refused);
+  store.saveBotMessage(refused.id, {
+    id: 'rejected-delivery',
+    kind: 'credentials',
+    status: 'failed',
+    delivery_issue: 'rejected',
+    recipient_id: '100001',
+    membership_slot: 1,
+    account_username: 'Synthetic rejected account',
+    content: '',
+    created_at: '2020-01-02T00:00:00Z',
+  });
   const imported = '2026-11-17T01:00:00Z';
   const next = '2026-11-19T01:00:00Z';
   const destination = await service.destinationSnapshots.status();
@@ -464,9 +477,18 @@ it('reports missing imports, retained delivery uncertainty, and session-scoped r
         last_successful_at: imported,
         next_run_at: next,
       }),
-      expect.objectContaining({ title: 'Check credential delivery', job_id: job.id }),
       expect.objectContaining({
-        title: 'Credentials await delivery',
+        title: 'Discord delivery record',
+        attention: false,
+        job_id: job.id,
+      }),
+      expect.objectContaining({
+        title: 'Discord rejected the DM',
+        attention: true,
+        job_id: refused.id,
+      }),
+      expect.objectContaining({
+        title: 'Credentials available',
         detail: expect.stringContaining('available to reveal in this session'),
       }),
     ]),

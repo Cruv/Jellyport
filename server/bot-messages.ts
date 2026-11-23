@@ -67,6 +67,32 @@ export const BOT_MESSAGE_CATALOG = {
 export type BotMessageTemplateId = keyof typeof BOT_MESSAGE_CATALOG;
 export type BotMessageTemplates = Partial<Record<BotMessageTemplateId, string>>;
 
+const discordDeliveryIssueLabels = {
+  rejected: 'Discord rejected the DM',
+  timeout: 'Discord DM timed out',
+  send_error: 'Discord send error',
+  interrupted: 'Discord send interrupted',
+  unavailable: 'Discord DM unavailable',
+} as const;
+export type DiscordDeliveryIssue = keyof typeof discordDeliveryIssueLabels;
+
+export function discordDeliveryIssueLabel(issue: unknown): string | undefined {
+  return typeof issue === 'string' && Object.hasOwn(discordDeliveryIssueLabels, issue)
+    ? discordDeliveryIssueLabels[issue as DiscordDeliveryIssue]
+    : undefined;
+}
+
+/** The Discord transport reports only safe categories, never the provider error or request body. */
+export class DiscordDeliveryError extends Error {
+  constructor(
+    readonly issue: DiscordDeliveryIssue,
+    message: string = discordDeliveryIssueLabels[issue],
+  ) {
+    super(message);
+    this.name = 'DiscordDeliveryError';
+  }
+}
+
 export interface BotMessageReceipt {
   /** Exact content submitted to Discord, after transport escaping. */
   content: string;
@@ -83,6 +109,7 @@ export interface BotMessageHistory {
   membership_slot: number;
   content: string;
   status: 'pending' | 'sent' | 'failed' | 'uncertain';
+  delivery_issue?: DiscordDeliveryIssue;
   created_at: string;
   sent_at?: string;
   message_id?: string;

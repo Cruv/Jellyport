@@ -109,7 +109,7 @@ describe('private administrator bot message archive', () => {
     const reopened = new Store(directory);
     stores.push(reopened);
     const recovered = reopened.botMessages(job().id)[0];
-    expect(recovered).toMatchObject({ status: 'uncertain' });
+    expect(recovered).toMatchObject({ status: 'uncertain', delivery_issue: 'interrupted' });
     expect(recovered).not.toHaveProperty('message_id');
     expect(recovered).not.toHaveProperty('sent_at');
   });
@@ -124,6 +124,10 @@ describe('private administrator bot message archive', () => {
     apps.push(app);
     app.jellyport.store.saveJob(job());
     app.jellyport.store.saveBotMessage(job().id, message({ status: 'sent' }));
+    app.jellyport.store.saveBotMessage(
+      job().id,
+      message({ id: 'synthetic-rejected', status: 'failed', delivery_issue: 'rejected' }),
+    );
     app.jellyport.store.saveSubscription({
       id: 'synthetic-billing-event',
       action: 'subscribe',
@@ -166,12 +170,17 @@ describe('private administrator bot message archive', () => {
       const response = await app.inject({ url: '/api/jobs/synthetic-job/messages', headers });
       expect(response.statusCode).toBe(200);
       expect(response.headers['cache-control']).toContain('no-store');
-      expect(response.json().messages[0]).toMatchObject({
+      const messages = response.json().messages as BotMessageHistory[];
+      expect(messages.find((item) => item.id === 'synthetic-delivery')).toMatchObject({
         status: 'sent',
         recipient_id: '100001',
         account_username: 'river_2',
       });
-      expect(response.json().messages[0]).not.toHaveProperty('content');
+      expect(messages.find((item) => item.id === 'synthetic-rejected')).toMatchObject({
+        status: 'failed',
+        delivery_issue: 'rejected',
+      });
+      expect(messages.every((item) => !Object.hasOwn(item, 'content'))).toBe(true);
       expect(response.body).not.toContain('SYNTHETIC_PRIVATE_PASSWORD');
     }
     for (const url of ['/api/jobs', '/api/jobs/synthetic-job'])
@@ -224,11 +233,12 @@ describe('private administrator bot message archive', () => {
         expect(result.error).toBeUndefined();
         expect(result).toMatchObject({ discord_delivery: 'sent' });
         expect(result.delivery_error).toContain('Discord confirmed delivery');
+        expect(result.delivery_issue).toBeUndefined();
         expect(store.takeCredentials(queued.id)).toHaveLength(1);
-        expect(store.botMessages(queued.id)[0].status).toBe(
-          failure === 'cleanup' ? 'sent' : 'uncertain',
-        );
-        expect(store.botMessages(queued.id)[0].content).toBe('');
+        const [message] = store.botMessages(queued.id);
+        expect(message.status).toBe(failure === 'cleanup' ? 'sent' : 'uncertain');
+        expect(message.delivery_issue).toBeUndefined();
+        expect(message.content).toBe('');
       } finally {
         vi.restoreAllMocks();
         await service.stop();

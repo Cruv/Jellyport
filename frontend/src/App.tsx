@@ -23,6 +23,7 @@ import {
 import SettingsPage from './SettingsPage';
 import BotMessageHistoryPanel, { DiscordDeliverySummary } from './BotMessageHistoryPanel';
 import AuthScreen from './AuthScreen';
+import ChangelogDialog from './ChangelogDialog';
 import UserMappingsPage from './UserMappingsPage';
 import MigrationPreviewDialog from './MigrationPreviewDialog';
 import AccountRolesPage from './AccountRolesPage';
@@ -108,6 +109,7 @@ type Dialog =
   | { kind: 'job'; job: Job; submissionReceipt?: string }
   | { kind: 'reveal'; jobId: string }
   | { kind: 'credentials'; jobId: string; credentials: Credential[] }
+  | { kind: 'changelog'; buildRevision?: string }
   | {
       kind: 'cleanup';
       candidates: CleanupCandidate[];
@@ -1802,9 +1804,17 @@ export default function App() {
                       <Icon name="logout" />
                     </button>
                   </div>
-                  <div className="sidebar-note" aria-label="Jellyport version">
-                    v{appVersion}
-                  </div>
+                  <button
+                    className="sidebar-version"
+                    type="button"
+                    aria-label={`Changelog for Jellyport v${appVersion}`}
+                    aria-haspopup="dialog"
+                    onClick={() =>
+                      showDialog({ kind: 'changelog', buildRevision: session.build_revision })
+                    }
+                  >
+                    v{appVersion} <Icon name="chevron" />
+                  </button>
                 </div>
               </aside>
               <main className="main" inert={mobileOpen && navigationDrawer}>
@@ -2175,6 +2185,8 @@ function DialogContent({
   notify: (text: string, error?: boolean) => void;
   templateUserId?: string;
 }) {
+  if (dialog.kind === 'changelog')
+    return <ChangelogDialog version={appVersion} revision={dialog.buildRevision} close={close} />;
   if (dialog.kind === 'cleanup')
     return <HistoryCleanupDialog review={dialog} close={close} submit={cleanupHistory} />;
   if (dialog.kind === 'preview')

@@ -17,7 +17,7 @@ import {
 } from './stripe-integration.js';
 import { createHash, randomBytes, randomUUID, scrypt, timingSafeEqual } from 'node:crypto';
 import { isDeepStrictEqual, promisify } from 'node:util';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Store, type MigrationSubmission } from './store.js';
 import { readBackupVerification } from './backup-verification.js';
@@ -69,6 +69,14 @@ import {
 const hashPassword = promisify(scrypt);
 const COOKIE = 'jellyport_session';
 const SETUP_COOKIE = 'jellyport_setup_session';
+const buildRevision = (() => {
+  try {
+    const revision = readFileSync(new URL('../build-revision.txt', import.meta.url), 'utf8').trim();
+    return /^[a-f0-9]{40}$/.test(revision) ? revision : undefined;
+  } catch {
+    return undefined;
+  }
+})();
 const CSP =
   "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 interface Session {
@@ -419,6 +427,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         : {}),
       ...(value.authenticated
         ? {
+            ...(buildRevision ? { build_revision: buildRevision } : {}),
             user: {
               id: value.identity?.userId ?? 'demo-admin',
               name: value.identity?.username ?? 'admin',

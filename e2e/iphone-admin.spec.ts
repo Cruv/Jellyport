@@ -218,7 +218,7 @@ test('rotation and a reduced keyboard-sized viewport retain drafts and reachable
   await expectTouchTarget(toggle);
   await toggle.click();
   const navigation = page.getByRole('complementary', { name: 'Main navigation' });
-  const last = navigation.getByRole('button', { name: 'Sign out', exact: true });
+  const last = navigation.getByRole('button', { name: /^Changelog for Jellyport v/ });
   await expectReachable(page, last);
   await page.keyboard.press('Escape');
   await expect(toggle).toHaveAttribute('aria-expanded', 'false');

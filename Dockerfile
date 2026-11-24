@@ -3,9 +3,16 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY tsconfig*.json vite.config.ts ./
+COPY CHANGELOG.md ./
+COPY scripts/changelog.mjs scripts/changelog.d.mts ./scripts/
 COPY server ./server
 COPY frontend ./frontend
-RUN npm run build
+ARG JELLYPORT_REVISION
+RUN npm run build && \
+    if [ -n "$JELLYPORT_REVISION" ]; then \
+      printf '%s\n' "$JELLYPORT_REVISION" | grep -Eq '^[a-f0-9]{40}$' && \
+      printf '%s\n' "$JELLYPORT_REVISION" > dist/build-revision.txt; \
+    fi
 
 FROM node:24.22.3-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS runtime
 LABEL org.opencontainers.image.source="https://github.com/Cruv/Jellyport" \

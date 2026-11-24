@@ -50,6 +50,55 @@ for (const name of pages) {
   });
 }
 
+test('the sidebar version opens the release notes and exact running commit', async ({
+  page,
+  mutations,
+}, info) => {
+  const revision = '0123456789abcdef0123456789abcdef01234567';
+  await page.route('**/api/session', async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({
+      response,
+      json: { ...(await response.json()), build_revision: revision },
+    });
+  });
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1, name: 'Overview' })).toBeVisible();
+  const toggle = page.getByRole('button', { name: 'Toggle navigation', includeHidden: true });
+  const drawer = await toggle.isVisible();
+  const touch = await page.evaluate(() => navigator.maxTouchPoints > 0);
+  if (drawer) {
+    await (touch ? toggle.tap() : toggle.click());
+    await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+    await expect(page.getByRole('button', { name: 'Overview', exact: true })).toBeFocused();
+  }
+  const version = page.getByRole('button', { name: /^Changelog for Jellyport v/ });
+  const versionLabel = (await version.innerText()).trim();
+  expect(versionLabel).toMatch(/^v\d+\.\d+\.\d+$/);
+  await (touch ? version.tap() : version.click());
+  const dialog = page.getByRole('dialog', { name: 'Changelog' });
+  await expect(dialog.getByRole('heading', { name: versionLabel })).toBeVisible();
+  await expect(dialog.locator('time')).toHaveAttribute('datetime', /^\d{4}-\d{2}-\d{2}$/);
+  await expect(dialog.getByRole('listitem').first()).toBeVisible();
+  await expect(
+    dialog.getByRole('link', { name: `GitHub release for ${versionLabel}` }),
+  ).toHaveAttribute('href', `https://github.com/Cruv/Jellyport/releases/tag/${versionLabel}`);
+  await expect(dialog.getByRole('link', { name: revision })).toHaveAttribute(
+    'href',
+    `https://github.com/Cruv/Jellyport/commit/${revision}`,
+  );
+  await expectContainedLayout(page);
+  await expect(dialog.getByRole('button', { name: 'Close dialog' })).toBeFocused();
+  await dialog.screenshot({ path: info.outputPath('changelog.png') });
+  await page.keyboard.press('Escape');
+  await expect(dialog).toHaveCount(0);
+  if (drawer) {
+    await expect(toggle).toHaveAttribute('aria-expanded', 'false');
+    await expect(toggle).toBeFocused();
+  }
+  expect(mutations).toEqual([]);
+});
+
 test('settings task tabs preserve drafts and independent schedules without exposing unrelated forms', async ({
   page,
   mutations,
@@ -452,11 +501,12 @@ test('mobile navigation contains keyboard focus and restores it on dismissal', a
   const nav = page.getByRole('complementary', { name: 'Main navigation' });
   await toggle.click();
   await expect(nav.getByRole('button', { name: 'Users', exact: true })).toBeFocused();
-  await nav.getByRole('button', { name: 'Sign out', exact: true }).focus();
+  const last = nav.getByRole('button', { name: /^Changelog for Jellyport v/ });
+  await last.focus();
   await page.keyboard.press('Tab');
   await expect(nav.getByRole('button', { name: 'Users', exact: true })).toBeFocused();
   await page.keyboard.press('Shift+Tab');
-  await expect(nav.getByRole('button', { name: 'Sign out', exact: true })).toBeFocused();
+  await expect(last).toBeFocused();
   await page.keyboard.press('Escape');
   await expect(toggle).toHaveAttribute('aria-expanded', 'false');
   await expect(toggle).toBeFocused();

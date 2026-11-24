@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { version as appVersion } from '../../package.json';
 import App from './App';
 import { jobOutcome } from './migration-outcome';
 import { StrictMode } from 'react';
@@ -3835,6 +3836,37 @@ describe('React account safeguards', () => {
     await screen.findByRole('heading', { name: 'Activity', level: 1 });
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
   });
+  it('opens the current changelog and identifies the running build', async () => {
+    vi.stubGlobal('innerWidth', 1200);
+    const revision = '0123456789abcdef0123456789abcdef01234567';
+    responses['/api/session'] = { ...session, build_revision: revision };
+    render(<App />);
+    const control = await screen.findByRole('button', {
+      name: `Changelog for Jellyport v${appVersion}`,
+    });
+    control.focus();
+    fireEvent.click(control);
+    const changelog = within(await screen.findByRole('dialog', { name: 'Changelog' }));
+    expect(changelog.getByRole('heading', { name: `v${appVersion}` })).toBeTruthy();
+    expect(changelog.getByText(/^Released/).querySelector('time')?.dateTime).toMatch(
+      /^\d{4}-\d{2}-\d{2}$/,
+    );
+    expect(changelog.getAllByRole('listitem').length).toBeGreaterThan(0);
+    expect(
+      changelog
+        .getByRole('link', { name: `GitHub release for v${appVersion}` })
+        .getAttribute('href'),
+    ).toBe(`https://github.com/Cruv/Jellyport/releases/tag/v${appVersion}`);
+    expect(changelog.getByRole('link', { name: revision }).getAttribute('href')).toBe(
+      `https://github.com/Cruv/Jellyport/commit/${revision}`,
+    );
+    fireEvent.keyDown(changelog.getByRole('button', { name: 'Close dialog' }), { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(document.activeElement).toBe(control);
+    expect(
+      requests.filter((request) => request.options?.method && request.options.method !== 'GET'),
+    ).toEqual([]);
+  });
   it('keeps keyboard focus in open mobile navigation and restores it on dismissal', async () => {
     vi.stubGlobal('innerWidth', 400);
     render(<App />);
@@ -3847,7 +3879,7 @@ describe('React account safeguards', () => {
     fireEvent.click(toggle);
     const current = screen.getByRole('button', { name: 'Overview' });
     const first = screen.getByRole('button', { name: 'Users' });
-    const last = screen.getByRole('button', { name: 'Sign out' });
+    const last = screen.getByRole('button', { name: `Changelog for Jellyport v${appVersion}` });
     expect(document.activeElement).toBe(current);
     first.focus();
     fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
@@ -3876,7 +3908,9 @@ describe('React account safeguards', () => {
     expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Users' }));
     toggle.focus();
     fireEvent.keyDown(window, { key: 'Tab', shiftKey: true });
-    expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Sign out' }));
+    expect(document.activeElement).toBe(
+      screen.getByRole('button', { name: `Changelog for Jellyport v${appVersion}` }),
+    );
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(document.activeElement).toBe(toggle);
   });

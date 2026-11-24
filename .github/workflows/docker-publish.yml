@@ -134,6 +134,14 @@ jobs:
         with:
           node-version: 24
           package-manager-cache: false
+      - name: Read the tested package version
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Log in to GitHub Container Registry
@@ -150,11 +158,13 @@ jobs:
           platforms: ${{ matrix.platform }}
           no-cache-filters: runtime # Refresh Debian security packages for every release.
           outputs: type=image,name=${{ needs.verify.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          build-args: JELLYPORT_REVISION=${{ needs.verify.outputs.sha }}
           labels: |
             org.opencontainers.image.title=Jellyport
             org.opencontainers.image.description=Emby to Jellyfin migration and Discord account management
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ needs.verify.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.package.outputs.version }}
           provenance: true
           sbom: true
           cache-from: type=gha,scope=jellyport-${{ matrix.architecture }}
@@ -169,7 +179,9 @@ jobs:
           --mount type=volume,destination=/data -p 127.0.0.1:8173:8000
           -e JELLYPORT_DEMO=true "$CANDIDATE_IMAGE"
       - name: Verify the running candidate
-        run: node scripts/smoke.mjs http://127.0.0.1:8173
+        env:
+          EXPECTED_REVISION: ${{ needs.verify.outputs.sha }}
+        run: node scripts/smoke.mjs http://127.0.0.1:8173 "$EXPECTED_REVISION"
       - name: Show smoke-test logs on failure
         if: failure()
         run: docker logs jellyport-smoke || true
@@ -200,6 +212,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.manifest.outputs.digest }}
     steps:
       - name: Download both verified image digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
@@ -216,6 +230,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Publish latest and the full commit tag
+        id: manifest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SOURCE_SHA: ${{ needs.verify.outputs.sha }}
@@ -235,7 +250,50 @@ jobs:
             digests+=("$IMAGE_NAME@sha256:$digest")
           done
           [[ ${#digests[@]} -eq 2 ]]
+          manifest_metadata="$RUNNER_TEMP/published-manifest.json"
           docker buildx imagetools create \
+            --metadata-file "$manifest_metadata" \
             --tag "$IMAGE_NAME:latest" --tag "$IMAGE_NAME:sha-$SOURCE_SHA" \
             "${digests[@]}"
-          docker buildx imagetools inspect "$IMAGE_NAME:sha-$SOURCE_SHA"
+          manifest_digest=$(jq -er '."containerimage.descriptor".digest' "$manifest_metadata")
+          [[ "$manifest_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          for tag in "latest" "sha-$SOURCE_SHA"; do
+            promoted=$(docker buildx imagetools inspect "$IMAGE_NAME:$tag" \
+              --format '{{.Manifest.Digest}}')
+            [[ "$promoted" == "$manifest_digest" ]]
+          done
+          printf 'digest=%s\n' "$manifest_digest" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: [verify, publish]
+    if: needs.verify.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Check out the tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish the reviewed stable version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ needs.verify.outputs.sha }}
+          IMAGE_NAME: ${{ needs.verify.outputs.image }}
+          IMAGE_DIGEST: ${{ needs.publish.outputs.digest }}
+        run: node scripts/publish-release.mjs

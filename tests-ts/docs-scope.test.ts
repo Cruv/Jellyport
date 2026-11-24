@@ -48,6 +48,7 @@ describe('documentation-only workflow scope', () => {
     'examples/compose.portainer.yaml',
     '.env.example',
     'CONTRIBUTING.md',
+    'CHANGELOG.md',
     'README.txt',
     'LICENSE',
     'docs/script.js',

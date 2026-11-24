@@ -317,10 +317,34 @@ hr {
 .operator-card .icon-button {
   margin-left: auto;
 }
-.sidebar-note {
-  padding: 5px 10px 0;
+.sidebar-version {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 0 10px;
+  background: none;
+  border: 0;
+  border-radius: 6px;
   font-size: 12px;
-  color: var(--subtle);
+  color: var(--purple);
+}
+.sidebar-version:hover {
+  background: var(--surface-3);
+}
+.sidebar-version svg {
+  height: 12px;
+  width: 12px;
+}
+.release-changes {
+  margin: 0;
+  padding-inline-start: 20px;
+}
+.release-changes li + li {
+  margin-top: 6px;
+}
+.release-revision {
+  overflow-wrap: anywhere;
 }
 .main {
   grid-column: 2;

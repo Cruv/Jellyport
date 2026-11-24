@@ -191,8 +191,14 @@ Follow the commit/push/squash-merge preference in [AGENTS.md](../AGENTS.md). Sta
 only owned paths. One cohesive outcome is one delivery boundary; do not require a
 commit, product version, tag or release for every subtask. Product version changes
 belong to intentional runtime releases, with `package.json` and its lockfile kept
-consistent. No semantic image tags, Git tags or GitHub Releases are currently
-automated; the owner has not established a separate release cadence.
+consistent.
+
+For an intentional release, run `npm version --no-git-tag-version <version>` and
+add a top entry to the [changelog](../CHANGELOG.md). Use a heading in the form
+`## [0.33.6] - 2026-11-24` with the release date and a short bullet for each
+user-facing change. Include the version and changelog in the same reviewed pull
+request. The publication workflow creates the Git tag, GitHub Release, and
+matching container tag after the release revision passes its checks.
 
 The workflows define the executable gates:
 
@@ -218,11 +224,21 @@ The workflows define the executable gates:
 - Native AMD64 and ARM64 candidates are tested by digest. Both tested digests
   must pass before promotion to `latest` and `sha-<full-commit-sha>`; do not rebuild
   between testing and promotion or replace a tested digest with a mutable tag.
+- An intentional version release also publishes the `v<version>` image tag and
+  a [GitHub Release](https://github.com/Cruv/Jellyport/releases) with its changelog
+  entry. The release and its version tag stay pinned to the published revision
+  as later main builds advance `latest`. The commit image tag identifies the
+  build’s source revision. The manifest digest pins the exact image.
 
 These gates prevent stale revisions, unverified runtime changes and untested image
 promotion. They do not authorize production deployment, load tests, migration
 trials or media-server restarts; the separate boundary remains in AGENTS. A blocked
 check or publication remains a blocker, never a completed release.
+
+If publication stops after reserving a version tag, inspect the failed run before
+announcing the release. Rerun the failed publication while the reserved revision
+is current main. If main has advanced, the tag identifies its reserved revision.
+Use the next deliberate version to release from current main.
 
 ## Resume without rereading everything
 

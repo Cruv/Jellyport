@@ -32,7 +32,9 @@ for the test environment and its scope.
 
 ### Portainer or a prebuilt image
 
-The public image is `ghcr.io/cruv/jellyport:latest`, published for Linux x86-64 and ARM64 after runtime changes pass main-branch CI and image checks. Documentation-only merges do not publish an image. Portainer can pull it without GitHub credentials. Each publication also has a `sha-<full-commit-sha>` tag for selecting a commit; pin the image's manifest digest when you need an immutable deployment. See [delivery gates and tags](docs/development.md#merge-and-publication-gates).
+The public image is `ghcr.io/cruv/jellyport:latest`, published for Linux x86-64 and ARM64 after runtime changes pass main-branch CI and image checks. Portainer can pull it without GitHub credentials. Each publication includes a `sha-<full-commit-sha>` tag for selecting a source revision. Versioned releases also include a `v<version>` image tag. Pin the manifest digest to select the exact image bytes. See [delivery gates and tags](docs/development.md#merge-and-publication-gates).
+
+Select the version number in Jellyport to see the release date, release notes, and running commit. Compare the running commit with the source commit on [GitHub Releases](https://github.com/Cruv/Jellyport/releases), or browse the [changelog](CHANGELOG.md).
 
 Paste [examples/compose.portainer.yaml](examples/compose.portainer.yaml) into Portainer's stack editor, or use this equivalent example:
 

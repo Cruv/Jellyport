@@ -16,6 +16,7 @@ export interface Session {
   setup_required: boolean;
   setup_connected: boolean;
   secure_cookie?: boolean;
+  build_revision?: string;
   setup_server_url?: string;
   user?: { id: string; name: string };
 }

@@ -181,6 +181,11 @@ describe('saved Jellyfin catalog service integration and independent readback', 
       afterWrite: undefined as undefined | ((itemId: string) => void),
       beforeFreshRead: undefined as undefined | ((itemId: string) => void),
     };
+    const capabilities = vi.fn(async () => ({
+      userData: !behavior.legacy,
+      privatePlaylists: true,
+      playlistDuplicates: true,
+    }));
     service.clientFactory = (...args) => {
       const client = servers.factory(...args);
       if (args[2] === 'emby') {
@@ -221,12 +226,7 @@ describe('saved Jellyfin catalog service integration and independent readback', 
           await update(id, itemId, supported);
           behavior.afterWrite?.(itemId);
         };
-        client.migrationCapabilities = async () => ({
-          userData: !behavior.legacy,
-          privatePlaylists: true,
-          playlistDuplicates: true,
-          version: '12.2.0.0',
-        });
+        client.migrationCapabilities = capabilities;
         const markPlayed = client.markPlayed.bind(client);
         client.markPlayed = async (id, itemId, date) => {
           if (behavior.legacy)
@@ -273,6 +273,7 @@ describe('saved Jellyfin catalog service integration and independent readback', 
       writes,
       freshReads,
       destinationReads,
+      capabilities,
       creates,
       accountChanges,
       migrate,
@@ -298,6 +299,11 @@ describe('saved Jellyfin catalog service integration and independent readback', 
     expect(fixture.savedCandidates).toHaveBeenCalledTimes(1);
     expect(fixture.savedCandidates.mock.calls[0]![0]).toBe(catalogId);
     expect(fixture.destinationReads).toHaveBeenCalledTimes(2);
+    expect(fixture.capabilities).toHaveBeenCalledWith({
+      serverId: '1'.repeat(32),
+      userId: targetId,
+      itemId: '1',
+    });
     expect(fixture.freshReads).not.toHaveBeenCalled();
     expect(fixture.writes.mock.calls.map(([, , patch]) => patch)).toEqual([
       { Played: true },
@@ -399,9 +405,16 @@ describe('saved Jellyfin catalog service integration and independent readback', 
     const fixture = setup();
     fixture.behavior.legacy = true;
     const limited = await finish(await fixture.migrate());
-    expect(limited.results[0]?.status).toBe('partial');
+    expect(limited.results[0]).toMatchObject({
+      status: 'partial',
+      data: {
+        failed_items: 0,
+        verification: { checked: 0, verified: 0, mismatched: 0, missing: 0, unsupported_fields: 2 },
+        warnings: ['Skipped history updates. Jellyfin’s update API could not be verified.'],
+      },
+    });
     expect(fixture.writes).not.toHaveBeenCalled();
-    expect(limited.results[0]?.data?.failed_items).toBeGreaterThan(0);
+    expect(fixture.destinationReads).toHaveBeenCalledOnce();
     fixture.behavior.legacy = false;
     const retry = await finish(await fixture.migrate());
     expect(retry.results[0]).toMatchObject({
@@ -424,6 +437,25 @@ describe('saved Jellyfin catalog service integration and independent readback', 
     expect(fixture.writes).toHaveBeenCalledTimes(firstWrites);
     expect(fixture.destinationReads).toHaveBeenCalledTimes(4);
     expect(fixture.catalog).not.toHaveBeenCalled();
+  });
+
+  it('verifies already-played items while counting a blocked change once per Jellyfin field', async () => {
+    const fixture = setup({ duplicateEdition: true });
+    fixture.behavior.legacy = true;
+    servers.userData[targetId]!['2'] = { Played: true, PlayCount: 7 };
+    const job = await finish(await fixture.migrate());
+    expect(job.results[0]).toMatchObject({
+      status: 'partial',
+      matched: 3,
+      data: {
+        failed_items: 0,
+        verification: { checked: 1, verified: 1, missing: 0, mismatched: 0, unsupported_fields: 1 },
+      },
+    });
+    expect(fixture.writes).not.toHaveBeenCalled();
+    expect(fixture.destinationReads.mock.calls[1]![1].map((item: MediaItem) => item.Id)).toEqual([
+      '2',
+    ]);
   });
 
   it('keeps the queued generation pinned when a newer generation becomes available', async () => {

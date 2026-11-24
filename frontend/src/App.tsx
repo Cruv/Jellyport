@@ -4,7 +4,7 @@ import { useClientLayout, useVisualViewport } from './client-layout';
 import { navigateWorkspace, useWorkspaceRoute, workspaceRouteHash } from './routing';
 import { WorkspaceDraftProvider } from './workspace-drafts';
 import { WorkspaceNotice, WorkspaceNoticeProvider } from './workspace-notices';
-import { jobOutcome, resultOutcome, MigrationCoverage } from './migration-outcome';
+import { jobOutcome, migrationReport, resultOutcome, MigrationCoverage } from './migration-outcome';
 import {
   DEFAULT_CREDENTIAL_MESSAGE_TEMPLATE,
   renderCredentialMessage,
@@ -41,6 +41,7 @@ import {
   date,
   num,
   safeUrl,
+  ApiResponseError,
   type Api,
   type ActivityFilter,
   type ActivityResults,
@@ -539,9 +540,10 @@ export default function App() {
               .join('; ');
           if (detail && typeof detail === 'object')
             detail = 'message' in detail ? String(detail.message) : JSON.stringify(detail);
-          throw new Error(
+          throw new ApiResponseError(
             typeof detail === 'string' ? detail : `Request failed (${response.status}).`,
-            { cause: data },
+            response.status,
+            data,
           );
         }
         if (
@@ -2209,6 +2211,17 @@ function DialogContent({
               data.preferences?.length ||
               data.avatar),
         ));
+    const results = (job.results ?? []).map((result) => ({
+      result,
+      report: migrationReport(result),
+    }));
+    const onlyHistoryBlocked =
+      migrationJob &&
+      results.some(({ report }) => report.blocked) &&
+      results.every(
+        ({ result, report }) =>
+          report.blocked || !resultOutcome(result, job.migration_scope).needsReview,
+      );
     const mayHaveCredentials =
       !activeJob(job) &&
       (job.credential_availability
@@ -2287,7 +2300,7 @@ function DialogContent({
           </Callout>
         )}
         <JobProgressDetails job={job} />
-        {jobOutcome(job).needsReview && (
+        {jobOutcome(job).needsReview && !onlyHistoryBlocked && (
           <Callout warning title="Review this operation before retrying.">
             <div className="button-row mt-12">
               {job.kind === 'create' && (
@@ -2327,25 +2340,6 @@ function DialogContent({
             </div>
           </Callout>
         )}
-        {job.elapsed_ms !== undefined && (
-          <p className="subtle text-small">
-            {migrationJob && job.workflow_elapsed_ms !== undefined && job.preview_timing ? (
-              <>
-                Combined migration elapsed: {(job.workflow_elapsed_ms / 1000).toFixed(1)} seconds ·
-                review build: {(job.preview_timing.elapsed_ms / 1000).toFixed(1)} seconds · accepted
-                migration: {(job.elapsed_ms / 1000).toFixed(1)} seconds
-              </>
-            ) : (
-              <>
-                {migrationJob ? 'Accepted migration elapsed' : 'Operation elapsed'}:{' '}
-                {(job.elapsed_ms / 1000).toFixed(1)} seconds
-              </>
-            )}
-            {job.queue_ms !== undefined && (
-              <> · preparation/queue: {(job.queue_ms / 1000).toFixed(1)} seconds</>
-            )}
-          </p>
-        )}
         {activeJob(job) && (
           <p className="subtle text-small mt-15">
             Cancel stops remaining work. Completed changes stay in place.
@@ -2357,7 +2351,7 @@ function DialogContent({
             Open the reveal in that session.
           </Callout>
         )}
-        {job.results?.map((result, index) => (
+        {results.map(({ result, report }, index) => (
           <section className="job-result" key={index}>
             <div className="job-result-header">
               <h3>{result.username || 'User'}</h3>
@@ -2378,36 +2372,6 @@ function DialogContent({
                 Emby: {result.source_username} → Jellyfin: {result.username}
               </p>
             )}
-            {result.source_snapshot && <SourceSnapshotNote snapshot={result.source_snapshot} />}
-            {result.destination_catalog && (
-              <p className="subtle text-small">
-                Jellyfin matching backup: {date(result.destination_catalog.backup_created_at)} ·{' '}
-                {num(result.destination_catalog.items)} catalog items. Shared import:{' '}
-                {(result.destination_catalog.import_elapsed_ms / 1000).toFixed(1)} seconds. Account
-                activity was read and verified live.
-              </p>
-            )}
-            {result.timing && (
-              <p className="subtle text-small">
-                Account work: {(result.timing.elapsed_ms / 1000).toFixed(1)} seconds.{' '}
-                {Object.entries(result.timing.phase_ms)
-                  .map(([phase, ms]) => `${phase.replaceAll('_', ' ')}: ${(ms / 1000).toFixed(1)}s`)
-                  .join(' · ')}
-              </p>
-            )}
-            {result.timing?.checkpoints && (
-              <p className="subtle text-small">
-                Progress checkpoints: {num(result.timing.checkpoints.count)} persisted ·{' '}
-                {(result.timing.checkpoints.total_duration_ms / 1000).toFixed(1)} seconds total ·{' '}
-                {(result.timing.checkpoints.max_duration_ms / 1000).toFixed(1)} seconds slowest.
-              </p>
-            )}
-            {result.source_catalog && (
-              <p className="subtle text-small">
-                Matching catalog collected {date(result.source_catalog.captured_at)} ·{' '}
-                {num(result.source_catalog.items)} items
-              </p>
-            )}
             {result.role_name && (
               <p className="subtle text-small">
                 Account role: {result.role_name} · Applied groups:{' '}
@@ -2423,14 +2387,15 @@ function DialogContent({
                   .join(', ') || 'none'}
               </p>
             )}
-            {migrationJob && !activeJob(job) && <MigrationCoverage result={result} />}
             <div className="job-meta">
               {result.created && (
                 <span>
                   <Icon name="userPlus" /> New account
                 </span>
               )}
-              {result.matched !== undefined && <span>{num(result.matched)} matched</span>}
+              {result.matched !== undefined && (!migrationJob || activeJob(job)) && (
+                <span>{num(result.matched)} matched</span>
+              )}
               {result.applied !== undefined && (
                 <span className="mint">
                   {num(result.applied)}{' '}
@@ -2442,14 +2407,18 @@ function DialogContent({
                 result.source_favorites !== undefined && (
                   <span>{num(result.source_favorites)} source favorites</span>
                 )}
-              {!!result.unmatched && <span>{num(result.unmatched)} unmatched</span>}
-              {!!result.ambiguous && <span>{num(result.ambiguous)} ambiguous</span>}
+              {!migrationJob && !!result.unmatched && (
+                <span>{num(result.unmatched)} unmatched</span>
+              )}
+              {!migrationJob && !!result.ambiguous && (
+                <span>{num(result.ambiguous)} ambiguous</span>
+              )}
               {result.data && (
                 <>
-                  <span>{num(result.data.items_updated)} items updated</span>
-                  {!!result.data.failed_items && (
-                    <span>{num(result.data.failed_items)} failed updates</span>
+                  {result.applied === undefined && (
+                    <span>{num(result.data.items_updated)} items updated</span>
                   )}
+                  {!!report.failed && <span>{num(report.failed)} failed updates</span>}
                   {!!result.data.favorites && (
                     <span>
                       {num(result.data.favorites)}{' '}
@@ -2482,43 +2451,35 @@ function DialogContent({
                 </>
               )}
             </div>
-            {result.data?.write_metrics && (
+            {!!report.verification?.unsupported_fields && (
               <p className="subtle text-small">
-                {job.migration_scope === 'played_favorites'
-                  ? 'Played-status and favorites'
-                  : 'Played-status'}{' '}
-                write requests: {num(result.data.write_metrics.attempts)} attempted ·{' '}
-                {num(result.data.write_metrics.succeeded)} succeeded ·{' '}
-                {num(result.data.write_metrics.failed)} failed · peak{' '}
-                {num(result.data.write_metrics.peak_in_flight)} in flight. Cumulative request time:{' '}
-                {(result.data.write_metrics.cumulative_ms / 1000).toFixed(1)} seconds; slowest
-                request: {(result.data.write_metrics.max_ms / 1000).toFixed(1)} seconds.
+                {num(report.verification.unsupported_fields)}{' '}
+                {report.verification.unsupported_fields === 1 ? 'change' : 'changes'} skipped
               </p>
             )}
-            {!!result.data?.failed_items && (
+            {!!report.failed && (
               <details className="disclosure">
                 <summary>
                   {job.migration_scope === 'watched_only'
                     ? 'Failed played updates'
                     : 'Failed item updates'}{' '}
-                  ({num(result.data.failed_items)})
+                  ({num(report.failed)})
                 </summary>
-                {result.data.failed_updates?.length ? (
+                {result.data?.failed_updates?.length ? (
                   <>
                     <ul>
-                      {result.data.failed_updates.slice(0, 200).map((failure, failureIndex) => (
+                      {result.data?.failed_updates.slice(0, 200).map((failure, failureIndex) => (
                         <li key={`${failure.target_id}-${failureIndex}`}>
                           <code>{failure.target_id}</code> · {failure.item_type || 'Unknown type'} ·{' '}
                           {failure.error}
                         </li>
                       ))}
                     </ul>
-                    {result.data.failed_items >
-                      Math.min(result.data.failed_updates.length, 200) && (
+                    {report.failed > Math.min(result.data?.failed_updates.length, 200) && (
                       <p className="mt-8">
-                        Showing {num(Math.min(result.data.failed_updates.length, 200))} of{' '}
-                        {num(result.data.failed_items)} failed updates. At most 200 item details are
-                        retained per account.
+                        Showing {num(Math.min(result.data?.failed_updates.length, 200))} of{' '}
+                        {num(report.failed)} failed updates. At most 200 item details are retained
+                        per account.
                       </p>
                     )}
                   </>
@@ -2527,27 +2488,36 @@ function DialogContent({
                 )}
               </details>
             )}
-            {result.data?.verification && (
-              <p className="subtle text-small">
-                Independent{' '}
-                {job.migration_scope === 'played_favorites'
-                  ? 'played-status and favorites'
-                  : job.migration_scope === 'watched_only'
-                    ? 'played-status'
-                    : 'history'}{' '}
-                verification: {num(result.data.verification.verified)} verified ·{' '}
-                {job.migration_scope !== 'played_favorites' && (
-                  <>
-                    {num(result.data.verification.preserved_newer)} newer Jellyfin activity
-                    preserved ·{' '}
-                  </>
-                )}
-                {num(result.data.verification.missing)} missing ·{' '}
-                {num(result.data.verification.mismatched)} mismatched ·{' '}
-                {num(result.data.verification.unsupported_fields)} unsupported fields.
-              </p>
-            )}
-            {result.data?.warnings.map((warning, index) => (
+            {report.verification &&
+              !!(
+                report.verification.verified ||
+                report.verification.preserved_newer ||
+                report.verification.missing ||
+                report.verification.mismatched
+              ) && (
+                <p className="subtle text-small">
+                  Independent{' '}
+                  {job.migration_scope === 'played_favorites'
+                    ? 'played-status and favorites'
+                    : job.migration_scope === 'watched_only'
+                      ? 'played-status'
+                      : 'history'}{' '}
+                  verification: {num(report.verification.verified)} verified
+                  {!!report.verification.preserved_newer && (
+                    <>
+                      {' '}
+                      · {num(report.verification.preserved_newer)} newer Jellyfin entries preserved
+                    </>
+                  )}
+                  {!!report.verification.missing && (
+                    <> · {num(report.verification.missing)} missing</>
+                  )}
+                  {!!report.verification.mismatched && (
+                    <> · {num(report.verification.mismatched)} mismatched</>
+                  )}
+                </p>
+              )}
+            {report.warnings.map((warning, index) => (
               <div
                 className={
                   result.status === 'partial' &&
@@ -2565,6 +2535,7 @@ function DialogContent({
                 {warning}
               </div>
             ))}
+            {migrationJob && !activeJob(job) && <MigrationCoverage result={result} />}
             <DiscordDeliverySummary result={result} />
             {result.error && <div className="error-block">{result.error}</div>}
             <Issues
@@ -2578,10 +2549,92 @@ function DialogContent({
               count={result.ambiguous}
               ambiguous
             />
+            {(result.source_snapshot ||
+              result.destination_catalog ||
+              result.timing ||
+              result.source_catalog ||
+              result.data?.write_metrics) && (
+              <details className="disclosure">
+                <summary>Technical details</summary>
+                <div className="form-stack mt-8">
+                  {result.source_snapshot && (
+                    <SourceSnapshotNote snapshot={result.source_snapshot} />
+                  )}
+                  {result.destination_catalog && (
+                    <p className="subtle text-small">
+                      Jellyfin matching backup: {date(result.destination_catalog.backup_created_at)}{' '}
+                      · {num(result.destination_catalog.items)} catalog items. Shared import:{' '}
+                      {(result.destination_catalog.import_elapsed_ms / 1000).toFixed(1)} seconds.
+                    </p>
+                  )}
+                  {result.timing && (
+                    <p className="subtle text-small">
+                      Account work: {(result.timing.elapsed_ms / 1000).toFixed(1)} seconds.{' '}
+                      {Object.entries(result.timing.phase_ms)
+                        .map(
+                          ([phase, ms]) =>
+                            `${phase.replaceAll('_', ' ')}: ${(ms / 1000).toFixed(1)}s`,
+                        )
+                        .join(' · ')}
+                    </p>
+                  )}
+                  {result.timing?.checkpoints && (
+                    <p className="subtle text-small">
+                      Progress checkpoints: {num(result.timing.checkpoints.count)} persisted ·{' '}
+                      {(result.timing.checkpoints.total_duration_ms / 1000).toFixed(1)} seconds
+                      total · {(result.timing.checkpoints.max_duration_ms / 1000).toFixed(1)}{' '}
+                      seconds slowest.
+                    </p>
+                  )}
+                  {result.source_catalog && (
+                    <p className="subtle text-small">
+                      Matching catalog collected {date(result.source_catalog.captured_at)} ·{' '}
+                      {num(result.source_catalog.items)} items
+                    </p>
+                  )}
+                  {result.data?.write_metrics && (
+                    <p className="subtle text-small">
+                      {job.migration_scope === 'played_favorites'
+                        ? 'Played-status and favorites'
+                        : 'Played-status'}{' '}
+                      write requests: {num(result.data.write_metrics.attempts)} attempted ·{' '}
+                      {num(result.data.write_metrics.succeeded)} succeeded ·{' '}
+                      {num(result.data.write_metrics.failed)} failed · peak{' '}
+                      {num(result.data.write_metrics.peak_in_flight)} in flight. Cumulative request
+                      time: {(result.data.write_metrics.cumulative_ms / 1000).toFixed(1)} seconds;
+                      slowest request: {(result.data.write_metrics.max_ms / 1000).toFixed(1)}{' '}
+                      seconds.
+                    </p>
+                  )}
+                </div>
+              </details>
+            )}
           </section>
         ))}
         {!job.results?.length && !activeJob(job) && !job.error && (
           <p className="muted text-small mt-18">This operation has no per-user results.</p>
+        )}
+        {job.elapsed_ms !== undefined && (
+          <details className="disclosure">
+            <summary>Operation timing</summary>
+            <p className="subtle text-small">
+              {migrationJob && job.workflow_elapsed_ms !== undefined && job.preview_timing ? (
+                <>
+                  Combined migration elapsed: {(job.workflow_elapsed_ms / 1000).toFixed(1)} seconds
+                  · review build: {(job.preview_timing.elapsed_ms / 1000).toFixed(1)} seconds ·
+                  accepted migration: {(job.elapsed_ms / 1000).toFixed(1)} seconds
+                </>
+              ) : (
+                <>
+                  {migrationJob ? 'Accepted migration elapsed' : 'Operation elapsed'}:{' '}
+                  {(job.elapsed_ms / 1000).toFixed(1)} seconds
+                </>
+              )}
+              {job.queue_ms !== undefined && (
+                <> · preparation/queue: {(job.queue_ms / 1000).toFixed(1)} seconds</>
+              )}
+            </p>
+          </details>
         )}
         <BotMessageHistoryPanel key={job.id} jobId={job.id} api={api} />
       </Modal>

@@ -32,6 +32,11 @@ export interface MigrationCapabilities {
   playlistDuplicates?: boolean;
   appendPlaylistItems?: boolean;
 }
+export interface MigrationCapabilityProbe {
+  serverId: string;
+  userId: string;
+  itemId: string;
+}
 export interface MediaItem extends JsonObject {
   Id: string;
   Name?: string;
@@ -66,7 +71,7 @@ export interface MediaUser extends JsonObject {
 export interface MediaAPI {
   close(): Promise<void>;
   systemInfo(options?: { signal?: AbortSignal; retry?: boolean }): Promise<JsonObject>;
-  jellyfinBackups?(): Promise<JellyfinBackupManifest[]>;
+  jellyfinBackups?(scope?: 'catalog-import'): Promise<JellyfinBackupManifest[]>;
   createJellyfinBackup?(): Promise<JellyfinBackupManifest>;
   jellyfinBackupTasks?(): Promise<JellyfinBackupTask[]>;
   users(): Promise<MediaUser[]>;
@@ -95,7 +100,7 @@ export interface MediaAPI {
   /** Fresh, access-scoped destination data for matched catalog candidates only. */
   destinationItems?(userId: string, candidates: MediaItem[]): Promise<MediaItem[]>;
   watchedItems?(userId: string): Promise<MediaItem[]>;
-  migrationCapabilities?(): Promise<MigrationCapabilities>;
+  migrationCapabilities?(probe?: MigrationCapabilityProbe): Promise<MigrationCapabilities>;
   updateUserData?(userId: string, itemId: string, patch: MediaUserDataPatch): Promise<void>;
   userData?(userId: string, itemId: string): Promise<MediaUserDataPatch>;
   markFavorite?(userId: string, itemId: string): Promise<void>;
@@ -691,7 +696,7 @@ export class MediaClient implements MediaAPI {
     path: string,
     params?: Record<string, string | number>,
     body?: unknown,
-    decode: boolean | 'image' = true,
+    decode: boolean | 'image' | 'allowedMethods' = true,
     bodyContentType?: MediaUserImage['contentType'],
     options: {
       signal?: AbortSignal;
@@ -759,13 +764,15 @@ export class MediaClient implements MediaAPI {
           continue;
         }
         if (decode === 'image' && response.status === 404) return null;
+        if (decode === 'allowedMethods' && response.status === 405)
+          return response.headers.get('Allow');
         if (!response.ok)
           throw new MediaError(
             `${this.label} rejected the request (HTTP ${response.status}).`,
             response.status,
             retryAfterMilliseconds(response.headers.get('Retry-After')),
           );
-        if (!decode || response.status === 204) return null;
+        if (!decode || decode === 'allowedMethods' || response.status === 204) return null;
         const maxBytes =
           decode === 'image'
             ? Math.min(this.maxResponseBytes, MAX_IMAGE_BYTES)
@@ -837,7 +844,9 @@ export class MediaClient implements MediaAPI {
           signal.aborted ||
           (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name));
         const suffix =
-          method !== 'GET' ? ' The operation may have been applied; check before retrying.' : '';
+          method !== 'GET' && method !== 'OPTIONS'
+            ? ' The operation may have been applied; check before retrying.'
+            : '';
         throw new MediaError(
           (timedOut ? `${this.label} request timed out.` : `Unable to connect to ${this.label}.`) +
             suffix,
@@ -879,13 +888,14 @@ export class MediaClient implements MediaAPI {
       await this.request('GET', 'System/Info', undefined, undefined, true, undefined, options),
     );
   }
-  async jellyfinBackups(): Promise<JellyfinBackupManifest[]> {
+  async jellyfinBackups(scope?: 'catalog-import'): Promise<JellyfinBackupManifest[]> {
     if (this.kind !== 'jellyfin')
       throw new MediaError('Native backup automation requires Jellyfin.');
     return parseJellyfinBackups(
       await this.request('GET', 'Backup', undefined, undefined, true, undefined, {
         retry: false,
       }),
+      scope,
     );
   }
   async createJellyfinBackup(): Promise<JellyfinBackupManifest> {
@@ -1819,36 +1829,98 @@ export class MediaClient implements MediaAPI {
     return items;
   }
 
-  async migrationCapabilities(): Promise<MigrationCapabilities> {
+  private async verifyLivePartialUserData(probe: MigrationCapabilityProbe): Promise<boolean> {
+    const signal = AbortSignal.timeout(MIGRATION_CONTRACT_TIMEOUT_MS);
+    const options = { signal, retry: false, timeoutMs: MIGRATION_CONTRACT_TIMEOUT_MS };
+    const server = await this.systemInfo(options);
+    if (!probe.serverId || server.Id !== probe.serverId || server.ProductName !== 'Jellyfin Server')
+      return false;
+
+    this.id(probe.userId);
+    const path = `UserItems/${this.id(probe.itemId)}/UserData`;
+    const params = { userId: probe.userId };
+    // ASP.NET reports the methods registered for this exact route in Allow on
+    // a plain OPTIONS 405. CORS policy responses do not establish route support.
+    const allow = await this.request(
+      'OPTIONS',
+      path,
+      params,
+      undefined,
+      'allowedMethods',
+      undefined,
+      options,
+    );
+    if (typeof allow !== 'string' || allow.length > 64) return false;
+    const methods = new Set(allow.split(',').map((method) => method.trim().toUpperCase()));
+    if (methods.size !== 2 || !methods.has('GET') || !methods.has('POST')) return false;
+
+    const state = await this.request('GET', path, params, undefined, true, undefined, options);
+    if (
+      !isObject(state) ||
+      typeof state.Played !== 'boolean' ||
+      typeof state.IsFavorite !== 'boolean'
+    )
+      return false;
+    if (state.ItemId === probe.itemId) return true;
+    const guid = /^(?:[a-f\d]{32}|[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12})$/i;
+    return (
+      typeof state.ItemId === 'string' &&
+      guid.test(state.ItemId) &&
+      guid.test(probe.itemId) &&
+      state.ItemId.replaceAll('-', '').toLowerCase() ===
+        probe.itemId.replaceAll('-', '').toLowerCase()
+    );
+  }
+
+  private async readMigrationCapabilities(
+    probe?: MigrationCapabilityProbe,
+  ): Promise<MigrationCapabilities> {
+    if (this.kind !== 'jellyfin')
+      return { userData: false, privatePlaylists: false, playlistDuplicates: false };
+    let document: unknown;
+    try {
+      document = await this.request(
+        'GET',
+        'api-docs/openapi.json',
+        undefined,
+        undefined,
+        true,
+        undefined,
+        {
+          retry: false,
+          timeoutMs: MIGRATION_CONTRACT_TIMEOUT_MS,
+        },
+      );
+      if (!isObject(document)) throw new MediaError('Jellyfin returned an invalid API response.');
+    } catch (error) {
+      // Official Jellyfin implements this fixed POST as a partial merge. A
+      // plugin or proxy can block its generated docs while the route still works.
+      // A readable but incompatible contract is authoritative and never falls back.
+      if (
+        probe &&
+        !this.controller.signal.aborted &&
+        !(error instanceof MediaError && [429, 503].includes(error.statusCode ?? 0)) &&
+        (await this.verifyLivePartialUserData(probe).catch(() => false))
+      )
+        return { userData: true, privatePlaylists: false, playlistDuplicates: false };
+      if (error instanceof MediaError)
+        throw new MediaError(
+          `${MIGRATION_CONTRACT_READ_ERROR} ${error.message}`,
+          error.statusCode,
+          error.retryAfterMs,
+        );
+      throw new MediaError(MIGRATION_CONTRACT_READ_ERROR);
+    }
+    return jellyfinWriteCapabilities(document);
+  }
+
+  async migrationCapabilities(probe?: MigrationCapabilityProbe): Promise<MigrationCapabilities> {
     if (!this.capabilities) {
-      this.capabilities =
-        this.kind === 'jellyfin'
-          ? this.request('GET', 'api-docs/openapi.json', undefined, undefined, true, undefined, {
-              retry: false,
-              timeoutMs: MIGRATION_CONTRACT_TIMEOUT_MS,
-            }).then(
-              (document) => {
-                if (!isObject(document)) throw new MediaError(MIGRATION_CONTRACT_READ_ERROR);
-                return jellyfinWriteCapabilities(document);
-              },
-              (error: unknown) => {
-                if (error instanceof MediaError)
-                  throw new MediaError(
-                    `${MIGRATION_CONTRACT_READ_ERROR} ${error.message}`,
-                    error.statusCode,
-                    error.retryAfterMs,
-                  );
-                throw new MediaError(MIGRATION_CONTRACT_READ_ERROR);
-              },
-            )
-          : Promise.resolve({
-              userData: false,
-              privatePlaylists: false,
-              playlistDuplicates: false,
-            });
+      const capabilities = this.readMigrationCapabilities(probe);
+      this.capabilities = capabilities;
       // A temporary read failure must not permanently disable retries for this client.
-      void this.capabilities.catch(() => {
-        this.capabilities = undefined;
+      void capabilities.catch(() => {
+        if (this.capabilities === capabilities) this.capabilities = undefined;
       });
     }
     return this.capabilities;

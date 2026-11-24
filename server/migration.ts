@@ -10,6 +10,7 @@ import {
   type MediaUserDataPatch,
   type MediaPlaylist,
   type MigrationCapabilities,
+  type MigrationCapabilityProbe,
 } from './media.js';
 import { MediaError, ServiceError } from './errors.js';
 import type { Store } from './store.js';
@@ -321,10 +322,11 @@ export async function readMigrationSource(
 
 export async function prepareMigrationCapabilities(
   jellyfin: MediaAPI,
+  probe?: MigrationCapabilityProbe,
 ): Promise<MigrationCapabilities | null> {
   try {
     return (
-      (await jellyfin.migrationCapabilities?.()) ?? {
+      (await jellyfin.migrationCapabilities?.(probe)) ?? {
         userData: false,
         privatePlaylists: false,
         playlistDuplicates: false,
@@ -367,15 +369,9 @@ export async function migrateItemState(
     options.capabilities === undefined
       ? await prepareMigrationCapabilities(jellyfin)
       : options.capabilities;
-  if (!capabilities) {
-    stopped();
-    migrationWarning(
-      details,
-      scope === 'played_favorites'
-        ? 'Jellyfin’s partial user-data API could not be verified. Check access to /api-docs/openapi.json before retrying. Played and favorite flags were not changed.'
-        : 'Jellyfin’s partial user-data API could not be verified. Check access to /api-docs/openapi.json before retrying. Watched flags were not changed.',
-    );
-  }
+  const updateUserData = capabilities?.userData
+    ? jellyfin.updateUserData?.bind(jellyfin)
+    : undefined;
   let applied = 0;
   const metrics = (details.write_metrics ??= {
     attempts: 0,
@@ -438,14 +434,14 @@ export async function migrateItemState(
         options.expectation?.(target, {}, []);
         return false;
       }
-      const supported = capabilities?.userData && !!jellyfin.updateUserData;
-      options.expectation?.(target, patch, supported ? [] : Object.keys(patch));
-      if (!supported)
-        throw new ServiceError(
-          scope === 'played_favorites'
-            ? 'Played and favorite updates require Jellyfin’s partial user-data API. Check its API description at /api-docs/openapi.json. Legacy endpoints can change unrelated personal data.'
-            : 'Watched-flag updates require Jellyfin’s partial user-data API. Check its API description at /api-docs/openapi.json. Legacy watched endpoints can change resume positions, dates and counts.',
+      options.expectation?.(target, patch, updateUserData ? [] : Object.keys(patch));
+      if (!updateUserData) {
+        migrationWarning(
+          details,
+          'Skipped history updates. Jellyfin’s update API could not be verified.',
         );
+        return false;
+      }
       if (attemptedTargets.has(target.Id))
         throw new ServiceError(
           'An earlier personal-flag update for this destination had an unverified outcome. No duplicate mutation was sent.',
@@ -464,7 +460,7 @@ export async function migrateItemState(
       inFlight++;
       metrics.peak_in_flight = Math.max(metrics.peak_in_flight, inFlight);
       try {
-        await jellyfin.updateUserData!(userId, target.Id, patch);
+        await updateUserData(userId, target.Id, patch);
         metrics.succeeded++;
       } catch (error) {
         metrics.failed++;

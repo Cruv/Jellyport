@@ -841,7 +841,9 @@ export class DestinationCatalogs {
         if (this.backupSelectionSupported && client.jellyfinBackups) {
           // The native API lists completed archives. A filename on disk may still
           // be an unfinished ZIP, and its local-time name is not a UTC ordering.
-          const completed = await client.jellyfinBackups();
+          const completed = await client.jellyfinBackups(
+            scheduledDate ? undefined : 'catalog-import',
+          );
           await verifyBackupServer();
           const latest = [...completed].sort(
             (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at),
@@ -897,7 +899,7 @@ export class DestinationCatalogs {
       this.state.last_finished_at = new Date().toISOString();
       this.state.last_outcome = 'failed';
       this.state.last_error =
-        error instanceof ServiceError
+        error instanceof ServiceError || error instanceof MediaError
           ? error.message
           : 'Jellyfin catalog import could not start. Check the helper and configured Jellyfin connection. Any previously saved catalog is preserved.';
       this.save();

@@ -1022,6 +1022,165 @@ describe('media API boundary', () => {
     await client.close();
   });
 
+  const liveHistoryProbe = {
+    serverId: 'fixture-server',
+    userId: 'fixture-user',
+    itemId: 'ed91f09a01f94df8a9d522280b0fc420',
+  };
+
+  it.each([403, 404, 500, 'html', 'timeout'] as const)(
+    'uses the documented partial route when OpenAPI is unavailable (%s)',
+    async (status) => {
+      const requests: string[] = [];
+      const cancel = vi.fn();
+      let state = {
+        ItemId: 'ed91f09a-01f9-4df8-a9d5-22280b0fc420',
+        Played: false,
+        IsFavorite: false,
+        PlaybackPositionTicks: 3_000_000,
+        PlayCount: 4,
+      };
+      const client = new MediaClient('https://jellyfin.test/prefix', 'synthetic-key', 'jellyfin', {
+        timeoutMs: 200,
+        transport: async (address, init) => {
+          const url = new URL(address);
+          requests.push(`${init.method} ${url.pathname}`);
+          expect(url.host).toBe('jellyfin.test');
+          expect(init.redirect).toBe('manual');
+          expect(new Headers(init.headers).get('Authorization')).toContain('synthetic-key');
+          if (url.pathname.endsWith('/openapi.json')) {
+            if (status === 'timeout') return new Response(new ReadableStream({ cancel }));
+            return status === 'html'
+              ? new Response('<html>Unavailable</html>')
+              : new Response(null, { status });
+          }
+          if (url.pathname.endsWith('/System/Info'))
+            return json({ Id: liveHistoryProbe.serverId, ProductName: 'Jellyfin Server' });
+          expect(url.pathname).toBe(`/prefix/UserItems/${liveHistoryProbe.itemId}/UserData`);
+          expect(url.searchParams.get('userId')).toBe(liveHistoryProbe.userId);
+          if (init.method === 'OPTIONS')
+            return new Response(null, { status: 405, headers: { Allow: 'GET, POST' } });
+          if (init.method === 'POST') {
+            const patch = JSON.parse(String(init.body));
+            expect(patch).toEqual({ Played: true, IsFavorite: true });
+            state = { ...state, ...patch };
+          }
+          return json(state);
+        },
+      });
+      try {
+        const capabilities = await Promise.all([
+          client.migrationCapabilities(liveHistoryProbe),
+          client.migrationCapabilities(liveHistoryProbe),
+        ]);
+        expect(
+          capabilities.every(({ userData, privatePlaylists }) => userData && !privatePlaylists),
+        ).toBe(true);
+        expect(requests).toEqual([
+          'GET /prefix/api-docs/openapi.json',
+          'GET /prefix/System/Info',
+          `OPTIONS /prefix/UserItems/${liveHistoryProbe.itemId}/UserData`,
+          `GET /prefix/UserItems/${liveHistoryProbe.itemId}/UserData`,
+        ]);
+        await client.updateUserData(liveHistoryProbe.userId, liveHistoryProbe.itemId, {
+          Played: true,
+          IsFavorite: true,
+        });
+        expect(requests).toHaveLength(5);
+        if (status === 'timeout') expect(cancel).toHaveBeenCalledOnce();
+        expect(state).toMatchObject({
+          Played: true,
+          IsFavorite: true,
+          PlaybackPositionTicks: 3_000_000,
+          PlayCount: 4,
+        });
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
+  it.each([429, 503])(
+    'does not send more discovery traffic after a %s OpenAPI response',
+    async (status) => {
+      const transport = vi.fn<FetchTransport>(async () => new Response(null, { status }));
+      const client = new MediaClient('http://jellyfin.test', 'synthetic-key', 'jellyfin', {
+        transport,
+      });
+      try {
+        await expect(client.migrationCapabilities(liveHistoryProbe)).rejects.toThrow(
+          `HTTP ${status}`,
+        );
+        expect(transport).toHaveBeenCalledOnce();
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
+  it.each([
+    'other product',
+    'new server',
+    'read only',
+    'proxy CORS',
+    'wrong item',
+    'wrong schema',
+    'denied data',
+  ])('keeps live discovery read-only with %s evidence', async (mismatch) => {
+    const transport = vi.fn<FetchTransport>(async (address, init) => {
+      const path = new URL(address).pathname;
+      expect(init.method).not.toBe('POST');
+      if (path.endsWith('/openapi.json')) return new Response(null, { status: 500 });
+      if (path.endsWith('/System/Info'))
+        return json({
+          Id: mismatch === 'new server' ? 'another-id' : liveHistoryProbe.serverId,
+          ProductName: mismatch === 'other product' ? 'Other Media Server' : 'Jellyfin Server',
+        });
+      if (init.method === 'OPTIONS')
+        return new Response(null, {
+          status: mismatch === 'proxy CORS' ? 204 : 405,
+          headers: { Allow: mismatch === 'read only' ? 'GET' : 'GET, POST' },
+        });
+      if (mismatch === 'denied data') return new Response(null, { status: 403 });
+      return json({
+        ItemId: mismatch === 'wrong item' ? 'unrelated-item' : liveHistoryProbe.itemId,
+        Played: false,
+        IsFavorite: mismatch === 'wrong schema' ? null : false,
+      });
+    });
+    const client = new MediaClient('http://jellyfin.test', 'synthetic-key', 'jellyfin', {
+      transport,
+    });
+    try {
+      await expect(client.migrationCapabilities(liveHistoryProbe)).rejects.toThrow('HTTP 500');
+      expect(transport.mock.calls.every(([, { method }]) => method !== 'POST')).toBe(true);
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('never uses route proof to override an incompatible OpenAPI contract', async () => {
+    const contract = jellyfinWriteContract();
+    Object.assign(contract.components.schemas.UpdateUserItemDataDto.properties.PlayCount, {
+      default: 0,
+    });
+    const transport = vi.fn<FetchTransport>(async () => json(contract));
+    const client = new MediaClient('http://jellyfin.test', 'synthetic-key', 'jellyfin', {
+      transport,
+    });
+    try {
+      expect(await client.migrationCapabilities(liveHistoryProbe)).toMatchObject({
+        userData: false,
+      });
+      await expect(
+        client.updateUserData(liveHistoryProbe.userId, liveHistoryProbe.itemId, { Played: true }),
+      ).rejects.toThrow('verified partial user-data contract');
+      expect(transport).toHaveBeenCalledOnce();
+    } finally {
+      await client.close();
+    }
+  });
+
   it('creates the full private playlist atomically with a bounded ordered ID list', async () => {
     const bodies: Record<string, unknown>[] = [];
     const client = new MediaClient('http://jellyfin.test', 'private-key', 'jellyfin', {

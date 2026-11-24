@@ -414,12 +414,8 @@ describe('migration coverage presentation', () => {
     const coverage = screen.getByRole('region', { name: 'Matching coverage' });
     expect(coverage.textContent).toContain('99.6% matched');
     expect(coverage.textContent).toContain('2,978 of 2,991 identifiable source items');
-    expect(coverage.textContent).toContain(
-      '13 identifiable source items skipped: 1 unmatched · 12 ambiguous',
-    );
-    expect(coverage.textContent).toContain(
-      '545 saved-history rows have no verified media identity and are excluded from coverage.',
-    );
+    expect(coverage.textContent).toContain('1 unmatched · 12 ambiguous');
+    expect(coverage.textContent).toContain('545 saved history entries without a media match.');
   });
 
   it('renders empty or unavailable coverage honestly', () => {

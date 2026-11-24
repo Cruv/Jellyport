@@ -199,7 +199,8 @@ describe('additive played and favorite flag transfer', () => {
   it('refuses legacy favorite endpoints when partial user-data updates are unavailable', async () => {
     const markPlayed = vi.fn(),
       markFavorite = vi.fn(),
-      updateUserData = vi.fn();
+      updateUserData = vi.fn(),
+      expectation = vi.fn();
     const details = migrationDetails();
     expect(
       await migrateItemState(
@@ -218,14 +219,20 @@ describe('additive played and favorite flag transfer', () => {
         details,
         () => {},
         () => {},
-        { migration_scope: 'played_favorites' },
+        { migration_scope: 'played_favorites', expectation },
       ),
     ).toBe(0);
     expect(updateUserData).not.toHaveBeenCalled();
     expect(markPlayed).not.toHaveBeenCalled();
     expect(markFavorite).not.toHaveBeenCalled();
-    expect(details.failed_items).toBe(1);
-    expect(details.warnings.join(' ')).toContain('partial user-data');
+    expect(details.failed_items).toBe(0);
+    expect(details.failed_updates).toBeUndefined();
+    expect(details.warnings).toEqual([
+      'Skipped history updates. Jellyfin’s update API could not be verified.',
+    ]);
+    expect(expectation).toHaveBeenCalledExactlyOnceWith(expect.anything(), { IsFavorite: true }, [
+      'IsFavorite',
+    ]);
   });
 
   it('never replays an uncertain combined mutation through a duplicate source edition', async () => {

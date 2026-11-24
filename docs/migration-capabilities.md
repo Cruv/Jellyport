@@ -33,7 +33,7 @@ The item-data write is `POST /UserItems/{itemId}/UserData?userId={userId}` with 
 
 ## Jellyfin compatibility and preservation
 
-Migration verifies Jellyfin's partial-field user-data contract through its API description at `api-docs/openapi.json` on the configured server. A missing or incompatible contract stops the migration before writes. The legacy watched-item endpoint can change counts, dates or resume state as a side effect. A successful write response is followed by independent played/favorite readback. Missing, mismatched or unsupported intended flags make the result partial.
+Migration checks Jellyfin's partial-field user-data contract through `api-docs/openapi.json`. If the API description is unavailable, Jellyport can confirm the standard partial update route on the reviewed Jellyfin server using read-only requests. It verifies the server identity, the route's allowed methods, and the exact matched item's user data. A readable incompatible contract or failed route verification blocks the updates. Only played and favorite flags are sent, followed by independent readback. The report separates skipped history from failed writes and readback mismatches. [Jellyfin's partial update implementation](https://github.com/jellyfin/jellyfin/blob/v10.9.0/Emby.Server.Implementations/Library/UserDataManager.cs#L84-L129)
 
 ## Membership account slots
 

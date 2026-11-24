@@ -368,13 +368,16 @@ describe('manual per-account family exemptions and account access', () => {
   it('treats an explicit administrator disable as manual even for a paid account, preserving it on renewal', async () => {
     await provision('sloop');
     const target = account(1);
-    await service.setAccountAccess({
-      kind: 'jellyfin',
-      user_id: target.Id,
-      disabled: true,
-      expected_username: target.Name,
-      expected_profile_revision: '',
-    });
+    await service.applyHouseholdAccess(
+      await service.reviewHouseholdAccess({
+        kind: 'jellyfin',
+        user_id: target.Id,
+        disabled: true,
+        expected_username: target.Name,
+        expected_profile_revision: '',
+        expected_discord_user_id: owner,
+      }),
+    );
     expect(store.link(owner)?.disabled_by_jellyport).toBe(0);
     expect(store.link(owner)?.pending_disabled).toBeNull();
     writes.length = 0;

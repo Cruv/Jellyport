@@ -25,6 +25,7 @@ import type {
   Page,
   Settings,
 } from './types';
+import type { ReviewedHouseholdAccess } from '../../server/service';
 
 const accessNames = {
   subscription: 'Subscription',
@@ -53,6 +54,9 @@ type ProfileAccount = {
   kind: 'emby' | 'jellyfin';
   account: DirectoryAccount;
 };
+type HouseholdAccessPlan = ReviewedHouseholdAccess['summary'] & { review_token: string };
+type HouseholdAccessAccount = HouseholdAccessPlan['accounts'][number];
+const serverName = (kind: ProfileAccount['kind']) => (kind === 'jellyfin' ? 'Jellyfin' : 'Emby');
 const profileAccounts = (user: DirectoryUser): ProfileAccount[] =>
   (['jellyfin', 'emby'] as const).flatMap((kind) =>
     user[kind]
@@ -67,6 +71,91 @@ const renameAccounts = (user: DirectoryUser) =>
   user.jellyfin.filter((account) => account.protected === false);
 const selectedFirst = (accounts: DirectoryAccount[], selectedId: string) =>
   [...accounts].sort((a, b) => Number(b.id === selectedId) - Number(a.id === selectedId));
+
+const exclusionReasons = {
+  tier: 'Over the account limit',
+  inactive: 'Subscription inactive',
+  protected: 'Protected account',
+};
+
+function HouseholdAccessWarning({
+  plan,
+  busy,
+  close,
+  apply,
+}: {
+  plan: HouseholdAccessPlan;
+  busy: boolean;
+  close: () => void;
+  apply: () => void;
+}) {
+  const eligible = plan.accounts.filter((account) => account.eligible);
+  const excluded = plan.accounts.filter((account) => !account.eligible);
+  const limited = excluded.some((account) => account.exclusion === 'tier');
+  const inactive = excluded.some((account) => account.exclusion === 'inactive');
+  const action = plan.disabled ? 'disable' : 'enable';
+  function accountsList(accounts: HouseholdAccessAccount[], label: string) {
+    return (
+      <ul className="person-workspace-accounts" role="list" aria-label={label}>
+        {accounts.map((account) => (
+          <li key={`${account.kind}:${account.user_id}`}>
+            <strong>
+              {serverName(account.kind)}: {account.username}
+            </strong>{' '}
+            · Slot {account.slot}
+            {account.exclusion && ` · ${exclusionReasons[account.exclusion]}`}
+          </li>
+        ))}
+      </ul>
+    );
+  }
+  return (
+    <Modal
+      title={
+        limited
+          ? 'Subscription account limit'
+          : inactive
+            ? 'Subscription inactive'
+            : 'Protected accounts'
+      }
+      description={
+        limited
+          ? `The current tier includes ${plan.account_limit} ${plan.account_limit === 1 ? 'slot' : 'slots'}.`
+          : undefined
+      }
+      close={close}
+      closeDisabled={busy}
+      footer={
+        <>
+          <button className="btn" type="button" disabled={busy} onClick={close}>
+            {eligible.length ? 'Cancel' : 'Close'}
+          </button>
+          {eligible.length > 0 && (
+            <button className="btn btn-primary" type="button" disabled={busy} onClick={apply}>
+              {busy ? 'Updating…' : `${plan.disabled ? 'Disable' : 'Enable'} eligible accounts`}
+            </button>
+          )}
+        </>
+      }
+    >
+      <div className="form-stack">
+        {eligible.length ? (
+          <section className="field">
+            <h3>Accounts to {action}</h3>
+            {accountsList(eligible, `Accounts to ${action}`)}
+          </section>
+        ) : (
+          <p>No eligible accounts to {action}.</p>
+        )}
+        {excluded.length > 0 && (
+          <Callout title="Excluded accounts" warning>
+            {accountsList(excluded, 'Excluded accounts')}
+          </Callout>
+        )}
+      </div>
+    </Modal>
+  );
+}
 
 export default function UserDirectoryPage({
   settings,
@@ -116,8 +205,8 @@ export default function UserDirectoryPage({
   const [ownerName, setOwnerName] = useState('');
   const [ownerNotes, setOwnerNotes] = useState('');
   const [accessReview, setAccessReview] = useState<DirectoryUser | null>(null);
-  const [accessTarget, setAccessTarget] = useState('');
   const [accessDisabled, setAccessDisabled] = useState(false);
+  const [householdAccessPlan, setHouseholdAccessPlan] = useState<HouseholdAccessPlan | null>(null);
   const [toolAccountId, setToolAccountId] = useState('');
   const [cloning, setCloning] = useState<DirectoryUser | null>(null);
   const [cloneReview, setCloneReview] = useState<AccountCloneReview | null>(null);
@@ -165,6 +254,7 @@ export default function UserDirectoryPage({
     if (busyRef.current) return;
     setEditing(null);
     setAccessReview(null);
+    setHouseholdAccessPlan(null);
     setCloning(null);
     setCloneReview(null);
     setRenaming(null);
@@ -248,6 +338,7 @@ export default function UserDirectoryPage({
     }
   }
   const workspaceUser = accessReview || editing || linking;
+  const linkedAccessOwner = accessReview?.discord_user_id;
   const workspaceAccounts = workspaceUser ? profileAccounts(workspaceUser) : [];
   const selectedWorkspaceAccount = workspaceAccounts.find((item) => item.key === workspaceTarget);
   const workspaceCloneAccounts = workspaceUser
@@ -280,6 +371,7 @@ export default function UserDirectoryPage({
   }
   function clearWorkspace() {
     setAccessReview(null);
+    setHouseholdAccessPlan(null);
     setEditing(null);
     setLinking(null);
     setOwnerReviewing(false);
@@ -364,25 +456,49 @@ export default function UserDirectoryPage({
     setLinking(null);
     setAccessReview(user);
     setWorkspaceTarget(target.key);
-    setAccessTarget(target.key);
     setAccessDisabled(accessDrafts.current.get(target.key) ?? !target.account.disabled);
     setError('');
   }
   function updateAccess(event: FormEvent) {
     event.preventDefault();
-    const target =
-      accessReview && profileAccounts(accessReview).find((item) => item.key === accessTarget);
-    if (!target || !accountReadiness.ready || accessDisabled === target.account.disabled) return;
+    const target = selectedWorkspaceAccount;
+    if (
+      !accessReview ||
+      !target ||
+      !accountReadiness.ready ||
+      (!linkedAccessOwner && accessDisabled === target.account.disabled)
+    )
+      return;
+    const body = {
+      kind: target.kind,
+      user_id: target.account.id,
+      disabled: accessDisabled,
+      expected_username: target.account.name,
+      expected_profile_revision: target.account.profile?.revision || '',
+    };
+    const sectionVersion = sectionGeneration.current.version;
     void run(async (signal) => {
+      if (linkedAccessOwner) {
+        const plan = await api<HouseholdAccessPlan>('/api/accounts/access/review', {
+          method: 'POST',
+          body: { ...body, expected_discord_user_id: linkedAccessOwner },
+          signal,
+        });
+        if (!mounted.current || signal.aborted) return;
+        if (sectionGeneration.current.version !== sectionVersion) {
+          clearWorkspace();
+          return;
+        }
+        if (!plan.accounts.length || plan.accounts.some((account) => !account.eligible)) {
+          setHouseholdAccessPlan(plan);
+          return;
+        }
+        await applyHouseholdAccess(plan, signal);
+        return;
+      }
       await api('/api/accounts/access', {
         method: 'POST',
-        body: {
-          kind: target.kind,
-          user_id: target.account.id,
-          disabled: accessDisabled,
-          expected_username: target.account.name,
-          expected_profile_revision: target.account.profile?.revision || '',
-        },
+        body,
         signal,
       });
       if (!mounted.current || signal.aborted) return;
@@ -392,6 +508,29 @@ export default function UserDirectoryPage({
       );
       await reload();
     });
+  }
+  async function applyHouseholdAccess(plan: HouseholdAccessPlan, signal: AbortSignal) {
+    try {
+      const result = await api<{ disabled: boolean; changed: number }>(
+        '/api/accounts/access/accept',
+        {
+          method: 'POST',
+          body: { review_token: plan.review_token },
+          signal,
+        },
+      );
+      if (!mounted.current || signal.aborted) return;
+      clearWorkspace();
+      notify(
+        result.changed
+          ? `${result.changed} ${result.changed === 1 ? 'account' : 'accounts'} ${result.disabled ? 'disabled' : 'enabled'}.`
+          : 'Household access is already up to date.',
+      );
+      await reload();
+    } catch (reason) {
+      if (mounted.current && !signal.aborted) setHouseholdAccessPlan(null);
+      throw reason;
+    }
   }
   function prepareClone(request: AccountCloneRequest) {
     void run(async (signal) => {
@@ -1089,7 +1228,6 @@ export default function UserDirectoryPage({
       {workspaceUser && !cloning && !renaming && (
         <Modal
           title={`Manage ${workspaceUser.discord_username ? '@' + workspaceUser.discord_username : workspaceAccounts[0]?.account.name || 'account'}`}
-          description="Account access is available immediately. Confirm relationships here only when you need member-based management."
           close={closeWorkspace}
           closeDisabled={busy}
           footer={
@@ -1106,16 +1244,13 @@ export default function UserDirectoryPage({
                     disabled={
                       busy ||
                       !accountReadiness.ready ||
-                      accessDisabled ===
-                        profileAccounts(accessReview).find((target) => target.key === accessTarget)
-                          ?.account.disabled
+                      (!linkedAccessOwner &&
+                        accessDisabled === selectedWorkspaceAccount?.account.disabled)
                     }
                   >
                     {busy
                       ? 'Updating…'
-                      : accessDisabled
-                        ? 'Disable selected account'
-                        : 'Enable selected account'}
+                      : `${accessDisabled ? 'Disable' : 'Enable'} ${linkedAccessOwner ? 'household' : 'selected account'}`}
                   </button>
                 ) : (
                   <button
@@ -1145,20 +1280,37 @@ export default function UserDirectoryPage({
                 ? ` · ${workspaceUser.account_limit} account allowance`
                 : ''}
             </p>
-            {selectedWorkspaceAccount && (
-              <p>
-                <strong>
-                  {selectedWorkspaceAccount.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}:{' '}
-                  {selectedWorkspaceAccount.account.name}
-                </strong>{' '}
-                · {selectedWorkspaceAccount.account.disabled ? 'Disabled' : 'Enabled'}
-              </p>
+            {linkedAccessOwner ? (
+              <ul
+                className="person-workspace-accounts"
+                role="list"
+                aria-label="Linked media accounts"
+              >
+                {workspaceAccounts.map((target) => (
+                  <li key={target.key}>
+                    <strong>
+                      {serverName(target.kind)}: {target.account.name}
+                    </strong>{' '}
+                    · {target.account.disabled ? 'Disabled' : 'Enabled'}
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              selectedWorkspaceAccount && (
+                <p>
+                  <strong>
+                    {serverName(selectedWorkspaceAccount.kind)}:{' '}
+                    {selectedWorkspaceAccount.account.name}
+                  </strong>{' '}
+                  · {selectedWorkspaceAccount.account.disabled ? 'Disabled' : 'Enabled'}
+                </p>
+              )
             )}
-            <small>
-              {workspaceUser.discord_user_id
-                ? 'Confirmed owner links are already available for this person.'
-                : 'No Discord link is required to change this account’s access or Family flag.'}
-            </small>
+            {!workspaceUser.discord_user_id && (
+              <small>
+                No Discord link is required to change this account’s access or Family flag.
+              </small>
+            )}
           </div>
           <Tabs
             id="person-workspace"
@@ -1179,39 +1331,35 @@ export default function UserDirectoryPage({
           {accessReview && (
             <form id={`${workspaceFormId}-access`} className="form-stack" onSubmit={updateAccess}>
               <WorkflowRequirements action={accountAction} compact />
-              <div className="field">
-                <label htmlFor="directory-access-account">Media account</label>
-                <select
-                  id="directory-access-account"
-                  value={accessTarget}
-                  disabled={busy}
-                  onChange={(event) => {
-                    const target = profileAccounts(accessReview).find(
-                      (item) => item.key === event.target.value,
-                    );
-                    if (!target) return;
-                    setAccessTarget(target.key);
-                    setWorkspaceTarget(target.key);
-                    setAccessDisabled(
-                      accessDrafts.current.get(target.key) ?? !target.account.disabled,
-                    );
-                  }}
-                >
-                  {profileAccounts(accessReview).map((target) => (
-                    <option key={target.key} value={target.key}>
-                      {target.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}: {target.account.name}
-                    </option>
-                  ))}
-                </select>
-                <small>
-                  Currently{' '}
-                  {profileAccounts(accessReview).find((target) => target.key === accessTarget)
-                    ?.account.disabled
-                    ? 'disabled'
-                    : 'enabled'}
-                  .
-                </small>
-              </div>
+              {!linkedAccessOwner && (
+                <div className="field">
+                  <label htmlFor="directory-access-account">Media account</label>
+                  <select
+                    id="directory-access-account"
+                    value={workspaceTarget}
+                    disabled={busy}
+                    onChange={(event) => {
+                      const target = workspaceAccounts.find(
+                        (item) => item.key === event.target.value,
+                      );
+                      if (!target) return;
+                      setWorkspaceTarget(target.key);
+                      setAccessDisabled(
+                        accessDrafts.current.get(target.key) ?? !target.account.disabled,
+                      );
+                    }}
+                  >
+                    {workspaceAccounts.map((target) => (
+                      <option key={target.key} value={target.key}>
+                        {target.kind === 'jellyfin' ? 'Jellyfin' : 'Emby'}: {target.account.name}
+                      </option>
+                    ))}
+                  </select>
+                  <small>
+                    Currently {selectedWorkspaceAccount?.account.disabled ? 'disabled' : 'enabled'}.
+                  </small>
+                </div>
+              )}
               <div className="field">
                 <label htmlFor="directory-access-change">Access change</label>
                 <select
@@ -1221,22 +1369,24 @@ export default function UserDirectoryPage({
                   onChange={(event) => {
                     const value = event.target.value === 'disable';
                     setAccessDisabled(value);
-                    accessDrafts.current.set(accessTarget, value);
+                    accessDrafts.current.set(workspaceTarget, value);
                   }}
                 >
-                  <option value="disable">Disable this account</option>
-                  <option value="enable">Enable this account</option>
+                  <option value="disable">
+                    Disable {linkedAccessOwner ? 'household' : 'this account'}
+                  </option>
+                  <option value="enable">
+                    Enable {linkedAccessOwner ? 'household' : 'this account'}
+                  </option>
                 </select>
               </div>
-              <p>
-                {accessDisabled
-                  ? 'Disabling prevents this account from signing in. Its password, watch history, favorites, playlists, and preferences are preserved, so you can enable it again later.'
-                  : 'Enabling restores access for this account with its existing password and media data.'}
-              </p>
-              <small>
-                Only the selected account changes. Its family flag, notes, and linked owner’s access
-                policy remain as saved.
-              </small>
+              {!linkedAccessOwner && (
+                <p>
+                  {accessDisabled
+                    ? 'Disabling prevents this account from signing in. Its password, watch history, favorites, playlists, and preferences are preserved, so you can enable it again later.'
+                    : 'Enabling restores access for this account with its existing password and media data.'}
+                </p>
+              )}
               {error && (
                 <div className="error-block" role="alert">
                   {error}
@@ -1501,6 +1651,16 @@ export default function UserDirectoryPage({
             </div>
           </div>
         </Modal>
+      )}
+      {householdAccessPlan && (
+        <HouseholdAccessWarning
+          plan={householdAccessPlan}
+          busy={busy}
+          close={() => {
+            if (!busy) setHouseholdAccessPlan(null);
+          }}
+          apply={() => void run((signal) => applyHouseholdAccess(householdAccessPlan, signal))}
+        />
       )}
       {preview && (
         <Modal

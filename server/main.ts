@@ -30,6 +30,8 @@ import {
   type ReviewedMigrationTarget,
   type MembershipWorkflowInput,
   type ReviewedMembershipWorkflow,
+  type HouseholdAccessInput,
+  type ReviewedHouseholdAccess,
   type Job,
 } from './service.js';
 import { WorkflowReadiness } from './workflow-readiness.js';
@@ -55,7 +57,7 @@ import {
   sameOrigin,
   WindowLimiter,
 } from './security.js';
-import type { ClientFactory, MediaUser } from './media.js';
+import { abortable, type ClientFactory, type MediaUser } from './media.js';
 import {
   JellyfinAuthClient,
   JellyfinAuthError,
@@ -237,6 +239,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
   const cloneReviews = new CloneReviews();
   const workflowReadiness = new WorkflowReadiness(service);
   const workflowReviews = new WorkflowReviews<ReviewedMembershipWorkflow>();
+  const householdAccessReviews = new WorkflowReviews<ReviewedHouseholdAccess>();
   const acceptingPreviews = new Set<string>();
   const previewContext = () =>
     createHash('sha256')
@@ -316,6 +319,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     },
   });
   service.verifyStripeEntitlement = (fact, check) => stripe.assertEntitlement(fact, check);
+  service.currentStripeAccountEntitlement = (owner) => stripe.currentAccountEntitlement(owner);
   service.finishStripePriceReview = (fact) => stripe.finishPriceReview(fact);
   const discordAuthorityReviews = new DiscordAuthorityReviews(service, stripe);
   service.reviewStripeMigrationMembership = (id, signal, draft) =>
@@ -354,6 +358,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     previews.cancelOwner(sid);
     cloneReviews.cancelOwner(sid);
     workflowReviews.cancelOwner(sid);
+    householdAccessReviews.cancelOwner(sid);
     authenticatedSessions.delete(sid);
     anonymousSessions.delete(sid);
     const owned = addresses.get(value.address);
@@ -1137,6 +1142,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         if (!isDeepStrictEqual(reviewSettings(previous), reviewSettings(settings))) {
           previews.close();
           workflowReviews.clear();
+          householdAccessReviews.clear();
         }
         if (!isDeepStrictEqual(cloneSettings(previous), cloneSettings(settings)))
           cloneReviews.close();
@@ -1194,6 +1200,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         previews.close();
         cloneReviews.close();
         workflowReviews.clear();
+        householdAccessReviews.clear();
         return publicSettings();
       } finally {
         replacingKey = false;
@@ -2518,6 +2525,13 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     },
     async (request) => service.saveAccountProfile(request.body),
   );
+  const accountAccessProperties = {
+    kind: { type: 'string', enum: ['emby', 'jellyfin'] },
+    user_id: id,
+    disabled: { type: 'boolean' },
+    expected_username: { type: 'string', minLength: 1, maxLength: 256 },
+    expected_profile_revision: { type: 'string', maxLength: 128 },
+  };
   app.post<{ Body: Parameters<Service['setAccountAccess']>[0] }>(
     '/api/accounts/access',
     {
@@ -2525,24 +2539,76 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
         body: {
           type: 'object',
           additionalProperties: false,
-          required: [
-            'kind',
-            'user_id',
-            'disabled',
-            'expected_username',
-            'expected_profile_revision',
-          ],
-          properties: {
-            kind: { type: 'string', enum: ['emby', 'jellyfin'] },
-            user_id: id,
-            disabled: { type: 'boolean' },
-            expected_username: { type: 'string', minLength: 1, maxLength: 256 },
-            expected_profile_revision: { type: 'string', maxLength: 128 },
-          },
+          required: Object.keys(accountAccessProperties),
+          properties: accountAccessProperties,
         },
       },
     },
     async (request) => service.setAccountAccess(request.body),
+  );
+  app.post<{ Body: HouseholdAccessInput }>(
+    '/api/accounts/access/review',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: [...Object.keys(accountAccessProperties), 'expected_discord_user_id'],
+          properties: {
+            ...accountAccessProperties,
+            expected_discord_user_id: { type: 'string', pattern: '^[0-9]{5,22}$' },
+          },
+        },
+      },
+    },
+    async (request, reply) => {
+      const read = workflowRequest(request, reply);
+      try {
+        const review = await abortable(
+          service.reviewHouseholdAccess(request.body, read.guard, read.signal),
+          read.signal,
+        );
+        read.guard();
+        return {
+          ...review.summary,
+          ...householdAccessReviews.save(request.cookies[COOKIE]!, read.context, review),
+        };
+      } catch (error) {
+        return read.fail(error);
+      } finally {
+        read.dispose();
+      }
+    },
+  );
+  app.post<{ Body: { review_token: string } }>(
+    '/api/accounts/access/accept',
+    {
+      schema: {
+        body: {
+          type: 'object',
+          additionalProperties: false,
+          required: ['review_token'],
+          properties: { review_token: { type: 'string', format: 'uuid' } },
+        },
+      },
+    },
+    async (request, reply) => {
+      const read = workflowRequest(request, reply);
+      try {
+        read.guard();
+        const review = householdAccessReviews.take(
+          request.cookies[COOKIE]!,
+          read.context,
+          request.body.review_token,
+        );
+        return await service.applyHouseholdAccess(review, read.guard, read.signal);
+      } catch (error) {
+        if (error instanceof ServiceError) throw error;
+        return read.fail(error);
+      } finally {
+        read.dispose();
+      }
+    },
   );
   app.get('/api/user-directory', async () => organization.directory());
   app.get('/api/discord/tag-roles', async () => organization.listTagRoles());
@@ -2812,6 +2878,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<Jellypo
     previews.close();
     cloneReviews.close();
     workflowReviews.clear();
+    householdAccessReviews.clear();
     const identitiesClosed = identities.close();
     await Promise.all([
       stripe.stop(),

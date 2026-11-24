@@ -220,9 +220,17 @@ describe('administrator membership HTTP endpoints', () => {
   });
 
   it('combines exact household accounts, redacted billing evidence and confirmed access changes', async () => {
-    const { app, headers } = await fixture();
+    const { app, headers, servers } = await fixture();
     const { service, store } = app.jellyport;
-    const settings = store.settings();
+    const source = servers.users.emby.find(({ Id }) => Id === 'e-river')!;
+    source.Name = 'River source';
+    source.Policy = { IsAdministrator: false, IsDisabled: false };
+    const settings = {
+      ...store.settings(),
+      emby_url: 'https://emby.example',
+      emby_api_key: 'synthetic-emby-key',
+    };
+    store.saveSettings(settings);
     service.memberships.save(
       {
         discord_user_id: owner,
@@ -300,19 +308,56 @@ describe('administrator membership HTTP endpoints', () => {
     });
     const url = `/api/memberships/${owner}/timeline`;
     expect((await app.inject(url)).statusCode).toBe(401);
-    const access = await app.inject({
+    const input = {
+      kind: 'jellyfin',
+      user_id: 'j-river',
+      disabled: true,
+      expected_username: 'river',
+      expected_profile_revision: '',
+    };
+    expect(
+      (await app.inject({ method: 'POST', url: '/api/accounts/access', headers, payload: input }))
+        .statusCode,
+    ).toBe(400);
+    const review = await app.inject({
       method: 'POST',
-      url: '/api/accounts/access',
+      url: '/api/accounts/access/review',
       headers,
-      payload: {
-        kind: 'jellyfin',
-        user_id: 'j-river',
-        disabled: true,
-        expected_username: 'river',
-        expected_profile_revision: '',
-      },
+      payload: { ...input, expected_discord_user_id: owner },
     });
+    expect(review.statusCode, review.body).toBe(200);
+    expect(review.headers['cache-control']).toBe('no-store');
+    expect(review.json().accounts).toMatchObject([
+      { kind: 'emby', username: 'River source', eligible: true, slot: 1 },
+      { kind: 'jellyfin', username: 'river', eligible: true, slot: 1 },
+    ]);
+    const accept = {
+      method: 'POST' as const,
+      url: '/api/accounts/access/accept',
+      headers,
+      payload: { review_token: review.json().review_token },
+    };
+    const anonymous = await app.inject('/api/session');
+    const otherLogin = await app.inject({
+      method: 'POST',
+      url: '/api/login',
+      headers: {
+        cookie: `jellyport_session=${anonymous.cookies[0]!.value}`,
+        'x-csrf-token': anonymous.json().csrf_token,
+      },
+      payload: { username: 'admin', password: 'private-admin-password' },
+    });
+    expect(otherLogin.statusCode).toBe(200);
+    const otherHeaders = {
+      ...headers,
+      cookie: `jellyport_session=${otherLogin.cookies[0]!.value}`,
+      'x-csrf-token': otherLogin.json().csrf_token,
+    };
+    expect((await app.inject({ ...accept, headers: otherHeaders })).statusCode).toBe(400);
+    const access = await app.inject(accept);
     expect(access.statusCode).toBe(200);
+    expect(access.json()).toEqual({ disabled: true, changed: 2 });
+    expect((await app.inject(accept)).statusCode).toBe(400);
     const response = await app.inject({ url, headers });
     expect(response.statusCode).toBe(200);
     expect(response.headers['cache-control']).toBe('no-store');
@@ -327,6 +372,7 @@ describe('administrator membership HTTP endpoints', () => {
       stripe: { invoice: null },
       milestones: expect.arrayContaining([
         expect.objectContaining({ type: 'access', disabled: true, username: 'river' }),
+        expect.objectContaining({ type: 'access', disabled: true, username: 'River source' }),
         expect.objectContaining({
           type: 'subscription',
           job_id: 'fixture-membership-operation',
@@ -690,6 +736,21 @@ describe('administrator membership HTTP endpoints', () => {
           expected_username: 'river',
           expected_profile_revision: '',
         },
+      },
+      {
+        url: '/api/accounts/access/review',
+        payload: {
+          kind: 'jellyfin',
+          user_id: 'j-river',
+          disabled: true,
+          expected_username: 'river',
+          expected_profile_revision: '',
+          expected_discord_user_id: owner,
+        },
+      },
+      {
+        url: '/api/accounts/access/accept',
+        payload: { review_token: '12345678-1234-4123-8123-123456789abc' },
       },
       {
         url: '/api/memberships/access',

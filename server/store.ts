@@ -1454,6 +1454,17 @@ export class Store {
       .prepare('UPDATE links SET pending_disabled=? WHERE discord_user_id=? AND membership_slot=?')
       .run(disabled === null ? null : Number(disabled), String(discordId), slot);
   }
+  /** An explicit verified change must not erase an unsettled lifecycle write or rebind an identity. */
+  markLinkAccessManual(link: Link): void {
+    const updated = this.db
+      .prepare(
+        `UPDATE links SET disabled_by_jellyport=0 WHERE discord_user_id=?
+        AND membership_slot=? AND remote_id=? AND username=? AND pending_disabled IS NULL`,
+      )
+      .run(link.discord_user_id, link.membership_slot, link.remote_id, link.username);
+    if (updated.changes !== 1)
+      throw new Error('The linked account access changed. Review the household again.');
+  }
   private householdAccessKey(discordId: string, settings: Settings): string {
     const auth = this.authState();
     return createHash('sha256')

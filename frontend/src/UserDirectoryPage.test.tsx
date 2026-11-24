@@ -503,10 +503,10 @@ describe('User directory and Discord organization', () => {
     const { requests } = page();
     fireEvent.click(await screen.findByRole('button', { name: 'Manage Family' }));
     const dialog = screen.getByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('tab', { name: 'Family & notes' }));
     fireEvent.change(within(dialog).getByLabelText('Media account'), {
       target: { value: JSON.stringify(['emby', 'emby-family']) },
     });
-    fireEvent.click(within(dialog).getByRole('tab', { name: 'Family & notes' }));
     expect(within(dialog).getByLabelText('Media account')).toHaveProperty(
       'value',
       JSON.stringify(['emby', 'emby-family']),
@@ -516,10 +516,8 @@ describe('User directory and Discord organization', () => {
       target: { value: 'Keep this in-progress note' },
     });
     fireEvent.click(within(dialog).getByRole('tab', { name: 'Account access' }));
-    expect(within(dialog).getByLabelText('Media account')).toHaveProperty(
-      'value',
-      JSON.stringify(['emby', 'emby-family']),
-    );
+    expect(within(dialog).queryByLabelText('Media account')).toBeNull();
+    expect(within(dialog).getByRole('button', { name: 'Disable household' })).toBeTruthy();
     fireEvent.click(within(dialog).getByRole('tab', { name: 'Family & notes' }));
     expect(within(dialog).getByLabelText('Private owner notes')).toHaveProperty(
       'value',
@@ -1369,8 +1367,25 @@ describe('User directory and Discord organization', () => {
     expect(api).toHaveBeenCalledTimes(2);
   });
 
-  it('requires explicit account access review and disables only the selected exact account', async () => {
-    const { requests, notify } = page();
+  it('disables only the selected exact account when same-name accounts have no confirmed owner', async () => {
+    const requests: { path: string; options?: ApiOptions }[] = [];
+    const api = vi.fn(async (path: string, options?: ApiOptions) => {
+      requests.push({ path, options });
+      return path === '/api/user-directory'
+        ? {
+            users: [
+              {
+                ...users[0],
+                discord_user_id: null,
+                discord_username: null,
+                account_limit: null,
+                access_mode: 'standalone',
+              },
+            ],
+          }
+        : {};
+    }) as Api;
+    const { notify } = page(api);
     fireEvent.click(await accountAction('Manage account access for Family'));
     const dialog = screen.getByRole('dialog');
     expect(within(dialog).getByText('Currently enabled.')).toBeTruthy();
@@ -1402,6 +1417,105 @@ describe('User directory and Discord organization', () => {
             expected_profile_revision: 'emby-profile-revision',
           },
         }),
+      },
+    ]);
+  });
+
+  it('binds a reduced household enable to a warning and its exact accepted review', async () => {
+    const requests: { path: string; options?: ApiOptions }[] = [];
+    const household: DirectoryUser = {
+      ...users[0]!,
+      account_limit: 1,
+      access_mode: 'subscription',
+      jellyfin: [
+        { id: 'jellyfin-primary', name: 'Crew primary', disabled: true, protected: false },
+        { id: 'jellyfin-secondary', name: 'Crew secondary', disabled: true, protected: false },
+      ],
+      emby: [{ id: 'emby-primary', name: 'Crew legacy', disabled: true, protected: false }],
+    };
+    const reviewed = {
+      disabled: false,
+      account_limit: 1,
+      expires_at: new Date(Date.now() + 300_000).toISOString(),
+      accounts: [
+        {
+          kind: 'jellyfin',
+          user_id: 'jellyfin-primary',
+          username: 'Crew primary',
+          slot: 1,
+          disabled: true,
+          eligible: true,
+        },
+        {
+          kind: 'emby',
+          user_id: 'emby-primary',
+          username: 'Crew legacy',
+          slot: 1,
+          disabled: true,
+          eligible: true,
+        },
+        {
+          kind: 'jellyfin',
+          user_id: 'jellyfin-secondary',
+          username: 'Crew secondary',
+          slot: 2,
+          disabled: true,
+          eligible: false,
+          exclusion: 'tier',
+        },
+      ],
+    };
+    let token = 0;
+    const api = vi.fn(async (path: string, options?: ApiOptions) => {
+      requests.push({ path, options });
+      if (path === '/api/user-directory') return { users: [household] };
+      if (path === '/api/accounts/access/review')
+        return { ...reviewed, review_token: `review-${++token}` };
+      if (path === '/api/accounts/access/accept') return { disabled: false, changed: 2 };
+      throw new Error(`Unexpected request ${path}`);
+    }) as Api;
+    page(api);
+    fireEvent.click(await screen.findByRole('button', { name: 'Manage Crew primary' }));
+    const workspace = screen.getByRole('dialog', { name: 'Manage @family_owner' });
+    const enable = within(workspace).getByRole('button', { name: 'Enable household' });
+    expect(within(workspace).queryByLabelText('Media account')).toBeNull();
+    expect(requests.filter((request) => request.options?.method)).toHaveLength(0);
+    fireEvent.click(enable);
+    const warning = await screen.findByRole('dialog', { name: 'Subscription account limit' });
+    const eligible = within(warning).getByRole('list', { name: 'Accounts to enable' });
+    const excluded = within(warning).getByRole('list', { name: 'Excluded accounts' });
+    expect(within(eligible).getAllByRole('listitem')).toHaveLength(2);
+    expect(within(excluded).getAllByRole('listitem')).toHaveLength(1);
+    for (const { username, eligible: included } of reviewed.accounts)
+      expect(within(included ? eligible : excluded).getByText(new RegExp(username))).toBeTruthy();
+    expect(excluded.textContent).toContain('Slot 2 · Over the account limit');
+    expect(requests.filter((request) => request.options?.method)).toEqual([
+      {
+        path: '/api/accounts/access/review',
+        options: expect.objectContaining({
+          method: 'POST',
+          body: {
+            kind: 'jellyfin',
+            user_id: 'jellyfin-primary',
+            disabled: false,
+            expected_username: 'Crew primary',
+            expected_profile_revision: '',
+            expected_discord_user_id: discordId,
+          },
+        }),
+      },
+    ]);
+    fireEvent.click(within(warning).getByRole('button', { name: /Cancel|Back/i }));
+    expect(screen.queryByRole('dialog', { name: 'Subscription account limit' })).toBeNull();
+    expect(requests.some((request) => request.path.endsWith('/accept'))).toBe(false);
+    fireEvent.click(await within(workspace).findByRole('button', { name: 'Enable household' }));
+    const renewed = await screen.findByRole('dialog', { name: 'Subscription account limit' });
+    fireEvent.click(within(renewed).getByRole('button', { name: 'Enable eligible accounts' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(requests.filter((request) => request.path.endsWith('/accept'))).toEqual([
+      {
+        path: '/api/accounts/access/accept',
+        options: expect.objectContaining({ method: 'POST', body: { review_token: 'review-2' } }),
       },
     ]);
   });

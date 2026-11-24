@@ -1918,11 +1918,23 @@ export class StripeIntegration {
   finishPriceReview(fact: StripeEntitlementFact): void {
     this.entitlements.finish(fact, true);
   }
-  assertEntitlement(fact: StripeEntitlementFact, check?: StripeEntitlementCheck): void {
+  /** A current verified decision can restrict manual restoration during the next read-only sync. */
+  currentAccountEntitlement(discordId: string): StripeEntitlementFact | undefined {
+    const fact = this.entitlements.currentForOwner(discordId);
+    if (!fact) return undefined;
+    try {
+      this.assertEntitlementEvidence(fact, true);
+      return structuredClone(fact);
+    } catch (error) {
+      if (!(error instanceof ServiceError)) throw error;
+      return undefined;
+    }
+  }
+  private assertEntitlementEvidence(fact: StripeEntitlementFact, allowDuringSync = false): void {
     this.scope();
     if (
       this.stopped ||
-      this.validatingBilling ||
+      (this.validatingBilling && !allowDuringSync) ||
       this.controller?.signal.aborted ||
       this.state.generation !== fact.generation ||
       this.state.last_error ||
@@ -1941,6 +1953,9 @@ export class StripeIntegration {
       fact,
       stripeAuthority(this.state.links, this.state.price_tiers, this.store),
     );
+  }
+  assertEntitlement(fact: StripeEntitlementFact, check?: StripeEntitlementCheck): void {
+    this.assertEntitlementEvidence(fact);
     if (fact.action === 'subscribe' && !check?.evidenceOnly) {
       const cutover = this.state.price_cutovers?.find(({ price_id }) => price_id === fact.price_id);
       // The cached review cannot prove that a later winning price is unrelated to a remap.

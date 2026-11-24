@@ -378,6 +378,7 @@ export const test = base.extend<{ admin: AdminFixture; mutations: string[] }>({
           '/api/memberships/workflow/review',
           '/api/workflow-readiness/refresh',
           '/api/accounts/review',
+          '/api/accounts/access/review',
         ].includes(path);
       if (path.startsWith('/api/') && !['GET', 'HEAD'].includes(request.method()) && !workflowRead)
         requests.push(`${request.method()} ${path}`);

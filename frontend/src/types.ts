@@ -676,6 +676,15 @@ export interface ApiOptions {
   signal?: AbortSignal;
   keepalive?: boolean;
 }
+export class ApiResponseError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    cause: unknown,
+  ) {
+    super(message, { cause });
+  }
+}
 export type Api = <T>(path: string, options?: ApiOptions) => Promise<T>;
 export type Notify = (message: string, error?: boolean) => void;
 export const activeJob = (job: Job) => ['queued', 'running'].includes(job.status);

@@ -22,6 +22,31 @@ export interface VerificationEvaluation {
   identity_mismatch?: boolean;
 }
 
+/** Skipped fields never become verification expectations or failed requests. */
+export function migrationReadback(scope: MigrationScope) {
+  const expectations = new Map<string, VerificationExpectation[]>();
+  const skipped = new Map<string, Set<string>>();
+  return {
+    expectations,
+    capture(target: MediaItem, patch: MediaUserDataPatch, unsupported: string[]) {
+      if (unsupported.length) {
+        const fields = skipped.get(target.Id) ?? new Set<string>();
+        for (const field of unsupported) fields.add(field);
+        skipped.set(target.Id, fields);
+        return;
+      }
+      const values = expectations.get(target.Id) ?? [];
+      values.push(captureExpectation(target, patch, scope));
+      expectations.set(target.Id, values);
+    },
+    skippedFields() {
+      let count = 0;
+      for (const fields of skipped.values()) count += fields.size;
+      return count;
+    },
+  };
+}
+
 const fieldValue = (value: unknown): boolean | undefined =>
   typeof value === 'boolean' ? value : undefined;
 

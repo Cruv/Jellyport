@@ -313,16 +313,107 @@ test('verified high matching coverage succeeds while failed writes stay in revie
   const coverage = details.getByRole('region', { name: 'Matching coverage', exact: true });
   await expect(coverage).toContainText('96.0% matched');
   await expect(coverage).toContainText('480 of 500 identifiable source items');
-  await expect(coverage).toContainText(
-    '20 identifiable source items skipped: 15 unmatched · 5 ambiguous',
-  );
-  await expect(coverage).toContainText(
-    '120 saved-history rows have no verified media identity and are excluded from coverage.',
-  );
+  await expect(coverage).toContainText('15 unmatched · 5 ambiguous');
+  await expect(coverage).toContainText('120 saved history entries without a media match.');
   await coverage.scrollIntoViewIfNeeded();
   await expectContainedLayout(page);
   await page.screenshot({ path: info.outputPath('matching-success-coverage.png'), fullPage: true });
   expect(imports.writes).toEqual([]);
+  expect(imports.userDataWrites).toEqual([]);
+  expect(imports.accountWrites).toEqual([]);
+});
+
+test('a legacy blocked history report shows skipped changes and matching coverage separately', async ({
+  page,
+  imports,
+}, info) => {
+  const time = new Date().toISOString();
+  const job: Job = {
+    id: 'synthetic-blocked-history-migration',
+    kind: 'migrate',
+    status: 'partial',
+    migration_scope: 'played_favorites',
+    created_at: time,
+    updated_at: time,
+    started_at: time,
+    finished_at: time,
+    progress: { processed: 1, total: 1 },
+    results: [
+      {
+        username: 'Synthetic blocked history member',
+        status: 'partial',
+        created: false,
+        target_user_id: destinationMember,
+        source_items: 920,
+        matched: 900,
+        unmatched: 15,
+        ambiguous: 5,
+        applied: 0,
+        already_played: 18,
+        migration_outcome: { version: 1, execution: 'needs_review', unresolved_source_history: 19 },
+        data: {
+          ...migrationDetails(),
+          failed_items: 882,
+          failed_updates: [
+            { target_id: movieId, item_type: 'Movie', error: 'Synthetic skipped item' },
+          ],
+          write_metrics: {
+            attempts: 0,
+            succeeded: 0,
+            failed: 0,
+            cumulative_ms: 0,
+            max_ms: 0,
+            peak_in_flight: 0,
+          },
+          verification: {
+            checked: 882,
+            verified: 0,
+            preserved_newer: 0,
+            missing: 0,
+            mismatched: 882,
+            unsupported_fields: 882,
+          },
+          warnings: [
+            '19 saved history entries have no verified media identity. They remain unresolved and were not assumed obsolete or migrated.',
+            'Jellyfin’s partial user-data API could not be verified. Check access to /api-docs/openapi.json before retrying. Played and favorite flags were not changed.',
+            'Played and favorite updates require Jellyfin’s partial user-data API. Check its API description at /api-docs/openapi.json. Legacy endpoints can change unrelated personal data.',
+            'Failed-update details are limited to 200 items. The full failed-item count is shown.',
+            'Independent Jellyfin readback did not verify every intended history field. Review missing, mismatched and unsupported counts before retrying.',
+          ],
+        },
+      },
+    ],
+  };
+  imports.app.jellyport.store.saveJob(job);
+  await page.goto('/#/activity');
+  const row = page.getByRole('row').filter({ hasText: 'Synthetic blocked history member' });
+  await expect(row).toContainText('Needs review');
+  await row.getByRole('button', { name: 'View operation details', exact: true }).click();
+  const details = page.getByRole('dialog', { name: 'Migration details', exact: true });
+  const skipCount = details.getByText('882 changes skipped', { exact: true });
+  const warning = details.getByText(
+    'Skipped history updates. Jellyfin’s update API could not be verified.',
+    { exact: true },
+  );
+  await expect(skipCount).toBeVisible();
+  await expect(warning).toBeVisible();
+  await expect(
+    details.getByText(/882 (mismatched|failed|unsupported)|api-docs|Independent.*verification/),
+  ).toHaveCount(0);
+  const coverage = details.getByRole('region', { name: 'Matching coverage', exact: true });
+  await expect(coverage).toContainText('900 of 920 identifiable source items');
+  await expect(coverage).toContainText('15 unmatched · 5 ambiguous');
+  await expect(coverage).toContainText('19 saved history entries without a media match.');
+  expect((await warning.boundingBox())!.y).toBeLessThan((await coverage.boundingBox())!.y);
+  const technical = details.getByText('Technical details', { exact: true });
+  const writes = details.getByText('write requests: 0 attempted', { exact: false });
+  await expect(technical).toBeVisible();
+  await expect(writes).toBeHidden();
+  await warning.scrollIntoViewIfNeeded();
+  await expectContainedLayout(page);
+  await page.screenshot({ path: info.outputPath('blocked-history-report.png'), fullPage: true });
+  await technical.click();
+  await expect(writes).toBeVisible();
   expect(imports.userDataWrites).toEqual([]);
   expect(imports.accountWrites).toEqual([]);
 });

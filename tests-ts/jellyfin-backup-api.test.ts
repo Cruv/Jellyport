@@ -87,6 +87,24 @@ describe('native Jellyfin backup API', () => {
     ).toEqual({ ...projected, metadata: true, trickplay: true, subtitles: true });
   });
 
+  it('selects importable archives from a native list containing other valid backups', async () => {
+    const database = nativeManifest();
+    const inventory = [
+      { ...database, Path: '/synthetic-private/copied-backup.zip' },
+      database,
+      {
+        ...database,
+        Path: '/synthetic-private/jellyfin-backup-20261019021530.zip',
+        Options: { ...database.Options, Database: false, Metadata: true },
+      },
+    ];
+    const transport = vi.fn(async () => json(inventory));
+    const media = client(transport);
+    await expect(media.jellyfinBackups('catalog-import')).resolves.toEqual([projected]);
+    await expect(media.jellyfinBackups()).rejects.toThrow('invalid backup information');
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     [undefined, undefined],
     [99, 'malformed\nlabel'],
@@ -253,6 +271,13 @@ describe('strict native backup observation validation', () => {
   it('rejects duplicate names and overlarge manifest lists before adoption', () => {
     expect(() => parseJellyfinBackups([nativeManifest(), nativeManifest()])).toThrow(MediaError);
     expect(() => parseJellyfinBackups(Array(10_001).fill(nativeManifest()))).toThrow(MediaError);
+  });
+
+  it('rejects malformed rows and conflicting archive names during manual selection too', () => {
+    const database = nativeManifest();
+    const duplicate = { ...database, Options: { ...database.Options, Database: false } };
+    expect(() => parseJellyfinBackups([database, duplicate], 'catalog-import')).toThrow(MediaError);
+    expect(() => parseJellyfinBackups([database, null], 'catalog-import')).toThrow(MediaError);
   });
 
   it('accepts exactly ten thousand distinct bounded manifest observations', () => {

@@ -26,21 +26,26 @@ const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 const invalid = () => new MediaError('Jellyfin returned invalid backup information.');
 
-export function jellyfinBackupOptions(value: unknown): JellyfinBackupOptions | undefined {
+function nativeBackupOptions(value: unknown) {
   if (
     !object(value) ||
-    value.Database !== true ||
+    typeof value.Database !== 'boolean' ||
     typeof value.Metadata !== 'boolean' ||
     typeof value.Trickplay !== 'boolean' ||
     typeof value.Subtitles !== 'boolean'
   )
     return;
   return {
-    database: true,
+    database: value.Database,
     metadata: value.Metadata,
     trickplay: value.Trickplay,
     subtitles: value.Subtitles,
   };
+}
+
+export function jellyfinBackupOptions(value: unknown): JellyfinBackupOptions | undefined {
+  const options = nativeBackupOptions(value);
+  return options?.database ? { ...options, database: true } : undefined;
 }
 
 export function validJellyfinBackupOptions(value: unknown): value is JellyfinBackupOptions {
@@ -114,7 +119,7 @@ function createdAt(value: unknown): string {
   return new Date(time).toISOString();
 }
 
-export function parseJellyfinBackupManifest(value: unknown): JellyfinBackupManifest {
+function parseNativeBackupManifest(value: unknown) {
   if (
     !object(value) ||
     typeof value.Path !== 'string' ||
@@ -123,8 +128,8 @@ export function parseJellyfinBackupManifest(value: unknown): JellyfinBackupManif
   )
     throw invalid();
   const name = value.Path.split(/[\\/]/).at(-1);
-  const options = jellyfinBackupOptions(value.Options);
-  if (!validJellyfinBackupName(name) || !options) throw invalid();
+  const options = nativeBackupOptions(value.Options);
+  if (!name?.endsWith('.zip') || !options) throw invalid();
   const serverVersion = snapshotVersionProvenance(value.ServerVersion);
   const engineVersion = snapshotVersionProvenance(value.BackupEngineVersion);
   return {
@@ -136,15 +141,32 @@ export function parseJellyfinBackupManifest(value: unknown): JellyfinBackupManif
   };
 }
 
-export function parseJellyfinBackups(value: unknown): JellyfinBackupManifest[] {
+export function parseJellyfinBackupManifest(value: unknown): JellyfinBackupManifest {
+  const manifest = parseNativeBackupManifest(value);
+  if (!manifest.database || !validJellyfinBackupName(manifest.name)) throw invalid();
+  return { ...manifest, database: true };
+}
+
+export function parseJellyfinBackups(
+  value: unknown,
+  scope?: 'catalog-import',
+): JellyfinBackupManifest[] {
   if (!Array.isArray(value) || value.length > MAX_ENTRIES) throw invalid();
   const names = new Set<string>();
-  return value.map((entry) => {
-    const parsed = parseJellyfinBackupManifest(entry);
+  const matches: JellyfinBackupManifest[] = [];
+  for (const entry of value) {
+    const parsed = parseNativeBackupManifest(entry);
     if (names.has(parsed.name)) throw invalid();
     names.add(parsed.name);
-    return parsed;
-  });
+    if (!parsed.database || !validJellyfinBackupName(parsed.name)) {
+      // Jellyfin lists renamed archives and backups without a database as well.
+      // Neither can be selected by the catalog worker's canonical basename.
+      if (scope === 'catalog-import') continue;
+      throw invalid();
+    }
+    matches.push({ ...parsed, database: true });
+  }
+  return matches;
 }
 
 export function parseJellyfinBackupTasks(value: unknown): JellyfinBackupTask[] {

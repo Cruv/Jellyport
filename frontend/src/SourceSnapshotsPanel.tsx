@@ -24,7 +24,7 @@ export default function SourceSnapshotsPanel({
   demo: boolean;
   active?: boolean;
 }) {
-  const { status, busy, loading, error, uncertain, stale, load, change } =
+  const { status, busy, loading, error, uncertain, lookingForImport, stale, load, change } =
     useImportWorkflow<SourceSnapshotStatus>({
       api,
       notify,
@@ -58,8 +58,8 @@ export default function SourceSnapshotsPanel({
         : 'Saved database captures cleared.',
       kind === 'import'
         ? pluginBackup
-          ? 'Backup import could not start. Check the backup folder and refresh status.'
-          : 'Database capture could not start. Check the read-only source mount and refresh status.'
+          ? 'Backup import was rejected.'
+          : 'Database capture was rejected.'
         : 'Saved captures could not be cleared. A capture or migration may still be using them. Refresh status and try again.',
     );
   }
@@ -152,6 +152,7 @@ export default function SourceSnapshotsPanel({
           error={error}
           stale={stale}
           uncertain={uncertain}
+          lookingForImport={lookingForImport}
           initialLabel="Loading Emby history status…"
           runningLabel={pluginBackup ? 'Importing Emby backup…' : 'Capturing Emby database…'}
           progressLabel={pluginBackup ? 'Backup import progress' : 'Database capture progress'}

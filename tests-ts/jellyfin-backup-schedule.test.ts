@@ -310,7 +310,7 @@ describe('scheduled native Jellyfin backup creation', () => {
     await f.manager.refresh();
     expect((await f.requests())[0]!.expected_backup).toEqual(expectedBackup(f.old));
     expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
-    expect(f.client.jellyfinBackups).toHaveBeenCalledOnce();
+    expect(f.client.jellyfinBackups).toHaveBeenCalledExactlyOnceWith('catalog-import');
     expect((await f.manager.status()).config).toEqual(saved.config);
   });
 
@@ -449,6 +449,24 @@ describe('scheduled native Jellyfin backup creation', () => {
     f.client.jellyfinBackups.mockResolvedValue([]);
     await f.heartbeat();
     await expect(f.manager.refresh()).rejects.toThrow('No completed Jellyfin backup');
+    expect(await f.requests()).toEqual([]);
+    expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
+  });
+
+  it('records a safe native list failure while retaining the previously usable catalog', async () => {
+    const f = await fixture();
+    const previous = await f.seedGood();
+    const detail = 'Jellyfin rejected the request (HTTP 403).';
+    f.client.jellyfinBackups.mockRejectedValueOnce(new MediaError(detail, 403));
+    await f.heartbeat();
+    await expect(f.manager.refresh()).rejects.toThrow(detail);
+    expect(await f.manager.status()).toMatchObject({
+      last_outcome: 'failed',
+      last_error: detail,
+      running: false,
+      usable: true,
+      record: { id: previous.id },
+    });
     expect(await f.requests()).toEqual([]);
     expect(f.client.createJellyfinBackup).not.toHaveBeenCalled();
   });

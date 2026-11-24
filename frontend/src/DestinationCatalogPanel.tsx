@@ -25,7 +25,7 @@ export default function DestinationCatalogPanel({
   active?: boolean;
 }) {
   const [confirmStopped, setConfirmStopped] = useState(false);
-  const { status, busy, loading, error, uncertain, stale, load, change } =
+  const { status, busy, loading, error, uncertain, lookingForImport, stale, load, change } =
     useImportWorkflow<DestinationCatalogStatus>({
       api,
       notify,
@@ -67,7 +67,7 @@ export default function DestinationCatalogPanel({
         ? 'Jellyfin backup import started. You can follow its status here.'
         : 'Saved Jellyfin matching catalog cleared.',
       kind === 'import'
-        ? 'Jellyfin backup import could not start. Check the completed backup and refresh status.'
+        ? 'Jellyfin backup import was rejected.'
         : 'The matching catalog could not be cleared. An import or migration may still be using it. Refresh status and try again.',
     );
   }
@@ -182,6 +182,7 @@ export default function DestinationCatalogPanel({
           error={error}
           stale={stale}
           uncertain={uncertain}
+          lookingForImport={lookingForImport}
           initialLabel="Loading Jellyfin catalog status…"
           runningLabel={
             preparation?.phase === 'creating'

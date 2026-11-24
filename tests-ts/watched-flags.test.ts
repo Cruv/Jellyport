@@ -224,20 +224,65 @@ describe('strict public played-flag writer', () => {
       expect(updateUserData).not.toHaveBeenCalled();
       expect(markPlayed).not.toHaveBeenCalled();
       expect(markFavorite).not.toHaveBeenCalled();
-      expect(details.failed_items).toBe(1);
+      expect(details.failed_items).toBe(0);
       expect(details.write_metrics).toMatchObject({ attempts: 0, succeeded: 0, failed: 0 });
-      expect(details.failed_updates).toEqual([
-        {
-          target_id: 'target-0',
-          item_type: 'Movie',
-          error: expect.stringContaining('partial user-data'),
-        },
+      expect(details.failed_updates).toBeUndefined();
+      expect(details.warnings).toEqual([
+        'Skipped history updates. Jellyfin’s update API could not be verified.',
       ]);
-      expect(details.warnings.join(' ')).toContain('partial user-data');
       expect(details.warnings.join(' ')).not.toContain('PRIVATE_RAW_FAILURE');
       expect(expectation).toHaveBeenCalledWith(expect.anything(), { Played: true }, ['Played']);
     },
   );
+
+  it('reports one capability issue across a large history without manufacturing failed writes', async () => {
+    const selected = plan(442);
+    selected.matches.at(-1)!.target.UserData = { Played: true };
+    const updateUserData = vi.fn(async () => {}),
+      before_write = vi.fn(async () => {}),
+      expectation = vi.fn(),
+      progress = vi.fn();
+    const details = migrationDetails();
+    await migrateItemState(
+      client({ updateUserData }),
+      'user',
+      selected,
+      details,
+      () => {},
+      () => {},
+      { capabilities: null, before_write, expectation, progress },
+    );
+    expect(updateUserData).not.toHaveBeenCalled();
+    expect(before_write).not.toHaveBeenCalled();
+    expect(details.failed_items).toBe(0);
+    expect(details.failed_updates).toBeUndefined();
+    expect(details.warnings).toEqual([
+      'Skipped history updates. Jellyfin’s update API could not be verified.',
+    ]);
+    expect(expectation.mock.calls.filter(([, , unsupported]) => unsupported.length)).toHaveLength(
+      441,
+    );
+    expect(expectation).toHaveBeenCalledWith(selected.matches.at(-1)!.target, {}, []);
+    expect(progress).toHaveBeenLastCalledWith(442, 442, 0);
+  });
+
+  it('leaves an already watched history verifiable when capability lookup fails', async () => {
+    const selected = plan(1);
+    selected.matches[0]!.target.UserData = { Played: true };
+    const expectation = vi.fn(),
+      details = migrationDetails();
+    await migrateItemState(
+      client(),
+      'user',
+      selected,
+      details,
+      () => {},
+      () => {},
+      { capabilities: null, expectation },
+    );
+    expect(details.warnings).toEqual([]);
+    expect(expectation).toHaveBeenCalledExactlyOnceWith(selected.matches[0]!.target, {}, []);
+  });
 
   it('deduplicates source editions to one mutation per destination and still captures every expectation', async () => {
     const selected = plan(100);

@@ -328,12 +328,7 @@ describe('Saved Emby database capture settings', () => {
     };
     render(<SourceSnapshotsPanel api={api} notify={vi.fn()} demo={false} />);
     fireEvent.click(await screen.findByRole('button', { name: 'Import latest backup' }));
-    await screen.findByRole('alert');
-    expect(
-      screen.getByText(
-        'Backup import could not start. Check the backup folder and refresh status.',
-      ),
-    ).toBeTruthy();
+    await screen.findByText('Looking for the import…');
     expect(screen.getByText('All Emby users')).toBeTruthy();
     expect(screen.queryByText('PRIVATE_BACKUP_PATH')).toBeNull();
   });

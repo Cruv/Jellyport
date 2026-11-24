@@ -3,6 +3,7 @@ import { StrictMode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { ImportStatus, useImportClock, useImportWorkflow } from './ImportWorkflow';
+import { ApiResponseError } from './types';
 import type {
   Api,
   ApiOptions,
@@ -57,6 +58,7 @@ function Harness({
         error={workflow.error}
         stale={workflow.stale}
         uncertain={workflow.uncertain}
+        lookingForImport={workflow.lookingForImport}
       />
       <button
         onClick={() => void workflow.load(true)}
@@ -243,18 +245,18 @@ describe('shared import lifecycle', () => {
         writes++;
         throw new Error('PRIVATE_BACKUP_PATH');
       }
-      if (++reads === 2) throw new Error('PRIVATE_NETWORK_DETAIL');
+      if ([2, 3].includes(++reads)) throw new Error('PRIVATE_NETWORK_DETAIL');
       return idle as T;
     };
     render(<Harness api={api} />);
     await act(async () => {});
     fireEvent.click(screen.getByRole('button', { name: 'Import' }));
     await act(async () => {});
-    expect(screen.getByText(/start request may have been accepted/)).toBeTruthy();
+    expect(screen.getByText('Looking for the import…')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Import' })).toHaveProperty('disabled', true);
     fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
     await act(async () => {});
-    expect(screen.getByText(/Showing the last known status/)).toBeTruthy();
+    expect(screen.getByRole('alert').textContent).toBe('Status refresh failed.');
     expect(screen.getByRole('button', { name: 'Import' })).toHaveProperty('disabled', true);
     fireEvent.click(screen.getByRole('button', { name: 'Import' }));
     expect(writes).toBe(1);
@@ -262,6 +264,115 @@ describe('shared import lifecycle', () => {
     await act(async () => {});
     expect(screen.getByRole('button', { name: 'Import' })).toHaveProperty('disabled', false);
     expect(screen.queryByText(/PRIVATE_/)).toBeNull();
+  });
+
+  it('reconciles a lost accepted response with a later status read without posting twice', async () => {
+    vi.useFakeTimers();
+    const previous = {
+      ...idle,
+      last_attempt_at: '2026-10-15T08:00:00Z',
+      last_finished_at: '2026-10-15T08:00:04Z',
+      last_outcome: 'succeeded',
+    };
+    let reads = 0,
+      writes = 0;
+    const api: Api = async <T,>(_path: string, options?: ApiOptions) => {
+      if (options?.method === 'POST') {
+        writes++;
+        throw new Error('PRIVATE_LOST_RESPONSE');
+      }
+      return (
+        ++reads < 3 ? previous : { ...idle, running: true, last_attempt_at: '2026-10-15T09:00:00Z' }
+      ) as T;
+    };
+    const notify = vi.fn();
+    render(<Harness api={api} notify={notify} />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: 'Import' }));
+    await act(async () => {});
+    expect(reads).toBe(2);
+    expect(screen.getByText('Completed')).toBeTruthy();
+    expect(screen.getByText('Looking for the import…')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Import' })).toHaveProperty('disabled', true);
+    await act(async () => vi.advanceTimersByTimeAsync(2000));
+    expect(screen.getByText('Import running…')).toBeTruthy();
+    expect(screen.queryByText('Looking for the import…')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(notify).not.toHaveBeenCalled();
+    expect(writes).toBe(1);
+  });
+
+  it('holds an unconfirmed start when idle status remains unchanged through bounded polling', async () => {
+    vi.useFakeTimers();
+    let reads = 0;
+    const api: Api = async <T,>(_path: string, options?: ApiOptions) => {
+      if (options?.method) throw new Error('PRIVATE_LOST_RESPONSE');
+      reads++;
+      return idle as T;
+    };
+    render(<Harness api={api} />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: 'Import' }));
+    await act(async () => {});
+    await act(async () => vi.advanceTimersByTimeAsync(8000));
+    expect(
+      screen.getByText('Start not confirmed. Refresh status before trying again.'),
+    ).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Import' })).toHaveProperty('disabled', true);
+    expect(screen.queryByRole('alert')).toBeNull();
+    const observed = reads;
+    await act(async () => vi.advanceTimersByTimeAsync(8000));
+    expect(reads).toBe(observed);
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+    await act(async () => {});
+    expect(screen.getByRole('button', { name: 'Import' })).toHaveProperty('disabled', false);
+  });
+
+  it('lets the operator recover when the first reconciliation read hangs', async () => {
+    vi.useFakeTimers();
+    const late = deferred<ImportWorkflowStatus>();
+    let reads = 0;
+    let reconciliation: AbortSignal | undefined;
+    const api: Api = async <T,>(_path: string, options?: ApiOptions) => {
+      if (options?.method) throw new Error('PRIVATE_LOST_RESPONSE');
+      if (++reads === 2) {
+        reconciliation = options?.signal;
+        return (await late.promise) as T;
+      }
+      return idle as T;
+    };
+    render(<Harness api={api} />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: 'Import' }));
+    await act(async () => {});
+    expect(screen.getByText('Looking for the import…')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Refresh status' })).toHaveProperty('disabled', true);
+    await act(async () => vi.advanceTimersByTimeAsync(8000));
+    expect(reconciliation?.aborted).toBe(true);
+    expect(
+      screen.getByText('Start not confirmed. Refresh status before trying again.'),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh status' }));
+    await act(async () => late.resolve({ ...idle, running: true }));
+    expect(screen.getByRole('button', { name: 'Import' })).toHaveProperty('disabled', false);
+    expect(screen.queryByText('Import running…')).toBeNull();
+  });
+
+  it('renders one known rejection beside the last confirmed status without a failure toast', async () => {
+    const detail = 'A backup import or capture is already running. Wait for it to finish.';
+    const api: Api = async <T,>(_path: string, options?: ApiOptions) => {
+      if (options?.method) throw new ApiResponseError(detail, 400, { detail });
+      return { ...idle, last_outcome: 'succeeded' } as T;
+    };
+    const notify = vi.fn();
+    render(<Harness api={api} notify={notify} />);
+    await act(async () => {});
+    fireEvent.click(screen.getByRole('button', { name: 'Import' }));
+    await act(async () => {});
+    expect(screen.getByRole('alert').textContent).toBe(detail);
+    expect(screen.getByText('Completed')).toBeTruthy();
+    expect(screen.queryByText('Looking for the import…')).toBeNull();
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it('does not poll hidden panels, refreshes on return, and never replays an import', async () => {

@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { readOperationStatus } from './operation-polling';
+import { ApiResponseError } from './types';
 import type {
   Api,
   ApiOptions,
@@ -114,6 +116,31 @@ export function useImportClock(deadlines: string[], active: boolean) {
 }
 
 type ChangeKind = 'import' | 'clear' | 'schedule' | 'backup-acknowledge' | 'backup-retention';
+type PendingImportStart = {
+  lastAttempt: ImportWorkflowStatus['last_attempt_at'];
+  lastFinish: ImportWorkflowStatus['last_finished_at'];
+  rejection?: string;
+  pollUntil: number;
+};
+
+function importRejection(error: unknown, fallback: string): string | undefined {
+  // A browser/network timeout can also occur after admission. A definite HTTP
+  // rejection supplies actionable detail when it came from Jellyport's API.
+  if (
+    !(error instanceof ApiResponseError) ||
+    error.status < 400 ||
+    error.status >= 500 ||
+    error.status === 408 ||
+    error.status === 425
+  )
+    return;
+  const body = error.cause;
+  const detail = typeof body === 'object' && body && 'detail' in body ? body.detail : undefined;
+  return typeof detail === 'string' && detail.length <= 500 && !/[\x00-\x1f\x7f]/.test(detail)
+    ? detail
+    : fallback;
+}
+
 /** Own one read or mutation at a time; hiding a panel pauses reads, not accepted server work. */
 export function useImportWorkflow<T extends ImportWorkflowStatus>({
   api,
@@ -134,7 +161,7 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
   const [busy, setBusy] = useState<ChangeKind | ''>('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [uncertain, setUncertain] = useState(false);
+  const [recovery, setRecovery] = useState<'looking' | 'unconfirmed' | ''>('');
   const [stale, setStale] = useState(false);
   const notifyRef = useRef(notify);
   notifyRef.current = notify;
@@ -145,6 +172,7 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
   const version = useRef(0);
   const read = useRef<AbortController | null>(null);
   const mutation = useRef<AbortController | null>(null);
+  const pendingStart = useRef<PendingImportStart | null>(null);
 
   useEffect(() => {
     mounted.current = true;
@@ -154,7 +182,8 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
     setLoading(false);
     setError('');
     setStale(false);
-    setUncertain(false);
+    setRecovery('');
+    pendingStart.current = null;
     return () => {
       mounted.current = false;
       version.current++;
@@ -172,17 +201,31 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
       setLoading(true);
       if (manual) notifyRef.current('Refreshing status…');
       try {
-        const value = await api<T>(path, { signal: controller.signal });
+        const value = pendingStart.current
+          ? await readOperationStatus<T>(api, path, controller.signal)
+          : await api<T>(path, { signal: controller.signal });
         if (!mounted.current || controller.signal.aborted || requestVersion !== version.current)
           return;
         setStatus(value);
-        setError('');
         setStale(false);
-        setUncertain(false);
+        const pending = pendingStart.current;
+        if (pending) {
+          const observed =
+            value.running ||
+            value.last_attempt_at !== pending.lastAttempt ||
+            value.last_finished_at !== pending.lastFinish;
+          if (observed || pending.rejection !== undefined || manual) {
+            pendingStart.current = null;
+            setRecovery('');
+            setError(observed ? '' : (pending.rejection ?? ''));
+          } else if (Date.now() >= pending.pollUntil) setRecovery('unconfirmed');
+        } else setError('');
         if (manual) notifyRef.current('Status refreshed.');
       } catch {
         if (mounted.current && !controller.signal.aborted && requestVersion === version.current) {
-          setError(statusError);
+          const pending = pendingStart.current;
+          setError(pending?.rejection ?? (!pending || manual ? statusError : ''));
+          if (pending && Date.now() >= pending.pollUntil) setRecovery('unconfirmed');
           setStale(true);
           if (manual) notifyRef.current(statusError, true);
         }
@@ -219,7 +262,7 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
     // This polls Jellyport's local status, never the media server. Discover an
     // imminent/due scheduled start promptly instead of showing idle for 30s.
     const imminent = Number.isFinite(next) && untilNext < 30_000 && untilNext > -60 * 60_000;
-    const delay = status.running || imminent ? 2000 : 30_000;
+    const delay = status.running || imminent || recovery === 'looking' ? 2000 : 30_000;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
@@ -231,7 +274,7 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
       stopped = true;
       clearTimeout(timer);
     };
-  }, [active, status?.running, status?.next_run_at, busy, load]);
+  }, [active, status?.running, status?.next_run_at, busy, recovery, load]);
 
   async function change(
     kind: ChangeKind,
@@ -244,7 +287,7 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
       !visible.current ||
       changing.current ||
       !status ||
-      (kind !== 'schedule' && (status.running || uncertain || stale))
+      (kind !== 'schedule' && (status.running || pendingStart.current || stale))
     )
       return;
     changing.current = true;
@@ -271,14 +314,24 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
         return;
       setStatus(value);
       setStale(false);
-      setUncertain(false);
       notify(success);
       return value;
-    } catch {
+    } catch (cause) {
       if (mounted.current && !controller.signal.aborted && requestVersion === version.current) {
-        setError(failure);
-        if (failure) notify(failure, true);
-        if (kind === 'import') setUncertain(true);
+        if (kind === 'import') {
+          const rejection = importRejection(cause, failure);
+          pendingStart.current = {
+            lastAttempt: status.last_attempt_at,
+            lastFinish: status.last_finished_at,
+            rejection,
+            pollUntil: Date.now() + 8000,
+          };
+          setRecovery('looking');
+          refreshAfterFailure = true;
+        } else {
+          setError(failure);
+          if (failure) notify(failure, true);
+        }
         // Reconciliation may find a completed backup and start importing it (409).
         // Never repeat the acknowledgement; read the authoritative state instead.
         if (kind === 'backup-acknowledge') refreshAfterFailure = true;
@@ -293,7 +346,17 @@ export function useImportWorkflow<T extends ImportWorkflowStatus>({
       if (refreshAfterFailure && mounted.current && !controller.signal.aborted) void load();
     }
   }
-  return { status, busy, loading, error, uncertain, stale, load, change };
+  return {
+    status,
+    busy,
+    loading,
+    error,
+    uncertain: recovery !== '',
+    lookingForImport: recovery === 'looking',
+    stale,
+    load,
+    change,
+  };
 }
 
 export function ImportStatus({
@@ -313,6 +376,7 @@ export function ImportStatus({
   error,
   stale,
   uncertain,
+  lookingForImport = false,
 }: {
   status: ImportWorkflowStatus | null;
   loading: boolean;
@@ -331,6 +395,7 @@ export function ImportStatus({
   error: string;
   stale: boolean;
   uncertain: boolean;
+  lookingForImport?: boolean;
 }) {
   const outcome = starting ? null : status?.running ? 'running' : status?.last_outcome;
   const now = Date.now();
@@ -486,17 +551,19 @@ export function ImportStatus({
           </p>
         </>
       )}
-      {error && (
+      {error && error !== status?.last_error && (
         <p className="error-block" role="alert">
           {error}
         </p>
       )}
-      {stale && status && (
+      {stale && status && !uncertain && (
         <p>Showing the last known status. Refresh status before starting another import.</p>
       )}
       {uncertain && (
         <p>
-          The start request may have been accepted. Refresh status to check before trying again.
+          {lookingForImport
+            ? 'Looking for the import…'
+            : 'Start not confirmed. Refresh status before trying again.'}
         </p>
       )}
     </div>

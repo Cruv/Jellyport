@@ -64,7 +64,9 @@ backup options. The API key stays in the web app. The helper's backup mount stay
 read-only unless the separate cleanup feature below is enabled. Manual **Import
 latest Jellyfin backup** remains import-only. With a compatible helper, imports
 select a completed backup from the native Jellyfin API by its original creation
-timestamp and pin that exact archive.
+timestamp and pin that exact archive. Manual import considers completed database
+backups with Jellyfin's native filenames. If the request's response is lost,
+Jellyport looks for the new attempt in import status before offering a retry.
 A newer ZIP still being written in the mounted folder cannot displace a completed
 archive. Filename ordering does not establish freshness. Older helper adapters
 without exact-selection support retain their legacy directory-selection behavior;

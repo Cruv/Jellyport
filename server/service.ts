@@ -79,11 +79,7 @@ import { snapshotVersionProvenance } from './snapshot-files.js';
 import { ImportCoordinator } from './daily-import-schedule.js';
 import { DestinationCatalogs } from './destination-catalogs.js';
 import type { DestinationCatalogMetadata } from './destination-catalog-files.js';
-import {
-  captureExpectation,
-  evaluateExpectation,
-  type VerificationExpectation,
-} from './migration-verification.js';
+import { evaluateExpectation, migrationReadback } from './migration-verification.js';
 import { MediaWorkload, type MediaWorkloadEvent } from './media-workload.js';
 import { MigrationCatalogCache, type MigrationCatalog } from './migration-catalog.js';
 import { snapshotHistoryWarnings } from './emby-snapshot-reader.js';
@@ -6367,7 +6363,8 @@ export class Service {
       result.already_played = plan.matches.filter(
         (match) => match.target.UserData?.Played === true,
       ).length;
-      const expectations = new Map<string, VerificationExpectation>();
+      const readback = migrationReadback('watched_only');
+      const { expectations } = readback;
       phase('transferring_history');
       let remaining = 0;
       let pendingGuard: Promise<void> | undefined;
@@ -6397,11 +6394,7 @@ export class Service {
           migration_scope: 'watched_only',
           capabilities,
           before_write: beforeWrite,
-          expectation: (item, patch, unsupported) => {
-            const expectation = captureExpectation(item, patch, 'watched_only');
-            expectation.unsupported_fields = unsupported;
-            expectations.set(item.Id, expectation);
-          },
+          expectation: readback.capture,
           progress: (processed, total, updated) => {
             Object.assign(job.progress, {
               items_processed: processed,
@@ -6416,25 +6409,27 @@ export class Service {
         },
       );
       phase('verifying_history');
-      await targetGuard();
-      const observed = new Map(
-        (await jellyfin.destinationItems(target.Id, targetItems)).map((item) => [item.Id, item]),
-      );
-      await targetGuard();
       const verification = (result.data!.verification = {
         checked: expectations.size,
         verified: 0,
         preserved_newer: 0,
         missing: 0,
         mismatched: 0,
-        unsupported_fields: 0,
+        unsupported_fields: readback.skippedFields(),
       });
-      for (const [id, expectation] of expectations) {
-        const evaluation = evaluateExpectation(expectation, observed.get(id));
-        if (evaluation.status === 'missing') verification.missing++;
-        else if (evaluation.status === 'mismatch') verification.mismatched++;
-        else verification.verified++;
-        verification.unsupported_fields += evaluation.unsupported_fields.length;
+      if (expectations.size) {
+        await targetGuard();
+        const observed = new Map(
+          (await jellyfin.destinationItems(target.Id, targetItems)).map((item) => [item.Id, item]),
+        );
+        await targetGuard();
+        for (const [id, values] of expectations) {
+          const evaluation = evaluateExpectation(values[0]!, observed.get(id));
+          if (evaluation.status === 'missing') verification.missing++;
+          else if (evaluation.status === 'mismatch') verification.mismatched++;
+          else verification.verified++;
+          verification.unsupported_fields += evaluation.unsupported_fields.length;
+        }
       }
       result.status =
         result.unmatched ||
@@ -7531,7 +7526,13 @@ export class Service {
         // Capability discovery and source identity reads can wait on remote I/O.
         // Finish them before taking the mutation lock, then repeat local guards
         // and check live destination identity immediately before writing.
-        const capabilities = await prepareMigrationCapabilities(jellyfin);
+        const matchedItem = plan.matches[0]?.target;
+        const capabilities = await prepareMigrationCapabilities(
+          jellyfin,
+          matchedItem && migrationPin
+            ? { userId: target.Id, itemId: matchedItem.Id, serverId: migrationPin.server_id }
+            : undefined,
+        );
         await confirmSource();
         phase('transferring_history');
         Object.assign(job.progress, {
@@ -7541,7 +7542,8 @@ export class Service {
           items_updated: 0,
         });
         this.save(job);
-        const expectations = new Map<string, VerificationExpectation[]>();
+        const readback = migrationReadback(scope);
+        const { expectations } = readback;
         let lastCheckpoint = performance.now();
         const checkpoint = (force = false) => {
           const started = performance.now();
@@ -7586,15 +7588,7 @@ export class Service {
               migration_scope: scope,
               capabilities,
               before_write: beforeHistoryWrite,
-              expectation: (target, patch, unsupported) => {
-                const expected = captureExpectation(target, patch, scope);
-                expected.unsupported_fields = [
-                  ...new Set([...(expected.unsupported_fields ?? []), ...unsupported]),
-                ];
-                const existing = expectations.get(target.Id) ?? [];
-                existing.push(expected);
-                expectations.set(target.Id, existing);
-              },
+              expectation: readback.capture,
               progress: (processed, total, updated) => {
                 Object.assign(job.progress, {
                   items_processed: processed,
@@ -7618,77 +7612,79 @@ export class Service {
           preserved_newer: 0,
           missing: 0,
           mismatched: 0,
-          unsupported_fields: 0,
+          unsupported_fields: readback.skippedFields(),
         };
         const verification = details.verification;
-        try {
-          const byId = new Map(targetItems.map((item) => [item.Id, item]));
-          const candidates = [...expectations.values()].map((values) => {
-            const item = values[0]!.item;
-            const trusted = byId.get(item.Id);
-            const membership = trusted?.JellyportLibraryIds;
-            return membership === undefined
-              ? item
-              : {
-                  ...item,
-                  JellyportLibraryIds: [...membership],
-                  ...(trusted?.JellyportLibraryConfigHash
-                    ? { JellyportLibraryConfigHash: trusted.JellyportLibraryConfigHash }
-                    : {}),
-                };
-          });
-          const ids = new Set(candidates.map((item) => item.Id));
-          for (const item of [...candidates]) {
-            const parent = item.SeriesId ? byId.get(item.SeriesId) : undefined;
-            if (parent && item.SeriesProviderIds && !ids.has(parent.Id)) {
-              ids.add(parent.Id);
-              candidates.push(parent);
+        if (expectations.size) {
+          try {
+            const byId = new Map(targetItems.map((item) => [item.Id, item]));
+            const candidates = [...expectations.values()].map((values) => {
+              const item = values[0]!.item;
+              const trusted = byId.get(item.Id);
+              const membership = trusted?.JellyportLibraryIds;
+              return membership === undefined
+                ? item
+                : {
+                    ...item,
+                    JellyportLibraryIds: [...membership],
+                    ...(trusted?.JellyportLibraryConfigHash
+                      ? { JellyportLibraryConfigHash: trusted.JellyportLibraryConfigHash }
+                      : {}),
+                  };
+            });
+            const ids = new Set(candidates.map((item) => item.Id));
+            for (const item of [...candidates]) {
+              const parent = item.SeriesId ? byId.get(item.SeriesId) : undefined;
+              if (parent && item.SeriesProviderIds && !ids.has(parent.Id)) {
+                ids.add(parent.Id);
+                candidates.push(parent);
+              }
             }
-          }
-          await validateLiveDestination(target.Id);
-          const observed = new Map(
-            (await jellyfin.destinationItems!(target.Id, candidates)).map((item) => [
-              item.Id,
-              item,
-            ]),
-          );
-          guard();
-          await validateLiveDestination(target.Id);
-          for (const item of candidates) {
-            if (
-              item.SeriesProviderIds &&
-              item.SeriesId &&
-              byId.has(item.SeriesId) &&
-              !observed.has(item.SeriesId)
-            )
-              throw new ServiceError('A series identity could not be independently verified.');
-          }
-          for (const [id, values] of expectations) {
-            const evaluations = values.map((expected) =>
-              evaluateExpectation(expected, observed.get(id)),
+            await validateLiveDestination(target.Id);
+            const observed = new Map(
+              (await jellyfin.destinationItems!(target.Id, candidates)).map((item) => [
+                item.Id,
+                item,
+              ]),
             );
-            verification.unsupported_fields += new Set(
-              evaluations.flatMap((value) => value.unsupported_fields),
-            ).size;
-            if (evaluations.some((value) => value.status === 'missing')) verification.missing++;
-            else if (evaluations.some((value) => value.status === 'mismatch'))
-              verification.mismatched++;
-            else if (evaluations.some((value) => value.status === 'preserved_newer'))
-              verification.preserved_newer++;
-            else verification.verified++;
-          }
-          if (verification.missing || verification.mismatched || verification.unsupported_fields)
+            guard();
+            await validateLiveDestination(target.Id);
+            for (const item of candidates) {
+              if (
+                item.SeriesProviderIds &&
+                item.SeriesId &&
+                byId.has(item.SeriesId) &&
+                !observed.has(item.SeriesId)
+              )
+                throw new ServiceError('A series identity could not be independently verified.');
+            }
+            for (const [id, values] of expectations) {
+              const evaluations = values.map((expected) =>
+                evaluateExpectation(expected, observed.get(id)),
+              );
+              verification.unsupported_fields += new Set(
+                evaluations.flatMap((value) => value.unsupported_fields),
+              ).size;
+              if (evaluations.some((value) => value.status === 'missing')) verification.missing++;
+              else if (evaluations.some((value) => value.status === 'mismatch'))
+                verification.mismatched++;
+              else if (evaluations.some((value) => value.status === 'preserved_newer'))
+                verification.preserved_newer++;
+              else verification.verified++;
+            }
+            if (verification.missing || verification.mismatched)
+              migrationWarning(
+                details,
+                'Independent Jellyfin readback found missing or mismatched history.',
+              );
+          } catch (error) {
+            guard();
+            verification.missing = expectations.size;
             migrationWarning(
               details,
-              'Independent Jellyfin readback did not verify every intended history field. Review missing, mismatched and unsupported counts before retrying.',
+              'Independent Jellyfin history verification could not finish.',
             );
-        } catch (error) {
-          guard();
-          verification.missing = expectations.size;
-          migrationWarning(
-            details,
-            'Independent Jellyfin history verification could not finish. Applied changes are preserved; review before retrying.',
-          );
+          }
         }
         this.save(job);
         guard();

@@ -3566,9 +3566,7 @@ describe('React account safeguards', () => {
     const coverage = within(dialog).getByRole('region', { name: 'Matching coverage' });
     expect(within(coverage).getByText('99.6% matched')).toBeTruthy();
     expect(coverage.textContent).toContain('2,978 of 2,991 identifiable source items');
-    expect(coverage.textContent).toContain(
-      '545 saved-history rows have no verified media identity and are excluded from coverage.',
-    );
+    expect(coverage.textContent).toContain('545 saved history entries without a media match.');
     expect(within(dialog).getByText(/37 attempted · 37 succeeded · 0 failed/)).toBeTruthy();
     expect(
       within(dialog).getByText(/Independent played-status verification: 2,976 verified/),
@@ -3584,6 +3582,64 @@ describe('React account safeguards', () => {
     ).toEqual([]);
     expect(localStorage.length).toBe(0);
     expect(sessionStorage.length).toBe(0);
+  });
+
+  it('puts skipped history first and keeps backup and timing details collapsed', async () => {
+    const blocked = verifiedHistoryMigration();
+    blocked.migration_scope = 'played_favorites';
+    blocked.elapsed_ms = 5_000;
+    const result = blocked.results![0]!;
+    Object.assign(result, {
+      matched: 895,
+      unmatched: 1,
+      ambiguous: 0,
+      applied: 0,
+      source_snapshot: sourceSnapshot,
+      timing: { elapsed_ms: 5_000, phase_ms: { reading_target: 500 } },
+      migration_outcome: { version: 1, execution: 'needs_review', unresolved_source_history: 19 },
+    });
+    result.data = {
+      ...emptyPlayedDetails,
+      failed_items: 882,
+      write_metrics: {
+        attempts: 0,
+        succeeded: 0,
+        failed: 0,
+        cumulative_ms: 0,
+        max_ms: 0,
+        peak_in_flight: 0,
+      },
+      verification: {
+        checked: 895,
+        verified: 0,
+        preserved_newer: 0,
+        missing: 0,
+        mismatched: 882,
+        unsupported_fields: 882,
+      },
+      warnings: [
+        '19 saved history entries have no verified media identity. They remain unresolved and were not assumed obsolete or migrated.',
+        'Jellyfin’s partial user-data API could not be verified. Check access to /api-docs/openapi.json before retrying.',
+        'Played and favorite updates require Jellyfin’s partial user-data API. Check its API description at /api-docs/openapi.json.',
+        'Failed-update details are limited to 200 items. The full failed-item count is shown.',
+        'Independent Jellyfin readback did not verify every intended history field. Review missing, mismatched and unsupported counts before retrying.',
+      ],
+    };
+    const before = structuredClone(blocked);
+    responses['/api/jobs/job-1'] = blocked;
+    const dialog = await openJob();
+    const ui = within(dialog);
+    expect(ui.getByText('882 changes skipped')).toBeTruthy();
+    expect(
+      ui.getAllByText('Skipped history updates. Jellyfin’s update API could not be verified.'),
+    ).toHaveLength(1);
+    expect(ui.queryByText(/882 mismatched|882 failed|openapi\.json|200 items/i)).toBeNull();
+    expect(ui.getAllByText('19 saved history entries without a media match.')).toHaveLength(1);
+    expect(ui.getByText('99.9% matched')).toBeTruthy();
+    expect(ui.getByText('Technical details').closest('details')?.open).toBe(false);
+    expect(ui.getByText('Operation timing').closest('details')?.open).toBe(false);
+    expect(ui.getByText(/Account work:/).closest('details')?.open).toBe(false);
+    expect(blocked).toEqual(before);
   });
 
   it('groups verified migrations with completed activity and keeps uncertain or failed reports separate', async () => {

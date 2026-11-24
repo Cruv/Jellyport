@@ -58,10 +58,9 @@ async function importBackup(
         'No completed Jellyfin backup was found. Create a database backup or enable scheduled backup creation.',
     });
     await expect(
-      view.getByRole('alert').filter({ hasText: 'Jellyfin backup import could not start.' }),
+      view.getByRole('alert').filter({ hasText: 'No completed Jellyfin backup was found.' }),
     ).toBeVisible();
     await expect(progress).toHaveCount(0);
-    await view.getByRole('button', { name: 'Refresh status', exact: true }).click();
   }
   const read = kind === 'emby' ? imports.sourceStatus : imports.destinationStatus;
   await expect.poll(async () => (await read()).last_outcome, { timeout: 15_000 }).toBe(outcome);

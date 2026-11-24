@@ -310,7 +310,7 @@ In **Users → Family and owner notes**, select the actual Emby or Jellyfin acco
 
 The same form stores an optional **Owner name** of up to 120 characters and **Private owner notes** of up to 2,000 characters. These annotations are visible only to Jellyport administrators, stored encrypted in Jellyport's local database, and never sent to Discord or either media server. Profiles are scoped to the selected account ID, server URL, and paired Jellyfin server identity rather than usernames. The upgrade adds this data without resetting existing accounts or inferring family flags from old records.
 
-Use **Users → Manage account access** to review and enable or disable a selected account. The action verifies its exact account ID, current name, and reviewed profile revision; changed details require a new review. It preserves the account's password, history, favorites, playlists, and preferences. Jellyport has no permanent-delete button; delete an account directly on its media server if needed. Family flags do not bypass Discord recipient checks: accounts without Discord use the web app's one-time credential reveal.
+Use **Users → Manage → Account access** to enable or disable a linked household across its Emby and Jellyfin accounts. When a lower subscription tier excludes slots, the enable dialog lists the accounts the allowance covers and lets you enable those accounts together. For accounts without a confirmed owner, choose the individual media account. Changing access preserves passwords, history, favorites, playlists, and preferences. Delete accounts directly on their media server if needed. Accounts without Discord use the web app's one-time credential reveal.
 
 ### Organize users and Discord roles
 

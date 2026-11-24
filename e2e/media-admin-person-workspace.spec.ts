@@ -70,6 +70,153 @@ test('independent account access can be disabled and restored without mapping or
   await expectContainedLayout(page);
 });
 
+test('household access changes both servers and warns before restoring a lower tier', async ({
+  page,
+  admin,
+  mutations,
+}, info) => {
+  const { service, store } = admin.app.jellyport;
+  const settings = {
+    ...store.settings(),
+    discord_enabled: true,
+    discord_guild_id: '333333333333333333',
+  };
+  store.saveSettings(settings);
+  const accountDetails = [
+    { kind: 'jellyfin', id: 'j-household-1', username: 'crew_primary', slot: 1 },
+    { kind: 'emby', id: 'e-household-1', username: 'crew_legacy', slot: 1 },
+    { kind: 'jellyfin', id: 'j-household-2', username: 'crew_second', slot: 2 },
+    { kind: 'emby', id: 'e-household-2', username: 'crew_second_legacy', slot: 2 },
+  ] as const;
+  const policyWrites = accountDetails.map(({ kind, id }) => ({ kind, id, method: 'setPolicy' }));
+  const originalUsers = structuredClone(admin.servers.users);
+  for (const { kind, id, username } of accountDetails) {
+    const account = {
+      Id: id,
+      Name: username,
+      Policy: { IsAdministrator: false, IsDisabled: false, EnableMediaPlayback: true },
+      Configuration: { SubtitleMode: 'None' },
+    };
+    originalUsers[kind].push(account);
+    admin.servers.users[kind].push({
+      ...account,
+      Policy: { ...account.Policy, IsDisabled: true },
+    });
+  }
+  const membership = service.memberships.save(
+    {
+      discord_user_id: paidOwner,
+      base_username: 'crew_owner',
+      tier_id: 'brigantine',
+      account_limit: 2,
+      active: true,
+    },
+    settings,
+  );
+  // Verify both lifecycle links and explicitly approved accounts enter one plan.
+  store.saveLink(paidOwner, 'crew_primary', 'j-household-1', false, 1);
+  service.mediaOwnerships.save(
+    accountDetails.map(({ kind, id, username, slot }) => ({
+      kind,
+      server_id: `demo-${kind}`,
+      account_id: id,
+      username,
+      discord_user_id: paidOwner,
+      slot,
+    })),
+    settings,
+  );
+  const initialRelationships = relationshipCounts(admin);
+
+  await page.goto('/#/users');
+  await page.getByRole('searchbox', { name: 'Search users', exact: true }).fill('crew_owner');
+  const manage = page
+    .getByRole('row')
+    .filter({ hasText: '@crew_owner' })
+    .getByRole('button', {
+      name: /^Manage /,
+    });
+  const workspace = page.getByRole('dialog', { name: 'Manage @crew_owner', exact: true });
+  const accept = 'POST /api/accounts/access/accept';
+  await manage.click();
+  expect(admin.writes).toEqual([]);
+  await workspace.getByRole('button', { name: 'Enable household', exact: true }).click();
+  await expect(workspace).toHaveCount(0);
+  expect(mutations).toEqual([accept]);
+  expect(admin.writes).toHaveLength(4);
+  expect(admin.writes).toEqual(expect.arrayContaining(policyWrites));
+  expect(admin.servers.users).toEqual(originalUsers);
+
+  await manage.click();
+  const disable = workspace.getByRole('button', { name: 'Disable household', exact: true });
+  await expect(disable).toBeInViewport({ ratio: 1 });
+  await disable.click();
+  await expect(workspace).toHaveCount(0);
+  expect(mutations).toEqual([accept, accept]);
+  expect(admin.writes.slice(4)).toHaveLength(4);
+  expect(admin.writes.slice(4)).toEqual(expect.arrayContaining(policyWrites));
+  for (const { kind, id } of accountDetails)
+    expect(admin.servers.users[kind].find((user) => user.Id === id)?.Policy?.IsDisabled).toBe(true);
+
+  await service.setMembershipAccess({
+    discord_user_id: paidOwner,
+    access_mode: 'subscription',
+    tier_id: 'sloop',
+    expected_revision: membership.revision,
+  });
+  await page.reload();
+  await page.getByRole('searchbox', { name: 'Search users', exact: true }).fill('crew_owner');
+  await manage.click();
+  await workspace.getByRole('button', { name: 'Enable household', exact: true }).click();
+  const warning = page.getByRole('dialog', { name: 'Subscription account limit', exact: true });
+  const allowed = warning.getByRole('list', { name: 'Accounts to enable', exact: true });
+  const excluded = warning.getByRole('list', { name: 'Excluded accounts', exact: true });
+  await expect(allowed.getByRole('listitem')).toHaveCount(2);
+  await expect(excluded.getByRole('listitem')).toHaveCount(2);
+  for (const { kind, username, slot } of accountDetails) {
+    const accountLabel = `${kind === 'emby' ? 'Emby' : 'Jellyfin'}: ${username}`;
+    await expect(
+      (slot === 1 ? allowed : excluded)
+        .getByRole('listitem')
+        .filter({ has: page.getByText(accountLabel, { exact: true }) }),
+    ).toContainText(slot === 1 ? 'Slot 1' : 'Slot 2 · Over the account limit');
+  }
+  expect(mutations).toEqual([accept, accept]);
+  expect(admin.writes).toHaveLength(8);
+  await expectContainedLayout(page);
+  const enableEligible = warning.getByRole('button', {
+    name: 'Enable eligible accounts',
+    exact: true,
+  });
+  await expect(enableEligible).toBeInViewport({ ratio: 1 });
+  await page.screenshot({ path: info.outputPath('household-tier-warning.png') });
+  await enableEligible.click();
+  await expect(warning).toHaveCount(0);
+  await expect(workspace).toHaveCount(0);
+  expect(mutations).toEqual([accept, accept, accept]);
+  expect(admin.writes.slice(8)).toHaveLength(2);
+  expect(admin.writes.slice(8)).toEqual(
+    expect.arrayContaining(
+      accountDetails
+        .filter(({ slot }) => slot === 1)
+        .map(({ kind, id }) => ({ kind, id, method: 'setPolicy' })),
+    ),
+  );
+  for (const kind of ['emby', 'jellyfin'] as const)
+    expect(admin.servers.users[kind]).toEqual(
+      originalUsers[kind].map((user) =>
+        accountDetails.some(
+          (account) => account.kind === kind && account.id === user.Id && account.slot === 2,
+        )
+          ? { ...user, Policy: { ...user.Policy, IsDisabled: true } }
+          : user,
+      ),
+    );
+  expect(relationshipCounts(admin)).toEqual(initialRelationships);
+  expect(admin.stateWrites).toEqual([]);
+  expect(admin.createdCredentials).toEqual([]);
+});
+
 test('an unavailable Emby source leaves verified Jellyfin accounts manageable', async ({
   page,
   admin,
@@ -267,9 +414,10 @@ test('confirming an owner inside the person workspace is reused for later accoun
   await workspace.getByRole('tab', { name: 'Account access', exact: true }).click();
   await page.screenshot({ path: info.outputPath('confirmed-owner-reused-viewport.png') });
   await page.screenshot({ path: info.outputPath('confirmed-owner-reused.png'), fullPage: true });
-  await workspace.getByRole('button', { name: 'Disable selected account', exact: true }).click();
+  await workspace.getByRole('button', { name: 'Disable household', exact: true }).click();
   await expect(workspace).toHaveCount(0);
   expect(mutations.filter((value) => value === 'POST /api/identity-review/apply')).toHaveLength(1);
+  expect(mutations.filter((value) => value === 'POST /api/accounts/access/accept')).toHaveLength(1);
   expect(mutations).not.toContain('POST /api/accounts/link');
   expect(relationshipCounts(admin)).toEqual({ owners: 1, mappings: 0, memberships: 0, links: 0 });
   expect(admin.writes).toEqual([{ kind: 'jellyfin', method: 'setPolicy', id: 'j-other' }]);

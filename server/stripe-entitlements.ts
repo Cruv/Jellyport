@@ -482,6 +482,9 @@ export class StripeEntitlements {
       this.persist();
     }
   }
+  currentForOwner(discordId: string): StripeEntitlementFact | undefined {
+    return this.state?.latest.find((entry) => entry.discord_user_id === discordId);
+  }
   assert(fact: StripeEntitlementFact, authorityRevision?: string): void {
     const state = this.state;
     const current = state?.latest.find((entry) => entry.event_id === fact.event_id);

@@ -3720,6 +3720,14 @@ progress.progress-track::-moz-progress-bar {
 .person-workspace-summary p {
   margin: 0;
 }
+.person-workspace-accounts {
+  list-style: none;
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  overflow-wrap: anywhere;
+}
 .person-workspace-actions,
 .person-workspace-tools {
   display: flex;

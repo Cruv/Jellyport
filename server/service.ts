@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import {
   generatePassword,
   accountCredentialMessage,
@@ -219,6 +220,32 @@ export interface ReviewedMembershipWorkflow {
   input: MembershipWorkflowInput;
   summary: MembershipWorkflowSummary;
   fingerprint: string;
+}
+export interface AccountAccessInput {
+  kind: MediaKind;
+  user_id: string;
+  disabled: boolean;
+  expected_username: string;
+  expected_profile_revision: string;
+}
+export interface HouseholdAccessInput extends AccountAccessInput {
+  expected_discord_user_id: string;
+}
+interface HouseholdAccessAccount {
+  kind: MediaKind;
+  user_id: string;
+  username: string;
+  slot: number;
+  disabled: boolean;
+  eligible: boolean;
+  exclusion?: 'tier' | 'inactive' | 'protected';
+}
+export interface ReviewedHouseholdAccess {
+  input: HouseholdAccessInput;
+  context: string;
+  allowance: { limit: number; active: boolean };
+  servers: Partial<Record<MediaKind, string>>;
+  summary: { disabled: boolean; account_limit: number; accounts: HouseholdAccessAccount[] };
 }
 export interface JobStats {
   source_played: number;
@@ -669,6 +696,7 @@ function previewItemSummary(item: MediaItem): MigrationItemSummary {
 /** Account jobs and subscription actions share a mutation lock released between users. */
 export class Service {
   verifyStripeEntitlement?: (fact: StripeEntitlementFact, check?: StripeEntitlementCheck) => void;
+  currentStripeAccountEntitlement?: (owner: string) => StripeEntitlementFact | undefined;
   finishStripePriceReview?: (fact: StripeEntitlementFact) => void;
   reviewStripeMigrationMembership?: (
     id: string,
@@ -2400,76 +2428,395 @@ export class Service {
       });
     });
   }
-  /** Explicit administrator access change, separate from subscription automation. */
-  async setAccountAccess(input: {
-    kind: MediaKind;
-    user_id: string;
-    disabled: boolean;
-    expected_username: string;
-    expected_profile_revision: string;
-  }) {
+  private accountAccessOwner(
+    kind: MediaKind,
+    serverId: string,
+    id: string,
+    username: string,
+    settings: Settings,
+  ) {
+    const approved = this.mediaOwnerships.get(kind, serverId, id, settings);
+    const link = kind === 'jellyfin' ? this.store.linkForRemote(id) : null;
+    const mapping =
+      kind === 'emby'
+        ? this.mappings.getForSource(id, settings)
+        : this.mappings.getForTarget(id, username, settings);
+    const exactMapping = kind === 'emby' || mapping?.target_user_id === id ? mapping : null;
+    const matches = [];
+    if (approved)
+      matches.push({
+        owner: approved.discord_user_id,
+        slot: approved.slot,
+        name: approved.username,
+      });
+    if (link)
+      matches.push({
+        owner: link.discord_user_id,
+        slot: link.membership_slot,
+        name: link.username,
+      });
+    if (exactMapping?.discord_user_id)
+      matches.push({
+        owner: exactMapping.discord_user_id,
+        slot: exactMapping.membership_slot ?? 1,
+        name: kind === 'emby' ? exactMapping.source_username : exactMapping.target_username,
+      });
+    const match = matches[0];
+    if (
+      match &&
+      matches.some(
+        ({ owner, slot, name }) =>
+          owner !== match.owner || slot !== match.slot || name !== username,
+      )
+    )
+      throw new ServiceError('Account ownership changed or conflicts. Review the linked account.');
+    return match;
+  }
+  private async accountAccessServer(
+    client: MediaAPI,
+    kind: MediaKind,
+    settings: Settings,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    const info = await client.systemInfo({ signal, retry: false });
+    const auth = this.store.authState();
+    if (
+      typeof info.Id !== 'string' ||
+      !info.Id ||
+      (kind === 'jellyfin' &&
+        auth?.kind === 'configured' &&
+        (info.Id !== auth.serverId ||
+          normalizeJellyfinUrl(settings.jellyfin_url) !== normalizeJellyfinUrl(auth.serverUrl)))
+    )
+      throw new ServiceError('The media server changed. Review account access again.');
+    return info.Id;
+  }
+  private householdAccessAllowance(owner: string, settings: Settings) {
+    const membership = this.memberships.get(owner, settings);
+    const tiers = settings.membership_tiers ?? DEFAULT_MEMBERSHIP_TIERS;
+    let limit = membership?.account_limit ?? 1;
+    const paid = membership?.access_mode !== 'complimentary';
+    let active = membership?.active !== false;
+    if (paid && membership) {
+      const tier = tiers.find(({ id }) => id === membership.tier_id);
+      if (tier) limit = Math.min(limit, tier.account_limit);
+      else active = false;
+    }
+    // Current, approved billing can be more restrictive while a change awaits
+    // review. A manual enable never adopts a new tier or resolves its review.
+    if (paid && settings.new_subscriber_source === 'stripe') {
+      const fact = this.currentStripeAccountEntitlement?.(owner);
+      if (fact?.discord_user_id === owner) {
+        if (fact.action === 'expire') active = false;
+        else {
+          const tier = tiers.find(({ id }) => id === fact.tier_id);
+          if (tier) limit = Math.min(limit, tier.account_limit);
+        }
+      }
+    }
+    return { limit, active };
+  }
+  async reviewHouseholdAccess(
+    input: HouseholdAccessInput,
+    authorize: () => void = () => {},
+    signal?: AbortSignal,
+  ): Promise<ReviewedHouseholdAccess> {
+    if (this.demo) throw new ServiceError('Demo account access is read-only.');
+    const settings = this.store.settings();
+    const owner = input.expected_discord_user_id;
+    const enrollment = () => this.householdAccessAllowance(owner, settings);
+    const allowance = enrollment();
+    const context = this.membershipWorkflowContext(owner);
+    const guard = () => {
+      authorize();
+      signal?.throwIfAborted();
+      this.checkStopped();
+      this.assertDiscordAuthority(owner, settings);
+      if (
+        context !== this.membershipWorkflowContext(owner) ||
+        (!input.disabled && !isDeepStrictEqual(allowance, enrollment())) ||
+        (!this.memberships.get(owner, settings) && this.memberships.hasOtherScope(owner, settings))
+      )
+        throw new ServiceError('Household access changed. Review it again.');
+      if (this.store.hasActiveMemberJob(owner))
+        throw new ServiceError('Wait for this household’s account job to finish.');
+    };
+    guard();
+    const accounts = new Map<
+      string,
+      Pick<HouseholdAccessAccount, 'kind' | 'user_id' | 'username' | 'slot'> & { server?: string }
+    >();
+    const slots = new Map<string, string>();
+    const add = (
+      kind: MediaKind,
+      user_id: string,
+      username: string,
+      slot: number,
+      server?: string,
+    ) => {
+      validateMembershipSlot(slot);
+      const key = `${kind}:${user_id}`;
+      const slotKey = `${kind}:${slot}`;
+      const previous = accounts.get(key);
+      if (
+        (previous &&
+          (previous.username !== username ||
+            previous.slot !== slot ||
+            (previous.server && server && previous.server !== server))) ||
+        (slots.has(slotKey) && slots.get(slotKey) !== user_id)
+      )
+        throw new ServiceError('Account ownership or slots conflict. Review the household links.');
+      slots.set(slotKey, user_id);
+      accounts.set(key, { kind, user_id, username, slot, server: server ?? previous?.server });
+    };
+    for (const record of this.mediaOwnerships.forOwner(owner, settings))
+      add(record.kind, record.account_id, record.username, record.slot, record.server_id);
+    for (const mapping of this.mappings.getAllForDiscord(owner, settings)) {
+      const slot = mapping.membership_slot ?? 1;
+      add('emby', mapping.source_user_id, mapping.source_username, slot);
+      if (mapping.target_user_id)
+        add('jellyfin', mapping.target_user_id, mapping.target_username, slot);
+    }
+    for (const link of this.store.linksForMember(owner)) {
+      const binding = this.store.accountIdentityBinding('link', link.remote_id);
+      if (
+        binding &&
+        (binding.server_url !== normalizeJellyfinUrl(settings.jellyfin_url) ||
+          binding.remote_id !== link.remote_id ||
+          binding.username !== link.username)
+      )
+        throw new ServiceError('A linked account changed. Review the household links.');
+      add('jellyfin', link.remote_id, link.username, link.membership_slot, binding?.server_id);
+    }
+    const anchor = accounts.get(`${input.kind}:${input.user_id}`);
+    if (
+      !anchor ||
+      anchor.username !== input.expected_username ||
+      (this.profiles.get(input.kind, input.user_id, settings)?.revision ?? '') !==
+        input.expected_profile_revision
+    )
+      throw new ServiceError('The selected account or owner changed. Refresh the directory.');
+    const ordered = [...accounts.values()].sort(
+      (a, b) => a.slot - b.slot || a.kind.localeCompare(b.kind),
+    );
+    const summary: ReviewedHouseholdAccess['summary'] = {
+      disabled: input.disabled,
+      account_limit: allowance.limit,
+      accounts: [],
+    };
+    const servers: ReviewedHouseholdAccess['servers'] = {};
+    if (!ordered.some(({ kind }) => kind === 'jellyfin')) await this.confirmPairedServer(settings);
+    for (const kind of ['emby', 'jellyfin'] as const) {
+      const targets = ordered.filter((account) => account.kind === kind);
+      if (!targets.length) continue;
+      await this.withClient(
+        settings,
+        kind,
+        async (client) => {
+          const server = (servers[kind] = await this.accountAccessServer(
+            client,
+            kind,
+            settings,
+            signal,
+          ));
+          for (const { user_id, username, slot, server: pinned } of targets) {
+            guard();
+            const target = await client.user(user_id);
+            if (
+              (pinned && pinned !== server) ||
+              target.Id !== user_id ||
+              target.Name !== username ||
+              typeof target.Policy?.IsDisabled !== 'boolean' ||
+              this.accountAccessOwner(kind, server, user_id, username, settings)?.owner !== owner
+            )
+              throw new ServiceError(
+                'A linked account or server changed. Review the household links.',
+              );
+            const family = this.profiles.get(kind, user_id, settings)?.family === true;
+            const exclusion =
+              target.Policy.IsAdministrator !== false ||
+              (kind === 'jellyfin' && user_id === settings.template_user_id)
+                ? 'protected'
+                : !input.disabled && !family && !allowance.active
+                  ? 'inactive'
+                  : !input.disabled && !family && slot > allowance.limit
+                    ? 'tier'
+                    : undefined;
+            if (
+              !exclusion &&
+              kind === 'jellyfin' &&
+              this.store.linkForRemote(user_id)?.pending_disabled != null
+            )
+              throw new ServiceError(
+                'A linked account has an unfinished access change. Resolve it first.',
+              );
+            summary.accounts.push({
+              kind,
+              user_id,
+              username,
+              slot,
+              disabled: target.Policy.IsDisabled,
+              eligible: !exclusion,
+              ...(exclusion ? { exclusion } : {}),
+            });
+          }
+        },
+        signal,
+      );
+    }
+    guard();
+    summary.accounts.sort((a, b) => a.slot - b.slot || a.kind.localeCompare(b.kind));
+    return { input, context, allowance, servers, summary };
+  }
+  async applyHouseholdAccess(
+    reviewed: ReviewedHouseholdAccess,
+    authorize: () => void = () => {},
+    signal?: AbortSignal,
+  ) {
+    const { input } = reviewed;
+    const preflight = this.reviewHouseholdAccess(input, authorize, signal);
+    const current = await (signal ? abortable(preflight, signal) : preflight);
+    if (!isDeepStrictEqual(current, reviewed))
+      throw new ServiceError(
+        'Account access or the subscription changed. Review the household again.',
+      );
+    const targets = current.summary.accounts.filter((account) => account.eligible);
+    if (!targets.length)
+      throw new ServiceError('No linked accounts qualify for this access change.');
+    return this.mutationMutex.run(async () => {
+      const settings = this.store.settings();
+      const owner = input.expected_discord_user_id;
+      let context = current.context;
+      let changed = 0;
+      const assertCurrent = () => {
+        this.checkStopped();
+        this.assertDiscordAuthority(owner, settings);
+        if (
+          context !== this.membershipWorkflowContext(owner) ||
+          this.store.hasActiveMemberJob(owner) ||
+          (!input.disabled &&
+            !isDeepStrictEqual(current.allowance, this.householdAccessAllowance(owner, settings)))
+        )
+          throw new ServiceError('The household or subscription changed.');
+      };
+      authorize();
+      signal?.throwIfAborted();
+      assertCurrent();
+      for (const kind of ['emby', 'jellyfin'] as const) {
+        const mediaTargets = targets.filter((account) => account.kind === kind);
+        if (!mediaTargets.length) continue;
+        await this.withClient(
+          settings,
+          kind,
+          async (client) => {
+            for (const account of mediaTargets) {
+              const { user_id, username } = account;
+              try {
+                authorize();
+                signal?.throwIfAborted();
+                assertCurrent();
+                const read = async () => {
+                  const target = await client.user(user_id);
+                  this.assertManageableAccount(target, user_id, settings, kind);
+                  const server = await this.accountAccessServer(client, kind, settings, signal);
+                  const identity = this.accountAccessOwner(
+                    kind,
+                    server,
+                    user_id,
+                    username,
+                    settings,
+                  );
+                  if (
+                    server !== current.servers[kind] ||
+                    username !== target.Name ||
+                    identity?.owner !== owner ||
+                    identity.slot !== account.slot
+                  )
+                    throw new ServiceError('A linked account or server changed.');
+                  assertCurrent();
+                  return target;
+                };
+                const target = await read();
+                if (target.Policy!.IsDisabled !== account.disabled)
+                  throw new ServiceError('The linked account access changed.');
+                authorize();
+                signal?.throwIfAborted();
+                if (account.disabled !== input.disabled) {
+                  try {
+                    await client.setPolicy(user_id, {
+                      ...target.Policy!,
+                      IsDisabled: input.disabled,
+                    });
+                  } catch {
+                    // A lost response can still mean the server applied the write.
+                    // Check the exact account before attributing the change.
+                  }
+                  if ((await read()).Policy!.IsDisabled !== input.disabled)
+                    throw new ServiceError('Access could not be confirmed.');
+                  changed++;
+                }
+                const link = kind === 'jellyfin' ? this.store.linkForRemote(user_id) : null;
+                if (link) this.store.markLinkAccessManual(link);
+                if (account.disabled !== input.disabled)
+                  this.store.saveHouseholdAccessChange(owner, settings, {
+                    kind,
+                    username,
+                    disabled: input.disabled,
+                  });
+                context = this.membershipWorkflowContext(owner);
+              } catch {
+                throw new ServiceError(
+                  `Could not confirm ${kind === 'emby' ? 'Emby' : 'Jellyfin'} access for ${username}. ` +
+                    (changed ? `${changed} earlier account changes were confirmed. ` : '') +
+                    'Refresh the household before retrying.',
+                );
+              }
+            }
+          },
+          signal,
+        );
+      }
+      return { disabled: input.disabled, changed };
+    });
+  }
+  /** Explicit access for an account without a confirmed household. */
+  async setAccountAccess(input: AccountAccessInput) {
     if (this.demo) throw new ServiceError('Demo account access is read-only.');
     if (typeof input.disabled !== 'boolean')
       throw new ServiceError('Choose the account access state.');
     return this.mutationMutex.run(async () => {
       this.checkStopped();
       const settings = this.store.settings();
-      await this.confirmPairedServer(settings);
+      if (input.kind === 'emby') await this.confirmPairedServer(settings);
       return this.withClient(settings, input.kind, async (client) => {
-        const link = input.kind === 'jellyfin' ? this.store.linkForRemote(input.user_id) : null;
-        const info = link ? null : await client.systemInfo().catch(() => null);
-        const approved =
-          typeof info?.Id === 'string'
-            ? this.mediaOwnerships.get(input.kind, info.Id, input.user_id, settings)
-            : null;
         const target = await client.user(input.user_id);
-        this.assertManageableAccount(target, input.user_id, settings, input.kind);
-        const changed = target.Policy!.IsDisabled !== input.disabled;
-        const owner =
-          link?.username === target.Name
-            ? link.discord_user_id
-            : approved?.username === target.Name
-              ? approved.discord_user_id
-              : null;
-        if (
-          target.Name !== input.expected_username ||
-          (this.profiles.get(input.kind, input.user_id, this.store.settings())?.revision ?? '') !==
-            input.expected_profile_revision ||
-          JSON.stringify(settings) !== JSON.stringify(this.store.settings())
-        )
-          throw new ServiceError(
-            'The account, owner notes, or configuration changed. Review access again.',
-          );
-        const policy = structuredClone(target.Policy!);
-        policy.IsDisabled = input.disabled;
+        const server = await this.accountAccessServer(client, input.kind, settings);
+        const guard = (account: MediaUser) => {
+          this.assertManageableAccount(account, input.user_id, settings, input.kind);
+          const current = this.store.settings();
+          if (
+            account.Name !== input.expected_username ||
+            (this.profiles.get(input.kind, input.user_id, current)?.revision ?? '') !==
+              input.expected_profile_revision ||
+            !isDeepStrictEqual(settings, current)
+          )
+            throw new ServiceError(
+              'The account, owner notes, or configuration changed. Review access again.',
+            );
+          if (this.accountAccessOwner(input.kind, server, account.Id, account.Name, current))
+            throw new ServiceError('This account is linked. Review access for its household.');
+        };
+        guard(target);
         this.checkStopped();
-        if (changed) await client.setPolicy(target.Id, policy);
+        if (target.Policy!.IsDisabled !== input.disabled)
+          await client.setPolicy(target.Id, { ...target.Policy!, IsDisabled: input.disabled });
         const confirmed = await client.user(target.Id);
-        this.assertManageableAccount(confirmed, input.user_id, settings, input.kind);
+        guard(confirmed);
         if (
-          confirmed.Name !== input.expected_username ||
           confirmed.Policy!.IsDisabled !== input.disabled ||
-          JSON.stringify(settings) !== JSON.stringify(this.store.settings()) ||
-          (this.profiles.get(input.kind, input.user_id, this.store.settings())?.revision ?? '') !==
-            input.expected_profile_revision
+          (await this.accountAccessServer(client, input.kind, settings)) !== server
         )
           throw new ServiceError('Account access could not be confirmed. Refresh before retrying.');
-        if (link) {
-          // An explicit administrator action is not a billing-owned disable.
-          this.store.saveLink(
-            link.discord_user_id,
-            link.username,
-            link.remote_id,
-            false,
-            link.membership_slot,
-          );
-        }
-        if (changed && owner)
-          this.store.saveHouseholdAccessChange(owner, settings, {
-            kind: input.kind,
-            username: confirmed.Name,
-            disabled: input.disabled,
-          });
         return { kind: input.kind, user_id: input.user_id, disabled: input.disabled };
       });
     });

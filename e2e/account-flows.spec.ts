@@ -25,21 +25,21 @@ test('creates an independent account and reveals its credentials only on request
   await page.getByRole('textbox', { name: 'Username', exact: true }).fill(username);
   await page.getByRole('main').getByRole('button', { name: 'Create account', exact: true }).click();
   await expect(
-    page.getByText(
-      'Could not reach Jellyport. Check that the application is running and try again.',
-      { exact: true },
-    ),
+    page.getByText('Could not reach Jellyport. Find the operation in Activity.', { exact: true }),
   ).toBeVisible();
   expect(submissionReceipt).toMatch(/^[a-f\d-]{36}$/);
   await page.reload();
-  await page.getByText('Operations tray', { exact: true }).click();
-  await expect(page.getByRole('textbox', { name: 'Operation submission receipt' })).toHaveValue(
-    submissionReceipt,
-  );
+  await expect(page.getByRole('heading', { name: 'Create account', level: 1 })).toBeVisible();
+  await expect(page.getByText('Operations tray', { exact: true })).toHaveCount(0);
+  const pending = page.getByRole('heading', { name: 'Pending submissions', exact: true });
+  await expect(pending).toHaveCount(0);
+  await navigate(page, 'Activity');
+  await expect(pending).toBeVisible();
+  await expectContainedLayout(page);
   const lookup = page.waitForResponse(
     (response) => new URL(response.url()).pathname === `/api/jobs/receipts/${submissionReceipt}`,
   );
-  await page.getByRole('button', { name: 'Find operation' }).click();
+  await page.getByRole('button', { name: 'Find operation', exact: true }).click();
   expect(await (await lookup).json()).toEqual({ job_id: acceptedJob });
   const details = page.getByRole('dialog', { name: 'Operation details' });
   await expect(details).toBeVisible();
@@ -79,7 +79,8 @@ test('creates an independent account and reveals its credentials only on request
   }
   await expect(confirmation.getByRole('button', { name: 'Cancel' })).toBeEnabled();
   await page.reload();
-  await navigate(page, 'Activity');
+  await expect(page.getByRole('heading', { name: 'Activity', level: 1 })).toBeVisible();
+  await expect(pending).toHaveCount(0);
   await page.getByRole('searchbox', { name: 'Search operations' }).fill(username);
   const report = page.getByRole('row').filter({ hasText: username });
   await report.getByRole('button', { name: 'View operation details', exact: true }).click();

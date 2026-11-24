@@ -172,7 +172,7 @@ function storePendingReceipts(receipts: string[]) {
     else sessionStorage.removeItem(pendingReceiptsKey);
     for (const key of legacyReceiptKeys) sessionStorage.removeItem(key);
   } catch {
-    // Receipt lookup stays available in the tray when storage is disabled.
+    // Receipt lookup still works until this page reloads when storage is disabled.
   }
 }
 const nextPreviewPoll = (signal: AbortSignal) =>
@@ -238,7 +238,6 @@ export default function App() {
   const wakeOperations = useRef<() => void>(() => {});
   const [pendingReceipts, setPendingReceipts] = useState(readPendingReceipts);
   const pendingReceiptsRef = useRef(pendingReceipts);
-  const [receipt, setReceipt] = useState(pendingReceipts[0] ?? '');
   const pendingJobRequests = useRef(new Map<string, string>());
   const updatePendingReceipts = useCallback((receipts: string[]) => {
     storePendingReceipts(receipts);
@@ -249,7 +248,6 @@ export default function App() {
     (value: string) => {
       if (!opaqueReceipt.test(value)) return;
       updatePendingReceipts([value, ...pendingReceiptsRef.current.filter((id) => id !== value)]);
-      setReceipt(value);
     },
     [updatePendingReceipts],
   );
@@ -259,7 +257,6 @@ export default function App() {
         if (id === value) pendingJobRequests.current.delete(request);
       const remaining = pendingReceiptsRef.current.filter((id) => id !== value);
       updatePendingReceipts(remaining);
-      setReceipt((current) => (current === value ? (remaining[0] ?? '') : current));
     },
     [updatePendingReceipts],
   );
@@ -440,7 +437,6 @@ export default function App() {
     setActivityFilter({ query: '', status: 'all', page: 1 });
     setLive(null);
     updatePendingReceipts([]);
-    setReceipt('');
     pendingJobRequests.current.clear();
     setFollowUp(null);
     setEvents([]);
@@ -484,6 +480,8 @@ export default function App() {
           headers['X-Jellyport-Submission'] = submission;
           rememberReceipt(submission);
         }
+        const recoverableSubmission =
+          submission !== undefined || (options.method === 'POST' && path === '/api/migrations');
         let response: Response;
         try {
           response = await fetch(path, {
@@ -495,8 +493,8 @@ export default function App() {
         } catch (error) {
           if (error instanceof Error && error.name === 'AbortError') throw error;
           throw new Error(
-            path === membershipAcceptPath
-              ? 'Could not reach Jellyport. Check the Operations tray for the job before reviewing again.'
+            recoverableSubmission
+              ? 'Could not reach Jellyport. Find the operation in Activity.'
               : 'Could not reach Jellyport. Check that the application is running and try again.',
           );
         }
@@ -509,8 +507,8 @@ export default function App() {
             // Never turn an unreadable success into a fabricated typed object.
             if (error instanceof Error && error.name === 'AbortError') throw error;
             throw new Error(
-              path === membershipAcceptPath
-                ? 'Jellyport’s response could not be read. Check the Operations tray for the job before reviewing again.'
+              recoverableSubmission
+                ? 'Jellyport’s response could not be read. Find the operation in Activity.'
                 : 'Jellyport’s response could not be read. Refresh to check its status before retrying.',
             );
           }
@@ -1192,20 +1190,22 @@ export default function App() {
       setFollowUp({ ...result, job_id: id });
     });
   }
-  function findSubmission(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const value = receipt.trim();
+  function findSubmission(receipt: string) {
     const version = dialogVersion.current;
     void work('receipt', async () => {
       const result = await readOperationStatus<{ job_id: string }>(
         api,
-        `/api/jobs/receipts/${value ? encodeURIComponent(value) : 'latest'}`,
+        `/api/jobs/receipts/${encodeURIComponent(receipt)}`,
       );
-      if (version !== dialogVersion.current || !sessionRef.current?.authenticated) return;
+      if (
+        version !== dialogVersion.current ||
+        pageRef.current !== 'activity' ||
+        !sessionRef.current?.authenticated
+      )
+        return;
       if (typeof result?.job_id !== 'string' || !result.job_id)
         throw new Error('The operation receipt could not be resolved.');
-      if (value && !pendingReceiptsRef.current.includes(value)) rememberReceipt(value);
-      await openJob(result.job_id, { submissionReceipt: value || undefined });
+      await openJob(result.job_id, { submissionReceipt: receipt });
     });
   }
   function refreshPreview() {
@@ -1673,6 +1673,11 @@ export default function App() {
       <ActivityPage
         jobs={[]}
         navigate={navigate}
+        pendingSubmissions={{
+          receipts: pendingReceipts,
+          find: findSubmission,
+          busy: busy.has('receipt'),
+        }}
         openJob={(id) => openJob(id, { activityRowScope: activityScope })}
         refresh={() => void load(page, true)}
         clearHistory={(ids, filtered, single) =>
@@ -1848,68 +1853,6 @@ export default function App() {
                     </div>
                   )}
                   <WorkspaceNotice />
-                  <details className="operations-tray panel">
-                    <summary>
-                      <strong>Operations tray</strong>
-                      {!!live?.active_count && (
-                        <span className="status">{num(live.active_count)} active</span>
-                      )}
-                    </summary>
-                    <div className="operations-tray-body">
-                      {live?.active.map((job) => (
-                        <button
-                          className="text-button"
-                          key={job.id}
-                          onClick={() => openJob(job.id)}
-                        >
-                          {job.progress &&
-                          typeof job.progress === 'object' &&
-                          job.progress.current_user
-                            ? job.progress.current_user
-                            : (job.results?.[0]?.username ?? job.kind)}
-                          {' · '}
-                          {job.status}
-                        </button>
-                      ))}
-                      {(live?.active_count ?? 0) > 12 && (
-                        <button className="text-button" onClick={() => navigate('activity')}>
-                          View all operations
-                        </button>
-                      )}
-                      <form className="operations-receipt" onSubmit={findSubmission}>
-                        <label className="field">
-                          Operation submission receipt
-                          <input
-                            value={receipt}
-                            maxLength={36}
-                            placeholder="Leave blank for your latest submission"
-                            onChange={(event) => setReceipt(event.target.value)}
-                          />
-                        </label>
-                        <button className="btn btn-small btn-quiet" disabled={busy.has('receipt')}>
-                          Find operation
-                        </button>
-                      </form>
-                      {pendingReceipts.length > 1 && (
-                        <div
-                          className="operations-receipt"
-                          role="group"
-                          aria-label="Pending submission receipts"
-                        >
-                          {pendingReceipts.map((id) => (
-                            <button
-                              className="text-button"
-                              key={id}
-                              type="button"
-                              onClick={() => setReceipt(id)}
-                            >
-                              Receipt ending in {id.slice(-8)}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </details>
                   {page === 'migrate' && previewProgress && (
                     <div className="setup-server preview-progress mb-17" role="status">
                       <span>

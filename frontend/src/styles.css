@@ -3786,37 +3786,16 @@ progress.progress-track::-moz-progress-bar {
   }
 }
 
-.operations-tray {
-  margin-bottom: 1rem;
-}
-
-.operations-tray > summary {
-  cursor: pointer;
-  padding: 0.65rem 1rem;
-}
-
-.operations-tray > summary .status {
-  margin-inline-start: 0.6rem;
-}
-
-.operations-tray-body {
-  display: grid;
-  justify-items: start;
-  gap: 0.65rem;
-  padding: 0 1rem 0.9rem;
-}
-
-.operations-receipt {
+.pending-submissions,
+.pending-submission-actions {
   display: flex;
-  align-items: end;
   flex-wrap: wrap;
   gap: 0.65rem;
-  width: 100%;
 }
 
-.operations-receipt .field {
-  flex: 0 1 23rem;
-  min-width: 0;
+.pending-submissions {
+  align-items: center;
+  justify-content: space-between;
 }
 
 .operations-inbox {

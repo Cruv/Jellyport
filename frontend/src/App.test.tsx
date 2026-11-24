@@ -935,9 +935,12 @@ describe('React account safeguards', () => {
     render(<App />);
     await screen.findByRole('heading', { name: 'Overview', level: 1 });
     await waitFor(() => expect(timers.has(20_000)).toBe(true));
+    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
+    await screen.findByRole('heading', { name: 'Activity', level: 1 });
+    await screen.findByText('View results or delete individual reports below.');
     responses['/api/jobs'] = { jobs: [active] };
     await act(async () => timers.get(20_000)!());
-    await screen.findByText('1 active');
+    await screen.findByText('1 operation is running. Progress updates automatically.');
     const original = fetch;
     let heldSignal: AbortSignal | null | undefined;
     vi.stubGlobal(
@@ -960,8 +963,7 @@ describe('React account safeguards', () => {
     responses['/api/jobs'] = { jobs: [job] };
     await act(async () => timers.get(3000)!());
     await waitFor(() => expect(screen.queryByText('Activity updates paused.')).toBeNull());
-    fireEvent.click(screen.getByRole('button', { name: 'Activity' }));
-    await screen.findByRole('button', { name: 'Delete activity…' });
+    await screen.findByText('View results or delete individual reports below.');
   });
   it('distinguishes a still-processing subscription from a completed access change', async () => {
     const event = {

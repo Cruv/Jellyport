@@ -1194,11 +1194,13 @@ export function ActivityPage({
   openJob,
   navigate,
   clearHistory,
+  pendingSubmissions,
   remote,
 }: Common & {
   jobs: Job[];
   refresh: () => void;
   clearHistory?: (filteredIds: string[], filtered: boolean, single?: Job) => void;
+  pendingSubmissions?: { receipts: string[]; find: (receipt: string) => void; busy: boolean };
   remote?: {
     filter: ActivityFilter;
     result: ActivityResults | null;
@@ -1261,6 +1263,26 @@ export function ActivityPage({
           </>
         }
       />
+      {!!pendingSubmissions?.receipts.length && (
+        <section className="panel panel-body pending-submissions" aria-label="Pending submissions">
+          <h2>Pending submissions</h2>
+          <div className="pending-submission-actions">
+            {pendingSubmissions.receipts.map((receipt) => (
+              <button
+                className="btn btn-quiet"
+                key={receipt}
+                type="button"
+                disabled={pendingSubmissions.busy}
+                onClick={() => pendingSubmissions.find(receipt)}
+              >
+                {pendingSubmissions.receipts.length === 1
+                  ? 'Find operation'
+                  : `Find operation ending in ${receipt.slice(-8)}`}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
       <section className="panel">
         <div className="panel-header">
           <div>

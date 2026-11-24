@@ -375,7 +375,7 @@ test('complimentary policy saves without media writes and paid slots downgrade a
   expect(admin.writes).toHaveLength(writesBeforeReview);
 });
 
-test('the Operations tray retains exact receipts across a report failure, later success and reload', async ({
+test('Activity retains exact pending submissions across a report failure, later success and reload', async ({
   page,
   admin,
   mutations,
@@ -433,16 +433,19 @@ test('the Operations tray retains exact receipts across a report failure, later 
     await page.evaluate(() => sessionStorage.getItem('jellyport:pending-operation-receipts')),
   ).toBe(JSON.stringify(lost.map(({ receipt }) => receipt).reverse()));
   await page.reload();
-  await page.getByText('Operations tray', { exact: true }).click();
-  const pending = page.getByRole('group', { name: 'Pending submission receipts' });
-  await expect(pending.getByRole('button')).toHaveCount(2);
+  await navigate(page, 'Activity');
+  const pending = page.getByRole('heading', { name: 'Pending submissions', exact: true });
+  const findOperations = page.getByRole('button', { name: /^Find operation/ });
+  await expect(pending).toBeVisible();
+  await expect(findOperations).toHaveCount(2);
   const first = lost[0]!;
   const latest = await admin.client.get('/api/jobs/receipts/latest');
   expect(latest.ok()).toBe(true);
   expect(lost.map(({ id }) => id)).not.toContain((await latest.json()).job_id);
-  await pending
-    .getByRole('button', { name: `Receipt ending in ${first.receipt.slice(-8)}` })
-    .click();
+  const findFirst = page.getByRole('button', {
+    name: `Find operation ending in ${first.receipt.slice(-8)}`,
+    exact: true,
+  });
   await page.route(`**/api/jobs/${first.id}`, (route) => route.abort(), { times: 1 });
   const failedDetail = page.waitForEvent(
     'requestfailed',
@@ -451,28 +454,27 @@ test('the Operations tray retains exact receipts across a report failure, later 
   const firstLookup = page.waitForResponse(
     (response) => new URL(response.url()).pathname === `/api/jobs/receipts/${first.receipt}`,
   );
-  await page.getByRole('button', { name: 'Find operation' }).click();
+  await findFirst.click();
   expect(await (await firstLookup).json()).toEqual({ job_id: first.id });
   expect((await failedDetail).method()).toBe('GET');
   await expect(lostNotice).toBeVisible();
   await expect(details).toHaveCount(0);
 
   await page.reload();
-  await page.getByText('Operations tray', { exact: true }).click();
-  await expect(pending.getByRole('button')).toHaveCount(2);
-  for (const [{ id, receipt }, username] of [
-    [lost[0]!, 'crew_owner'],
-    [lost[1]!, 'lost-synthetic-account'],
+  await expect(pending).toBeVisible();
+  await expect(findOperations).toHaveCount(2);
+  for (const [{ id, receipt }, username, findOperation] of [
+    [first, 'crew_owner', findFirst],
+    [
+      lost[1]!,
+      'lost-synthetic-account',
+      page.getByRole('button', { name: 'Find operation', exact: true }),
+    ],
   ] as const) {
-    if (await pending.count())
-      await pending.getByRole('button', { name: `Receipt ending in ${receipt.slice(-8)}` }).click();
-    await expect(page.getByRole('textbox', { name: 'Operation submission receipt' })).toHaveValue(
-      receipt,
-    );
     const lookup = page.waitForResponse(
       (response) => new URL(response.url()).pathname === `/api/jobs/receipts/${receipt}`,
     );
-    await page.getByRole('button', { name: 'Find operation' }).click();
+    await findOperation.click();
     expect(await (await lookup).json()).toEqual({ job_id: id });
     await expect(details).toContainText(username);
     await details.getByRole('button', { name: 'Close dialog' }).click();
@@ -480,6 +482,7 @@ test('the Operations tray retains exact receipts across a report failure, later 
   expect(
     await page.evaluate(() => sessionStorage.getItem('jellyport:pending-operation-receipts')),
   ).toBeNull();
+  await expect(pending).toHaveCount(0);
   expect(mutations.filter((request) => request === `POST ${acceptPath}`)).toHaveLength(1);
   expect(
     admin.app.jellyport.store

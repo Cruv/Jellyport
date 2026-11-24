@@ -1,4 +1,4 @@
-import { test, expect, expectContainedLayout, paidOwner } from './media-admin-fixtures';
+import { test, expect, navigate, expectContainedLayout, paidOwner } from './media-admin-fixtures';
 import type { Locator } from '@playwright/test';
 
 async function assignCrewOwner(review: Locator) {
@@ -275,18 +275,21 @@ test('differently named migration accounts can be explicitly grouped under one D
     const receipt = accepted[0]!.submission_receipt;
     expect(receipt).toBeTruthy();
     await page.reload();
-    await page.goto('/#/activity');
-    const tray = page.locator('.operations-tray');
-    await expect(tray.getByText('1 active', { exact: true })).toBeVisible();
-    await tray.getByText('Operations tray', { exact: true }).click();
-    await expect(tray.getByRole('button', { name: /running/ })).toBeVisible();
-    await expect(tray.getByRole('textbox', { name: 'Operation submission receipt' })).toHaveValue(
-      String(receipt),
-    );
+    await navigate(page, 'Activity');
+    await page.getByRole('combobox', { name: 'Status', exact: true }).selectOption('active');
+    await page.getByRole('searchbox', { name: 'Search operations', exact: true }).fill(id);
+    await expect(page.getByText('1 operation is running.', { exact: false })).toBeVisible();
+    const running = page
+      .getByRole('row')
+      .filter({ has: page.getByText('In progress', { exact: true }) });
+    await expect(running.getByRole('button', { name: 'View operation details' })).toBeVisible();
+    await expect(
+      page.getByRole('heading', { name: 'Pending submissions', exact: true }),
+    ).toBeVisible();
     const lookup = page.waitForRequest(
       (request) => new URL(request.url()).pathname === `/api/jobs/receipts/${receipt}`,
     );
-    await tray.getByRole('button', { name: 'Find operation' }).click();
+    await page.getByRole('button', { name: 'Find operation', exact: true }).click();
     await lookup;
     await expect(page.getByRole('dialog').getByText(id, { exact: true })).toBeVisible();
   } finally {

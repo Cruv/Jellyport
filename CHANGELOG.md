@@ -1,5 +1,9 @@
 # Jellyport changelog
 
+## [0.33.7] - 2026-11-24
+
+- Remove the workspace-wide Operations tray. Follow jobs in Activity and recover pending submissions there when a response is lost.
+
 ## [0.33.6] - 2026-11-24
 
 - Select the version number to see release notes, the release date, and the exact running commit.

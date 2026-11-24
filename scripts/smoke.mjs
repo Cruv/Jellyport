@@ -89,9 +89,14 @@ assert.equal(
 );
 let session = await request('/api/session');
 assert(session.demo, 'Smoke tests require JELLYPORT_DEMO=true.');
+assert.equal(session.build_revision, undefined);
 csrf = session.csrf_token;
 session = await request('/api/login', 'POST', { username: 'admin', password: 'demo-jellyport' });
 assert(session.authenticated);
+if (process.argv[3] !== undefined) {
+  assert.match(process.argv[3], /^[a-f0-9]{40}$/);
+  assert.equal(session.build_revision, process.argv[3], 'Running container build revision');
+}
 csrf = session.csrf_token;
 const settings = await request('/api/settings');
 assert(!Object.hasOwn(settings, 'jellyfin_api_key'));

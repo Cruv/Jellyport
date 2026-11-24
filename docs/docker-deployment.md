@@ -71,6 +71,8 @@ File-copy capture does not open a source SQLite connection or pin a source read 
 
 The examples use the public image `ghcr.io/cruv/jellyport:latest`. Portainer can pull it without GitHub credentials or a registry login. It supports Linux x86-64 and ARM64. Each publication follows successful CI and smoke tests on both architectures.
 
+Use a `v<version>` image tag to install a specific release, a `sha-<full-commit-sha>` tag to select a source revision, or a manifest digest to pin the exact image. Select the version number in Jellyport and compare its running commit with the corresponding [GitHub release](https://github.com/Cruv/Jellyport/releases).
+
 For a privately published fork, add a **Custom registry** in Portainer with URL `ghcr.io` and authentication enabled. Use your GitHub username and a personal access token **classic** with `read:packages` from an account that can access that package. Store the token in the registry configuration, rather than Compose. Fine-grained tokens do not support registry authentication. See [Portainer's Custom registry instructions](https://docs.portainer.io/admin/registries/add/custom) and [GitHub's Container registry authentication](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry#authenticating-to-the-container-registry).
 
 Create a stack using the selected example and deploy it. For later image updates, use Portainer's stack update option to pull the image again and recreate the container, retaining the same data mount.
